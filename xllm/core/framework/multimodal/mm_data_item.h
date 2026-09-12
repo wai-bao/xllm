@@ -44,15 +44,15 @@ class MMDataItem {
 
  public:
   MMDataItem(MMType type);
-  MMDataItem(MMType type, const MMDict& data);
-  MMDataItem(MMType type, const MMDict& data, const MMMetadata& metadata);
+  MMDataItem(MMType type, MMDict data);
+  MMDataItem(MMType type, MMDict data, MMMetadata metadata);
 
   bool valid() const { return type_ != MMType::NONE; }
   bool is_type(MMType type) const { return type_ == type; }
 
   const MMDict& data() const { return data_; }
   MMDict& mutable_data() { return data_; }
-  void set_data(const MMDict& data) { data_ = std::move(data); }
+  void set_data(MMDict data) { data_ = std::move(data); }
 
   MMType type() const { return type_; }
   bool has(const MMKey& key) const;

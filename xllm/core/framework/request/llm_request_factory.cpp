@@ -411,7 +411,7 @@ std::shared_ptr<Request> LLMRequestFactory::create(
 
   Timer timer;
 
-  const std::optional<ChatTemplateRenderResult> render_result =
+  std::optional<ChatTemplateRenderResult> render_result =
       chat_template_->apply_with_generation_mode(
           messages, sp.tools, sp.chat_template_kwargs);
   if (!render_result.has_value()) {

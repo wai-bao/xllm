@@ -124,8 +124,8 @@ bool DiTWorkerImpl::init_model(const std::string& model_weights_path,
   }
 
   dit_context_ = DiTModelContext(parallel_args_,
-                                 std::move(loader->get_model_args()),
-                                 std::move(loader->get_quant_args()),
+                                 loader->get_model_args(),
+                                 loader->get_quant_args(),
                                  tensor_options,
                                  cache_config,
                                  model_type);
@@ -178,12 +178,11 @@ folly::SemiFuture<std::optional<ForwardOutput>> DiTWorkerImpl::step_async(
     const ForwardInput& inputs) {
   folly::Promise<std::optional<ForwardOutput>> promise;
   auto future = promise.getSemiFuture();
-  threadpool_.schedule([this,
-                        input = std::move(inputs),
-                        promise = std::move(promise)]() mutable {
-    auto output = this->step(input);
-    promise.setValue(output);
-  });
+  threadpool_.schedule(
+      [this, input = inputs, promise = std::move(promise)]() mutable {
+        auto output = this->step(input);
+        promise.setValue(output);
+      });
   return future;
 }
 

@@ -20,12 +20,10 @@ namespace xllm {
 
 MMDataItem::MMDataItem(MMType type) : type_(type) {}
 
-MMDataItem::MMDataItem(MMType type, const MMDict& data)
+MMDataItem::MMDataItem(MMType type, MMDict data)
     : type_(type), data_(std::move(data)) {}
 
-MMDataItem::MMDataItem(MMType type,
-                       const MMDict& data,
-                       const MMMetadata& metadata)
+MMDataItem::MMDataItem(MMType type, MMDict data, MMMetadata metadata)
     : type_(type), data_(std::move(data)), metadata_(std::move(metadata)) {}
 
 bool MMDataItem::has(const MMKey& key) const {

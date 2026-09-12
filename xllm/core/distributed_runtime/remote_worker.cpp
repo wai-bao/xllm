@@ -173,10 +173,9 @@ folly::SemiFuture<std::optional<RawForwardOutput>>
 RemoteWorker::step_remote_async(const ForwardInput& input) {
   folly::Promise<std::optional<RawForwardOutput>> promise;
   auto future = promise.getSemiFuture();
-  threadpool_.schedule(
-      [this, input = std::move(input), promise = std::move(promise)]() mutable {
-        channel_->execute_model_async(input, promise);
-      });
+  threadpool_.schedule([this, input, promise = std::move(promise)]() mutable {
+    channel_->execute_model_async(input, promise);
+  });
   return future;
 }
 
@@ -266,9 +265,7 @@ folly::SemiFuture<uint32_t> RemoteWorker::transfer_kv_blocks(
   folly::Promise<uint32_t> promise;
   auto future = promise.getSemiFuture();
   copy_threadpool_.schedule(
-      [this,
-       block_transfer_info = std::move(block_transfer_info),
-       promise = std::move(promise)]() mutable {
+      [this, block_transfer_info, promise = std::move(promise)]() mutable {
         channel_->transfer_kv_blocks(block_transfer_info, promise);
       });
   return future;
@@ -278,9 +275,7 @@ void RemoteWorker::transfer_kv_blocks(
     const uint64_t batch_id,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
   threadpool_.schedule(
-      [this,
-       batch_id = batch_id,
-       block_transfer_info = std::move(block_transfer_info)]() mutable {
+      [this, batch_id = batch_id, block_transfer_info]() mutable {
         channel_->transfer_kv_blocks(batch_id, block_transfer_info);
       });
 }
@@ -289,14 +284,13 @@ void RemoteWorker::prefetch_from_storage(
     const std::vector<BlockTransferInfo>& block_transfer_info,
     std::shared_ptr<PrefetchResult> result,
     size_t worker_index) {
-  copy_threadpool_.schedule(
-      [this,
-       block_transfer_info = std::move(block_transfer_info),
-       result = std::move(result),
-       worker_index]() mutable {
-        channel_->prefetch_from_storage(
-            block_transfer_info, std::move(result), worker_index);
-      });
+  copy_threadpool_.schedule([this,
+                             block_transfer_info,
+                             result = std::move(result),
+                             worker_index]() mutable {
+    channel_->prefetch_from_storage(
+        block_transfer_info, std::move(result), worker_index);
+  });
 }
 
 const torch::Device& RemoteWorker::device() const {

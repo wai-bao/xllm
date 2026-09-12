@@ -623,7 +623,7 @@ void WorkerService::TransferBlocks(
   uint64_t batch_id = proto_to_block_transfer_info(*req, block_transfer_info);
 
   resp->set_success_cnt(
-      worker_->transfer_kv_blocks(batch_id, std::move(block_transfer_info)));
+      worker_->transfer_kv_blocks(batch_id, block_transfer_info));
   return;
 }
 

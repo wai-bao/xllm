@@ -192,7 +192,7 @@ folly::SemiFuture<bool> Worker::pull_kv_blocks_async(
 uint32_t Worker::transfer_kv_blocks(
     const uint64_t batch_id,
     const std::vector<BlockTransferInfo>& block_transfer_info) {
-  return impl_->transfer_kv_blocks(batch_id, std::move(block_transfer_info));
+  return impl_->transfer_kv_blocks(batch_id, block_transfer_info);
 }
 
 uint32_t Worker::transfer_kv_blocks(

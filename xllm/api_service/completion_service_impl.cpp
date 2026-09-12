@@ -230,7 +230,7 @@ void CompletionServiceImpl::process_async_rpc_impl(
   }
 
   // schedule the request
-  master_->handle_request(std::move(rpc_request.prompt()),
+  master_->handle_request(rpc_request.prompt(),
                           std::move(prompt_tokens),
                           std::move(request_params),
                           std::nullopt,
@@ -282,7 +282,7 @@ void CompletionServiceImpl::process_async_impl(
   auto saved_request_id = request_params.request_id;
   // schedule the request
   master->handle_request(
-      std::move(rpc_request.prompt()),
+      rpc_request.prompt(),
       std::move(prompt_tokens),
       std::move(request_params),
       call.get(),

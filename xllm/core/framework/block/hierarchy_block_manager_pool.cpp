@@ -1010,7 +1010,7 @@ void HierarchyBlockManagerPool::transfer_blocks(std::vector<Batch>& batches) {
         << "Missing batch for pending H2D transfer at dp_rank=" << i;
     batches[i].set_batch_id();
     engine_->transfer_kv_blocks(
-        i, batches[i].batch_id(), std::move(load_block_transfer_infos_[i]));
+        i, batches[i].batch_id(), load_block_transfer_infos_[i]);
     load_block_transfer_infos_[i].clear();
   }
 
@@ -1065,8 +1065,7 @@ void HierarchyBlockManagerPool::transfer_offload_blocks() {
       }
       std::shared_ptr<KVTransferTracker::Completion> completion =
           offload_transfers_.track();
-      folly::collectAll(
-          std::move(engine_->transfer_kv_blocks(i, std::move(transfer_infos))))
+      folly::collectAll(engine_->transfer_kv_blocks(i, transfer_infos))
           .via(&folly::InlineExecutor::instance())
           .thenValue([device_blocks = std::move(src_blocks),
                       host_blocks = std::move(dst_blocks),

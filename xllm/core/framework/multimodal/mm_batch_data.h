@@ -32,8 +32,8 @@ namespace xllm {
 class MMBatchData {
  public:
   MMBatchData() = default;
-  MMBatchData(const std::vector<MMData>& data);
-  MMBatchData(uint32_t type, const MMDict& items);
+  MMBatchData(std::vector<MMData> data);
+  MMBatchData(uint32_t type, MMDict items);
 
   bool has(uint32_t type) const { return type & type_ != 0; }
   bool valid() const { return type_ != MMType::NONE; }
@@ -48,7 +48,7 @@ class MMBatchData {
   static MMBatchData to(const MMBatchData& mm_data,
                         const torch::Device& device);
 
-  void batch(const std::vector<MMData>& mm_datas);
+  void batch(std::vector<MMData> mm_datas);
 
   template <typename T>
   std::optional<T> get(const MMKey& key) const {
@@ -62,7 +62,7 @@ class MMBatchData {
     }
   }
 
-  void replace(const MMDict& data) { data_ = std::move(data); }
+  void replace(MMDict data) { data_ = std::move(data); }
   const std::vector<MMData>& mm_data_vec() const { return mm_datas_; }
 
   bool foreach (MMData::IVisitor& v) {

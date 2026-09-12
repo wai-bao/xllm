@@ -110,7 +110,7 @@ CacheStepOut FBCacheTaylorSeer::on_after_step(const CacheStepIn& stepin) {
         get_tensor_or_empty(stepin.tensors, "original_hidden_states");
 
     auto hidden_states_residual = hidden_states - original_hidden_states;
-    taylorseer->update(std::move(hidden_states_residual));
+    taylorseer->update(hidden_states_residual);
 
     auto encoder_hidden_states =
         get_tensor_or_empty(stepin.tensors, "encoder_hidden_states");

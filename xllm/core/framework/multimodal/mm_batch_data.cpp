@@ -23,9 +23,11 @@ limitations under the License.
 
 namespace xllm {
 
-MMBatchData::MMBatchData(const std::vector<MMData>& data) { this->batch(data); }
+MMBatchData::MMBatchData(std::vector<MMData> data) {
+  this->batch(std::move(data));
+}
 
-MMBatchData::MMBatchData(uint32_t type, const MMDict& items)
+MMBatchData::MMBatchData(uint32_t type, MMDict items)
     : type_(type), data_(std::move(items)) {}
 
 bool MMBatchData::has(const MMKey& key) const {
@@ -80,13 +82,13 @@ MMBatchData MMBatchData::to(const MMBatchData& mm_data,
   return new_mm_data;
 }
 
-void MMBatchData::batch(const std::vector<MMData>& mm_datas) {
+void MMBatchData::batch(std::vector<MMData> mm_datas) {
   mm_datas_ = std::move(mm_datas);
   CollectMMDataTensorVisitor visitor;
   this->foreach (static_cast<MMData::IVisitor&>(visitor));
 
   MMDict dict;
-  for (const auto& pair : visitor.datas_) {
+  for (auto& pair : visitor.datas_) {
     torch::Tensor tar;
     if (safe_concat(pair.second, tar)) {
       dict[pair.first] = tar;

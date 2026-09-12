@@ -60,8 +60,8 @@ class MMData {
 
  public:
   MMData() = default;
-  MMData(uint32_t type, const MMItemVec& items);
-  MMData(uint32_t type, const MMDict& items);
+  MMData(uint32_t type, MMItemVec items);
+  MMData(uint32_t type, MMDict items);
 
   bool has(uint32_t type) const { return type & type_ != 0; }
   bool has(MMType type) const { return type & type_ != 0; }
@@ -136,9 +136,9 @@ class MMData {
   }
 
   template <typename T>
-  void set(uint32_t type, const T& item) {
+  void set(uint32_t type, T item) {
     type_ = type;
-    items_ = item;
+    items_ = std::move(item);
   }
 
   template <typename T>

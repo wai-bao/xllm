@@ -19,10 +19,10 @@ limitations under the License.
 
 namespace xllm {
 
-MMData::MMData(uint32_t type, const MMItemVec& items)
+MMData::MMData(uint32_t type, MMItemVec items)
     : type_(type), items_(std::move(items)) {}
 
-MMData::MMData(uint32_t type, const MMDict& items)
+MMData::MMData(uint32_t type, MMDict items)
     : type_(type), items_(std::move(items)) {}
 
 bool MMData::has(const MMKey& key) const {

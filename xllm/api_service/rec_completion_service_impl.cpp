@@ -339,7 +339,7 @@ void RecCompletionServiceImpl::process_async_impl(
   auto saved_streaming = request_params.streaming;
   auto saved_request_id = request_params.request_id;
   master_->handle_request(
-      std::move(rpc_request_ref.prompt()),
+      rpc_request_ref.prompt(),
       std::move(prompt_tokens),
       std::move(input_tensors),
       std::move(request_params),

@@ -109,7 +109,7 @@ class HeapQueue final : public RequestPriorityQueue {
 
  public:
   explicit HeapQueue(Comparator lower_priority_comparator)
-      : queue_(std::move(lower_priority_comparator)) {}
+      : queue_(lower_priority_comparator) {}
 
   void push(std::shared_ptr<Request> req) override { queue_.push(req); }
   void push(std::shared_ptr<Request> req, bool if_back) override {

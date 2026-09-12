@@ -111,7 +111,7 @@ void EmbeddingServiceImpl::process_async_impl(
   auto saved_request_id = request_params.request_id;
   // schedule the request
   master_->handle_request(
-      std::move(input),
+      input,
       std::nullopt,
       std::move(request_params),
       call.get(),

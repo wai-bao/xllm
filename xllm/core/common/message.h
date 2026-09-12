@@ -44,16 +44,16 @@ struct AudioURL {
 };
 
 struct MMContent {
-  MMContent(const std::string& type, const std::string& text)
-      : type(type), text(std::move(text)) {}
-  MMContent(const std::string& type, const ImageURL& image_url)
-      : type(type), image_url(std::move(image_url)) {}
-  MMContent(const std::string& type, const VideoURL& video_url)
-      : type(type), video_url(std::move(video_url)) {}
-  MMContent(const std::string& type, const AudioURL& audio_url)
-      : type(type), audio_url(std::move(audio_url)) {}
-  MMContent(const std::string& type, const Embedding& embedding)
-      : type(type), embedding(embedding) {}
+  MMContent(std::string type, std::string text)
+      : type(std::move(type)), text(std::move(text)) {}
+  MMContent(std::string type, ImageURL image_url)
+      : type(std::move(type)), image_url(std::move(image_url)) {}
+  MMContent(std::string type, VideoURL video_url)
+      : type(std::move(type)), video_url(std::move(video_url)) {}
+  MMContent(std::string type, AudioURL audio_url)
+      : type(std::move(type)), audio_url(std::move(audio_url)) {}
+  MMContent(std::string type, Embedding embedding)
+      : type(std::move(type)), embedding(std::move(embedding)) {}
 
   std::string type;
 
@@ -80,11 +80,11 @@ struct Message {
   };
   using ToolCallVec = std::vector<ToolCall>;
 
-  Message(const std::string& role, const std::string& content)
-      : role(role), content(content) {}
+  Message(std::string role, std::string content)
+      : role(std::move(role)), content(std::move(content)) {}
 
-  Message(const std::string& role, const MMContentVec& content)
-      : role(role), content(std::move(content)) {}
+  Message(std::string role, MMContentVec content)
+      : role(std::move(role)), content(std::move(content)) {}
 
   int calc_count(const std::string& type) {
     if (std::holds_alternative<std::string>(content)) {

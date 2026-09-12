@@ -213,7 +213,7 @@ bool EncoderInputGatherVisitor::visit(MMDataItem& item) {
 
 bool EncoderInputGatherVisitor::finish(MMBatchData& mm_data) {
   MMDict dict;
-  for (const auto& pair : datas_) {
+  for (auto& pair : datas_) {
     torch::Tensor tar;
     if (safe_concat(pair.second, tar)) {
       dict[pair.first] = tar;
@@ -221,7 +221,7 @@ bool EncoderInputGatherVisitor::finish(MMBatchData& mm_data) {
       dict[pair.first] = std::move(pair.second);
     }
   }
-  mm_data.replace(dict);
+  mm_data.replace(std::move(dict));
   return true;
 }
 

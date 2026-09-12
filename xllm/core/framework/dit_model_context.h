@@ -34,8 +34,8 @@ class DiTModelContext {
   DiTModelContext() : parallel_args_(1, 1, nullptr) {};
 
   DiTModelContext(const ParallelArgs& input_parallel_args,
-                  const std::unordered_map<std::string, ModelArgs>& model_args,
-                  const std::unordered_map<std::string, QuantArgs>& quant_args,
+                  std::unordered_map<std::string, ModelArgs> model_args,
+                  std::unordered_map<std::string, QuantArgs> quant_args,
                   const torch::TensorOptions& tensor_options,
                   const DiTCacheConfig& dit_config,
                   const std::string& model_type);

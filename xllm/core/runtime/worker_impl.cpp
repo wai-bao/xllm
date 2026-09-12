@@ -790,7 +790,7 @@ void WorkerImpl::update_last_step_output(
     const std::vector<std::string>& request_ids,
     const std::vector<std::string>& sample_sequence_ids) {
   const bool has_tokens = output.value().sample_output.next_tokens.defined();
-  last_step_output_ = std::move(output.value());
+  last_step_output_ = output.value();
   last_step_request_ids_ = request_ids;
   last_step_sample_sequence_ids_ = sample_sequence_ids;
   if (has_tokens) {
@@ -1907,7 +1907,7 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
       options_.model_path() != model_weights_path) {
     model_loader->set_reference_model_weights_path(options_.model_path());
   }
-  model_weights_path_ = std::move(model_weights_path);
+  model_weights_path_ = model_weights_path;
 
   auto args = model_loader->model_args();
   auto quant_args = model_loader->quant_args();
