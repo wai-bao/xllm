@@ -263,7 +263,7 @@ void RecMaster::handle_request(const std::vector<int>& prompt_tokens,
   schedule_request(
       std::move(sp),
       std::move(callback),
-      [this, prompt_tokens, mm_data = std::move(mm_data)](
+      [this, prompt_tokens = prompt_tokens, mm_data = std::move(mm_data)](
           const RequestParams& params, OutputCallback cb) mutable {
         return request_factory_->create(
             prompt_tokens, std::move(mm_data), params, std::move(cb));
