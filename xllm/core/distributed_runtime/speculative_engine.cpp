@@ -78,7 +78,6 @@ SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
       LOG(FATAL) << "Current only support target and draft engine using the "
                     "same devices";
     }
-    share_device_ = true;
   }
 }
 
@@ -175,16 +174,9 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
       std::min(target_kv_cache_cap.cache_size_in_bytes(),
                draft_kv_cache_cap.cache_size_in_bytes());
 
-  int64_t n_blocks = 0;
-  // check if llm and ssm are using same device
-  if (share_device_) {
-    // on the same device, use the smaller kv cache size
-    n_blocks = calculate_kv_cache(target_kv_cache_cap, draft_kv_cache_cap);
-  } else {
-    // on different devices, use the smaller number of blocks
-    n_blocks =
-        std::min(target_kv_cache_cap.n_blocks(), draft_kv_cache_cap.n_blocks());
-  }
+  // Target and draft share devices and therefore a common KV cache budget.
+  const int64_t n_blocks =
+      calculate_kv_cache(target_kv_cache_cap, draft_kv_cache_cap);
   CHECK_GT(n_blocks, 0) << "no memory for kv cache";
 
   // allocate kv cache

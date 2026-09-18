@@ -117,9 +117,6 @@ class SpeculativeEngineBase : public Engine {
   // whether this speculative engine uses an external draft engine
   const bool use_draft_engine_;
 
-  // whether target and draft engine are sharing the same device
-  bool share_device_ = false;
-
   ModelArgs model_args_;
 
   std::shared_ptr<DistManager> dist_manager_ = nullptr;
