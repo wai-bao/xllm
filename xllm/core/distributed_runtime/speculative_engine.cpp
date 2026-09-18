@@ -63,8 +63,9 @@ SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
     // In vlm mtp case, we'd like to use llm backend instead of vlm backend for
     // draft engine.
     runtime::Options draft_engine_options = options_;
+    // The draft engine always runs on the target's device list.
     draft_engine_options.model_path(options_.draft_model_path().value_or(""))
-        .devices(options.draft_devices())
+        .devices(options.devices())
         .backend("llm")
         .num_decoding_tokens(1)
         .enable_speculative_decode(/*enable_speculative_decode=*/false)
@@ -72,12 +73,6 @@ SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
         .is_draft_engine(true);
     draft_engine_ =
         std::make_unique<LLMEngine>(draft_engine_options, dist_manager_);
-
-    // Currently target and draft engines must use the same device list.
-    if (options.devices() != options.draft_devices()) {
-      LOG(FATAL) << "Current only support target and draft engine using the "
-                    "same devices";
-    }
   }
 }
 
@@ -174,7 +169,8 @@ bool SpeculativeEngineBase<TargetEngine>::allocate_kv_cache() {
       std::min(target_kv_cache_cap.cache_size_in_bytes(),
                draft_kv_cache_cap.cache_size_in_bytes());
 
-  // Target and draft share devices and therefore a common KV cache budget.
+  // Target and draft run on the same device list, so they share a common KV
+  // cache budget.
   const int64_t n_blocks =
       calculate_kv_cache(target_kv_cache_cap, draft_kv_cache_cap);
   CHECK_GT(n_blocks, 0) << "no memory for kv cache";

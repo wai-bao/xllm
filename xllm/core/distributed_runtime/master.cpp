@@ -607,16 +607,11 @@ Master::Master(const Options& options, EngineType type)
     const bool use_suffix_spec = options_.speculative_algorithm() == "Suffix";
     CHECK(use_suffix_spec || !draft_model_path.empty())
         << "draft model path is required unless --speculative_algorithm=Suffix";
-    // Draft model shares the same devices as the target model.
-    const auto& draft_devices = devices;
-    LOG(INFO) << "Using draft devices: "
-              << DeviceNameUtils::to_string(draft_devices);
     runtime::Options spec_options;
     spec_options.model_path(options_.model_path())
         .model_id(options_.model_id())
         .draft_model_path(draft_model_path)
         .devices(devices)
-        .draft_devices(draft_devices)
         .backend(options_.backend())
         .block_size(options_.block_size())
         .max_cache_size(options_.max_cache_size())

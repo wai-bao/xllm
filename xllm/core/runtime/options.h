@@ -41,9 +41,6 @@ struct Options {
   // devices for execute model
   PROPERTY(std::vector<torch::Device>, devices);
 
-  // devices for execute draft model
-  PROPERTY(std::vector<torch::Device>, draft_devices);
-
   // the number of slots per block, default 128, value must be multiple of 16
   PROPERTY(int32_t, block_size) = 128;
 
