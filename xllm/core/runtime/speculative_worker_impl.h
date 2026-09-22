@@ -153,7 +153,8 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   // next_tokens must already be on CPU to avoid a hidden device sync.
   void record_speculative_metrics(
       SampleOutput& output,
-      const std::vector<int32_t>& proposed_tokens) const;
+      const std::vector<int32_t>& proposed_tokens,
+      bool publish_position_metrics) const;
 
   // prepare inputs for target model at Decode phase (validation).
   void prepare_validate_inputs(const ForwardInput& inputs,

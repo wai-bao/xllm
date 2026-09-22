@@ -265,7 +265,8 @@ SpeculativeWorkerImpl::SpeculativeWorkerImpl(
 
 void SpeculativeWorkerImpl::record_speculative_metrics(
     SampleOutput& output,
-    const std::vector<int32_t>& proposed_tokens) const {
+    const std::vector<int32_t>& proposed_tokens,
+    bool publish_position_metrics) const {
   CHECK(output.next_tokens.defined())
       << "speculative output tokens are undefined";
   CHECK(output.next_tokens.device().is_cpu())
@@ -278,38 +279,17 @@ void SpeculativeWorkerImpl::record_speculative_metrics(
       options_.num_speculative_tokens());
   output.speculative_token_stats = std::move(metrics.sequence_stats);
 
-  for (size_t position = 0; position < metrics.accepted_per_position.size();
-       ++position) {
-    MULTI_COUNTER_ADD(
-        speculative_num_accepted_tokens_per_pos,
-        speculative_position_labels_[position],
-        metrics.accepted_per_position[position]);
+  if (publish_position_metrics) {
+    for (size_t position = 0; position < metrics.accepted_per_position.size();
+         ++position) {
+      MULTI_COUNTER_ADD(
+          speculative_num_accepted_tokens_per_pos,
+          speculative_position_labels_[position],
+          metrics.accepted_per_position[position]);
+    }
   }
-  COUNTER_ADD(speculative_num_drafts_total, output.next_tokens.size(0));
   COUNTER_ADD(speculative_num_draft_tokens_total, metrics.proposed_tokens);
   COUNTER_ADD(speculative_num_accepted_tokens_total, metrics.accepted_tokens);
-  COUNTER_ADD(speculative_num_committed_tokens_total, metrics.committed_tokens);
-
-  const double total_drafts = COUNTER_VALUE(speculative_num_drafts_total);
-  if (total_drafts > 0) {
-    GAUGE_SET(
-        speculative_mean_acceptance_length,
-        COUNTER_VALUE(speculative_num_committed_tokens_total) / total_drafts);
-  }
-
-  double previous_accepted = total_drafts;
-  for (size_t position = 0; position < metrics.accepted_per_position.size();
-       ++position) {
-    const std::string& label = speculative_position_labels_[position];
-    const double current_accepted = MULTI_COUNTER_VALUE(
-        speculative_num_accepted_tokens_per_pos, label);
-    if (previous_accepted > 0) {
-      MULTI_GAUGE_SET(speculative_conditional_acceptance_rate_per_pos,
-                      label,
-                      current_accepted / previous_accepted);
-    }
-    previous_accepted = current_accepted;
-  }
 }
 
 SpeculativeWorkerImpl::~SpeculativeWorkerImpl() {

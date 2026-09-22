@@ -2846,7 +2846,10 @@ void MTPWorkerImpl::record_validate_metrics(
                      num_speculative_tokens);
     }
   }
-  record_speculative_metrics(validate_output, proposed_tokens);
+  // WorkerService publishes per-position and committed-token metrics after
+  // applying graph-warmup filtering.
+  record_speculative_metrics(
+      validate_output, proposed_tokens, /*publish_position_metrics=*/false);
 }
 
 bool MTPWorkerImpl::adaptive_enabled() const {

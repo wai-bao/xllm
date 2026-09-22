@@ -1114,7 +1114,10 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
           std::clamp(per_seq_val_tokens[seq_id], 1, output_width) - 1;
     }
   }
-  record_speculative_metrics(val_output, proposed_tokens);
+  // WorkerService skips block-diffusion outputs, so publish their precise
+  // per-position counts here using the actual per-sequence widths.
+  record_speculative_metrics(
+      val_output, proposed_tokens, /*publish_position_metrics=*/true);
   write_target_context_to_cache(input, val_output);
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {

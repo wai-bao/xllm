@@ -146,12 +146,16 @@ WorkerService::record_speculative_metrics_from_output(
       CHECK_EQ(output_stats.size(), static_cast<size_t>(next_tokens.size(0)))
           << "speculative token stats batch mismatch";
     }
-    // Algorithm workers use the shared speculative metrics path when they
-    // provide per-sequence stats. Avoid publishing the same batch twice.
-    return output_stats;
   }
   if (!next_tokens.defined() || next_tokens.dim() != 2 ||
       next_tokens.numel() == 0) {
+    return output_stats;
+  }
+  // DFlash / DSpark record metrics inline in their own worker
+  // (DFlashWorkerImpl::record_validate_metrics) with precise per-seq widths,
+  // so this generic per-tensor count would double-count them.
+  if (SpeculativeConfig::is_block_diffusion_algorithm(
+          options_.speculative_algorithm())) {
     return output_stats;
   }
 
@@ -184,8 +188,12 @@ WorkerService::record_speculative_metrics_from_output(
         accepted);
   }
   COUNTER_ADD(speculative_num_drafts_total, batch_size);
-  COUNTER_ADD(speculative_num_draft_tokens_total, num_draft_tokens);
-  COUNTER_ADD(speculative_num_accepted_tokens_total, num_accepted_tokens);
+  // Adaptive MTP records these totals inline using the actual per-sequence
+  // proposal widths. Still publish the remaining output metrics below.
+  if (output_stats.empty()) {
+    COUNTER_ADD(speculative_num_draft_tokens_total, num_draft_tokens);
+    COUNTER_ADD(speculative_num_accepted_tokens_total, num_accepted_tokens);
+  }
   COUNTER_ADD(speculative_num_committed_tokens_total, stats.committed_tokens);
   // Derive from the global counters, not per-instance totals, so multi-DP
   // writers converge on one aggregate instead of overwriting the gauge.
@@ -212,6 +220,9 @@ WorkerService::record_speculative_metrics_from_output(
                       cur_accepted / prev_accepted);
     }
     prev_accepted = cur_accepted;
+  }
+  if (!output_stats.empty()) {
+    return output_stats;
   }
   return stats.sequence_stats;
 }
