@@ -13,6 +13,7 @@ cc_library(
     mtp_json_object_state.h
     draft_extend_input.h
     embedding_cache.h
+    metrics.h
     spec_verify.h
   SRCS
     adaptive_speculative_controller.cpp
@@ -23,6 +24,7 @@ cc_library(
     mtp_async_state.cpp
     draft_extend_input.cpp
     embedding_cache.cpp
+    metrics.cpp
     spec_verify.cpp
   DEPS
     torch

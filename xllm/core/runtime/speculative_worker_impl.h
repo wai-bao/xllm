@@ -22,6 +22,7 @@ limitations under the License.
 #include "common/macros.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/embedding_cache.h"
+#include "core/framework/speculative/metrics.h"
 #include "framework/sampling/draft_sampling_mode.h"
 #include "framework/sampling/rejection_sampler.h"
 #include "runtime/options.h"
@@ -47,24 +48,6 @@ bool should_run_speculative_decode(const ModelInputParams& params);
 // Keep padded and raw DP token-count views in the same speculative layout.
 void scale_speculative_parallel_token_counts(ModelInputParams& params,
                                              int32_t multiplier);
-
-struct SpeculativeOutputStats {
-  std::vector<int64_t> accepted_per_position;
-  std::vector<SpeculativeTokenStats> sequence_stats;
-  int64_t committed_tokens = 0;
-};
-
-SpeculativeOutputStats calculate_speculative_output_stats(
-    const torch::Tensor& tokens,
-    int64_t num_speculative_tokens);
-
-std::vector<SpeculativeTokenStats> calculate_mtp_speculative_token_stats(
-    const torch::Tensor& tokens,
-    const std::vector<int32_t>& proposed_tokens);
-
-std::vector<SpeculativeTokenStats> calculate_block_speculative_token_stats(
-    const torch::Tensor& tokens,
-    const std::vector<int32_t>& proposed_tokens);
 
 // Base class for all speculative decoding workers.
 // Provides common logic: target model management, step dispatch, and
