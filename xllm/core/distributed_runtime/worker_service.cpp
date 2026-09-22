@@ -151,9 +151,8 @@ WorkerService::record_speculative_metrics_from_output(
       next_tokens.numel() == 0) {
     return output_stats;
   }
-  // DFlash / DSpark record metrics inline in their own worker
-  // (DFlashWorkerImpl::record_validate_metrics) with precise per-seq widths,
-  // so this generic per-tensor count would double-count them.
+  // DFlash / DSpark publish metrics through the shared worker helper with
+  // precise per-sequence widths, so this generic count would double-count them.
   if (SpeculativeConfig::is_block_diffusion_algorithm(
           options_.speculative_algorithm())) {
     return output_stats;
