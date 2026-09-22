@@ -149,6 +149,12 @@ class SpeculativeWorkerImpl : public WorkerImpl {
 
   static void force_greedy_draft_sampling(SamplingParameters& sampling_params);
 
+  // Calculate and publish validation metrics shared by speculative algorithms.
+  // next_tokens must already be on CPU to avoid a hidden device sync.
+  void record_speculative_metrics(
+      SampleOutput& output,
+      const std::vector<int32_t>& proposed_tokens) const;
+
   // prepare inputs for target model at Decode phase (validation).
   void prepare_validate_inputs(const ForwardInput& inputs,
                                ForwardInput& validate_inputs);
@@ -220,5 +226,6 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   bool enable_fused_kernel_ = false;
   int32_t embedding_size_ = 0;
   DraftSamplingMode draft_sampling_mode_ = DraftSamplingMode::GREEDY;
+  std::vector<std::string> speculative_position_labels_;
 };
 }  // namespace xllm

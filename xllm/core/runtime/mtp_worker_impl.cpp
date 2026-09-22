@@ -2834,33 +2834,19 @@ void MTPWorkerImpl::record_validate_metrics(
   CHECK_EQ(validate_output.next_tokens.size(1), num_speculative_tokens + 1)
       << "validate output width mismatch";
 
-  CHECK(validate_output.next_tokens.device().is_cpu())
-      << "record_validate_metrics expects next_tokens already on CPU to avoid "
-         "a blocking device sync on the hot path";
   std::vector<int32_t> proposed_tokens(static_cast<size_t>(batch_size),
                                        num_speculative_tokens);
-  for (int32_t seq_id = 0; seq_id < batch_size; ++seq_id) {
-    if (pruned_prefix_lengths != nullptr) {
-      CHECK_EQ(pruned_prefix_lengths->size(), static_cast<size_t>(batch_size))
-          << "adaptive pruning prefix length batch mismatch";
+  if (pruned_prefix_lengths != nullptr) {
+    CHECK_EQ(pruned_prefix_lengths->size(), static_cast<size_t>(batch_size))
+        << "adaptive pruning prefix length batch mismatch";
+    for (int32_t seq_id = 0; seq_id < batch_size; ++seq_id) {
       proposed_tokens[static_cast<size_t>(seq_id)] =
           std::clamp((*pruned_prefix_lengths)[static_cast<size_t>(seq_id)],
                      0,
                      num_speculative_tokens);
     }
   }
-  validate_output.speculative_token_stats =
-      calculate_mtp_speculative_token_stats(validate_output.next_tokens,
-                                            proposed_tokens);
-  int64_t num_draft_tokens = 0;
-  int64_t accepted_count = 0;
-  for (const SpeculativeTokenStats& stats :
-       validate_output.speculative_token_stats) {
-    num_draft_tokens += stats.proposed_tokens;
-    accepted_count += stats.accepted_tokens;
-  }
-  COUNTER_ADD(speculative_num_draft_tokens_total, num_draft_tokens);
-  COUNTER_ADD(speculative_num_accepted_tokens_total, accepted_count);
+  record_speculative_metrics(validate_output, proposed_tokens);
 }
 
 bool MTPWorkerImpl::adaptive_enabled() const {

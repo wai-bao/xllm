@@ -27,9 +27,20 @@ namespace xllm {
 struct SpeculativeOutputStats {
   std::vector<int64_t> accepted_per_position;
   std::vector<SpeculativeTokenStats> sequence_stats;
+  int64_t proposed_tokens = 0;
+  int64_t accepted_tokens = 0;
   int64_t committed_tokens = 0;
 };
 
+// Calculates validation metrics for a contiguous [batch, output_width] tensor.
+// Column 0 is the target token; the following columns are accepted drafts.
+// proposed_tokens carries each sequence's actual draft width after pruning.
+SpeculativeOutputStats calculate_speculative_metrics(
+    const torch::Tensor& tokens,
+    const std::vector<int32_t>& proposed_tokens,
+    int64_t max_speculative_tokens);
+
+// Compatibility helpers for existing callers.
 SpeculativeOutputStats calculate_speculative_output_stats(
     const torch::Tensor& tokens,
     int64_t num_speculative_tokens);

@@ -190,15 +190,6 @@ class DFlashWorkerImpl : public SpeculativeWorkerImpl {
       ForwardInput& validate_input,
       const std::vector<int32_t>& per_seq_val_tokens);
 
-  // Record precise (draft, accepted) counters. Padded -1 slots at positions
-  // past per_seq_val_tokens[i]-1 are excluded — the count only walks each
-  // row up to its per-seq width. Passing an empty vector treats every row
-  // as full width (static). Caller must ensure val_output.next_tokens is on
-  // CPU (avoids a blocking device sync on the hot path).
-  void record_validate_metrics(
-      SampleOutput& val_output,
-      const std::vector<int32_t>& per_seq_val_tokens) const;
-
   void process_draft_sample_output(SampleOutput& sample_output);
 
   // Mirrors sampled tokens to rank 0 under schedule-overlap so every rank
@@ -224,9 +215,6 @@ class DFlashWorkerImpl : public SpeculativeWorkerImpl {
   // Fixed once the target finishes loading; the hybrid spec-verify gates and
   // the adaptive-pruning guard read this instead of re-scanning layer_types.
   bool target_is_hybrid_recurrent_ = false;
-  // Preformatted labels keep per-position acceptance telemetry allocation-free
-  // on the decode hot path.
-  std::vector<std::string> speculative_position_labels_;
   dflash_detail::DSparkSasMode draft_sas_mode_ =
       dflash_detail::DSparkSasMode::NOT_DSPARK;
 };

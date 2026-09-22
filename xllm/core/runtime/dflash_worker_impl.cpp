@@ -365,13 +365,6 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
   }
   draft_impl_ = std::make_unique<LLMWorkerImpl>(
       parallel_args, device, draft_options(options));
-  speculative_position_labels_.reserve(
-      static_cast<size_t>(options.num_speculative_tokens()));
-  for (int32_t position = 0; position < options.num_speculative_tokens();
-       ++position) {
-    speculative_position_labels_.emplace_back(std::to_string(position));
-  }
-
   // Adaptive per-seq validate pruning. DP is supported: the worker gathers
   // each rank's true validate token count over the DP group before the target
   // forward (see sync_dp_global_token_nums_after_prune).
@@ -1109,8 +1102,19 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   // passes an empty per_seq_val_tokens and every row counts full width;
   // adaptive passes the per-seq widths so padded tail slots aren't counted
   // as rejections. Zero extra device sync — we're already on CPU.
-  record_validate_metrics(
-      val_output, did_prune ? per_seq_val_tokens : std::vector<int32_t>{});
+  const int32_t output_width =
+      static_cast<int32_t>(val_output.next_tokens.size(1));
+  std::vector<int32_t> proposed_tokens(
+      static_cast<size_t>(val_output.next_tokens.size(0)), output_width - 1);
+  if (did_prune) {
+    CHECK_EQ(per_seq_val_tokens.size(), proposed_tokens.size())
+        << "per-sequence validate width batch mismatch";
+    for (size_t seq_id = 0; seq_id < proposed_tokens.size(); ++seq_id) {
+      proposed_tokens[seq_id] =
+          std::clamp(per_seq_val_tokens[seq_id], 1, output_width) - 1;
+    }
+  }
+  record_speculative_metrics(val_output, proposed_tokens);
   write_target_context_to_cache(input, val_output);
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
@@ -1625,88 +1629,6 @@ void DFlashWorkerImpl::apply_per_seq_varlen_prune(
   validate_input = std::move(new_validate);
 }
 
-void DFlashWorkerImpl::record_validate_metrics(
-    SampleOutput& val_output,
-    const std::vector<int32_t>& per_seq_val_tokens) const {
-  if (!val_output.next_tokens.defined() || val_output.next_tokens.dim() != 2 ||
-      val_output.next_tokens.numel() == 0) {
-    return;
-  }
-  const int32_t batch_size =
-      static_cast<int32_t>(val_output.next_tokens.size(0));
-  const int32_t width = static_cast<int32_t>(val_output.next_tokens.size(1));
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
-  if (num_speculative_tokens <= 0 || width < 2) {
-    return;
-  }
-  CHECK(val_output.next_tokens.device().is_cpu())
-      << "record_validate_metrics expects next_tokens already on CPU to avoid "
-         "a blocking device sync on the hot path";
-  const bool have_per_seq = !per_seq_val_tokens.empty();
-  if (have_per_seq) {
-    CHECK_EQ(per_seq_val_tokens.size(), static_cast<size_t>(batch_size))
-        << "per_seq_val_tokens size mismatch with next_tokens batch";
-  }
 
-  std::vector<int32_t> proposed_tokens(static_cast<size_t>(batch_size));
-  torch::Tensor next_tokens_cpu =
-      val_output.next_tokens.to(torch::kInt64).contiguous();
-  const int64_t* token_data = next_tokens_cpu.const_data_ptr<int64_t>();
-  c10::SmallVector<int64_t, 8> accepted_per_position(
-      static_cast<size_t>(num_speculative_tokens), 0);
-  for (int32_t seq_id = 0; seq_id < batch_size; ++seq_id) {
-    // seq_width = target-side validate width for this seq (anchor + drafts).
-    // Under adaptive per-seq varlen prune it is per_seq_val_tokens[i], else
-    // the full dense width.
-    int32_t seq_width = width;
-    if (have_per_seq) {
-      // lo=1: a controller prefix=0 decision yields per_seq_val_tokens[i]==1
-      // (bonus only, zero drafts). Clamping to 1 gives prefix_len=0 so a
-      // fully-pruned seq contributes no draft/accept counts; clamping to 2
-      // would fabricate one phantom draft + one phantom accept.
-      seq_width = std::clamp(per_seq_val_tokens[static_cast<size_t>(seq_id)],
-                             /*lo=*/1,
-                             /*hi=*/width);
-    }
-    // Drafts attempted for this seq = seq_width - 1 (bonus column excluded).
-    const int32_t prefix_len = seq_width - 1;
-    proposed_tokens[static_cast<size_t>(seq_id)] = prefix_len;
-
-    // next_tokens column 0 is the token committed by the target; accepted
-    // draft position i is represented by column i + 1. Walk the complete
-    // per-seq output (draft prefix plus target bonus/replacement), then remove
-    // that guaranteed first token. Padding past seq_width is ignored.
-    const int64_t row_offset =
-        static_cast<int64_t>(seq_id) * static_cast<int64_t>(width);
-    int32_t emitted_len = 0;
-    for (int32_t token_idx = 0; token_idx < seq_width; ++token_idx) {
-      if (token_data[row_offset + token_idx] < 0) {
-        break;
-      }
-      ++emitted_len;
-    }
-    const int32_t accepted = std::min(prefix_len, std::max(emitted_len - 1, 0));
-    for (int32_t position = 0; position < accepted; ++position) {
-      ++accepted_per_position[static_cast<size_t>(position)];
-    }
-  }
-  val_output.speculative_token_stats = calculate_block_speculative_token_stats(
-      val_output.next_tokens, proposed_tokens);
-  int64_t num_draft_tokens = 0;
-  int64_t accepted_count = 0;
-  for (const SpeculativeTokenStats& stats :
-       val_output.speculative_token_stats) {
-    num_draft_tokens += stats.proposed_tokens;
-    accepted_count += stats.accepted_tokens;
-  }
-  for (int32_t position = 0; position < num_speculative_tokens; ++position) {
-    MULTI_COUNTER_ADD(
-        speculative_num_accepted_tokens_per_pos,
-        speculative_position_labels_[static_cast<size_t>(position)],
-        accepted_per_position[static_cast<size_t>(position)]);
-  }
-  COUNTER_ADD(speculative_num_draft_tokens_total, num_draft_tokens);
-  COUNTER_ADD(speculative_num_accepted_tokens_total, accepted_count);
-}
 
 }  // namespace xllm
