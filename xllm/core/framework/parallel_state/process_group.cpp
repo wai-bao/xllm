@@ -194,7 +194,7 @@ std::pair<int, std::vector<uint64_t>> get_group_rank(int world_size,
     return get_trans_group_rank(world_size, global_rank, split_size);
   }
   int target_group_index = global_rank / split_size;
-  uint64_t start_rank = target_group_index * split_size;
+  uint64_t start_rank = static_cast<int64_t>(target_group_index) * split_size;
   uint64_t end_rank = start_rank + split_size;
   std::vector<uint64_t> group_rank;
   int index = global_rank - start_rank;
