@@ -41,7 +41,7 @@ class CausalConv1dKernel(TilelangKernel):
     ]
     SPECIALIZATIONS = [
         {
-            "variant_key": "bs1_d2048_w4_silu0_f16",
+            "variant_key": "dim_2048",
             "batch_size": 1,
             "dim": 2048,
             "width": 4,
@@ -49,7 +49,7 @@ class CausalConv1dKernel(TilelangKernel):
             "dtype": "float16",
         },
         {
-            "variant_key": "bs1_d4096_w4_silu0_f16",
+            "variant_key": "dim_4096",
             "batch_size": 1,
             "dim": 4096,
             "width": 4,
@@ -57,7 +57,7 @@ class CausalConv1dKernel(TilelangKernel):
             "dtype": "float16",
         },
         {
-            "variant_key": "bs1_d5120_w4_silu0_f16",
+            "variant_key": "dim_5120",
             "batch_size": 1,
             "dim": 5120,
             "width": 4,
@@ -65,7 +65,7 @@ class CausalConv1dKernel(TilelangKernel):
             "dtype": "float16",
         },
         {
-            "variant_key": "bs1_d6144_w4_silu0_f16",
+            "variant_key": "dim_6144",
             "batch_size": 1,
             "dim": 6144,
             "width": 4,
@@ -73,7 +73,7 @@ class CausalConv1dKernel(TilelangKernel):
             "dtype": "float16",
         },
         {
-            "variant_key": "bs1_d8192_w4_silu0_f16",
+            "variant_key": "dim_8192",
             "batch_size": 1,
             "dim": 8192,
             "width": 4,
