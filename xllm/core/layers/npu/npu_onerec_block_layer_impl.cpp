@@ -1137,7 +1137,9 @@ void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
           return;
         }
 
-        if (absl::StrContains(state_key, ".DenseReluDense.weight1") ||
+        if (absl::StrContains(state_key,
+                              ".DenseReluDense."
+                              "weight1") ||
             absl::StrContains(state_key, ".ffn.weight1")) {
           torch::Tensor fused_gate_up =
               (parallel_args_.world_size() > 1)
@@ -1164,7 +1166,9 @@ void NpuOneRecBlockLayerImpl::load_state_dict(const StateDict& state_dict) {
           return;
         }
 
-        if (absl::StrContains(state_key, ".DenseReluDense.weight2") ||
+        if (absl::StrContains(state_key,
+                              ".DenseReluDense."
+                              "weight2") ||
             absl::StrContains(state_key, ".ffn.weight2")) {
           torch::Tensor wo_weight =
               (parallel_args_.world_size() > 1)
