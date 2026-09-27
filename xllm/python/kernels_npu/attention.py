@@ -25,6 +25,8 @@ import torch
 reshape_paged_cache = torch.ops.xllm_ops.reshape_paged_cache
 update_decode_graph_metadata = torch.ops.xllm_ops.update_decode_graph_metadata
 
+_TRANSPOSE_BATCH_MATMUL_MAX_BATCH_K = 65_536
+
 
 def vision_fusion_attention(
     q: torch.Tensor,
@@ -64,8 +66,25 @@ def vision_fusion_attention(
     )[0]
 
 
+def batch_matmul_transpose(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Project MLA input [T,H,D] with weight [H,D,O] into [T,H,O]."""
+    # aclnnTransposeBatchMatMul requires H * D < 65536. The DeepSeek-V3.2
+    # TP=1 value projection has 128 * 512 == 65536, even for a single token.
+    # Select the supported batched-matmul path before launching the operator.
+    if x.shape[1] * x.shape[2] >= _TRANSPOSE_BATCH_MATMUL_MAX_BATCH_K:
+        return torch.bmm(x.transpose(0, 1), weight).transpose(0, 1).contiguous()
+    return torch.ops.npu.npu_transpose_batchmatmul(
+        x,
+        weight,
+        perm_x1=(1, 0, 2),
+        perm_x2=(0, 1, 2),
+        perm_y=(1, 0, 2),
+    )
+
+
 __all__ = [
     "reshape_paged_cache",
     "update_decode_graph_metadata",
     "vision_fusion_attention",
+    "batch_matmul_transpose",
 ]
