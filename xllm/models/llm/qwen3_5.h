@@ -200,6 +200,7 @@ REGISTER_MODEL_BACKEND(qwen3_5_text, "llm");
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_MUSA) || \
     defined(USE_DCU)
 REGISTER_CAUSAL_MODEL(qwen3_5_text, Qwen3_5ForCausalLM);
+REGISTER_TARGET_SPEC_VERIFY_MODE(qwen3_5_text, UNIFORM_EXPANDED_VERIFY);
 #endif
 REGISTER_MODEL_ARGS(qwen3_5_text, [&] {
   LOAD_QWEN3_5_TEXT_TYPE_AND_DTYPE("qwen3_5_text");
@@ -213,6 +214,7 @@ REGISTER_MODEL_BACKEND(qwen3_5_moe_text, "llm");
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_MUSA) || \
     defined(USE_DCU)
 REGISTER_CAUSAL_MODEL(qwen3_5_moe_text, Qwen3_5ForCausalLM);
+REGISTER_TARGET_SPEC_VERIFY_MODE(qwen3_5_moe_text, UNIFORM_EXPANDED_VERIFY);
 #endif
 REGISTER_MODEL_ARGS(qwen3_5_moe_text, [&] {
   LOAD_QWEN3_5_TEXT_TYPE_AND_DTYPE("qwen3_5_moe_text");

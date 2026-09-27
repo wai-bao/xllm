@@ -25,6 +25,7 @@ limitations under the License.
 #include "core/framework/model/causal_vlm.h"
 #include "core/framework/model/dit_model.h"
 #include "core/framework/model/rec_causal_lm.h"
+#include "core/framework/model/target_spec_verify_mode.h"
 #include "core/framework/model_context.h"
 #include "core/framework/tokenizer/tokenizer_args.h"
 #include "core/util/json_reader.h"
@@ -78,6 +79,7 @@ struct ModelMeta {
   QuantArgsLoader quant_args_loader;
   TokenizerArgsLoader tokenizer_args_loader;
   CpShardingMode cp_sharding_mode = CpShardingMode::NONE;
+  TargetSpecVerifyMode target_spec_verify_mode = TargetSpecVerifyMode::GENERIC;
 };
 
 // Model registry is a singleton class that registers all models with the
@@ -122,6 +124,11 @@ class ModelRegistry {
   // Read-only query of the registered CP sharding mode. Returns NONE when
   // `name` is unknown or the model did not opt into model-side CP.
   static CpShardingMode get_cp_sharding_mode(const std::string& name);
+
+  static void register_target_spec_verify_mode(const std::string& name,
+                                               TargetSpecVerifyMode mode);
+  static TargetSpecVerifyMode get_target_spec_verify_mode(
+      const std::string& name);
 
   static CausalLMFactory get_causallm_factory(const std::string& name);
 
@@ -191,6 +198,13 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
 
 #define REGISTER_CAUSAL_MODEL(ModelType, ModelClass) \
   REGISTER_CAUSAL_MODEL_WITH_VARNAME(ModelType, ModelType, ModelClass)
+
+#define REGISTER_TARGET_SPEC_VERIFY_MODE(ModelType, Mode) \
+  const bool ModelType##_spec_verify_registered = []() {  \
+    ModelRegistry::register_target_spec_verify_mode(      \
+        #ModelType, TargetSpecVerifyMode::Mode);          \
+    return true;                                          \
+  }()
 
 #define REGISTER_REC_MODEL_WITH_VARNAME(VarName, ModelType, ModelClass) \
   const bool VarName##_rec_registered = []() {                          \

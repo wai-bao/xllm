@@ -50,8 +50,11 @@ inline StateDict get_lm_head_dict(const StateDict& state_dict) {
 
 inline bool load_model_args(const JsonReader& json,
                             ModelArgs* args,
-                            const std::string& base_type,
                             const std::string& mtp_type) {
+  // The paired text target owns the base config; derive it from the draft type
+  // so the pairing stays single-sourced in model_args.h.
+  const std::string base_type =
+      std::string(qwen3_5_target_model_type_for_draft(mtp_type));
   ModelArgsLoader base_loader = ModelRegistry::get_model_args_loader(base_type);
   if (base_loader == nullptr || base_loader(json, args) == false) {
     return false;
@@ -253,6 +256,8 @@ class Qwen3_5MtpModelImplBase : public Qwen3HybridModelImplBase {
 
 class Qwen3_5MtpForCausalLMImplBase : public Qwen3HybridForCausalLMImplBase {
  public:
+  bool owns_mtp_draft_weights() const { return true; }
+
   void load_model(std::unique_ptr<ModelLoader> loader) {
     static const std::vector<std::string> kEmbeddingPrefixes = {
         "model.language_model.", "language_model.model.", "model.", ""};

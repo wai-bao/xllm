@@ -301,6 +301,8 @@ class DeepseekV4MtpForCausalLMImpl final
   explicit DeepseekV4MtpForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<DeepseekV4MtpModel>(context) {}
 
+  bool provides_spec_hidden_hook() const { return true; }
+
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "model.") override {
     for (const std::unique_ptr<StateDict>& state_dict :

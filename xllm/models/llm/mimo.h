@@ -86,6 +86,7 @@ TORCH_MODULE(MiMoForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(mimo, MiMoForCausalLM);
+REGISTER_TARGET_SPEC_VERIFY_MODE(mimo, CAUSAL_CHUNKED_PREFILL);
 
 // register the model args
 // example config: /root/models/MiMo-7B-Base/config.json

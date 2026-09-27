@@ -335,6 +335,7 @@ TORCH_MODULE(GlmMoeDsaForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(glm_moe_dsa, GlmMoeDsaForCausalLM);
+REGISTER_TARGET_SPEC_VERIFY_MODE(glm_moe_dsa, PYTHON_EXPANDED_VERIFY);
 
 // register the model args
 REGISTER_MODEL_ARGS(

@@ -383,6 +383,21 @@ CpShardingMode ModelRegistry::get_cp_sharding_mode(const std::string& name) {
   return it->second.cp_sharding_mode;
 }
 
+void ModelRegistry::register_target_spec_verify_mode(
+    const std::string& name,
+    TargetSpecVerifyMode mode) {
+  get_instance()->model_registry_[name].target_spec_verify_mode = mode;
+}
+
+TargetSpecVerifyMode ModelRegistry::get_target_spec_verify_mode(
+    const std::string& name) {
+  ModelRegistry* instance = get_instance();
+  const auto it = instance->model_registry_.find(name);
+  return it == instance->model_registry_.end()
+             ? TargetSpecVerifyMode::GENERIC
+             : it->second.target_spec_verify_mode;
+}
+
 CausalLMFactory ModelRegistry::get_causallm_factory(const std::string& name) {
   ModelRegistry* instance = get_instance();
 

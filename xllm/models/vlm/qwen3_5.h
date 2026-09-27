@@ -344,6 +344,7 @@ TORCH_MODULE(Qwen3_5ForConditionalGeneration);
 // uses qwen3_5_text/qwen3_5_moe_text from llm/qwen3_5.h because the VLM
 // request protocol currently requires array-form chat content.
 REGISTER_CAUSAL_VLM_MODEL(qwen3_5, Qwen3_5ForConditionalGeneration);
+REGISTER_TARGET_SPEC_VERIFY_MODE(qwen3_5, UNIFORM_EXPANDED_VERIFY);
 REGISTER_MPOSITION_GENERATOR(qwen3_5, Qwen3VLMPositionGenerator);
 using Qwen35MultimodalProcessor = MultimodalProcessor<Qwen3VLPromptProcessor,
                                                       Qwen2VLImageProcessor,
@@ -362,6 +363,7 @@ REGISTER_MODEL_ARGS(qwen3_5, [&] {
 });
 
 REGISTER_CAUSAL_VLM_MODEL(qwen3_5_moe, Qwen3_5ForConditionalGeneration);
+REGISTER_TARGET_SPEC_VERIFY_MODE(qwen3_5_moe, UNIFORM_EXPANDED_VERIFY);
 REGISTER_MPOSITION_GENERATOR(qwen3_5_moe, Qwen3VLMPositionGenerator);
 REGISTER_MULTIMODAL_PROCESSOR(qwen3_5_moe, Qwen35MultimodalProcessor);
 REGISTER_MODEL_ARGS(qwen3_5_moe, [&] {
@@ -399,6 +401,7 @@ REGISTER_CAUSAL_MODEL_WITH_VARNAME(qwen3_5_moe_lm,
                                    Qwen3_5ForCausalLM);
 
 REGISTER_CAUSAL_MODEL(qwen3_5_text, Qwen3_5ForCausalLM);
+REGISTER_TARGET_SPEC_VERIFY_MODE(qwen3_5_text, UNIFORM_EXPANDED_VERIFY);
 REGISTER_MODEL_ARGS(qwen3_5_text, [&] {
   LOAD_QWEN3_5_COMMON_ARGS();
   SET_ARG(num_experts, 0);
@@ -410,6 +413,7 @@ REGISTER_MODEL_ARGS(qwen3_5_text, [&] {
 });
 
 REGISTER_CAUSAL_MODEL(qwen3_5_moe_text, Qwen3_5ForCausalLM);
+REGISTER_TARGET_SPEC_VERIFY_MODE(qwen3_5_moe_text, UNIFORM_EXPANDED_VERIFY);
 REGISTER_MODEL_ARGS(qwen3_5_moe_text, [&] {
   LOAD_QWEN3_5_COMMON_ARGS();
   LOAD_ARG_OR(decoder_sparse_step, "text_config.decoder_sparse_step", 1);

@@ -1006,6 +1006,11 @@ class DeepseekV4ModelImpl
     if (is_sequence_sharded(fc1_ctx)) {
       h = gather_sequence(h, fc1_ctx);
     }
+    torch::Tensor restored_aux_hidden_states;
+    if (cp_ctx.enabled() && aux_capture_.enabled()) {
+      restored_aux_hidden_states = cp_ctx.gather_restore(
+          aux_capture_.captured_hidden_states(cp_ctx.local_token_count));
+    }
     if (cp_ctx.enabled()) {
       // Restore full global-order tokens before hc_head / norm / lm_head, which
       // are not CP-aware. Done before capturing pre_hc_head_hidden_states so
@@ -1022,6 +1027,11 @@ class DeepseekV4ModelImpl
     h = hc_head(h);
     auto [hidden_states, residual_out] = norm_(h, std::nullopt);
     if (aux_capture_.enabled()) {
+      if (restored_aux_hidden_states.defined()) {
+        ModelOutput output(hidden_states, residual_out);
+        output.aux_hidden_states = std::move(restored_aux_hidden_states);
+        return output;
+      }
       return aux_capture_.finalize(hidden_states, residual_out);
     }
     if (pre_hc_head_hidden_states.defined()) {
@@ -1929,7 +1939,12 @@ class DeepseekV4ForCausalLMImpl
   explicit DeepseekV4ForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<DeepseekV4Model>(context),
         first_k_dense_replace_(
-            context.get_model_args().first_k_dense_replace()) {}
+            context.get_model_args().first_k_dense_replace()),
+        spec_hidden_hook_enabled_(
+            context.get_model_args().num_speculative_tokens() > 0 &&
+            context.get_model_args().layers_to_capture().empty()) {}
+
+  bool provides_spec_hidden_hook() const { return spec_hidden_hook_enabled_; }
 
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "model.") override {
@@ -1975,6 +1990,7 @@ class DeepseekV4ForCausalLMImpl
 
  private:
   int32_t first_k_dense_replace_;
+  bool spec_hidden_hook_enabled_ = false;
 };
 TORCH_MODULE(DeepseekV4ForCausalLM);
 

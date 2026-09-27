@@ -332,7 +332,11 @@ class DeepseekV4ForCausalLMImpl final
     : public LlmForCausalLMImplBase<DeepseekV4Model> {
  public:
   explicit DeepseekV4ForCausalLMImpl(const ModelContext& context)
-      : LlmForCausalLMImplBase<DeepseekV4Model>(context) {}
+      : LlmForCausalLMImplBase<DeepseekV4Model>(context),
+        spec_hidden_hook_enabled_(
+            context.get_model_args().num_speculative_tokens() > 0) {}
+
+  bool provides_spec_hidden_hook() const { return spec_hidden_hook_enabled_; }
 
   bool requires_graph_forward_metadata() {
     return this->model_->requires_graph_forward_metadata();
@@ -376,6 +380,9 @@ class DeepseekV4ForCausalLMImpl final
       }
     }
   }
+
+ private:
+  bool spec_hidden_hook_enabled_ = false;
 };
 TORCH_MODULE(DeepseekV4ForCausalLM);
 
