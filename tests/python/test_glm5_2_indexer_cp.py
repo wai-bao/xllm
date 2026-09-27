@@ -23,6 +23,13 @@ from unittest.mock import ANY, MagicMock, patch
 import pytest
 import torch
 
+from tests.python.glm5_2_test_utils import (
+    dynamic_quant,
+    make_indexer,
+    quant_matmul,
+    quantize_per_tensor,
+    scatter_nd_update,
+)
 from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
 from xllm.python.model_executor.cp_utils import CpContext, cp_shard_positions, cp_shard_rows
@@ -56,17 +63,7 @@ def _three_token_plan(rank: int) -> CpContext:
 
 
 def _indexer() -> glm5_2.Glm52Indexer:
-    cfg = glm5_2.Glm52Config(
-        hidden_size=2,
-        q_lora_rank=2,
-        index_n_heads=1,
-        index_head_dim=2,
-        qk_rope_head_dim=2,
-        index_topk=1,
-        indexer_rope_interleave=False,
-    )
-    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
-    indexer.wq_b._set_dynamic_activation(False)
+    indexer = make_indexer()
     with torch.no_grad():
         indexer.wq_b.weight.copy_(torch.eye(2, dtype=torch.int8))
         indexer.wq_b.deq_scale.fill_(1)
@@ -112,21 +109,7 @@ def _backend_and_metadata(
 def _quantize(x: torch.Tensor, *_args: object) -> torch.Tensor:
     if x.shape[0] == 0:
         raise AssertionError("empty-query ranks must not launch the Q projection")
-    return x.round().to(torch.int8)
-
-
-def _quant_matmul(x: torch.Tensor, weight: torch.Tensor, *_args: object) -> torch.Tensor:
-    return x.float() @ weight.float().T
-
-
-def _dynamic_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ones_like(x, dtype=torch.int8), torch.ones(x.shape[:-1])
-
-
-def _scatter(cache: torch.Tensor, indices: torch.Tensor, values: torch.Tensor) -> None:
-    for slot, value in zip(indices.flatten().tolist(), values, strict=True):
-        if slot >= 0:
-            cache[slot].copy_(value)
+    return quantize_per_tensor(x)
 
 
 @pytest.mark.parametrize("rank", [0, 1])
@@ -179,9 +162,9 @@ def test_short_prompt_indexer_keeps_queries_local_and_returns_padded_topk(rank: 
     with (
         forward_context(context),
         patch.object(glm5_2.kernels, "quantize_per_tensor", side_effect=_quantize, create=True),
-        patch.object(glm5_2.kernels, "quant_matmul", side_effect=_quant_matmul, create=True),
-        patch.object(glm5_2.kernels, "dynamic_quant", side_effect=_dynamic_quant, create=True),
-        patch.object(glm5_2.kernels, "scatter_nd_update", side_effect=_scatter, create=True),
+        patch.object(glm5_2.kernels, "quant_matmul", quant_matmul, create=True),
+        patch.object(glm5_2.kernels, "dynamic_quant", dynamic_quant, create=True),
+        patch.object(glm5_2.kernels, "scatter_nd_update", scatter_nd_update, create=True),
         patch.object(glm5_2.kernels, "quant_lightning_indexer_metadata", side_effect=indexer_metadata, create=True),
         patch.object(
             glm5_2.kernels,
@@ -251,9 +234,9 @@ def test_empty_query_rank_still_populates_index_cache(quantized: bool) -> None:
     with (
         forward_context(context),
         patch.object(glm5_2.kernels, "quantize_per_tensor", side_effect=_quantize, create=True),
-        patch.object(glm5_2.kernels, "quant_matmul", side_effect=_quant_matmul, create=True),
-        patch.object(glm5_2.kernels, "dynamic_quant", side_effect=_dynamic_quant, create=True),
-        patch.object(glm5_2.kernels, "scatter_nd_update", side_effect=_scatter, create=True),
+        patch.object(glm5_2.kernels, "quant_matmul", quant_matmul, create=True),
+        patch.object(glm5_2.kernels, "dynamic_quant", dynamic_quant, create=True),
+        patch.object(glm5_2.kernels, "scatter_nd_update", scatter_nd_update, create=True),
         patch.object(glm5_2.kernels, "quant_lightning_indexer", side_effect=select, create=True),
         patch.object(glm5_2.kernels, "lightning_indexer", side_effect=select, create=True),
         patch("xllm.python.model_executor.cp_utils.distributed.all_gather", side_effect=all_gather, create=True),
@@ -351,9 +334,9 @@ def test_packed_chunked_pcp4_preserves_segment_owners_and_prefix(quantized: bool
     with (
         forward_context(ForwardContext(backend, torch.device("cpu"), metadata, [cache], cp_context=plan)),
         patch.object(glm5_2.kernels, "quantize_per_tensor", side_effect=_quantize, create=True),
-        patch.object(glm5_2.kernels, "quant_matmul", side_effect=_quant_matmul, create=True),
-        patch.object(glm5_2.kernels, "dynamic_quant", side_effect=_dynamic_quant, create=True),
-        patch.object(glm5_2.kernels, "scatter_nd_update", side_effect=_scatter, create=True),
+        patch.object(glm5_2.kernels, "quant_matmul", quant_matmul, create=True),
+        patch.object(glm5_2.kernels, "dynamic_quant", dynamic_quant, create=True),
+        patch.object(glm5_2.kernels, "scatter_nd_update", scatter_nd_update, create=True),
         patch.object(glm5_2.kernels, "quant_lightning_indexer_metadata", side_effect=indexer_metadata, create=True),
         patch.object(
             glm5_2.kernels,
@@ -381,17 +364,7 @@ def test_packed_chunked_pcp4_preserves_segment_owners_and_prefix(quantized: bool
 
 
 def test_indexer_fuses_k_and_weight_projections_after_loading() -> None:
-    cfg = glm5_2.Glm52Config(
-        hidden_size=3,
-        q_lora_rank=2,
-        index_n_heads=2,
-        index_head_dim=2,
-        qk_rope_head_dim=1,
-        index_topk=1,
-        indexer_rope_interleave=False,
-    )
-    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
-    indexer.wq_b._set_dynamic_activation(False)
+    indexer = make_indexer(hidden_size=3, index_n_heads=2, qk_rope_head_dim=1)
     with torch.no_grad():
         indexer.wk.weight.copy_(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
         indexer.weights_proj.weight.copy_(torch.tensor([[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]]))
@@ -413,16 +386,7 @@ def test_indexer_fuses_k_and_weight_projections_after_loading() -> None:
 
 
 def test_indexer_keeps_separate_projections_for_distinct_cache_rows() -> None:
-    cfg = glm5_2.Glm52Config(
-        hidden_size=3,
-        q_lora_rank=2,
-        index_n_heads=2,
-        index_head_dim=2,
-        qk_rope_head_dim=1,
-        index_topk=1,
-        indexer_rope_interleave=False,
-    )
-    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
+    indexer = make_indexer(hidden_size=3, index_n_heads=2, qk_rope_head_dim=1)
     with torch.no_grad():
         indexer.wk.weight.copy_(torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]))
         indexer.weights_proj.weight.copy_(torch.tensor([[7.0, 8.0, 9.0], [10.0, 11.0, 12.0]]))
@@ -436,17 +400,7 @@ def test_indexer_keeps_separate_projections_for_distinct_cache_rows() -> None:
 
 
 def test_indexer_invalidates_fused_projection_after_state_dict_load() -> None:
-    cfg = glm5_2.Glm52Config(
-        hidden_size=3,
-        q_lora_rank=2,
-        index_n_heads=2,
-        index_head_dim=2,
-        qk_rope_head_dim=1,
-        index_topk=1,
-        indexer_rope_interleave=False,
-    )
-    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
-    indexer.wq_b._set_dynamic_activation(False)
+    indexer = make_indexer(hidden_size=3, index_n_heads=2, qk_rope_head_dim=1)
     with patch.object(
         glm5_2.kernels,
         "prepare_quant_weight",
@@ -461,24 +415,15 @@ def test_indexer_invalidates_fused_projection_after_state_dict_load() -> None:
     state_dict["weights_proj.weight"] = torch.full_like(indexer.weights_proj.weight, 3.0)
     indexer.load_state_dict(state_dict)
 
-    hidden = torch.ones((1, cfg.hidden_size))
+    hidden = torch.ones((1, 3))
     key, weights = indexer._project_index_inputs(hidden, hidden)
     assert not indexer._wk_weights_proj_ready
-    torch.testing.assert_close(key, torch.full((1, cfg.index_head_dim), 6.0))
-    torch.testing.assert_close(weights, torch.full((1, cfg.index_n_heads), 9.0))
+    torch.testing.assert_close(key, torch.full((1, indexer.head_dim), 6.0))
+    torch.testing.assert_close(weights, torch.full((1, indexer.n_head), 9.0))
 
 
 def test_interleaved_indexer_rope_uses_inplace_partial_kernel() -> None:
-    cfg = glm5_2.Glm52Config(
-        hidden_size=4,
-        q_lora_rank=4,
-        index_n_heads=1,
-        index_head_dim=4,
-        qk_rope_head_dim=2,
-        index_topk=1,
-        indexer_rope_interleave=True,
-    )
-    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
+    indexer = make_indexer(hidden_size=4, q_lora_rank=4, index_head_dim=4, indexer_rope_interleave=True)
     value = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
     cos = torch.tensor([[[[2.0, 2.0]]], [[[3.0, 3.0]]]])
     sin = torch.tensor([[[[1.0, 1.0]]], [[[1.0, 1.0]]]])
@@ -517,16 +462,7 @@ def test_interleaved_indexer_rope_uses_inplace_partial_kernel() -> None:
 
 @pytest.mark.parametrize("multi_stream", [False, True])
 def test_indexer_reuses_interleaved_cos_sin_for_query_and_key(multi_stream: bool) -> None:
-    cfg = glm5_2.Glm52Config(
-        hidden_size=2,
-        q_lora_rank=2,
-        index_n_heads=1,
-        index_head_dim=4,
-        qk_rope_head_dim=2,
-        index_topk=1,
-        indexer_rope_interleave=True,
-    )
-    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
+    indexer = make_indexer(index_head_dim=4, indexer_rope_interleave=True)
     index_cache = torch.zeros(1, 1, 1, 4)
     if multi_stream:
         indexer._weights_stream = MagicMock()
@@ -571,16 +507,7 @@ def test_indexer_reuses_interleaved_cos_sin_for_query_and_key(multi_stream: bool
 
 @pytest.mark.parametrize("multi_stream", [False, True])
 def test_indexer_consumes_explicit_distinct_query_and_key_cos_sin(multi_stream: bool) -> None:
-    cfg = glm5_2.Glm52Config(
-        hidden_size=2,
-        q_lora_rank=2,
-        index_n_heads=1,
-        index_head_dim=4,
-        qk_rope_head_dim=2,
-        index_topk=1,
-        indexer_rope_interleave=True,
-    )
-    indexer = glm5_2.Glm52Indexer(cfg, torch.float32, torch.device("cpu"))
+    indexer = make_indexer(index_head_dim=4, indexer_rope_interleave=True)
     index_cache = torch.zeros(1, 1, 1, 4)
     if multi_stream:
         indexer._weights_stream = MagicMock()

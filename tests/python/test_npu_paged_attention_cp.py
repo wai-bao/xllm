@@ -24,13 +24,14 @@ import torch
 
 sys.modules.setdefault("torch_npu", types.ModuleType("torch_npu"))
 
+from tests.python.glm5_2_test_utils import scatter_nd_update  # noqa: E402
 from xllm.python.attention.npu_paged_attention import (  # noqa: E402
     NpuPagedAttentionBackend,
     _build_stable_sfa_page_layout,
 )
 from xllm.python.model_executor.cp_utils import build_cp_context, cp_shard_rows  # noqa: E402
-from xllm.python.model_executor.runners.decode_acl_graph import (  # noqa: E402
-    _StaticAttentionMetadata,
+from xllm.python.model_executor.runners.acl_graph import (  # noqa: E402
+    StaticGraphAttentionMetadata,
 )
 
 
@@ -53,7 +54,7 @@ def test_decode_prepare_does_not_require_cp_metadata_fields() -> None:
 def test_mla_index_context_accepts_decode_graph_static_metadata() -> None:
     backend = object.__new__(NpuPagedAttentionBackend)
     slot_mapping = torch.arange(2, dtype=torch.int64)
-    backend._metadata = _StaticAttentionMetadata(
+    backend._metadata = StaticGraphAttentionMetadata(
         slot_mapping=slot_mapping,
         paged_kv_indptr=torch.arange(3, dtype=torch.int32),
         paged_kv_indices=torch.arange(2, dtype=torch.int32),
@@ -87,15 +88,9 @@ def test_owner_local_index_write_ignores_non_owned_slots(dtype: torch.dtype, slo
     scale_cache = torch.full((2, 2, 1, 1), -1, dtype=torch.float16) if dtype == torch.int8 else None
     scales = values.to(torch.float16) + 1 if scale_cache is not None else None
 
-    def scatter(var: torch.Tensor, indices: torch.Tensor, updates: torch.Tensor) -> None:
-        # Model the native operator's device-side negative-index handling.
-        indices = indices.flatten()
-        valid = indices >= 0
-        var.index_copy_(0, indices[valid], updates[valid])
-
     with patch(
         "xllm.python.attention.npu_paged_attention.kernels.scatter_nd_update",
-        side_effect=scatter,
+        side_effect=scatter_nd_update,
         create=True,
     ):
         NpuPagedAttentionBackend._update_mla_index_cache(

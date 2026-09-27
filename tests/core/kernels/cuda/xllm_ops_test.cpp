@@ -286,46 +286,12 @@ TEST_F(XllmOpsTest, ModelExecutorUsesExplicitRuntimeBatchLimit) {
   prepend_python_model_path();
 
   py::exec(R"PY(
-import torch
-from unittest.mock import patch
-
-from xllm.python.layers.attention import Attention
+from tests.python.model_executor_fake_modules import FakeModel, patched_fake_backend
 from xllm.python.model_executor import executor as executor_module
 
-
-class FakeBackend:
-    def __init__(self, **kwargs):
-        pass
-
-    def bind_kv_caches(self, kv_caches):
-        pass
-
-    def prepare(self, metadata, *, graph_mode=False):
-        pass
-
-    def execute(self, q, k, v, layer):
-        return q
-
-    @property
-    def num_kv_blocks(self):
-        return 0
-
-    @property
-    def page_size(self):
-        return 1
-
-
-class FakeModel(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros(1, device="cuda"))
-        self.attention = Attention(1, 1, 8, 1.0, 0, 0)
-        self.model = torch.nn.Identity()
-
-
-with patch.object(executor_module, "_create_attention_backend", return_value=FakeBackend()):
+with patched_fake_backend():
     model_executor = executor_module.ModelExecutor(
-        FakeModel(),
+        FakeModel("cuda"),
         {
             "python_graph_backend": "cudagraphs",
             "max_position_embeddings": 64,

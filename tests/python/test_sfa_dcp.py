@@ -20,10 +20,14 @@ from dataclasses import fields
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import torch
-import torch.nn as nn
 
+from tests.python.glm5_2_test_utils import (
+    dynamic_quant,
+    make_indexer,
+    quant_matmul,
+    quantize_per_tensor,
+)
 from xllm.python.attention.backend import MlaIndexContext
 from xllm.python.attention.kv_shard_layout import KVShardLayout
 from xllm.python.attention.npu_paged_attention import NpuPagedAttentionBackend
@@ -237,21 +241,7 @@ def test_mla_index_materialization_without_scale_keeps_legacy_path() -> None:
 
 
 def test_glm_quant_indexer_without_cp_uses_materialized_scale() -> None:
-    indexer = glm5_2.Glm52Indexer.__new__(glm5_2.Glm52Indexer)
-    nn.Module.__init__(indexer)
-    indexer.n_head = 1
-    indexer.head_dim = 2
-    indexer.rope_dim = 0
-    indexer.topk = 2
-    indexer.indexer_rope_interleave = False
-    indexer._q_stream = None
-    indexer._weights_stream = None
-    indexer._wk_weights_proj_ready = False
-    indexer.wq_b = MagicMock(return_value=torch.ones(2, 2))
-    indexer.wk = MagicMock(return_value=torch.ones(2, 2))
-    indexer.k_norm = nn.Identity()
-    indexer.weights_proj = MagicMock(return_value=torch.ones(2, 1))
-    indexer.hadamard = torch.eye(2)
+    indexer = make_indexer(qk_rope_head_dim=0, index_topk=2)
 
     persistent_cache = torch.empty(2, 2, 1, dtype=torch.int8)
     persistent_scale = torch.empty(2, 2, 1, dtype=torch.float16)
@@ -274,24 +264,11 @@ def test_glm_quant_indexer_without_cp_uses_materialized_scale() -> None:
         cp_context=None,
     )
 
-    def dynamic_quant(value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        quantized = torch.ones_like(value, dtype=torch.int8)
-        scale = torch.ones(value.shape[:-1], dtype=torch.float32)
-        return quantized, scale
-
     with (
         patch.object(glm5_2, "_apply_half_rope_with_cos_sin", side_effect=lambda value, _cos, _sin: value),
-        patch.object(
-            glm5_2.kernels,
-            "dynamic_quant",
-            side_effect=dynamic_quant,
-            create=True,
-        ),
-        patch.object(
-            indexer,
-            "_pad_q_heads_to_kernel_gsize",
-            side_effect=lambda q, q_scale, weights, _required_heads: (q, q_scale, weights),
-        ),
+        patch.object(glm5_2.kernels, "quantize_per_tensor", quantize_per_tensor, create=True),
+        patch.object(glm5_2.kernels, "quant_matmul", quant_matmul, create=True),
+        patch.object(glm5_2.kernels, "dynamic_quant", dynamic_quant, create=True),
         patch.object(
             glm5_2.kernels,
             "quant_lightning_indexer",
@@ -301,8 +278,8 @@ def test_glm_quant_indexer_without_cp_uses_materialized_scale() -> None:
         forward_context(_cpu_context(None)),
     ):
         output = indexer.select_qli(
-            torch.ones(2, 3),
-            torch.ones(2, 3),
+            torch.ones(2, 2),
+            torch.ones(2, 2),
             context,
             (torch.empty(2, 0), torch.empty(2, 0)),
             (torch.empty(2, 0), torch.empty(2, 0)),

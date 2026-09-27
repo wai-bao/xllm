@@ -90,21 +90,10 @@ def _pack_mla_int8_weight(weight: torch.Tensor) -> torch.Tensor:
         weight,
         (0, padded_columns - columns, 0, padded_rows - rows),
     )
-    packed = padded.reshape(
-        padded_rows // _INT8_NZ_ROW_BLOCK_SIZE,
-        _INT8_NZ_ROW_BLOCK_SIZE,
-        padded_columns // _INT8_NZ_COLUMN_BLOCK_SIZE,
-        _INT8_NZ_COLUMN_BLOCK_SIZE,
-    ).permute(2, 0, 1, 3)
-    return (
-        packed.reshape(
-            packed.shape[0],
-            packed.shape[1] * packed.shape[2],
-            packed.shape[3],
-        )
-        .unsqueeze(0)
-        .contiguous()
-    )
+    # npu_format_cast does not pad, so align K to 16 and N to 32 first.
+    if padded.device.type == "cpu":
+        return padded.contiguous()
+    return torch_npu.npu_format_cast(padded, _FRACTAL_NZ_FORMAT)
 
 
 def prepare_mla_preprocess_v2_qkv(
@@ -146,8 +135,6 @@ def prepare_mla_preprocess_v2_q_b(
         return reordered.reshape(shape).contiguous()
 
     prepared_weight = _pack_mla_int8_weight(_prepare(weight))
-    if prepared_weight.device.type != "cpu":
-        prepared_weight = torch_npu.npu_format_cast(prepared_weight, _FRACTAL_NZ_FORMAT)
     return prepared_weight, _prepare(descale), _prepare(bias)
 
 

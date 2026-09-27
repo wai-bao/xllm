@@ -55,6 +55,7 @@ def _require_mla_preprocess_v2() -> ModuleType:
 
 
 def _make_inputs(mla: ModuleType) -> dict[str, torch.Tensor | int | float | bool]:
+    """Build a deterministic input set; every call re-seeds to identical values."""
     device = torch.device("npu")
     torch.manual_seed(0)
 
@@ -223,9 +224,10 @@ def test_mla_preprocess_v2_writes_outputs_and_selected_cache_slots() -> None:
 def test_mla_preprocess_v2_python_wrapper_matches_low_level_op() -> None:
     mla = _require_mla_preprocess_v2()
     low_level_inputs = _make_inputs(mla)
-    wrapper_inputs = {
-        name: value.clone() if isinstance(value, torch.Tensor) else value for name, value in low_level_inputs.items()
-    }
+    # Do not .clone() the NZ tensors: torch_npu clones lose the NZ storage
+    # description and ACLNN then reads different data. Rebuilding re-seeds
+    # identical values.
+    wrapper_inputs = _make_inputs(mla)
 
     low_level_outputs = _run_low_level_op(low_level_inputs)
     wrapper_outputs = mla.deepseek_mla_preprocess_decode_v2(

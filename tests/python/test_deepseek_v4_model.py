@@ -310,9 +310,8 @@ def test_dequant_swiglu_quant_can_write_into_caller_buffer(
         raising=False,
     )
 
-    def fake_quant_matmul_out(*_args: object) -> torch.Tensor:
-        out = _args[-1]
-        assert isinstance(out, torch.Tensor)
+    def fake_quant_matmul_out(*_args: object, **kwargs: object) -> torch.Tensor:
+        out = kwargs.get("out", _args[-1])
         calls.append(out)
         return out
 
@@ -328,7 +327,9 @@ def test_dense_mlp_uses_native_aware_tp_reduce(monkeypatch) -> None:
     mlp = DeepseekV3MLP(cfg, cfg.moe_intermediate_size, torch.float32, torch.device("cpu"))
     mlp.gate_up_proj.forward = MagicMock(return_value=torch.ones(1, 2 * mlp.gate_up_proj.out_features))
     mlp.down_proj.forward = MagicMock(return_value=torch.ones(1, cfg.hidden_size))
-    monkeypatch.setattr(deepseek_v32.kernels, "silu_and_mul", lambda tensor: tensor[..., : tensor.shape[-1] // 2])
+    monkeypatch.setattr(
+        deepseek_v32.kernels, "silu_and_mul", lambda tensor: tensor[..., : tensor.shape[-1] // 2], raising=False
+    )
     tp_reduce = MagicMock()
     monkeypatch.setattr(deepseek_v32.distributed, "tp_all_reduce", tp_reduce, raising=False)
 
