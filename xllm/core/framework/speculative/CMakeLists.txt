@@ -6,24 +6,25 @@ cc_library(
   HDRS
     adaptive_speculative_controller.h
     speculative_profile_registry.h
-    adaptive_pruning_helpers.h
-    spec_input_builder.h
-    mtp_async_input_builder.h
-    mtp_async_state.h
+    draft_seed_model_spec.h
+    draft_seed_spec_provider.h
+    speculative_predictor_sink.h
     mtp_json_object_state.h
-    draft_extend_input.h
-    embedding_cache.h
-    spec_verify.h
+    mtp_draft_seed.h
+    mtp_seed_sampling.h
+    mtp_sampling_history.h
+    spec_hidden_source.h
+    eagle3_sampling.h
+    mtp_seed_state_store.h
+    target_decode_state_store.h
   SRCS
     adaptive_speculative_controller.cpp
     speculative_profile_registry.cpp
-    adaptive_pruning_helpers.cpp
-    spec_input_builder.cpp
-    mtp_async_input_builder.cpp
-    mtp_async_state.cpp
-    draft_extend_input.cpp
-    embedding_cache.cpp
-    spec_verify.cpp
+    mtp_seed_sampling.cpp
+    mtp_sampling_history.cpp
+    eagle3_sampling.cpp
+    mtp_seed_state_store.cpp
+    target_decode_state_store.cpp
   DEPS
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>

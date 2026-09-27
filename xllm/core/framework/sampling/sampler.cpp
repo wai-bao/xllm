@@ -24,6 +24,7 @@ limitations under the License.
 #include "common/global_flags.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/sampling/json_object_grammar.h"
+#include "core/util/tensor_helper.h"
 #include "logits_utils.h"
 #include "sampling_params.h"
 
@@ -101,15 +102,9 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
       !use_sample_indices && !filter_mask.defined()) {
     torch::Tensor sample_indices =
         greedy_sample(sample_logits).to(torch::kLong);
-    torch::Tensor selected_logits =
-        sample_logits.gather(/*dim=*/-1, sample_indices.view({-1, 1}))
-            .to(torch::kFloat32);
-    torch::Tensor log_probs =
-        selected_logits - torch::logsumexp(sample_logits,
-                                           /*dim=*/-1,
-                                           /*keepdim=*/true);
     output.next_tokens = sample_indices;
-    output.probs = log_probs.exp().view({-1}).to(logits.dtype());
+    output.probs =
+        selected_softmax_prob(sample_logits, sample_indices).to(logits.dtype());
     return output;
   }
 

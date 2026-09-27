@@ -135,10 +135,30 @@ void JsonObjectGrammarState::copy_trial_state_from(
   // Intentionally leave committed_token_ids_ empty: acceptance never reads it.
 }
 
+JsonObjectGrammarState JsonObjectGrammarState::fork_matcher_only() const {
+  JsonObjectGrammarState state;
+  state.copy_trial_state_from(*this);
+  return state;
+}
+
 bool JsonObjectGrammarState::can_accept_token(int32_t token_id) const {
   JsonObjectGrammarState candidate;
   candidate.copy_trial_state_from(*this);
   return candidate.accept_token(token_id);
+}
+
+bool JsonObjectGrammarState::try_accept_token(int32_t token_id) {
+  // The fork isolates the FSM from partial mutation on failure. On success the
+  // matcher fields are written back and only the token is appended to this
+  // state's own committed history.
+  JsonObjectGrammarState candidate;
+  candidate.copy_trial_state_from(*this);
+  if (!candidate.accept_token(token_id)) {
+    return false;
+  }
+  copy_trial_state_from(candidate);
+  committed_token_ids_.push_back(token_id);
+  return true;
 }
 
 bool JsonObjectGrammarState::accept_token(int32_t token_id) {

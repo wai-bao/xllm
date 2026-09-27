@@ -23,6 +23,8 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/framework/speculative/mtp_draft_seed.h"
+
 namespace xllm {
 
 struct RequestSamplingParam {
@@ -184,6 +186,15 @@ struct SamplingParameters {
   bool use_beam_search = false;
 };
 
+// True when any repetition-family penalty tensor is set, i.e. the sampler must
+// build and consult per-token history. Centralizes the predicate shared by the
+// draft/seed sampling paths.
+inline bool has_penalty_params(const SamplingParameters& params) {
+  return params.frequency_penalties.defined() ||
+         params.presence_penalties.defined() ||
+         params.repetition_penalties.defined();
+}
+
 // Draft proposals and acceptances executed by the verifier, before output
 // truncation. Accepted drafts exclude the target replacement/bonus
 // contribution; neither count can be inferred from the number of streamed
@@ -220,6 +231,7 @@ struct SampleOutput {
 
   std::vector<std::vector<torch::Tensor>> mm_embeddings;
   std::vector<SpeculativeTokenStats> speculative_token_stats;
+  std::optional<MtpDraftSeed> mtp_draft_seed;
 };
 
 }  // namespace xllm
