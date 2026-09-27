@@ -21,6 +21,7 @@ limitations under the License.
 #include "core/framework/speculative/spec_verify.h"
 #include "framework/sampling/sampling_params.h"
 #include "util/slice.h"
+#include "util/tensor_helper.h"
 #include "util/timer.h"
 #include "util/utils.h"
 
@@ -110,8 +111,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_prefill(
   if (suffix_cache_ != nullptr &&
       request_ids.size() == static_cast<size_t>(num_sequences)) {
     const torch::Tensor& token_ids = input.token_ids_host;
-    Slice<int32_t> tokens_ids_slice = {token_ids.data_ptr<int32_t>(),
-                                       static_cast<size_t>(token_ids.numel())};
+    Slice<int32_t> tokens_ids_slice = tensor_slice(token_ids);
 
     int32_t start_idx = 0;
     for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
@@ -142,9 +142,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_prefill(
     if (next_tokens.defined() &&
         next_tokens.numel() == static_cast<int64_t>(num_sequences)) {
       next_tokens = next_tokens.view({-1}).to(torch::kInt);
-      Slice<int32_t> next_tokens_slice = {
-          next_tokens.data_ptr<int32_t>(),
-          static_cast<size_t>(next_tokens.numel())};
+      Slice<int32_t> next_tokens_slice = tensor_slice(next_tokens);
       for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
         int32_t token = next_tokens_slice[seq_id];
         if (token < 0) {
@@ -201,9 +199,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   }
 
   const torch::Tensor& input_token_ids = input.token_ids_host;
-  Slice<int32_t> input_tokens_slice = {
-      input_token_ids.data_ptr<int32_t>(),
-      static_cast<size_t>(input_token_ids.numel())};
+  Slice<int32_t> input_tokens_slice = tensor_slice(input_token_ids);
 
   Timer timer;
 
@@ -309,9 +305,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
     torch::Tensor accepted_tokens =
         safe_to(val_output.next_tokens, torch::kCPU).to(torch::kInt);
     accepted_tokens = accepted_tokens.view({num_sequences, num_val_tokens});
-    Slice<int32_t> accepted_tokens_slice = {
-        accepted_tokens.data_ptr<int32_t>(),
-        static_cast<size_t>(accepted_tokens.numel())};
+    Slice<int32_t> accepted_tokens_slice = tensor_slice(accepted_tokens);
 
     for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
       const std::string& req_id = req_ids[seq_id];

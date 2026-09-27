@@ -22,14 +22,6 @@ namespace adaptive_pruning {
 
 namespace {
 
-torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {
-  return torch::tensor(values,
-                       torch::TensorOptions()
-                           .dtype(torch::kInt)
-                           .device(torch::kCPU)
-                           .pinned_memory(true));
-}
-
 void sync_pruned_boundary_logprobs(SampleOutput& sample_output,
                                    const ForwardOutput& target_output,
                                    int32_t batch_size,
@@ -154,16 +146,7 @@ torch::Tensor selected_probs_by_step(
       CHECK_EQ(logits.dim(), 2)
           << "adaptive pruning expects draft logits [batch,vocab], got "
           << logits.sizes();
-      // Compute p_selected = exp(logit_selected - logsumexp(logits)) without
-      // materializing the dense [batch, vocab] softmax. logsumexp is a
-      // reduction to [batch]; the gather picks one column of logits. This
-      // saves batch*vocab fp32 (≈39 MiB at batch=64, vocab=152k) per draft
-      // step, executed on every adaptive decode.
-      const torch::Tensor logits_f32 = logits.to(torch::kFloat32);
-      const torch::Tensor logsumexp = torch::logsumexp(logits_f32, /*dim=*/-1);
-      const torch::Tensor selected_logits =
-          gather_selected(logits_f32, next_tokens);
-      probs = torch::exp(selected_logits - logsumexp).to(logits.dtype());
+      probs = selected_softmax_prob(logits, next_tokens).to(logits.dtype());
     } else if (probs.dim() == 2 && probs.size(1) != 1) {
       const torch::Tensor& next_tokens = draft_output.sample_output.next_tokens;
       CHECK(next_tokens.defined())

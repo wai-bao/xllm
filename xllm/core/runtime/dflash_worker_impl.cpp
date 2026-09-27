@@ -50,6 +50,7 @@ limitations under the License.
 #include "runtime/llm_worker_impl.h"
 #include "util/json_reader.h"
 #include "util/model_config_utils.h"
+#include "util/tensor_helper.h"
 #include "util/timer.h"
 #include "util/utils.h"
 
@@ -111,7 +112,7 @@ void expand_block_parallel_sequence_rows(ModelInputParams& input_params,
 torch::Tensor cpu_int_vec_to_device(const std::vector<int32_t>& values,
                                     const Device& device) {
   return safe_to(
-      specBuilder::make_cpu_int_tensor(values),
+      make_cpu_int_tensor(values),
       torch::TensorOptions().dtype(torch::kInt).device(device.unwrap()),
       /*non_blocking=*/true);
 }
@@ -238,9 +239,7 @@ void build_query_rows(const ForwardInput& input,
     CHECK(row_ctx.model_managed_multiblock)
         << "DSV4 block-parallel rows require grouped KV tables";
   }
-  Slice<int32_t> token_ids = {
-      input.token_ids_host.data_ptr<int32_t>(),
-      static_cast<size_t>(input.token_ids_host.numel())};
+  Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
   CHECK_GE(static_cast<int32_t>(token_ids.size()), num_sequences)
       << "DFlash input token_ids size is smaller than num_sequences.";
 
@@ -697,9 +696,8 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
   if (embeddings.defined()) {
     CHECK(processed_target_input.positions_host.defined())
         << "DFlash prefill requires processed positions_host.";
-    Slice<int32_t> positions = {
-        processed_target_input.positions_host.data_ptr<int32_t>(),
-        static_cast<size_t>(processed_target_input.positions_host.numel())};
+    Slice<int32_t> positions =
+        tensor_slice(processed_target_input.positions_host);
     CHECK_EQ(positions.size(), static_cast<size_t>(embeddings.size(0)))
         << "DFlash prefill hidden/position count mismatch.";
     torch::Tensor context_cache_slots =
@@ -761,9 +759,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
              static_cast<int64_t>(embedding.mtp_bootstrap_row_idxes.size()))
         << "DFlash bootstrap row count mismatch";
 
-    Slice<int32_t> token_ids = {
-        input.token_ids_host.data_ptr<int32_t>(),
-        static_cast<size_t>(input.token_ids_host.numel())};
+    Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
     for (int32_t i = 0;
          i < static_cast<int32_t>(embedding.mtp_bootstrap_row_idxes.size());
          ++i) {
@@ -1231,10 +1227,8 @@ void DFlashWorkerImpl::update_decode_step_input(
 
   const torch::Tensor& token_ids_cpu = input.token_ids_host;
   const torch::Tensor& positions_cpu = input.positions_host;
-  Slice<int32_t> input_token_ids = {token_ids_cpu.data_ptr<int32_t>(),
-                                    static_cast<size_t>(token_ids_cpu.numel())};
-  Slice<int32_t> input_positions = {positions_cpu.data_ptr<int32_t>(),
-                                    static_cast<size_t>(positions_cpu.numel())};
+  Slice<int32_t> input_token_ids = tensor_slice(token_ids_cpu);
+  Slice<int32_t> input_positions = tensor_slice(positions_cpu);
 
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
     CHECK_LT(static_cast<size_t>(seq_id), input_token_ids.size())
@@ -1269,8 +1263,8 @@ void DFlashWorkerImpl::update_decode_step_input(
     specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
   }
 
-  input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
+  input.token_ids_host = make_cpu_int_tensor(token_ids_vec);
+  input.positions_host = make_cpu_int_tensor(positions_vec);
   input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
   input.device_tensors_ready = false;
 }
@@ -1379,7 +1373,7 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
   // Pinned-host + async H2D on prepare_stream_ (the file's idiom), so the copy
   // overlaps instead of a blocking non-pinned transfer every decode step.
   query_input.sampling_params.selected_token_idxes =
-      safe_to(specBuilder::make_cpu_int_tensor(selected_idxes),
+      safe_to(make_cpu_int_tensor(selected_idxes),
               idx_options,
               /*non_blocking=*/true);
   query_input.sampling_params.sample_idxes =

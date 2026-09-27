@@ -30,6 +30,8 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
+#include "util/slice.h"
+
 namespace xllm {
 
 inline bool is_cpu_int_tensor(const torch::Tensor& tensor, int32_t dimensions) {
@@ -86,10 +88,35 @@ inline torch::Tensor safe_to(const torch::Tensor& t,
   return t.defined() ? t.to(options, non_blocking) : t;
 };
 
-// Creates an independent contiguous tensor that is detached from autograd.
+// Copies directly into independent contiguous storage, detached from autograd.
 inline torch::Tensor clone_contiguous_detached_tensor(
     const torch::Tensor& tensor) {
-  return tensor.contiguous().clone().detach();
+  if (!tensor.defined()) {
+    return tensor;
+  }
+  return tensor.detach().clone(torch::MemoryFormat::Contiguous);
+};
+
+// Packs a host int32 vector into a pinned CPU tensor for async H2D staging.
+// Other element types and allocation policies should use their own options.
+inline torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {
+  return torch::tensor(values,
+                       torch::TensorOptions()
+                           .dtype(torch::kInt)
+                           .device(torch::kCPU)
+                           .pinned_memory(true));
+};
+
+// Borrows contiguous CPU int32 storage as a flat Slice, regardless of rank.
+// Does not copy or retain storage: the owner must outlive the slice and must
+// not resize/reallocate its storage while the slice is in use.
+inline Slice<int32_t> tensor_slice(const torch::Tensor& tensor) {
+  CHECK(tensor.defined()) << "tensor_slice requires a defined tensor";
+  CHECK(tensor.device().is_cpu()) << "tensor_slice requires a CPU tensor";
+  CHECK_EQ(tensor.scalar_type(), torch::kInt)
+      << "tensor_slice requires an int32 tensor";
+  CHECK(tensor.is_contiguous()) << "tensor_slice requires contiguous storage";
+  return {tensor.data_ptr<int32_t>(), static_cast<size_t>(tensor.numel())};
 };
 
 inline std::vector<char> get_the_bytes(std::string filename) {
@@ -351,6 +378,22 @@ constexpr torch::ScalarType get_scalar_type() {
   }
 }
 
+// Returns a contiguous CPU copy with the requested scalar type for
+// host-side read loops. Fuses the device, dtype, and layout change into a
+// single copy; a no-op when the tensor already has that device/dtype/layout.
+template <typename T>
+inline torch::Tensor to_cpu_contiguous(const torch::Tensor& tensor) {
+  return safe_to(tensor,
+                 torch::TensorOptions()
+                     .device(torch::kCPU)
+                     .dtype(get_scalar_type<T>())
+                     .memory_format(torch::MemoryFormat::Contiguous));
+};
+
+inline torch::Tensor to_cpu_int64_contiguous(const torch::Tensor& tensor) {
+  return to_cpu_contiguous<int64_t>(tensor);
+};
+
 inline std::optional<torch::ScalarType> try_get_scalar_type_from_string(
     const std::string& dtype_str) {
   static const std::unordered_map<std::string, torch::ScalarType> kDtypeMap = {
@@ -487,5 +530,25 @@ inline std::vector<int64_t> get_tensor_shape(const torch::Tensor& tensor) {
   }
   c10::IntArrayRef sizes = tensor.sizes();
   return std::vector<int64_t>(sizes.begin(), sizes.end());
+}
+
+// Returns exp(selected_logit - logsumexp(logits)) in fp32: the selected-token
+// probability without materializing the dense [batch, vocab] softmax. The
+// reduction runs on fp32 logits for BF16 accuracy (a fp32 output alone still
+// leaves BF16 intermediate rounding in PyTorch's logsumexp). `logits` must be
+// [batch, vocab]; `index` supplies one column index per row. Callers that
+// need the source dtype cast the result themselves.
+inline torch::Tensor selected_softmax_prob(const torch::Tensor& logits,
+                                           const torch::Tensor& index) {
+  CHECK_EQ(logits.dim(), 2) << "selected_softmax_prob expects [batch, vocab]";
+  const torch::Tensor logits_f32 = logits.to(torch::kFloat);
+  torch::Tensor logsumexp_f32 =
+      torch::empty({logits.size(0)}, logits.options().dtype(torch::kFloat));
+  torch::logsumexp_out(logsumexp_f32, logits_f32, /*dim=*/-1);
+  const torch::Tensor selected_logits =
+      logits.gather(/*dim=*/-1, index.view({-1, 1}).to(torch::kLong))
+          .squeeze(/*dim=*/-1)
+          .to(torch::kFloat);
+  return torch::exp(selected_logits - logsumexp_f32);
 }
 }  // namespace xllm

@@ -162,9 +162,6 @@ void update_input_params(ModelInputParams& input_params,
                          std::vector<int32_t> kv_seq_lens_vec,
                          bool update_block_tables = false);
 
-// Packs a host int32 vector into a pinned CPU tensor for async H2D staging.
-torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values);
-
 // Stages token_ids/positions into both the host and device tensors of `input`
 // with async H2D copies, toggling device_tensors_ready around the write.
 void set_token_position_tensors(ForwardInput& input,

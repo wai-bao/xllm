@@ -23,20 +23,8 @@ limitations under the License.
 #include <vector>
 
 #include "util/tensor_helper.h"
-#include "util/utils.h"
 
 namespace xllm {
-namespace {
-
-torch::Tensor to_cpu_int64_contiguous(const torch::Tensor& tensor) {
-  torch::Tensor cpu_tensor = safe_to(tensor, torch::kCPU).contiguous();
-  if (cpu_tensor.scalar_type() != torch::kInt64) {
-    cpu_tensor = cpu_tensor.to(torch::kInt64);
-  }
-  return cpu_tensor;
-}
-
-}  // namespace
 
 EmbeddingCache::EmbeddingCache(int32_t total_nums) {
   CHECK_GT(total_nums, 0) << "No embeddings to allocate";

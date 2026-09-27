@@ -21,6 +21,10 @@ limitations under the License.
 
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <utility>
 
 namespace xllm {
 namespace util {
@@ -267,66 +271,56 @@ torch::ScalarType datatype_proto_to_torch(const std::string& proto_datatype) {
 }
 
 namespace {
-template <typename T>
-const void* get_data_from_contents(const proto::TensorContents& contents,
-                                   const std::string& datatype) {
-  if constexpr (std::is_same_v<T, bool>) {
-    if (contents.bool_contents().empty()) {
-      LOG(ERROR) << "TensorContents.bool_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.bool_contents().data();
-  } else if constexpr (std::is_same_v<T, int32_t>) {
-    if (contents.int_contents().empty()) {
-      LOG(ERROR) << "TensorContents.int_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.int_contents().data();
-  } else if constexpr (std::is_same_v<T, int64_t>) {
-    if (contents.int64_contents().empty()) {
-      LOG(ERROR) << "TensorContents.int64_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.int64_contents().data();
-  } else if constexpr (std::is_same_v<T, uint32_t>) {
-    if (contents.uint_contents().empty()) {
-      LOG(ERROR) << "TensorContents.uint_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.uint_contents().data();
-  } else if constexpr (std::is_same_v<T, uint64_t>) {
-    if (contents.uint64_contents().empty()) {
-      LOG(ERROR) << "TensorContents.uint64_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.uint64_contents().data();
-  } else if constexpr (std::is_same_v<T, float>) {
-    if (contents.fp32_contents().empty()) {
-      LOG(ERROR) << "TensorContents.fp32_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.fp32_contents().data();
-  } else if constexpr (std::is_same_v<T, double>) {
-    if (contents.fp64_contents().empty()) {
-      LOG(ERROR) << "TensorContents.fp64_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.fp64_contents().data();
-  } else if constexpr (std::is_same_v<T, uint8_t>) {
-    return static_cast<const void*>(contents.bytes_contents().data());
-  } else {
-    LOG(FATAL) << "Unsupported data type for TensorContents: "
-               << typeid(T).name();
-    return nullptr;
+
+// Payload descriptor for a proto datatype: the backing storage in
+// TensorContents plus its element count. proto_to_torch dispatches through
+// resolve_payload so a datatype is encoded exactly once; unknown datatypes
+// and misaligned byte payloads return nullopt, empty payloads report
+// data == nullptr.
+struct PayloadInfo {
+  // Backing storage; nullptr when the contents field is empty.
+  const void* data;
+  // Element count held in the contents field.
+  uint64_t element_count;
+};
+
+std::optional<PayloadInfo> resolve_payload(
+    const proto::TensorContents& contents,
+    const std::string& datatype) {
+  const auto from_field = [](const auto& field) -> PayloadInfo {
+    return PayloadInfo{field.data(), static_cast<uint64_t>(field.size())};
+  };
+  if (datatype == "BOOL") {
+    return from_field(contents.bool_contents());
   }
-  return nullptr;
+  if (datatype == "INT32") {
+    return from_field(contents.int_contents());
+  }
+  if (datatype == "INT64") {
+    return from_field(contents.int64_contents());
+  }
+  if (datatype == "UINT32") {
+    return from_field(contents.uint_contents());
+  }
+  if (datatype == "UINT64") {
+    return from_field(contents.uint64_contents());
+  }
+  if (datatype == "FP32") {
+    return from_field(contents.fp32_contents());
+  }
+  if (datatype == "FP64") {
+    return from_field(contents.fp64_contents());
+  }
+  if (datatype == "FP16" || datatype == "BF16" || datatype == "BYTES") {
+    const std::string& bytes = contents.bytes_contents();
+    const uint64_t element_size = datatype == "BYTES" ? 1 : 2;
+    const uint64_t byte_count = static_cast<uint64_t>(bytes.size());
+    if (byte_count % element_size != 0) {
+      return std::nullopt;
+    }
+    return PayloadInfo{bytes.data(), byte_count / element_size};
+  }
+  return std::nullopt;
 }
 
 }  // namespace
@@ -369,41 +363,32 @@ bool set_data_to_contents(proto::TensorContents* contents,
     return false;
   }
 
+  // Scalar payloads copy in one memcpy-sized batch instead of per-element
+  // add() calls; [1, vocab] proposal rows dominate RPC serialization cost.
+  const auto bulk_assign = [data_ptr, data_count](auto* field) {
+    using FieldT = decltype(field->Get(0));
+    static_assert(sizeof(FieldT) == sizeof(T));
+    field->Reserve(static_cast<int>(data_count));
+    // AddNAlreadyReserved skips Resize's zero-fill that the memcpy would
+    // immediately overwrite.
+    std::memcpy(field->AddNAlreadyReserved(static_cast<int>(data_count)),
+                data_ptr,
+                data_count * sizeof(T));
+  };
   if constexpr (std::is_same_v<T, bool>) {
-    contents->mutable_bool_contents()->Reserve(data_count);
-    for (size_t i = 0; i < data_count; ++i) {
-      contents->add_bool_contents(data_ptr[i]);
-    }
+    bulk_assign(contents->mutable_bool_contents());
   } else if constexpr (std::is_same_v<T, int32_t>) {
-    contents->mutable_int_contents()->Reserve(data_count);
-    for (size_t i = 0; i < data_count; ++i) {
-      contents->add_int_contents(data_ptr[i]);
-    }
+    bulk_assign(contents->mutable_int_contents());
   } else if constexpr (std::is_same_v<T, int64_t>) {
-    contents->mutable_int64_contents()->Reserve(data_count);
-    for (size_t i = 0; i < data_count; ++i) {
-      contents->add_int64_contents(data_ptr[i]);
-    }
+    bulk_assign(contents->mutable_int64_contents());
   } else if constexpr (std::is_same_v<T, uint32_t>) {
-    contents->mutable_uint_contents()->Reserve(data_count);
-    for (size_t i = 0; i < data_count; ++i) {
-      contents->add_uint_contents(data_ptr[i]);
-    }
+    bulk_assign(contents->mutable_uint_contents());
   } else if constexpr (std::is_same_v<T, uint64_t>) {
-    contents->mutable_uint64_contents()->Reserve(data_count);
-    for (size_t i = 0; i < data_count; ++i) {
-      contents->add_uint64_contents(data_ptr[i]);
-    }
+    bulk_assign(contents->mutable_uint64_contents());
   } else if constexpr (std::is_same_v<T, float>) {
-    contents->mutable_fp32_contents()->Reserve(data_count);
-    for (size_t i = 0; i < data_count; ++i) {
-      contents->add_fp32_contents(data_ptr[i]);
-    }
+    bulk_assign(contents->mutable_fp32_contents());
   } else if constexpr (std::is_same_v<T, double>) {
-    contents->mutable_fp64_contents()->Reserve(data_count);
-    for (size_t i = 0; i < data_count; ++i) {
-      contents->add_fp64_contents(data_ptr[i]);
-    }
+    bulk_assign(contents->mutable_fp64_contents());
   } else if constexpr (std::is_same_v<T, uint8_t>) {
     const char* char_ptr = reinterpret_cast<const char*>(data_ptr);
     contents->set_bytes_contents(char_ptr, data_count * sizeof(T));
@@ -436,7 +421,6 @@ torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor) {
 
   const std::string& proto_datatype = proto_tensor.datatype();
   torch::ScalarType torch_dtype = datatype_proto_to_torch(proto_datatype);
-  const size_t element_size = torch::elementSize(torch_dtype);
 
   std::vector<int64_t> torch_shape;
   int64_t total_elements = 1;
@@ -446,48 +430,26 @@ torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor) {
                  << " (must be positive, datatype=" << proto_datatype << ")";
       return torch::Tensor();
     }
+    if (total_elements > std::numeric_limits<int64_t>::max() / dim) {
+      LOG(ERROR) << "Proto Tensor shape overflows int64 (datatype="
+                 << proto_datatype << ")";
+      return torch::Tensor();
+    }
     torch_shape.emplace_back(dim);
     total_elements *= dim;
   }
   torch::IntArrayRef tensor_shape(torch_shape);
 
-  const void* data_ptr = nullptr;
-  size_t data_count = 0;
-  if (proto_datatype == "BOOL") {
-    data_ptr = get_data_from_contents<bool>(proto_contents, proto_datatype);
-    data_count = proto_contents.bool_contents_size();
-  } else if (proto_datatype == "INT32") {
-    data_ptr = get_data_from_contents<int32_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.int_contents_size();
-  } else if (proto_datatype == "INT64") {
-    data_ptr = get_data_from_contents<int64_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.int64_contents_size();
-  } else if (proto_datatype == "UINT32") {
-    data_ptr = get_data_from_contents<uint32_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.uint_contents_size();
-  } else if (proto_datatype == "UINT64") {
-    data_ptr = get_data_from_contents<uint64_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.uint64_contents_size();
-  } else if (proto_datatype == "FP32") {
-    data_ptr = get_data_from_contents<float>(proto_contents, proto_datatype);
-    data_count = proto_contents.fp32_contents_size();
-  } else if (proto_datatype == "FP64") {
-    data_ptr = get_data_from_contents<double>(proto_contents, proto_datatype);
-    data_count = proto_contents.fp64_contents_size();
-  } else if (proto_datatype == "BF16") {
-    data_ptr = get_data_from_contents<uint8_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.bytes_contents().size() /
-                 static_cast<size_t>(sizeof(torch::BFloat16));
-  } else if (proto_datatype == "FP16") {
-    data_ptr = get_data_from_contents<uint8_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.bytes_contents().size() /
-                 static_cast<size_t>(sizeof(torch::Half));
-  } else if (proto_datatype == "BYTES") {
-    data_ptr = get_data_from_contents<uint8_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.bytes_contents().size();
+  const std::optional<PayloadInfo> payload =
+      resolve_payload(proto_contents, proto_datatype);
+  if (!payload.has_value()) {
+    LOG(ERROR) << "Unsupported or malformed TensorContents (datatype="
+               << proto_datatype << ")";
+    return torch::Tensor();
   }
+  const size_t data_count = static_cast<size_t>(payload->element_count);
 
-  if (data_ptr == nullptr) {
+  if (payload->data == nullptr) {
     LOG(ERROR) << "Failed to get data from TensorContents (datatype="
                << proto_datatype << ")";
     return torch::Tensor();
@@ -502,7 +464,8 @@ torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor) {
   }
 
   torch::Tensor tensor =
-      torch::from_blob(const_cast<void*>(data_ptr), tensor_shape, torch_dtype)
+      torch::from_blob(
+          const_cast<void*>(payload->data), tensor_shape, torch_dtype)
           .clone();
   return tensor;
 }

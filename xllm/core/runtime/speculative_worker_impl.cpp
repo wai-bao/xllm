@@ -96,10 +96,6 @@ namespace {
                   : tensor_;                                                  \
   } while (0)
 
-Slice<int32_t> tensor_slice(const torch::Tensor& tensor) {
-  return {tensor.data_ptr<int32_t>(), static_cast<size_t>(tensor.numel())};
-}
-
 std::string stable_path_digest(const std::string& path_string) {
   const std::filesystem::path path(path_string);
   std::error_code error;

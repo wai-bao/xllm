@@ -58,6 +58,7 @@ limitations under the License.
 #include "runtime/llm_worker_impl.h"
 #include "util/pretty_print.h"
 #include "util/slice.h"
+#include "util/tensor_helper.h"
 #include "util/timer.h"
 #include "util/utils.h"
 
@@ -346,8 +347,7 @@ void check_mtp_decode_states(
   CHECK_GE(token_ids_host.numel(), static_cast<int64_t>(states.size()))
       << "MTP decode token/state count mismatch";
 
-  Slice<int32_t> token_ids = {token_ids_host.data_ptr<int32_t>(),
-                              static_cast<size_t>(token_ids_host.numel())};
+  Slice<int32_t> token_ids = tensor_slice(token_ids_host);
   for (int32_t i = 0; i < static_cast<int32_t>(states.size()); ++i) {
     const EmbeddingCache::DecodeState& state = states[i];
     const int32_t token_id = token_ids[i];
@@ -392,9 +392,7 @@ void replace_host_token_placeholders(ForwardInput& input,
   int32_t* token_ids = input.token_ids_host.data_ptr<int32_t>();
   const size_t num_token_ids =
       static_cast<size_t>(input.token_ids_host.numel());
-  Slice<int32_t> replacement_ids = {
-      replacement_cpu.data_ptr<int32_t>(),
-      static_cast<size_t>(replacement_cpu.numel())};
+  Slice<int32_t> replacement_ids = tensor_slice(replacement_cpu);
 
   size_t replacement_idx = 0;
   for (size_t i = 0; i < num_token_ids; ++i) {
@@ -1333,8 +1331,7 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
   auto& extra_token_ids = input_params.embedding.extra_token_ids;
 
   const torch::Tensor& token_ids = input.token_ids_host;
-  Slice<int32_t> tokens_ids_slice = {token_ids.data_ptr<int32_t>(),
-                                     static_cast<size_t>(token_ids.numel())};
+  Slice<int32_t> tokens_ids_slice = tensor_slice(token_ids);
 
   int32_t start_idx = 0;
   std::vector<int32_t> new_token_ids;
@@ -1350,8 +1347,7 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
     new_token_ids.emplace_back(extra_token_ids[i]);
   }
   prefill_input.device_tensors_ready = false;
-  prefill_input.token_ids_host =
-      specBuilder::make_cpu_int_tensor(new_token_ids);
+  prefill_input.token_ids_host = make_cpu_int_tensor(new_token_ids);
   prefill_input.token_ids = safe_to(prefill_input.token_ids_host,
                                     prefill_input.positions.options(),
                                     /*non_blocking=*/true);
@@ -1463,9 +1459,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_decode(
              static_cast<int64_t>(embedding.mtp_bootstrap_row_idxes.size()))
         << "MTP bootstrap row count mismatch";
 
-    Slice<int32_t> token_ids = {
-        input.token_ids_host.data_ptr<int32_t>(),
-        static_cast<size_t>(input.token_ids_host.numel())};
+    Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
     for (int32_t i = 0;
          i < static_cast<int32_t>(embedding.mtp_bootstrap_row_idxes.size());
          ++i) {
@@ -2895,10 +2889,8 @@ void MTPWorkerImpl::update_decode_step_input(
 
   const torch::Tensor& token_ids_cpu = input.token_ids_host;
   const torch::Tensor& positions_cpu = input.positions_host;
-  Slice<int32_t> input_token_ids = {token_ids_cpu.data_ptr<int32_t>(),
-                                    static_cast<size_t>(token_ids_cpu.numel())};
-  Slice<int32_t> input_positions = {positions_cpu.data_ptr<int32_t>(),
-                                    static_cast<size_t>(positions_cpu.numel())};
+  Slice<int32_t> input_token_ids = tensor_slice(token_ids_cpu);
+  Slice<int32_t> input_positions = tensor_slice(positions_cpu);
   std::vector<int32_t> positions_vec;
   positions_vec.reserve(num_sequences);
 
@@ -2984,8 +2976,8 @@ void MTPWorkerImpl::update_decode_step_input(
     specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
   }
 
-  input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
+  input.token_ids_host = make_cpu_int_tensor(token_ids_vec);
+  input.positions_host = make_cpu_int_tensor(positions_vec);
   input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
   input.device_tensors_ready = false;
 }
@@ -3033,12 +3025,8 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
 #endif
   specBuilder::DecodeRowContext row_ctx =
       specBuilder::make_decode_row_context(input);
-  Slice<int32_t> token_ids = {
-      input.token_ids_host.data_ptr<int32_t>(),
-      static_cast<size_t>(input.token_ids_host.numel())};
-  Slice<int32_t> positions = {
-      input.positions_host.data_ptr<int32_t>(),
-      static_cast<size_t>(input.positions_host.numel())};
+  Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
+  Slice<int32_t> positions = tensor_slice(input.positions_host);
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   const bool use_atb_spec_kernel =
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
@@ -3456,12 +3444,8 @@ void MTPWorkerImpl::prepare_validate_inputs(
   const bool positions_decoupled = positions_are_decoupled_from_kv_length();
   specBuilder::DecodeRowContext row_ctx =
       specBuilder::make_decode_row_context(input);
-  Slice<int32_t> token_ids = {
-      input.token_ids_host.data_ptr<int32_t>(),
-      static_cast<size_t>(input.token_ids_host.numel())};
-  Slice<int32_t> positions = {
-      input.positions_host.data_ptr<int32_t>(),
-      static_cast<size_t>(input.positions_host.numel())};
+  Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
+  Slice<int32_t> positions = tensor_slice(input.positions_host);
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   const bool use_atb_spec_kernel =
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
@@ -3656,9 +3640,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       specBuilder::make_decode_row_context(base_input);
   torch::TensorOptions token_options = extend_input.token_ids.options();
   torch::TensorOptions position_options = extend_input.positions.options();
-  Slice<int32_t> token_ids = {
-      base_input.token_ids_host.data_ptr<int32_t>(),
-      static_cast<size_t>(base_input.token_ids_host.numel())};
+  Slice<int32_t> token_ids = tensor_slice(base_input.token_ids_host);
 
   specBuilder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(num_sequences * 2);
@@ -3863,10 +3845,9 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
         /*step=*/2,
         idx_options);
   } else {
-    params.selected_token_idxes =
-        safe_to(specBuilder::make_cpu_int_tensor(selected_row_idx),
-                idx_options,
-                /*non_blocking=*/true);
+    params.selected_token_idxes = safe_to(make_cpu_int_tensor(selected_row_idx),
+                                          idx_options,
+                                          /*non_blocking=*/true);
   }
   if (!params.sample_idxes.defined()) {
     // This control tensor is always the identity mapping. Generate it directly
@@ -3910,9 +3891,8 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
       << "draft kv slots/positions mismatch";
 
   torch::TensorOptions position_options = input.positions.options();
-  set_positions_tensor(draft_input,
-                       specBuilder::make_cpu_int_tensor(buf.out_positions),
-                       position_options);
+  set_positions_tensor(
+      draft_input, make_cpu_int_tensor(buf.out_positions), position_options);
   specBuilder::update_input_params(
       input_params,
       buf,

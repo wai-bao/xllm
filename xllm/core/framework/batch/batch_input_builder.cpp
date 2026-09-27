@@ -178,14 +178,6 @@ BlockCopyKernelInputData build_block_copy_kernel_input_data(
   return input_data;
 }
 
-torch::Tensor build_pinned_int_tensor(const std::vector<int32_t>& values) {
-  return torch::tensor(values,
-                       torch::TensorOptions()
-                           .dtype(torch::kInt)
-                           .device(torch::kCPU)
-                           .pinned_memory(true));
-}
-
 // Whether the current prefill step end should hold a linear-state checkpoint.
 // Checkpoints are saved at prefill step ends that land on a chunk-end boundary
 // (stride = max_tokens_per_chunk_for_prefill). The linear-state cache is a
@@ -1426,22 +1418,21 @@ void BatchInputBuilder::process_swap_block_infos(ForwardInput& forward_input) {
                                            /*detect_overlap=*/true);
     if (!kernel_input.has_overlap) {
       input_params.block_copy.src_block_indices =
-          build_pinned_int_tensor(kernel_input.src_indices);
+          make_cpu_int_tensor(kernel_input.src_indices);
       input_params.block_copy.dst_block_indices =
-          build_pinned_int_tensor(kernel_input.dst_indices);
+          make_cpu_int_tensor(kernel_input.dst_indices);
       input_params.block_copy.cum_sum =
-          build_pinned_int_tensor(kernel_input.cum_sum);
+          make_cpu_int_tensor(kernel_input.cum_sum);
     }
 #else
     const BlockCopyKernelInputData kernel_input =
         build_block_copy_kernel_input_data(swap_blocks,
                                            /*detect_overlap=*/false);
     input_params.block_copy.src_block_indices =
-        build_pinned_int_tensor(kernel_input.src_indices);
+        make_cpu_int_tensor(kernel_input.src_indices);
     input_params.block_copy.dst_block_indices =
-        build_pinned_int_tensor(kernel_input.dst_indices);
-    input_params.block_copy.cum_sum =
-        build_pinned_int_tensor(kernel_input.cum_sum);
+        make_cpu_int_tensor(kernel_input.dst_indices);
+    input_params.block_copy.cum_sum = make_cpu_int_tensor(kernel_input.cum_sum);
 #endif
   } else {
     input_params.block_copy.swap_blocks.insert(
