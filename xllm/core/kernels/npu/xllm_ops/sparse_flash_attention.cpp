@@ -13,9 +13,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <aclnnop/aclnn_sparse_flash_attention.h>
+#include <dlfcn.h>
 #include <torch/library.h>
 
+#if __has_include(<version/cann_version.h>)
+#include <version/cann_version.h>
+#endif
+
+#include <limits>
 #include <string>
+#include <string_view>
+#include <type_traits>
 
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
 #include "xllm_ops_api.h"
@@ -56,6 +65,166 @@ void check_sparse_flash_attention_shape_and_dtype(
   TORCH_CHECK(!layout_kv.empty(), "layout_kv should not be empty.");
 }
 
+#if defined(CANN_MAJOR) && CANN_MAJOR >= 9
+std::string_view resolved_op_api_provider(const char* function_name) {
+  void* function = aclnn::detail::get_op_api_func_addr(function_name);
+  CHECK(function != nullptr) << function_name << " is unavailable";
+  Dl_info provider_info{};
+  CHECK_NE(dladdr(function, &provider_info), 0);
+  CHECK(provider_info.dli_fname != nullptr);
+  return provider_info.dli_fname;
+}
+
+bool uses_legacy_sparse_flash_attention_abi() {
+  static const bool legacy_abi = [] {
+    const std::string_view provider =
+        resolved_op_api_provider("aclnnSparseFlashAttentionGetWorkspaceSize");
+    const std::string_view execute_provider =
+        resolved_op_api_provider("aclnnSparseFlashAttention");
+    CHECK(provider == execute_provider)
+        << "SparseFlashAttention workspace and execute providers differ: "
+        << provider << " vs. " << execute_provider;
+    if (provider.find("/custom_xllm_math/") != std::string_view::npos) {
+      CHECK(resolved_op_api_provider(
+                "aclnnSparseFlashAttentionLseGetWorkspaceSize") == provider);
+      CHECK(resolved_op_api_provider("aclnnSparseFlashAttentionLse") ==
+            provider);
+      return true;
+    }
+    CHECK(provider.find("/glm_next_transformer/") != std::string_view::npos ||
+          provider.find("/libopapi.so") != std::string_view::npos ||
+          provider.find("/libopapi_transformer.so") != std::string_view::npos)
+        << "unknown SparseFlashAttention ABI provider: " << provider;
+    return false;
+  }();
+  return legacy_abi;
+}
+#endif
+
+void launch_sparse_flash_attention(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& sparse_indices,
+    const c10::optional<at::Tensor>& block_table,
+    const c10::optional<at::Tensor>& actual_seq_lengths_query,
+    const c10::optional<at::Tensor>& actual_seq_lengths_kv,
+    const c10::optional<at::Tensor>& query_rope,
+    const c10::optional<at::Tensor>& key_rope,
+    double scale_value,
+    int64_t sparse_block_size,
+    c10::string_view layout_query,
+    c10::string_view layout_kv,
+    int64_t sparse_mode,
+    at::Tensor& output) {
+  std::string query_layout_str(layout_query);
+  std::string kv_layout_str(layout_kv);
+  char* query_layout_ptr = query_layout_str.data();
+  char* kv_layout_ptr = kv_layout_str.data();
+
+#if defined(CANN_MAJOR) && CANN_MAJOR >= 9
+  // CANN 9's built-in and glm_next_transformer providers add four arguments
+  // and two required outputs. custom_xllm_math's old SparseFlashAttention
+  // symbol cannot supply those outputs to CANN 9, but its Lse variant can.
+  // Dispatch by the resolved provider, not the installed CANN version alone.
+  static_assert(std::is_invocable_r_v<
+                aclnnStatus,
+                decltype(&aclnnSparseFlashAttentionGetWorkspaceSize),
+                const aclTensor*,
+                const aclTensor*,
+                const aclTensor*,
+                const aclTensor*,
+                const aclTensor*,
+                const aclTensor*,
+                const aclTensor*,
+                const aclTensor*,
+                const aclTensor*,
+                double,
+                int64_t,
+                char*,
+                char*,
+                int64_t,
+                int64_t,
+                int64_t,
+                int64_t,
+                bool,
+                const aclTensor*,
+                const aclTensor*,
+                const aclTensor*,
+                uint64_t*,
+                aclOpExecutor**>);
+  constexpr int64_t kUnboundedWindow = std::numeric_limits<int64_t>::max();
+  constexpr int64_t kAttentionMode = 2;
+  bool return_softmax_lse = false;
+  at::Tensor softmax_max = at::empty({0}, query.options().dtype(at::kFloat));
+  at::Tensor softmax_sum = at::empty({0}, query.options().dtype(at::kFloat));
+  if (uses_legacy_sparse_flash_attention_abi()) {
+    EXEC_NPU_CMD(aclnnSparseFlashAttentionLse,
+                 query,
+                 key,
+                 value,
+                 sparse_indices,
+                 block_table,
+                 actual_seq_lengths_query,
+                 actual_seq_lengths_kv,
+                 query_rope,
+                 key_rope,
+                 scale_value,
+                 sparse_block_size,
+                 query_layout_ptr,
+                 kv_layout_ptr,
+                 sparse_mode,
+                 kUnboundedWindow,
+                 kUnboundedWindow,
+                 kAttentionMode,
+                 return_softmax_lse,
+                 output,
+                 softmax_max,
+                 softmax_sum);
+  } else {
+    EXEC_NPU_CMD(aclnnSparseFlashAttention,
+                 query,
+                 key,
+                 value,
+                 sparse_indices,
+                 block_table,
+                 actual_seq_lengths_query,
+                 actual_seq_lengths_kv,
+                 query_rope,
+                 key_rope,
+                 scale_value,
+                 sparse_block_size,
+                 query_layout_ptr,
+                 kv_layout_ptr,
+                 sparse_mode,
+                 kUnboundedWindow,
+                 kUnboundedWindow,
+                 kAttentionMode,
+                 return_softmax_lse,
+                 output,
+                 softmax_max,
+                 softmax_sum);
+  }
+#else
+  EXEC_NPU_CMD(aclnnSparseFlashAttention,
+               query,
+               key,
+               value,
+               sparse_indices,
+               block_table,
+               actual_seq_lengths_query,
+               actual_seq_lengths_kv,
+               query_rope,
+               key_rope,
+               scale_value,
+               sparse_block_size,
+               query_layout_ptr,
+               kv_layout_ptr,
+               sparse_mode,
+               output);
+#endif
+}
+
 }  // namespace
 
 at::Tensor sparse_flash_attention(
@@ -82,27 +251,21 @@ at::Tensor sparse_flash_attention(
                                                layout_kv);
   at::Tensor out = construct_sparse_flash_attention_output_tensor(query);
 
-  std::string query_layout_str = std::string(layout_query);
-  std::string kv_layout_str = std::string(layout_kv);
-  char* query_layout_ptr = const_cast<char*>(query_layout_str.c_str());
-  char* kv_layout_ptr = const_cast<char*>(kv_layout_str.c_str());
-
-  EXEC_NPU_CMD(aclnnSparseFlashAttention,
-               query,
-               key,
-               value,
-               sparse_indices,
-               block_table,
-               actual_seq_lengths_query,
-               actual_seq_lengths_kv,
-               query_rope,
-               key_rope,
-               scale_value,
-               sparse_block_size,
-               query_layout_ptr,
-               kv_layout_ptr,
-               sparse_mode,
-               out);
+  launch_sparse_flash_attention(query,
+                                key,
+                                value,
+                                sparse_indices,
+                                block_table,
+                                actual_seq_lengths_query,
+                                actual_seq_lengths_kv,
+                                query_rope,
+                                key_rope,
+                                scale_value,
+                                sparse_block_size,
+                                layout_query,
+                                layout_kv,
+                                sparse_mode,
+                                out);
 
   return out;
 }
@@ -136,27 +299,21 @@ at::Tensor sparse_flash_attention_out(
   CHECK(output.scalar_type() == query.scalar_type())
       << "output dtype must match query dtype";
 
-  std::string query_layout_str = std::string(layout_query);
-  std::string kv_layout_str = std::string(layout_kv);
-  char* query_layout_ptr = const_cast<char*>(query_layout_str.c_str());
-  char* kv_layout_ptr = const_cast<char*>(kv_layout_str.c_str());
-
-  EXEC_NPU_CMD(aclnnSparseFlashAttention,
-               query,
-               key,
-               value,
-               sparse_indices,
-               block_table,
-               actual_seq_lengths_query,
-               actual_seq_lengths_kv,
-               query_rope,
-               key_rope,
-               scale_value,
-               sparse_block_size,
-               query_layout_ptr,
-               kv_layout_ptr,
-               sparse_mode,
-               output);
+  launch_sparse_flash_attention(query,
+                                key,
+                                value,
+                                sparse_indices,
+                                block_table,
+                                actual_seq_lengths_query,
+                                actual_seq_lengths_kv,
+                                query_rope,
+                                key_rope,
+                                scale_value,
+                                sparse_block_size,
+                                layout_query,
+                                layout_kv,
+                                sparse_mode,
+                                output);
   return output;
 }
 

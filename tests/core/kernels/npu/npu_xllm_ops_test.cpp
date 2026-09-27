@@ -1144,6 +1144,24 @@ assert eager_result.shape == query.shape
 assert eager_result.dtype == query.dtype
 assert eager_result.data_ptr() == output_address
 
+allocated_result = torch.ops.xllm_ops.sparse_flash_attention(
+    query,
+    key,
+    value,
+    sparse_indices,
+    block_table,
+    actual_seq_lengths_query,
+    actual_seq_lengths_kv,
+    query_rope,
+    key_rope,
+    1.0 / 16.0,
+    1,
+    "TND",
+    "PA_BSND",
+    3,
+)
+torch.testing.assert_close(allocated_result, eager_result, rtol=1e-2, atol=1e-2)
+
 stream = torch.npu.Stream()
 graph = torch.npu.NPUGraph()
 with torch.npu.stream(stream):
