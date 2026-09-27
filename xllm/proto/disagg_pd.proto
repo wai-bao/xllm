@@ -239,6 +239,16 @@ message RemoteToken {
   double time_to_first_token_latency_seconds = 6;
 }
 
+message MtpDraftSeed {
+  Tensor token_ids = 1;
+  Tensor hidden_states = 2;
+  Tensor probs = 3;
+  Tensor selected_probs = 4;
+  // All proposal rows are deterministic point masses at token_ids. When set,
+  // probs is absent; receivers may materialize q only for mixed batches.
+  bool point_mass_q = 5;
+}
+
 message DisaggGenerationsRequest {
   reserved 8, 13, 16;
 
@@ -251,13 +261,15 @@ message DisaggGenerationsRequest {
   int32 dp_rank = 10;
   string x_request_id = 11;
   string x_request_time = 12;
-  // MTP bootstrap state for the first decode draft extend.
-  Tensor mtp_bootstrap_embedding = 14;
+  // Legacy bootstrap payload. New senders use the root token and leave this
+  // field unset; receivers ignore it during a coordinated upgrade.
+  Tensor mtp_bootstrap_embedding = 14 [deprecated = true];
   // Number of prompt tokens served from the prefill prefix cache.
   int32 num_cached_tokens = 15;
   repeated KVTransferGroup source_groups = 20;
   // Cumulative end-to-end latency measured by the source at handoff.
   optional double upstream_elapsed_seconds = 21;
+  MtpDraftSeed mtp_draft_seed = 22;
 }
 
 message DisaggGenerationsRequests {
