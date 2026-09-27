@@ -38,6 +38,7 @@ limitations under the License.
 #include "core/layers/common/rms_norm.h"
 #include "core/layers/common/word_embedding.h"
 #include "core/layers/deepseek_v4_decoder_layer.h"
+#include "core/util/tensor_helper.h"
 #include "layers/npu/deepseek_v4_rotary_embedding.h"
 #include "layers/npu_torch/deepseek_v4_cp_context.h"
 #include "models/llm/deepseek_v4.h"
@@ -552,15 +553,11 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
       return;
     }
 
-    auto cpu_int_options = torch::TensorOptions()
-                               .dtype(torch::kInt32)
-                               .device(torch::kCPU)
-                               .pinned_memory(true);
     params.multi_block_tables.clear();
     params.multi_block_tables.reserve(manager_num);
     for (int32_t manager_id = 0; manager_id < manager_num; ++manager_id) {
       params.multi_block_tables.emplace_back(
-          torch::zeros({metadata_batch_size, 1}, cpu_int_options));
+          make_cpu_zeros({metadata_batch_size, 1}, torch::kInt32));
     }
   }
 
@@ -616,31 +613,13 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
   }
 
   void fill_empty_dp_rank_input_params(ModelInputParams& params) const {
-    auto cpu_int_options = torch::TensorOptions()
-                               .dtype(torch::kInt32)
-                               .device(torch::kCPU)
-                               .pinned_memory(true);
     params.meta.num_sequences = 1;
     params.meta.actual_num_sequences = 1;
     params.meta.kv_max_seq_len =
         std::max<int32_t>(params.meta.kv_max_seq_len, 1);
     params.meta.q_max_seq_len = 1;
     params.meta.batch_forward_type = BatchForwardType::DECODE;
-    params.attention.host.kv_seq_lens = {1};
-    params.attention.host.q_seq_lens = {1};
-    params.attention.host.q_cu_seq_lens = {1};
-    params.attention.device.kv_seq_lens =
-        torch::tensor(params.attention.host.kv_seq_lens, cpu_int_options);
-    params.attention.device.q_seq_lens =
-        torch::tensor(params.attention.host.q_seq_lens, cpu_int_options);
-    params.attention.device.q_cu_seq_lens = torch::tensor({1}, cpu_int_options);
-    params.attention.device.kv_cache_tokens_nums =
-        torch::tensor({1}, cpu_int_options);
-    params.attention.host.kv_cache_tokens_nums = {1};
-    params.attention.device.new_cache_slots =
-        torch::tensor({0}, cpu_int_options);
-    params.attention.device.block_tables =
-        torch::zeros({1, 1}, cpu_int_options);
+    fill_dummy_attention_tensors(params, /*kv_len=*/1);
 
     if (!params.multi_block_tables.empty()) {
       return;
@@ -650,7 +629,7 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
     params.multi_block_tables.reserve(manager_num);
     for (int32_t manager_id = 0; manager_id < manager_num; ++manager_id) {
       params.multi_block_tables.emplace_back(
-          torch::zeros({1, 1}, cpu_int_options));
+          make_cpu_zeros({1, 1}, torch::kInt32));
     }
   }
 

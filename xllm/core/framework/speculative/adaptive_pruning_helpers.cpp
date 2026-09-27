@@ -22,14 +22,6 @@ namespace adaptive_pruning {
 
 namespace {
 
-torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {
-  return torch::tensor(values,
-                       torch::TensorOptions()
-                           .dtype(torch::kInt)
-                           .device(torch::kCPU)
-                           .pinned_memory(true));
-}
-
 void sync_pruned_boundary_logprobs(SampleOutput& sample_output,
                                    const ForwardOutput& target_output,
                                    int32_t batch_size,
@@ -113,7 +105,7 @@ PrunedPrefixMasks build_pruned_prefix_masks(
     const torch::Device& device) {
   const int32_t num_val_tokens = num_speculative_tokens + 1;
   torch::Tensor prefix_lengths =
-      safe_to(make_cpu_int_tensor(pruned_prefix_lengths),
+      safe_to(make_cpu_tensor(pruned_prefix_lengths),
               torch::TensorOptions().dtype(torch::kLong).device(device),
               /*non_blocking=*/true)
           .clamp(0, num_speculative_tokens);

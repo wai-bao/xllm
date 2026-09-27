@@ -37,10 +37,6 @@ void push_cumsum(std::vector<int32_t>& vec, int32_t len) {
   vec.emplace_back(vec.back() + len);
 }
 
-Slice<int32_t> tensor_slice(const torch::Tensor& tensor) {
-  return {tensor.data_ptr<int32_t>(), static_cast<size_t>(tensor.numel())};
-}
-
 Slice<int32_t> get_token_ids(const ForwardInput& input) {
   return tensor_slice(input.token_ids_host);
 }
@@ -108,13 +104,7 @@ torch::Tensor create_flat_2d_tensor(const std::vector<int32_t>& values,
   CHECK_EQ(values.size(), static_cast<size_t>(rows) * stride)
       << "flat 2D tensor size mismatch, rows=" << rows << ", stride=" << stride
       << ", values_size=" << values.size();
-  auto tensor = torch::empty({rows, stride},
-                             torch::TensorOptions()
-                                 .dtype(torch::kInt)
-                                 .device(torch::kCPU)
-                                 .pinned_memory(true));
-  std::copy(values.begin(), values.end(), tensor.data_ptr<int32_t>());
-  return tensor;
+  return make_cpu_tensor(values).view({rows, stride});
 }
 
 void fill_multi_block_table_slices(DecodeRowContext& ctx) {
@@ -131,11 +121,21 @@ void fill_multi_block_table_slices(DecodeRowContext& ctx) {
         << "num_sequences exceeds multi_block_tables[" << m
         << "] rows, num_sequences=" << ctx.num_sequences
         << ", rows=" << manager_table.size(0);
+    // Rows of a validated contiguous 2D int32 table are contiguous by
+    // construction; borrow by pointer arithmetic instead of paying
+    // per-row tensor_slice CHECKs and Tensor view construction on every
+    // decode step.
+    CHECK(manager_table.is_contiguous())
+        << "multi_block_tables[" << m << "] must be contiguous";
+    CHECK_EQ(manager_table.scalar_type(), torch::kInt32)
+        << "multi_block_tables[" << m << "] must be int32";
+    const int32_t* table_data = manager_table.const_data_ptr<int32_t>();
+    const int64_t stride = manager_table.size(1);
     ctx.multi_block_tables[m].reserve(static_cast<size_t>(ctx.num_sequences));
     for (int32_t seq_id = 0; seq_id < ctx.num_sequences; ++seq_id) {
-      torch::Tensor row = manager_table[seq_id];
-      ctx.multi_block_tables[m].emplace_back(row.data_ptr<int32_t>(),
-                                             static_cast<size_t>(row.numel()));
+      const int32_t* row_data = table_data + seq_id * stride;
+      ctx.multi_block_tables[m].emplace_back(row_data,
+                                             static_cast<size_t>(stride));
     }
   }
 }
@@ -287,10 +287,7 @@ DecodeRowContext make_decode_row_context(const ForwardInput& input) {
         input.input_params.multi_block_tables.size());
     for (const torch::Tensor& block_table :
          input.input_params.multi_block_tables) {
-      torch::Tensor cpu_block_table = block_table.device().is_cpu()
-                                          ? block_table
-                                          : block_table.to(torch::kCPU);
-      ctx.multi_block_tables_owner.emplace_back(cpu_block_table.contiguous());
+      ctx.multi_block_tables_owner.emplace_back(to_cpu_contiguous(block_table));
     }
     fill_multi_block_table_slices(ctx);
     return ctx;
@@ -489,22 +486,14 @@ void update_input_params(ModelInputParams& input_params,
   }
 }
 
-torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {
-  return torch::tensor(values,
-                       torch::TensorOptions()
-                           .dtype(torch::kInt)
-                           .device(torch::kCPU)
-                           .pinned_memory(true));
-}
-
 void set_token_position_tensors(ForwardInput& input,
                                 const std::vector<int32_t>& token_ids,
                                 const std::vector<int32_t>& positions,
                                 const torch::TensorOptions& token_options,
                                 const torch::TensorOptions& position_options) {
   input.device_tensors_ready = false;
-  input.token_ids_host = make_cpu_int_tensor(token_ids);
-  input.positions_host = make_cpu_int_tensor(positions);
+  input.token_ids_host = make_cpu_tensor(token_ids);
+  input.positions_host = make_cpu_tensor(positions);
   input.token_ids =
       safe_to(input.token_ids_host, token_options, /*non_blocking=*/true);
   input.positions =

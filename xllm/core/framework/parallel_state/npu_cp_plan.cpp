@@ -959,19 +959,6 @@ torch::Tensor map_cache_slots_to_kv_shard(
 // counts and block tables from the attention metadata.
 CpPlanInput make_plan_input(const ForwardInput& processed_input,
                             const CpPlanRuntimeConfig& runtime_config) {
-  auto tensor_to_int32_vec = [](const torch::Tensor& tensor) {
-    std::vector<int32_t> values;
-    if (!tensor.defined() || tensor.numel() == 0) {
-      return values;
-    }
-    torch::Tensor cpu =
-        tensor.device().is_cpu() ? tensor : tensor.to(torch::kCPU);
-    cpu = cpu.contiguous().to(torch::kInt32);
-    values.assign(cpu.data_ptr<int32_t>(),
-                  cpu.data_ptr<int32_t>() + cpu.numel());
-    return values;
-  };
-
   const int32_t num_sequences = processed_input.input_params.meta.num_sequences;
   const std::vector<int32_t>& host_q_seq_lens =
       processed_input.input_params.attention.host.q_seq_lens;
@@ -995,23 +982,22 @@ CpPlanInput make_plan_input(const ForwardInput& processed_input,
       global_q_seq_lens = host_q_seq_lens;
     }
   } else {
-    global_q_seq_lens = tensor_to_int32_vec(
+    global_q_seq_lens = tensor_to_vector<int32_t>(
         processed_input.input_params.attention.device.q_seq_lens);
   }
 
   torch::Tensor global_positions = processed_input.host_positions();
   if (!global_positions.defined() || global_positions.numel() == 0) {
-    global_positions = processed_input.positions;
-    if (global_positions.defined() && !global_positions.device().is_cpu()) {
-      global_positions =
-          global_positions.to(torch::kCPU).contiguous().to(torch::kInt32);
-    }
+    // to_cpu_contiguous no-ops on an already-CPU int32 tensor; the defined()
+    // guard keeps it from producing a defined empty tensor from undefined.
+    global_positions =
+        to_cpu_contiguous(processed_input.positions, torch::kInt32);
   }
 
   std::vector<int32_t> kv_cache_tokens_per_seq =
       processed_input.input_params.attention.host.kv_cache_tokens_nums;
   if (kv_cache_tokens_per_seq.empty()) {
-    kv_cache_tokens_per_seq = tensor_to_int32_vec(
+    kv_cache_tokens_per_seq = tensor_to_vector<int32_t>(
         processed_input.input_params.attention.device.kv_cache_tokens_nums);
   }
 

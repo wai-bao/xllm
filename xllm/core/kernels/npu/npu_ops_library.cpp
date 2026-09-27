@@ -31,6 +31,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
+#include "core/util/tensor_helper.h"
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "npu_ops_api.h"
 #include "triton_npu/torch_api/triton_ops_api.h"
@@ -76,16 +77,9 @@ torch::Tensor causal_conv1d_prefill_npu(torch::Tensor x,
   }
 
   // Convert device tensors to host vectors for IntArrayRef parameters.
-  auto qsl_cpu = query_start_loc.to(torch::kCPU, torch::kInt64).contiguous();
-  auto si_cpu = state_indices.to(torch::kCPU, torch::kInt64).contiguous();
-  auto ism_cpu = has_initial_state.to(torch::kCPU, torch::kInt64).contiguous();
-
-  std::vector<int64_t> qsl_vec(qsl_cpu.data_ptr<int64_t>(),
-                               qsl_cpu.data_ptr<int64_t>() + qsl_cpu.numel());
-  std::vector<int64_t> si_vec(si_cpu.data_ptr<int64_t>(),
-                              si_cpu.data_ptr<int64_t>() + si_cpu.numel());
-  std::vector<int64_t> ism_vec(ism_cpu.data_ptr<int64_t>(),
-                               ism_cpu.data_ptr<int64_t>() + ism_cpu.numel());
+  std::vector<int64_t> qsl_vec = tensor_to_vector<int64_t>(query_start_loc);
+  std::vector<int64_t> si_vec = tensor_to_vector<int64_t>(state_indices);
+  std::vector<int64_t> ism_vec = tensor_to_vector<int64_t>(has_initial_state);
 
   constexpr int64_t kActivationSilu = 1;
   constexpr int64_t kPadSlotId = -1;
@@ -122,16 +116,9 @@ causal_conv1d_qkv_prefill_npu(torch::Tensor x,
     weight = weight.t().contiguous();
   }
 
-  auto qsl_cpu = query_start_loc.to(torch::kCPU, torch::kInt64).contiguous();
-  auto si_cpu = state_indices.to(torch::kCPU, torch::kInt64).contiguous();
-  auto ism_cpu = has_initial_state.to(torch::kCPU, torch::kInt64).contiguous();
-
-  std::vector<int64_t> qsl_vec(qsl_cpu.data_ptr<int64_t>(),
-                               qsl_cpu.data_ptr<int64_t>() + qsl_cpu.numel());
-  std::vector<int64_t> si_vec(si_cpu.data_ptr<int64_t>(),
-                              si_cpu.data_ptr<int64_t>() + si_cpu.numel());
-  std::vector<int64_t> ism_vec(ism_cpu.data_ptr<int64_t>(),
-                               ism_cpu.data_ptr<int64_t>() + ism_cpu.numel());
+  std::vector<int64_t> qsl_vec = tensor_to_vector<int64_t>(query_start_loc);
+  std::vector<int64_t> si_vec = tensor_to_vector<int64_t>(state_indices);
+  std::vector<int64_t> ism_vec = tensor_to_vector<int64_t>(has_initial_state);
 
   return xllm::kernel::npu::causal_conv1d_qkv(x,
                                               weight,

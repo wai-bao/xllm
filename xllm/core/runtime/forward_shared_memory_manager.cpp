@@ -495,7 +495,7 @@ inline void write_tensor(char*& buffer, const torch::Tensor& tensor) {
     write_data(buffer, ndim);
     return;
   }
-  auto contig_tensor = tensor.cpu().contiguous();
+  auto contig_tensor = to_cpu_contiguous(tensor);
   // write ndim
   const uint64_t tensor_ndim = contig_tensor.dim();
   write_data(buffer, tensor_ndim);
@@ -542,7 +542,7 @@ inline void write_tensor(RawInputSerializeContext& context,
   }
 
   if (context.tensor_arena.ptr != nullptr) {
-    torch::Tensor contiguous_tensor = tensor.cpu().contiguous();
+    torch::Tensor contiguous_tensor = to_cpu_contiguous(tensor);
     write_bytes(
         context.tensor_arena, contiguous_tensor.data_ptr(), tensor_data_bytes);
   } else {
@@ -2789,20 +2789,6 @@ void serialize_raw_forward_output(const RawForwardOutput& output,
   if (has_dit_forward_output) {
     write_dit_forward_output(buffer, output.dit_forward_output);
   }
-}
-
-template <typename T>
-std::vector<T> tensor_to_vector(const torch::Tensor& tensor) {
-  if (!tensor.defined() || tensor.numel() == 0) {
-    return {};
-  }
-  torch::Tensor cpu_tensor = tensor.cpu().contiguous();
-  if (cpu_tensor.scalar_type() != get_scalar_type<T>()) {
-    cpu_tensor = cpu_tensor.to(get_scalar_type<T>());
-  }
-  const T* data_ptr = cpu_tensor.data_ptr<T>();
-  const size_t size = static_cast<size_t>(cpu_tensor.numel());
-  return std::vector<T>(data_ptr, data_ptr + size);
 }
 
 template <typename T>

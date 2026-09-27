@@ -53,6 +53,28 @@ namespace xllm {
 
 inline constexpr int64_t kDeepseekV4DsaMetadataBufferElements = 1024;
 
+// Fills the single-sequence dummy attention tensors for an empty DP rank:
+// one sequence of `kv_len` kv length, one query token, no cache slots.
+// Both DeepseekV4 and its MTP head use this to keep collective shapes
+// rank-uniform when a rank prunes all sequences.
+inline void fill_dummy_attention_tensors(ModelInputParams& params,
+                                         int32_t kv_len) {
+  params.attention.host.kv_seq_lens = {kv_len};
+  params.attention.host.q_seq_lens = {1};
+  params.attention.host.q_cu_seq_lens = {1};
+  params.attention.host.kv_cache_tokens_nums = {1};
+  params.attention.device.kv_seq_lens =
+      make_cpu_tensor(params.attention.host.kv_seq_lens);
+  params.attention.device.q_seq_lens =
+      make_cpu_tensor(params.attention.host.q_seq_lens);
+  params.attention.device.q_cu_seq_lens =
+      make_cpu_tensor(params.attention.host.q_cu_seq_lens);
+  params.attention.device.kv_cache_tokens_nums =
+      make_cpu_tensor(params.attention.host.kv_cache_tokens_nums);
+  params.attention.device.new_cache_slots = make_cpu_zeros({1}, torch::kInt32);
+  params.attention.device.block_tables = make_cpu_zeros({1, 1}, torch::kInt32);
+}
+
 inline int64_t deepseek_v4_next_power_of_two(int64_t n) {
   int64_t value = 1;
   while (value < n) {
@@ -1263,10 +1285,6 @@ class DeepseekV4ModelImpl
     const bool is_chunked_prefill =
         params.meta.batch_forward_type.is_chunked_prefill();
     params.attn_metadata = nullptr;
-    auto cpu_int_options = torch::TensorOptions()
-                               .dtype(torch::kInt32)
-                               .device(torch::kCPU)
-                               .pinned_memory(true);
     // The DSA sparse-attention/indexer metadata kernels are configured with a
     // fixed sparse top-k (index_topk_) and sliding-window size. A dummy/empty
     // DP rank that reports a kv length of 1 makes cmp_topk/sparse_count far
@@ -1283,22 +1301,7 @@ class DeepseekV4ModelImpl
     params.meta.batch_forward_type = is_chunked_prefill
                                          ? BatchForwardType::CHUNKED_PREFILL
                                          : BatchForwardType::DECODE;
-    params.attention.host.kv_seq_lens = {dummy_kv_len};
-    params.attention.host.q_seq_lens = {1};
-    params.attention.host.q_cu_seq_lens = {1};
-    params.attention.device.kv_seq_lens =
-        torch::tensor(params.attention.host.kv_seq_lens, cpu_int_options);
-    params.attention.device.q_seq_lens =
-        torch::tensor(params.attention.host.q_seq_lens, cpu_int_options);
-    params.attention.device.q_cu_seq_lens =
-        torch::tensor(params.attention.host.q_cu_seq_lens, cpu_int_options);
-    params.attention.device.kv_cache_tokens_nums =
-        torch::tensor({1}, cpu_int_options);
-    params.attention.host.kv_cache_tokens_nums = {1};
-    params.attention.device.new_cache_slots =
-        torch::tensor({0}, cpu_int_options);
-    params.attention.device.block_tables =
-        torch::zeros({1, 1}, cpu_int_options);
+    fill_dummy_attention_tensors(params, dummy_kv_len);
 
     if (!params.multi_block_tables.empty()) {
       return;
@@ -1314,7 +1317,7 @@ class DeepseekV4ModelImpl
       }
       block_num = std::max<int64_t>(block_num, 1);
       params.multi_block_tables.emplace_back(
-          torch::zeros({1, block_num}, cpu_int_options));
+          make_cpu_zeros({1, block_num}, torch::kInt32));
     }
   }
 
@@ -1360,15 +1363,11 @@ class DeepseekV4ModelImpl
       return;
     }
 
-    auto cpu_int_options = torch::TensorOptions()
-                               .dtype(torch::kInt32)
-                               .device(torch::kCPU)
-                               .pinned_memory(true);
     params.multi_block_tables.clear();
     params.multi_block_tables.reserve(manager_num);
     for (int32_t manager_id = 0; manager_id < manager_num; ++manager_id) {
       params.multi_block_tables.emplace_back(
-          torch::zeros({metadata_batch_size, 1}, cpu_int_options));
+          make_cpu_zeros({metadata_batch_size, 1}, torch::kInt32));
     }
   }
 

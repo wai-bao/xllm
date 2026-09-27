@@ -96,10 +96,6 @@ namespace {
                   : tensor_;                                                  \
   } while (0)
 
-Slice<int32_t> tensor_slice(const torch::Tensor& tensor) {
-  return {tensor.data_ptr<int32_t>(), static_cast<size_t>(tensor.numel())};
-}
-
 std::string stable_path_digest(const std::string& path_string) {
   const std::filesystem::path path(path_string);
   std::error_code error;
@@ -203,8 +199,8 @@ std::vector<SpeculativeTokenStats> calculate_contiguous_speculative_token_stats(
   CHECK_EQ(proposed_tokens.size(), static_cast<size_t>(batch_size))
       << "proposed token count batch mismatch";
 
-  torch::Tensor int_tokens = tokens.to(torch::kInt64).contiguous();
-  const int64_t* data = int_tokens.const_data_ptr<int64_t>();
+  const std::vector<int64_t> int_tokens = tensor_to_vector<int64_t>(tokens);
+  const int64_t* data = int_tokens.data();
   std::vector<SpeculativeTokenStats> sequence_stats(
       static_cast<size_t>(batch_size));
   for (int64_t row = 0; row < batch_size; ++row) {
@@ -291,10 +287,10 @@ std::vector<SpeculativeTokenStats> calculate_block_speculative_token_stats(
 SpeculativeOutputStats calculate_speculative_output_stats(
     const torch::Tensor& tokens,
     int64_t num_speculative_tokens) {
-  torch::Tensor int_tokens = tokens.to(torch::kInt64).contiguous();
-  const int64_t* data = int_tokens.const_data_ptr<int64_t>();
-  const int64_t batch_size = int_tokens.size(0);
-  const int64_t token_width = int_tokens.size(1);
+  const int64_t batch_size = tokens.size(0);
+  const int64_t token_width = tokens.size(1);
+  const std::vector<int64_t> int_tokens = tensor_to_vector<int64_t>(tokens);
+  const int64_t* data = int_tokens.data();
   CHECK_LE(token_width, num_speculative_tokens + 1)
       << "next_tokens width exceeds num_speculative_tokens + 1.";
   SpeculativeOutputStats stats;
@@ -520,9 +516,10 @@ ForwardInput SpeculativeWorkerImpl::update_input_by_last_step_output(
   Slice<int32_t> token_ids = tensor_slice(inputs.token_ids_host);
   torch::Tensor last_token_ids = safe_to(
       last_step_output_.sample_output.next_tokens.flatten(), torch::kCPU);
-  Slice<int64_t> last_tokens_ids_slice = {
-      last_token_ids.data_ptr<int64_t>(),
-      static_cast<size_t>(last_token_ids.numel())};
+  const std::span<const int64_t> last_tokens_ids_span =
+      tensor_span<int64_t>(last_token_ids);
+  const Slice<int64_t> last_tokens_ids_slice = {last_tokens_ids_span.data(),
+                                                last_tokens_ids_span.size()};
 
   // Determine how many tokens were decoded in the last step
   // If the output is 2D, it means multiple tokens were generated per sequence
@@ -916,24 +913,21 @@ void SpeculativeWorkerImpl::sync_dp_global_token_nums_after_prune(
       {local_total_val_tokens},
       torch::TensorOptions().dtype(torch::kInt32).device(device_.unwrap()));
   torch::Tensor gathered = dp_group->allgather_base_sync(local);
-  torch::Tensor gathered_cpu =
-      safe_to(gathered.view({dp_size}), torch::kCPU).contiguous();
-  const int32_t* gathered_data = gathered_cpu.data_ptr<int32_t>();
+  const std::vector<int32_t> gathered_vals =
+      tensor_to_vector<int32_t>(gathered.view({dp_size}));
 
   std::vector<int32_t>& token_nums = input_params.parallel.dp_global_token_nums;
   std::vector<int32_t>& raw_token_nums =
       input_params.parallel.raw_dp_global_token_nums;
   CHECK_EQ(static_cast<int32_t>(token_nums.size()), dp_size)
       << "dp_global_token_nums size must match DP group world size";
-  for (int32_t dp_rank = 0; dp_rank < dp_size; ++dp_rank) {
-    token_nums[static_cast<size_t>(dp_rank)] = gathered_data[dp_rank];
-  }
+  CHECK_EQ(gathered_vals.size(), static_cast<size_t>(dp_size))
+      << "allgather result size must match DP group world size";
+  token_nums = gathered_vals;
   if (!raw_token_nums.empty()) {
     CHECK_EQ(static_cast<int32_t>(raw_token_nums.size()), dp_size)
         << "raw_dp_global_token_nums size must match DP group world size";
-    for (int32_t dp_rank = 0; dp_rank < dp_size; ++dp_rank) {
-      raw_token_nums[static_cast<size_t>(dp_rank)] = gathered_data[dp_rank];
-    }
+    raw_token_nums = gathered_vals;
   }
 }
 

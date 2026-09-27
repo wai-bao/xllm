@@ -22,6 +22,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/multimodal/mm_batch_data.h"
+#include "util/tensor_helper.h"
 #include "util/timer.h"
 #include "util/utils.h"
 
@@ -332,15 +333,12 @@ void forward_output_to_proto(
   }
 
   if (src_seq_idxes.defined() && src_seq_idxes.numel() > 0) {
-    Slice<int32_t> src_seq_idxes_slice = {
-        src_seq_idxes.data_ptr<int32_t>(),
-        static_cast<size_t>(src_seq_idxes.numel())};
+    Slice<int32_t> src_seq_idxes_slice = tensor_slice(src_seq_idxes);
     ADD_VECTOR_TO_PROTO(pb_forward_output->mutable_src_seq_idxes(),
                         src_seq_idxes_slice);
   }
   if (out_tokens.defined() && out_tokens.numel() > 0) {
-    Slice<int32_t> out_tokens_slice = {out_tokens.data_ptr<int32_t>(),
-                                       static_cast<size_t>(out_tokens.numel())};
+    Slice<int32_t> out_tokens_slice = tensor_slice(out_tokens);
     ADD_VECTOR_TO_PROTO(pb_forward_output->mutable_out_tokens(),
                         out_tokens_slice);
   }

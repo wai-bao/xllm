@@ -1106,19 +1106,10 @@ void WorkerImpl::prepare_dp_ep_padding(ModelInputParams& input_params) {
     }
   }
 
-  torch::Tensor token_size_per_dp_group =
-      torch::tensor(token_sizes,
-                    torch::TensorOptions()
-                        .device(torch::kCPU)
-                        .dtype(torch::kInt32)
-                        .pinned_memory(true));
+  torch::Tensor token_size_per_dp_group = make_cpu_tensor(token_sizes);
   torch::Tensor raw_token_size_per_dp_group =
       raw_token_sizes.empty() ? torch::Tensor()
-                              : torch::tensor(raw_token_sizes,
-                                              torch::TensorOptions()
-                                                  .device(torch::kCPU)
-                                                  .dtype(torch::kInt32)
-                                                  .pinned_memory(true));
+                              : make_cpu_tensor(raw_token_sizes);
   DpEpPadding dp_ep_padding(token_size_per_dp_group,
                             raw_token_size_per_dp_group,
                             context_.get_model_args().num_experts_per_tok(),
@@ -2529,16 +2520,10 @@ void WorkerImpl::prepare_mla_prefixcache_inputs(
            input_params.attention.device.kv_cache_tokens_nums.to(device_)})
           .to(device_);
 
-  torch::Tensor ring_cur_seqlen_host =
-      input_params.attention.device.ring_cur_seqlen.cpu().contiguous();
-  torch::Tensor ring_cache_seqlen_host =
-      input_params.attention.device.ring_cache_seqlen.cpu().contiguous();
-  input_params.attention.host.ring_cur_seqlen = std::vector<int>(
-      ring_cur_seqlen_host.data_ptr<int>(),
-      ring_cur_seqlen_host.data_ptr<int>() + ring_cur_seqlen_host.numel());
-  input_params.attention.host.ring_cache_seqlen = std::vector<int>(
-      ring_cache_seqlen_host.data_ptr<int>(),
-      ring_cache_seqlen_host.data_ptr<int>() + ring_cache_seqlen_host.numel());
+  input_params.attention.host.ring_cur_seqlen =
+      tensor_to_vector<int32_t>(input_params.attention.device.ring_cur_seqlen);
+  input_params.attention.host.ring_cache_seqlen = tensor_to_vector<int32_t>(
+      input_params.attention.device.ring_cache_seqlen);
 }
 
 int64_t WorkerImpl::get_num_layers() const {

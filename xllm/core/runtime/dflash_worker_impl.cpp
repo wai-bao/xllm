@@ -50,6 +50,7 @@ limitations under the License.
 #include "runtime/llm_worker_impl.h"
 #include "util/json_reader.h"
 #include "util/model_config_utils.h"
+#include "util/tensor_helper.h"
 #include "util/timer.h"
 #include "util/utils.h"
 
@@ -107,15 +108,6 @@ void expand_block_parallel_sequence_rows(ModelInputParams& input_params,
   }
 }
 
-// Stage a host int32 vector to `device` on the caller's active stream.
-torch::Tensor cpu_int_vec_to_device(const std::vector<int32_t>& values,
-                                    const Device& device) {
-  return safe_to(
-      specBuilder::make_cpu_int_tensor(values),
-      torch::TensorOptions().dtype(torch::kInt).device(device.unwrap()),
-      /*non_blocking=*/true);
-}
-
 void repeat_sampling_tensor(torch::Tensor& tensor, int32_t repeats) {
   if (tensor.defined()) {
     tensor = tensor.repeat_interleave(/*repeats=*/repeats, /*dim=*/0);
@@ -167,12 +159,7 @@ void build_dflash_expanded_spec_verify_graph_input(
       layer::ExpandedDecodeMetadataBuilder::build_tokenwise_kv_seq_lens(
           q_seq_lens, kv_seq_lens);
   torch::Tensor expanded_kv_seq_lens_device =
-      torch::tensor(expanded_kv_seq_lens,
-                    torch::TensorOptions()
-                        .dtype(torch::kInt)
-                        .device(torch::kCPU)
-                        .pinned_memory(true))
-          .to(device, /*non_blocking=*/true);
+      make_device_tensor(expanded_kv_seq_lens, device);
 
   std::vector<torch::Tensor> expanded_block_rows;
   expanded_block_rows.reserve(expanded_kv_seq_lens.size());
@@ -238,9 +225,7 @@ void build_query_rows(const ForwardInput& input,
     CHECK(row_ctx.model_managed_multiblock)
         << "DSV4 block-parallel rows require grouped KV tables";
   }
-  Slice<int32_t> token_ids = {
-      input.token_ids_host.data_ptr<int32_t>(),
-      static_cast<size_t>(input.token_ids_host.numel())};
+  Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
   CHECK_GE(static_cast<int32_t>(token_ids.size()), num_sequences)
       << "DFlash input token_ids size is smaller than num_sequences.";
 
@@ -697,9 +682,8 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
   if (embeddings.defined()) {
     CHECK(processed_target_input.positions_host.defined())
         << "DFlash prefill requires processed positions_host.";
-    Slice<int32_t> positions = {
-        processed_target_input.positions_host.data_ptr<int32_t>(),
-        static_cast<size_t>(processed_target_input.positions_host.numel())};
+    Slice<int32_t> positions =
+        tensor_slice(processed_target_input.positions_host);
     CHECK_EQ(positions.size(), static_cast<size_t>(embeddings.size(0)))
         << "DFlash prefill hidden/position count mismatch.";
     torch::Tensor context_cache_slots =
@@ -709,7 +693,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
           specBuilder::build_grouped_prefill_swa_slots(processed_target_input,
                                                        options_.block_size());
       c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-      context_cache_slots = cpu_int_vec_to_device(grouped_swa_slots, device_);
+      context_cache_slots = make_device_tensor(grouped_swa_slots, device_);
     }
     CHECK(context_cache_slots.defined())
         << "DFlash prefill requires context cache slots.";
@@ -761,9 +745,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
              static_cast<int64_t>(embedding.mtp_bootstrap_row_idxes.size()))
         << "DFlash bootstrap row count mismatch";
 
-    Slice<int32_t> token_ids = {
-        input.token_ids_host.data_ptr<int32_t>(),
-        static_cast<size_t>(input.token_ids_host.numel())};
+    Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
     for (int32_t i = 0;
          i < static_cast<int32_t>(embedding.mtp_bootstrap_row_idxes.size());
          ++i) {
@@ -1231,10 +1213,8 @@ void DFlashWorkerImpl::update_decode_step_input(
 
   const torch::Tensor& token_ids_cpu = input.token_ids_host;
   const torch::Tensor& positions_cpu = input.positions_host;
-  Slice<int32_t> input_token_ids = {token_ids_cpu.data_ptr<int32_t>(),
-                                    static_cast<size_t>(token_ids_cpu.numel())};
-  Slice<int32_t> input_positions = {positions_cpu.data_ptr<int32_t>(),
-                                    static_cast<size_t>(positions_cpu.numel())};
+  Slice<int32_t> input_token_ids = tensor_slice(token_ids_cpu);
+  Slice<int32_t> input_positions = tensor_slice(positions_cpu);
 
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
     CHECK_LT(static_cast<size_t>(seq_id), input_token_ids.size())
@@ -1269,8 +1249,8 @@ void DFlashWorkerImpl::update_decode_step_input(
     specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
   }
 
-  input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
+  input.token_ids_host = make_cpu_tensor(token_ids_vec);
+  input.positions_host = make_cpu_tensor(positions_vec);
   input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
   input.device_tensors_ready = false;
 }
@@ -1376,12 +1356,8 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
 
   torch::TensorOptions idx_options =
       torch::TensorOptions().dtype(torch::kInt).device(device_);
-  // Pinned-host + async H2D on prepare_stream_ (the file's idiom), so the copy
-  // overlaps instead of a blocking non-pinned transfer every decode step.
   query_input.sampling_params.selected_token_idxes =
-      safe_to(specBuilder::make_cpu_int_tensor(selected_idxes),
-              idx_options,
-              /*non_blocking=*/true);
+      make_device_tensor(selected_idxes, device_);
   query_input.sampling_params.sample_idxes =
       torch::arange(static_cast<int64_t>(selected_idxes.size()), idx_options);
   force_greedy_draft_sampling(query_input.sampling_params);
@@ -1494,27 +1470,17 @@ void DFlashWorkerImpl::write_target_context_to_cache(
   specBuilder::DecodeBuildBuffers buf;
   std::vector<int64_t> accepted_idxes = build_accepted_context_rows(
       input, accepted_tokens, options_.block_size(), buf);
-  torch::TensorOptions host_index_options = torch::TensorOptions()
-                                                .dtype(torch::kLong)
-                                                .device(torch::kCPU)
-                                                .pinned_memory(true);
-  torch::TensorOptions device_index_options =
-      torch::TensorOptions()
-          .dtype(torch::kLong)
-          .device(accepted_embeddings.device());
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
   torch::Tensor accepted_index =
-      safe_to(torch::tensor(accepted_idxes, host_index_options),
-              device_index_options,
-              /*non_blocking=*/true);
+      make_device_tensor(accepted_idxes, accepted_embeddings.device());
   torch::Tensor flat_embeddings = accepted_embeddings.reshape(
       {batch_size * token_width, accepted_embeddings.size(/*dim=*/2)});
   torch::Tensor context_hidden =
       flat_embeddings.index_select(/*dim=*/0, accepted_index);
   torch::Tensor positions_device =
-      cpu_int_vec_to_device(buf.out_positions, device_);
+      make_device_tensor(buf.out_positions, device_);
   torch::Tensor new_cache_slots_device =
-      cpu_int_vec_to_device(buf.out_new_cache_slots, device_);
+      make_device_tensor(buf.out_new_cache_slots, device_);
   // Publish the prepare_stream_ work (index_select producing context_hidden +
   // pinned H2D copies for positions/slots) so compute_stream_ waits for it
   // before the model reads these tensors. Without this, torch does not
@@ -1650,7 +1616,7 @@ void DFlashWorkerImpl::record_validate_metrics(
 
   std::vector<int32_t> proposed_tokens(static_cast<size_t>(batch_size));
   torch::Tensor next_tokens_cpu =
-      val_output.next_tokens.to(torch::kInt64).contiguous();
+      to_cpu_contiguous(val_output.next_tokens, torch::kInt64);
   const int64_t* token_data = next_tokens_cpu.const_data_ptr<int64_t>();
   c10::SmallVector<int64_t, 8> accepted_per_position(
       static_cast<size_t>(num_speculative_tokens), 0);

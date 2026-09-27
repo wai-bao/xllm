@@ -30,6 +30,8 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
+#include "util/slice.h"
+
 namespace xllm {
 
 inline bool is_cpu_int_tensor(const torch::Tensor& tensor, int32_t dimensions) {
@@ -38,14 +40,30 @@ inline bool is_cpu_int_tensor(const torch::Tensor& tensor, int32_t dimensions) {
          tensor.is_contiguous();
 }
 
-// Borrows flattened CPU int32 storage; the caller validates dtype and layout.
-// Undefined or empty tensors produce an empty view.
-inline std::span<const int32_t> int_span(const torch::Tensor& tensor) {
+// Borrows flattened CPU storage of the given element type; the caller
+// validates dtype and layout. Undefined or empty tensors produce an empty view.
+template <typename T>
+inline std::span<const T> tensor_span(const torch::Tensor& tensor) {
   if (!tensor.defined() || tensor.numel() == 0) {
     return {};
   }
+  return {tensor.const_data_ptr<T>(), static_cast<uint64_t>(tensor.numel())};
+}
+
+// int32 convenience overload of tensor_span; the dominant element type in
+// token/position/length tensors keeps its unqualified call sites.
+inline std::span<const int32_t> int_span(const torch::Tensor& tensor) {
+  return tensor_span<int32_t>(tensor);
+}
+
+// CHECKed int_span: borrows contiguous CPU int32 storage as a flat Slice,
+// regardless of rank, enforcing the contract the plain span leaves to callers.
+inline Slice<int32_t> tensor_slice(const torch::Tensor& tensor) {
+  CHECK(tensor.defined()) << "tensor_slice requires a defined tensor";
+  CHECK(tensor.device().is_cpu()) << "tensor_slice requires a CPU tensor";
+  CHECK(tensor.is_contiguous()) << "tensor_slice requires contiguous storage";
   return {tensor.const_data_ptr<int32_t>(),
-          static_cast<uint64_t>(tensor.numel())};
+          static_cast<size_t>(tensor.numel())};
 }
 
 template <typename T>
@@ -86,10 +104,52 @@ inline torch::Tensor safe_to(const torch::Tensor& t,
   return t.defined() ? t.to(options, non_blocking) : t;
 };
 
-// Creates an independent contiguous tensor that is detached from autograd.
+// Copies directly into independent contiguous storage, detached from autograd.
 inline torch::Tensor clone_contiguous_detached_tensor(
     const torch::Tensor& tensor) {
-  return tensor.contiguous().clone().detach();
+  return tensor.detach().clone(torch::MemoryFormat::Contiguous);
+};
+
+// Maps a C++ element type to its torch scalar type. Thin alias over the torch
+// trait: unsupported types fail at compile time instead of silently producing
+// a wrong-dtype tensor.
+template <typename T>
+constexpr torch::ScalarType get_scalar_type() {
+  return c10::CppTypeToScalarType<T>::value;
+}
+
+// Packs a host vector (int32_t/int64_t/float/...) into a pinned CPU tensor
+// for async H2D staging. Uses empty+memcpy: torch::tensor(vector,
+// pinned_options) would build an intermediate non-pinned CPU tensor and then
+// copy it to pinned storage (2 allocations + 2 full copies).
+template <typename T>
+inline torch::Tensor make_cpu_tensor(const std::vector<T>& values) {
+  torch::Tensor tensor = torch::empty({static_cast<int64_t>(values.size())},
+                                      torch::TensorOptions()
+                                          .dtype(get_scalar_type<T>())
+                                          .device(torch::kCPU)
+                                          .pinned_memory(true));
+  std::memcpy(tensor.data_ptr<T>(), values.data(), values.size() * sizeof(T));
+  return tensor;
+};
+
+// Zero-initialized pinned CPU tensor, e.g. dummy block tables.
+inline torch::Tensor make_cpu_zeros(torch::IntArrayRef shape,
+                                    torch::ScalarType dtype) {
+  return torch::zeros(shape,
+                      torch::TensorOptions()
+                          .dtype(dtype)
+                          .device(torch::kCPU)
+                          .pinned_memory(true));
+};
+
+// Stages a host vector onto the device with an async H2D copy from a pinned
+// CPU tensor. Callers must synchronize on the device stream before reading
+// the result.
+template <typename T>
+inline torch::Tensor make_device_tensor(const std::vector<T>& values,
+                                        const torch::Device& device) {
+  return make_cpu_tensor(values).to(device, /*non_blocking=*/true);
 };
 
 inline std::vector<char> get_the_bytes(std::string filename) {
@@ -329,27 +389,35 @@ inline torch::Tensor view_as_dtype(const torch::Tensor& src,
       src.data_ptr(), new_shape, deleter, src.options().dtype(target_dtype));
 }
 
+// Returns a contiguous CPU copy with the requested scalar type for
+// host-side read loops. Fuses the device and dtype change into a single
+// copy when either differs; the trailing contiguous() covers the no-op
+// path, where Tensor::to() returns a same-device/dtype non-contiguous
+// input as-is. Omitting dtype keeps the input's scalar type.
+inline torch::Tensor to_cpu_contiguous(
+    const torch::Tensor& tensor,
+    std::optional<torch::ScalarType> dtype = std::nullopt) {
+  return safe_to(tensor,
+                 torch::TensorOptions()
+                     .device(torch::kCPU)
+                     .dtype(dtype.value_or(tensor.scalar_type())))
+      .contiguous();
+};
+
+// Reads a tensor into a host vector, converting to T's scalar type if needed.
+// Undefined input yields an empty vector: data_ptr() on an undefined tensor
+// is not safe to dereference.
 template <typename T>
-constexpr torch::ScalarType get_scalar_type() {
-  if constexpr (std::is_same_v<T, float>) {
-    return torch::kFloat32;
-  } else if constexpr (std::is_same_v<T, double>) {
-    return torch::kFloat64;
-  } else if constexpr (std::is_same_v<T, int32_t>) {
-    return torch::kInt32;
-  } else if constexpr (std::is_same_v<T, int64_t>) {
-    return torch::kInt64;
-  } else if constexpr (std::is_same_v<T, uint8_t>) {
-    return torch::kUInt8;
-  } else if constexpr (std::is_same_v<T, int8_t>) {
-    return torch::kInt8;
-  } else if constexpr (std::is_same_v<T, bool>) {
-    return torch::kBool;
-  } else {
-    LOG(FATAL) << "Unsupported type for torch::ScalarType.";
-    return torch::kFloat32;
+inline std::vector<T> tensor_to_vector(const torch::Tensor& tensor) {
+  if (!tensor.defined()) {
+    return {};
   }
-}
+  const torch::Tensor cpu_tensor =
+      to_cpu_contiguous(tensor, get_scalar_type<T>());
+  const T* data_ptr = cpu_tensor.data_ptr<T>();
+  const size_t size = static_cast<size_t>(cpu_tensor.numel());
+  return std::vector<T>(data_ptr, data_ptr + size);
+};
 
 inline std::optional<torch::ScalarType> try_get_scalar_type_from_string(
     const std::string& dtype_str) {

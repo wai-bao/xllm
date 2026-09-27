@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/config/rec_config.h"
 #include "framework/model/model_input_params.h"
 #include "util/rec_model_utils.h"
+#include "util/tensor_helper.h"
 #if defined(USE_CUDA)
 #include "kernels/cuda/cuda_ops_api.h"
 #include "kernels/cuda/xattention/xattention_ops_api.h"
@@ -433,21 +434,13 @@ void RecWorkerImpl::RecWorkPipeline::prepare_work_before_execute(
   if (!runtime_.context->get_parallel_args().mapping_data().empty() &&
       (runtime_.context->get_parallel_args().dp_size() > 1 ||
        runtime_.context->get_parallel_args().ep_size() > 1)) {
-    torch::Tensor token_size_per_dp_group = torch::tensor(
-        processed_inputs.input_params.parallel.dp_global_token_nums,
-        torch::TensorOptions()
-            .device(torch::kCPU)
-            .dtype(torch::kInt32)
-            .pinned_memory(true));
+    torch::Tensor token_size_per_dp_group = make_cpu_tensor(
+        processed_inputs.input_params.parallel.dp_global_token_nums);
     const auto& raw_dp_token_nums =
         processed_inputs.input_params.parallel.raw_dp_global_token_nums;
     torch::Tensor raw_token_size_per_dp_group =
         raw_dp_token_nums.empty() ? torch::Tensor()
-                                  : torch::tensor(raw_dp_token_nums,
-                                                  torch::TensorOptions()
-                                                      .device(torch::kCPU)
-                                                      .dtype(torch::kInt32)
-                                                      .pinned_memory(true));
+                                  : make_cpu_tensor(raw_dp_token_nums);
     bool is_prefill =
         processed_inputs.input_params.meta.batch_forward_type.is_prefill();
     DpEpPadding dp_ep_padding(
@@ -1285,12 +1278,8 @@ void RecWorkerImpl::OneRecXAttentionWorkPipeline::prepare_work_before_execute(
       processed_inputs.sampling_params.selected_token_idxes.defined()) {
     onerec_params.debug_selected_token_idxes =
         processed_inputs.sampling_params.selected_token_idxes;
-    auto selected_cpu = inputs.sampling_params.selected_token_idxes.to(
-        torch::kCPU, /*non_blocking=*/false);
-    auto selected_cpu_i64 = selected_cpu.to(torch::kInt64).contiguous();
-    const int64_t* ptr = selected_cpu_i64.data_ptr<int64_t>();
-    onerec_params.debug_selected_token_idxes_expected.assign(
-        ptr, ptr + selected_cpu_i64.numel());
+    onerec_params.debug_selected_token_idxes_expected =
+        tensor_to_vector<int64_t>(inputs.sampling_params.selected_token_idxes);
   } else {
     onerec_params.debug_selected_token_idxes = torch::Tensor();
     onerec_params.debug_selected_token_idxes_expected.clear();

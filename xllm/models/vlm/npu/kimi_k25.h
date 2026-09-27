@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/layers/npu/npu_lm_head_impl.h"
 #include "core/layers/npu/npu_qwen2_decoder_layer_impl.h"
 #include "core/layers/npu/npu_rms_norm_impl.h"
+#include "core/util/tensor_helper.h"
 #include "models/llm/npu/deepseek_v3.h"
 #include "models/model_registry.h"
 #include "processors/kimi25_image_processor.h"
@@ -861,11 +862,8 @@ class KimiK2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     auto n_patches_each_media = grid_thws.prod(-1);
     const int32_t max_infer_batch = std::max(
         n_patches_each_media.max().item<int32_t>(), kKimiVtInferMaxPatchNum);
-    auto n_patches_tensor =
-        n_patches_each_media.cpu().to(torch::kInt).contiguous();
-    std::vector<int32_t> n_patches_vec(
-        n_patches_tensor.data_ptr<int32_t>(),
-        n_patches_tensor.data_ptr<int32_t>() + n_patches_tensor.numel());
+    std::vector<int32_t> n_patches_vec =
+        tensor_to_vector<int32_t>(n_patches_each_media);
 
     std::vector<torch::Tensor> features;
     features.reserve(n);

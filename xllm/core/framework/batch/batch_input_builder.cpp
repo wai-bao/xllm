@@ -124,12 +124,20 @@ struct BlockCopyKernelInputData {
 };
 
 BlockCopyKernelInputData build_block_copy_kernel_input_data(
-    const std::vector<BlockTransferInfo>& swap_blocks,
-    bool detect_overlap) {
+    const std::vector<BlockTransferInfo>& swap_blocks) {
   BlockCopyKernelInputData input_data;
   if (swap_blocks.empty()) {
     return input_data;
   }
+
+  // Overlap detection is only needed where the raw sorted swap list is also
+  // consumed downstream (CUDA/MUSA); other platforms use only the derived
+  // index tensors, so the check is skipped.
+#if defined(USE_CUDA) || defined(USE_MUSA)
+  constexpr bool kDetectOverlap = true;
+#else
+  constexpr bool kDetectOverlap = false;
+#endif
 
   int32_t current_src = swap_blocks[0].src_block_id;
   input_data.src_indices.reserve(swap_blocks.size());
@@ -138,7 +146,7 @@ BlockCopyKernelInputData build_block_copy_kernel_input_data(
 
   std::unordered_set<int32_t> src_set;
   std::unordered_map<int32_t, int32_t> dst_to_src;
-  if (detect_overlap) {
+  if (kDetectOverlap) {
     for (const auto& block : swap_blocks) {
       src_set.insert(block.src_block_id);
     }
@@ -146,7 +154,7 @@ BlockCopyKernelInputData build_block_copy_kernel_input_data(
 
   input_data.src_indices.push_back(swap_blocks[0].src_block_id);
   input_data.dst_indices.push_back(swap_blocks[0].dst_block_id);
-  if (detect_overlap) {
+  if (kDetectOverlap) {
     dst_to_src.emplace(swap_blocks[0].dst_block_id,
                        swap_blocks[0].src_block_id);
     if (src_set.count(swap_blocks[0].dst_block_id) > 0 &&
@@ -157,7 +165,7 @@ BlockCopyKernelInputData build_block_copy_kernel_input_data(
 
   for (size_t i = 1; i < swap_blocks.size(); ++i) {
     input_data.dst_indices.push_back(swap_blocks[i].dst_block_id);
-    if (detect_overlap) {
+    if (kDetectOverlap) {
       auto [it, inserted] = dst_to_src.emplace(swap_blocks[i].dst_block_id,
                                                swap_blocks[i].src_block_id);
       if (!inserted && it->second != swap_blocks[i].src_block_id) {
@@ -176,14 +184,6 @@ BlockCopyKernelInputData build_block_copy_kernel_input_data(
   }
   input_data.cum_sum.emplace_back(static_cast<int32_t>(swap_blocks.size()));
   return input_data;
-}
-
-torch::Tensor build_pinned_int_tensor(const std::vector<int32_t>& values) {
-  return torch::tensor(values,
-                       torch::TensorOptions()
-                           .dtype(torch::kInt)
-                           .device(torch::kCPU)
-                           .pinned_memory(true));
 }
 
 // Whether the current prefill step end should hold a linear-state checkpoint.
@@ -1421,28 +1421,16 @@ void BatchInputBuilder::process_swap_block_infos(ForwardInput& forward_input) {
         input_params.block_copy.swap_blocks.end(),
         swap_blocks.begin(),
         swap_blocks.end());
+#endif
     const BlockCopyKernelInputData kernel_input =
-        build_block_copy_kernel_input_data(swap_blocks,
-                                           /*detect_overlap=*/true);
+        build_block_copy_kernel_input_data(swap_blocks);
     if (!kernel_input.has_overlap) {
       input_params.block_copy.src_block_indices =
-          build_pinned_int_tensor(kernel_input.src_indices);
+          make_cpu_tensor(kernel_input.src_indices);
       input_params.block_copy.dst_block_indices =
-          build_pinned_int_tensor(kernel_input.dst_indices);
-      input_params.block_copy.cum_sum =
-          build_pinned_int_tensor(kernel_input.cum_sum);
+          make_cpu_tensor(kernel_input.dst_indices);
+      input_params.block_copy.cum_sum = make_cpu_tensor(kernel_input.cum_sum);
     }
-#else
-    const BlockCopyKernelInputData kernel_input =
-        build_block_copy_kernel_input_data(swap_blocks,
-                                           /*detect_overlap=*/false);
-    input_params.block_copy.src_block_indices =
-        build_pinned_int_tensor(kernel_input.src_indices);
-    input_params.block_copy.dst_block_indices =
-        build_pinned_int_tensor(kernel_input.dst_indices);
-    input_params.block_copy.cum_sum =
-        build_pinned_int_tensor(kernel_input.cum_sum);
-#endif
   } else {
     input_params.block_copy.swap_blocks.insert(
         input_params.block_copy.swap_blocks.end(),
