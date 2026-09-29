@@ -139,9 +139,6 @@ int32_t calc_kv_len(const Slice<int32_t>& kv_seq_lens_slice,
                     int32_t seq_id,
                     int32_t offset);
 
-// Appends one q/kv length element using current backend layout policy.
-void append_seq_len_by_layout(std::vector<int32_t>& vec, int32_t len);
-
 // Appends one q length and the matching cumulative q length.
 void append_q_seq_len(std::vector<int32_t>& q_seq_lens,
                       std::vector<int32_t>& q_cu_seq_lens,
@@ -161,9 +158,6 @@ void update_input_params(ModelInputParams& input_params,
                          int32_t kv_max_seq_len,
                          std::vector<int32_t> kv_seq_lens_vec,
                          bool update_block_tables = false);
-
-// Packs a host int32 vector into a pinned CPU tensor for async H2D staging.
-torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values);
 
 // Stages token_ids/positions into both the host and device tensors of `input`
 // with async H2D copies, toggling device_tensors_ready around the write.

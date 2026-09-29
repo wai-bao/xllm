@@ -922,6 +922,79 @@ inline void scale_parallel_token_counts(ParallelInput& parallel,
   }
 }
 
+// Platform seq-lens layout: plain per-sequence lengths on NPU,
+// zero-prefixed cumulative lengths elsewhere.
+// Platform-independent single-pass cumsum of plain per-sequence lengths:
+// [l_0, l_0 + l_1, ...] without a leading zero.
+inline std::vector<int32_t> cumsum_seq_lens(
+    const std::vector<int32_t>& seq_lens) {
+  std::vector<int32_t> cu_seq_lens;
+  cu_seq_lens.reserve(seq_lens.size());
+  int32_t cum_seq_len = 0;
+  for (int32_t seq_len : seq_lens) {
+    cum_seq_len += seq_len;
+    cu_seq_lens.emplace_back(cum_seq_len);
+  }
+  return cu_seq_lens;
+}
+
+// Builds cumulative lengths with a leading zero: [0, l_0, l_0 + l_1, ...].
+// Unlike prepare_q_cu_seq_lens this keeps the leading zero.
+inline std::vector<int32_t> prepare_cu_seq_lens_with_leading_zero(
+    const std::vector<int32_t>& seq_lens) {
+  std::vector<int32_t> cu_seq_lens;
+  cu_seq_lens.reserve(seq_lens.size() + 1);
+  cu_seq_lens.emplace_back(0);
+  for (int32_t seq_len : seq_lens) {
+    cu_seq_lens.emplace_back(cu_seq_lens.back() + seq_len);
+  }
+  return cu_seq_lens;
+}
+
+// Builds q_cu_seq_lens (cumulative without leading zero) from q_seq_lens.
+// On NPU the per-sequence lengths are summed in a single pass; elsewhere the
+// input is expected to already be cumulative with a leading zero, which is
+// dropped.
+inline std::vector<int32_t> prepare_q_cu_seq_lens(
+    const std::vector<int32_t>& q_seq_lens) {
+#if defined(USE_NPU)
+  return cumsum_seq_lens(q_seq_lens);
+#else
+  std::vector<int32_t> q_cu_seq_lens;
+  if (q_seq_lens.empty()) {
+    return q_cu_seq_lens;
+  }
+  CHECK(q_seq_lens.front() == 0)
+      << "q_seq_lens must be cumulative with leading zero";
+  q_cu_seq_lens.assign(q_seq_lens.begin() + 1, q_seq_lens.end());
+  return q_cu_seq_lens;
+#endif
+}
+
+// Batch form of append_seq_len_by_layout below: converts plain
+// per-sequence lengths to the platform q_seq_lens form.
+inline std::vector<int32_t> prepare_seq_lens_by_layout(
+    std::vector<int32_t> plain_lens) {
+#if defined(USE_NPU)
+  return plain_lens;
+#else
+  return prepare_cu_seq_lens_with_leading_zero(plain_lens);
+#endif
+}
+
+// Appends `len` to a cumulative-length vector: plain `len` on NPU,
+// `back() + len` elsewhere (with an initial 0 when the vector is empty).
+inline void append_seq_len_by_layout(std::vector<int32_t>& vec, int32_t len) {
+#if defined(USE_NPU)
+  vec.emplace_back(len);
+#else
+  if (vec.empty()) {
+    vec.emplace_back(0);
+  }
+  vec.emplace_back(vec.back() + len);
+#endif
+}
+
 using LinearStatePrefixHash = PrefixHash;
 using LinearStateValidityMask = std::vector<int64_t>;
 
@@ -1141,6 +1214,24 @@ struct ModelInputParams {
     return attention.host.q_seq_lens[seq_idx + 1] -
            attention.host.q_seq_lens[seq_idx];
 #endif
+  }
+
+  // Rebuilds q_cu_seq_lens as the zero-prefixed cumulative form of the plain
+  // per-sequence q lengths, for spec-verify paths that canonicalize the layout
+  // after the generic builder ran. Lengths are resolved through get_q_seq_len,
+  // so the current platform layout of host.q_seq_lens is interpreted
+  // correctly. No-op when there are no sequences.
+  void rebuild_q_cu_seq_lens_with_leading_zero() {
+    if (attention.host.q_seq_lens.empty()) {
+      return;
+    }
+    std::vector<int32_t>& q_cu = attention.host.q_cu_seq_lens;
+    q_cu.clear();
+    q_cu.reserve(static_cast<size_t>(meta.num_sequences) + 1);
+    q_cu.emplace_back(0);
+    for (int32_t i = 0; i < meta.num_sequences; ++i) {
+      q_cu.emplace_back(q_cu.back() + get_q_seq_len(i));
+    }
   }
 
   bool synchronize_layer(int64_t layer_idx) const {

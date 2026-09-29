@@ -52,6 +52,7 @@ limitations under the License.
 #include "runtime/llm_worker_impl.h"
 #include "util/json_reader.h"
 #include "util/model_config_utils.h"
+#include "util/tensor_helper.h"
 #include "util/timer.h"
 #include "util/utils.h"
 
@@ -112,15 +113,6 @@ void expand_block_parallel_sequence_rows(ModelInputParams& input_params,
   }
 }
 
-// Stage a host int32 vector to `device` on the caller's active stream.
-torch::Tensor cpu_int_vec_to_device(const std::vector<int32_t>& values,
-                                    const Device& device) {
-  return safe_to(
-      specBuilder::make_cpu_int_tensor(values),
-      torch::TensorOptions().dtype(torch::kInt).device(device.unwrap()),
-      /*non_blocking=*/true);
-}
-
 void repeat_sampling_tensor(torch::Tensor& tensor, int32_t repeats) {
   if (tensor.defined()) {
     tensor = tensor.repeat_interleave(/*repeats=*/repeats, /*dim=*/0);
@@ -172,12 +164,7 @@ void build_dflash_expanded_spec_verify_graph_input(
       layer::ExpandedDecodeMetadataBuilder::build_tokenwise_kv_seq_lens(
           q_seq_lens, kv_seq_lens);
   torch::Tensor expanded_kv_seq_lens_device =
-      torch::tensor(expanded_kv_seq_lens,
-                    torch::TensorOptions()
-                        .dtype(torch::kInt)
-                        .device(torch::kCPU)
-                        .pinned_memory(true))
-          .to(device, /*non_blocking=*/true);
+      async_h2d_tensor(expanded_kv_seq_lens, device);
 
   std::vector<torch::Tensor> expanded_block_rows;
   expanded_block_rows.reserve(expanded_kv_seq_lens.size());
@@ -777,7 +764,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
           specBuilder::build_grouped_prefill_swa_slots(processed_target_input,
                                                        options_.block_size());
       c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-      context_cache_slots = cpu_int_vec_to_device(grouped_swa_slots, device_);
+      context_cache_slots = async_h2d_tensor(grouped_swa_slots, device_);
     }
     CHECK(context_cache_slots.defined())
         << "DFlash prefill requires context cache slots.";
@@ -1334,11 +1321,11 @@ void DFlashWorkerImpl::update_decode_step_input(
     token_ids_vec.emplace_back(rewrite_fake_token ? state.token_id
                                                   : input_token_id);
     positions_vec.emplace_back(current_position);
-    specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
+    append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
   }
 
-  input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
+  input.token_ids_host = make_pinned_cpu_tensor(token_ids_vec);
+  input.positions_host = make_pinned_cpu_tensor(positions_vec);
   input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
   input.device_tensors_ready = false;
 }
@@ -1368,22 +1355,14 @@ void DFlashWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
     input_params.num_accepted_tokens =
         torch::tensor(accepted_prefix_lengths,
                       validate_input.token_ids.options().dtype(torch::kInt32));
-    if (!input_params.attention.host.q_seq_lens.empty()) {
-      std::vector<int32_t> q_cu_seq_lens;
-      q_cu_seq_lens.reserve(input_params.attention.host.q_seq_lens.size() + 1);
-      q_cu_seq_lens.emplace_back(0);
-      for (int32_t q_len : input_params.attention.host.q_seq_lens) {
-        q_cu_seq_lens.emplace_back(q_cu_seq_lens.back() + q_len);
-      }
-      input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens);
-    }
+    input_params.rebuild_q_cu_seq_lens_with_leading_zero();
     // The generic builder materializes the device buffer before the hybrid
     // cumulative lengths above are canonicalized.  Rebind it so GDN sees
     // [0, q_len_0, ...] rather than the stale pre-verify host layout.
     input_params.attention.rebuild_device_buffer(device_);
 #if defined(USE_NPU)
     build_dflash_expanded_spec_verify_graph_input(
-        input_params, device_.unwrap(), options_.block_size());
+        input_params, device_, options_.block_size());
 #endif
   }
   record_metadata_ready_event(*prepare_stream_, validate_input);
@@ -1442,16 +1421,10 @@ void DFlashWorkerImpl::prepare_query_inputs(const ForwardInput& input,
   scale_speculative_parallel_token_counts(input_params, query_width);
   input_params.attention.rebuild_device_buffer(device_);
 
-  torch::TensorOptions idx_options =
-      torch::TensorOptions().dtype(torch::kInt).device(device_);
-  // Pinned-host + async H2D on prepare_stream_ (the file's idiom), so the copy
-  // overlaps instead of a blocking non-pinned transfer every decode step.
   query_input.sampling_params.selected_token_idxes =
-      safe_to(specBuilder::make_cpu_int_tensor(selected_idxes),
-              idx_options,
-              /*non_blocking=*/true);
+      async_h2d_tensor(selected_idxes, device_);
   query_input.sampling_params.sample_idxes =
-      torch::arange(static_cast<int64_t>(selected_idxes.size()), idx_options);
+      arange_indices(static_cast<int64_t>(selected_idxes.size()), device_);
   force_greedy_draft_sampling(query_input.sampling_params);
   repeat_sampling_params(query_input.sampling_params,
                          options_.num_speculative_tokens());
@@ -1469,7 +1442,7 @@ void DFlashWorkerImpl::write_context_kv(
       << "DFlash context hidden size must be hidden_size * "
       << "target_layer_ids.size().";
 
-  CHECK(context_hidden.device() == device_.unwrap())
+  CHECK(context_hidden.device() == device_)
       << "DFlash context hidden must already be on the compute device.";
 
   // Both the target forward that produced context_hidden and this pass run
@@ -1562,27 +1535,16 @@ void DFlashWorkerImpl::write_target_context_to_cache(
   specBuilder::DecodeBuildBuffers buf;
   std::vector<int64_t> accepted_idxes = build_accepted_context_rows(
       input, accepted_tokens, options_.block_size(), buf);
-  torch::TensorOptions host_index_options = torch::TensorOptions()
-                                                .dtype(torch::kLong)
-                                                .device(torch::kCPU)
-                                                .pinned_memory(true);
-  torch::TensorOptions device_index_options =
-      torch::TensorOptions()
-          .dtype(torch::kLong)
-          .device(accepted_embeddings.device());
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
   torch::Tensor accepted_index =
-      safe_to(torch::tensor(accepted_idxes, host_index_options),
-              device_index_options,
-              /*non_blocking=*/true);
+      async_h2d_tensor(accepted_idxes, accepted_embeddings.device());
   torch::Tensor flat_embeddings = accepted_embeddings.reshape(
       {batch_size * token_width, accepted_embeddings.size(/*dim=*/2)});
   torch::Tensor context_hidden =
       flat_embeddings.index_select(/*dim=*/0, accepted_index);
-  torch::Tensor positions_device =
-      cpu_int_vec_to_device(buf.out_positions, device_);
+  torch::Tensor positions_device = async_h2d_tensor(buf.out_positions, device_);
   torch::Tensor new_cache_slots_device =
-      cpu_int_vec_to_device(buf.out_new_cache_slots, device_);
+      async_h2d_tensor(buf.out_new_cache_slots, device_);
   // Publish the prepare_stream_ work (index_select producing context_hidden +
   // pinned H2D copies for positions/slots) so compute_stream_ waits for it
   // before the model reads these tensors. Without this, torch does not

@@ -67,9 +67,7 @@ torch::Tensor generate_query_balance_indices(
                                      query_balance_indices_last.begin(),
                                      query_balance_indices_last.end());
 
-  auto tensor = torch::tensor(query_balance_indices_first,
-                              torch::dtype(torch::kInt32).device(torch::kCPU));
-  return tensor;
+  return make_pinned_cpu_tensor(query_balance_indices_first);
 }
 
 torch::Tensor generate_attention_output_reorder_indices(
@@ -99,8 +97,7 @@ torch::Tensor generate_attention_output_reorder_indices(
     base += chunk_len;
   }
 
-  return torch::tensor(attention_output_reorder_indices,
-                       torch::dtype(torch::kInt32).device(torch::kCPU));
+  return make_pinned_cpu_tensor(attention_output_reorder_indices);
 }
 
 torch::Tensor generate_kv_reorder_indices(
@@ -132,8 +129,7 @@ torch::Tensor generate_kv_reorder_indices(
     req_offset += req_chunk_len * 2;
   }
 
-  return torch::tensor(kv_reorder_indices,
-                       torch::dtype(torch::kInt32).device(torch::kCPU));
+  return make_pinned_cpu_tensor(kv_reorder_indices);
 }
 
 std::pair<torch::Tensor, torch::Tensor> compute_input_lengths_cumsum_cp(
@@ -197,10 +193,8 @@ std::pair<torch::Tensor, torch::Tensor> generate_k_gather_index(
     k_offset += input_len_data[i] * cp_size;
   }
 
-  auto prev_tensor = torch::tensor(
-      prev_kv_gather_indices, torch::dtype(torch::kInt32).device(torch::kCPU));
-  auto next_tensor = torch::tensor(
-      next_kv_gather_indices, torch::dtype(torch::kInt32).device(torch::kCPU));
+  auto prev_tensor = make_pinned_cpu_tensor(prev_kv_gather_indices);
+  auto next_tensor = make_pinned_cpu_tensor(next_kv_gather_indices);
   return {prev_tensor, next_tensor};
 }
 
@@ -255,7 +249,7 @@ torch::Tensor build_prefix_cache_slots(
   const PrefixRankGeometry geometry = compute_prefix_rank_geometry(
       prefix_token_counts, kv_split_size, block_size);
   if (block_tables.size(0) == 0) {
-    return torch::tensor({0}, torch::kInt32);
+    return make_pinned_cpu_tensor(std::vector<int32_t>{0});
   }
 
   std::vector<int32_t> prefix_cache_slots;
@@ -276,7 +270,7 @@ torch::Tensor build_prefix_cache_slots(
       }
     }
   }
-  return torch::tensor(prefix_cache_slots, torch::kInt32);
+  return make_pinned_cpu_tensor(prefix_cache_slots);
 }
 
 // Current-segment K gather indices (local offsets; rebased in merge).
@@ -316,9 +310,7 @@ std::pair<torch::Tensor, torch::Tensor> generate_current_k_gather_index(
     k_offset += input_len_data[i] * cp_size;
   }
 
-  return {
-      torch::tensor(prev_idx, torch::dtype(torch::kInt32).device(torch::kCPU)),
-      torch::tensor(next_idx, torch::dtype(torch::kInt32).device(torch::kCPU))};
+  return {make_pinned_cpu_tensor(prev_idx), make_pinned_cpu_tensor(next_idx)};
 }
 
 // Prefix-segment gather: stitch per-rank slices across kv_split_size; skip
@@ -345,8 +337,7 @@ std::pair<torch::Tensor, torch::Tensor> generate_context_k_gather_index(
     }
   }
 
-  auto tensor =
-      torch::tensor(ctx_idx, torch::dtype(torch::kInt32).device(torch::kCPU));
+  auto tensor = make_pinned_cpu_tensor(ctx_idx);
   return {tensor, tensor.clone()};
 }
 
@@ -417,10 +408,8 @@ merge_context_and_current_k_gather_index(
     current_off_next += cur_next_len_i;
   }
 
-  return {torch::tensor(merged_prev,
-                        torch::dtype(torch::kInt32).device(torch::kCPU)),
-          torch::tensor(merged_next,
-                        torch::dtype(torch::kInt32).device(torch::kCPU))};
+  return {make_pinned_cpu_tensor(merged_prev),
+          make_pinned_cpu_tensor(merged_next)};
 }
 
 CpAttentionMeta build_attention_tensor_meta(
@@ -491,10 +480,8 @@ CpAttentionMeta build_attention_tensor_meta(
       current_next_vec[i] =
           std::max(0, next_total_data[i] - prefix_kv_len_total);
     }
-    auto current_lengths_kv_cp_prev = torch::tensor(
-        current_prev_vec, torch::dtype(torch::kInt32).device(torch::kCPU));
-    auto current_lengths_kv_cp_next = torch::tensor(
-        current_next_vec, torch::dtype(torch::kInt32).device(torch::kCPU));
+    auto current_lengths_kv_cp_prev = make_cpu_tensor(current_prev_vec);
+    auto current_lengths_kv_cp_next = make_cpu_tensor(current_next_vec);
 
     // The CURRENT segment (intermediate_kv) is still rearranged by token-CP,
     // so generate_current_k_gather_index uses cp_size (not kv_split_size) for
@@ -552,8 +539,7 @@ CpAttentionMeta build_attention_meta(
     int32_t kv_split_size) {
   CHECK_GT(cp_size, 1) << "cp_size must be > 1";
   const torch::Tensor local_padded_seq_lens =
-      torch::tensor(shard_meta.local_padded_seq_lens,
-                    torch::dtype(torch::kInt32).device(torch::kCPU));
+      make_cpu_tensor(shard_meta.local_padded_seq_lens);
   CpAttentionMeta meta =
       build_attention_tensor_meta(cp_size,
                                   shard_meta.local_padded_token_count,
@@ -661,12 +647,9 @@ CpInputShardMeta build_input_shard_meta(
   shard_meta.local_real_seq_lens = std::move(local_q_seq_lens);
   shard_meta.local_padded_seq_lens = std::move(local_padded_seq_lens);
 
-  shard_meta.input_source_indices = torch::tensor(
-      source_vec, torch::dtype(torch::kInt64).device(torch::kCPU));
-  shard_meta.input_destination_indices =
-      torch::tensor(dest_vec, torch::dtype(torch::kInt64).device(torch::kCPU));
-  shard_meta.local_position_ids = torch::tensor(
-      virtual_pos_vec, torch::dtype(torch::kInt32).device(torch::kCPU));
+  shard_meta.input_source_indices = make_pinned_cpu_tensor(source_vec);
+  shard_meta.input_destination_indices = make_pinned_cpu_tensor(dest_vec);
+  shard_meta.local_position_ids = make_pinned_cpu_tensor(virtual_pos_vec);
 
   return shard_meta;
 }
@@ -710,22 +693,8 @@ CpOutputMergeMeta build_output_merge_meta(
     global_padded_token_count += p_i;
   }
   merge_meta.global_padded_token_count = global_padded_token_count;
-  merge_meta.output_restore_indices = torch::tensor(
-      restore_vec, torch::dtype(torch::kInt64).device(torch::kCPU));
+  merge_meta.output_restore_indices = make_pinned_cpu_tensor(restore_vec);
   return merge_meta;
-}
-
-std::vector<int32_t> preserve_length_layout(const std::vector<int32_t>& lengths,
-                                            bool cumulative) {
-  if (!cumulative) {
-    return lengths;
-  }
-  std::vector<int32_t> cumulative_lengths = {0};
-  cumulative_lengths.reserve(lengths.size() + 1);
-  for (int32_t length : lengths) {
-    cumulative_lengths.push_back(cumulative_lengths.back() + length);
-  }
-  return cumulative_lengths;
 }
 
 float get_cp_ep_buffer_factor(int64_t length, int32_t attention_cp_size) {
@@ -865,7 +834,9 @@ CpAttentionMeta copy_attention_meta_to(const CpAttentionMeta& meta,
                                        const torch::Device& device) {
   CpAttentionMeta result = meta;
   result.q_seq_lens = safe_to(meta.q_seq_lens, device, true);
-  result.kv_seq_lens = safe_to(meta.kv_seq_lens, device, true);
+  result.kv_seq_lens = meta.kv_seq_lens.is_same(meta.q_seq_lens)
+                           ? result.q_seq_lens
+                           : safe_to(meta.kv_seq_lens, device, true);
   result.q_cu_seq_lens = safe_to(meta.q_cu_seq_lens, device, true);
   result.query_balance_indices =
       safe_to(meta.query_balance_indices, device, true);
@@ -1072,32 +1043,40 @@ NpuCpPlan NpuCpPlan::build(const CpPlanInput& input,
                                               input.block_tables,
                                               config.block_size,
                                               config.kv_split_size);
-  plan.attention_meta_.host_q_seq_lens =
-      preserve_length_layout(plan.input_shard_meta_.local_padded_seq_lens,
-                             input.q_seq_lens_are_cumulative);
-  plan.attention_meta_.host_kv_seq_lens =
-      preserve_length_layout(plan.input_shard_meta_.local_padded_seq_lens,
-                             input.kv_seq_lens_are_cumulative);
-  plan.attention_meta_.host_q_cu_seq_lens.reserve(
-      plan.input_shard_meta_.local_padded_seq_lens.size());
-  int32_t cumulative_length = 0;
-  int32_t max_seq_len = 0;
-  for (int32_t length : plan.input_shard_meta_.local_padded_seq_lens) {
-    cumulative_length += length;
-    plan.attention_meta_.host_q_cu_seq_lens.push_back(cumulative_length);
-    max_seq_len = std::max(max_seq_len, length);
+  // Both layout flags describe the same plain-length source, so build the
+  // cumulative form once and share it between the q and kv host vectors.
+  const std::vector<int32_t>& local_padded_seq_lens =
+      plan.input_shard_meta_.local_padded_seq_lens;
+  std::vector<int32_t> cu_seq_lens;
+  if (input.q_seq_lens_are_cumulative || input.kv_seq_lens_are_cumulative) {
+    cu_seq_lens = prepare_cu_seq_lens_with_leading_zero(local_padded_seq_lens);
   }
+  plan.attention_meta_.host_q_seq_lens =
+      input.q_seq_lens_are_cumulative ? cu_seq_lens : local_padded_seq_lens;
+  plan.attention_meta_.host_kv_seq_lens =
+      input.kv_seq_lens_are_cumulative ? cu_seq_lens : local_padded_seq_lens;
+  plan.attention_meta_.host_q_cu_seq_lens =
+      cumsum_seq_lens(local_padded_seq_lens);
+  const int32_t max_seq_len =
+      local_padded_seq_lens.empty()
+          ? 0
+          : *std::max_element(local_padded_seq_lens.begin(),
+                              local_padded_seq_lens.end());
   plan.attention_meta_.q_max_seq_len = max_seq_len;
   plan.attention_meta_.kv_max_seq_len = max_seq_len;
 
-  const torch::TensorOptions cpu_int32 =
-      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+  // The two host vectors are identical exactly when the layout flags agree;
+  // sharing one pinned staging tensor saves the duplicate packing.
+  const bool layouts_match =
+      input.q_seq_lens_are_cumulative == input.kv_seq_lens_are_cumulative;
   plan.attention_meta_.q_seq_lens =
-      torch::tensor(plan.attention_meta_.host_q_seq_lens, cpu_int32);
+      make_pinned_cpu_tensor(plan.attention_meta_.host_q_seq_lens);
   plan.attention_meta_.kv_seq_lens =
-      torch::tensor(plan.attention_meta_.host_kv_seq_lens, cpu_int32);
+      layouts_match
+          ? plan.attention_meta_.q_seq_lens
+          : make_pinned_cpu_tensor(plan.attention_meta_.host_kv_seq_lens);
   plan.attention_meta_.q_cu_seq_lens =
-      torch::tensor(plan.attention_meta_.host_q_cu_seq_lens, cpu_int32);
+      make_pinned_cpu_tensor(plan.attention_meta_.host_q_cu_seq_lens);
   plan.cp_ep_meta_ =
       build_cp_ep_meta(plan.input_shard_meta_.local_padded_token_count, config);
   plan.output_merge_meta_ =

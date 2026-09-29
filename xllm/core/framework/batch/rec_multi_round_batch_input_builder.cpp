@@ -43,30 +43,6 @@ limitations under the License.
 #include "core/util/utils.h"
 
 namespace xllm {
-namespace {
-
-std::vector<int32_t> build_q_cu_seq_lens_vec(
-    const std::vector<int32_t>& q_seq_lens) {
-  std::vector<int32_t> q_cu_seq_lens;
-  if (q_seq_lens.empty()) {
-    return q_cu_seq_lens;
-  }
-#if defined(USE_NPU)
-  q_cu_seq_lens.reserve(q_seq_lens.size());
-  int32_t cum_seq_len = 0;
-  for (int32_t q_len : q_seq_lens) {
-    cum_seq_len += q_len;
-    q_cu_seq_lens.emplace_back(cum_seq_len);
-  }
-#else
-  CHECK(q_seq_lens.front() == 0)
-      << "q_seq_lens must be cumulative with leading zero";
-  q_cu_seq_lens.assign(q_seq_lens.begin() + 1, q_seq_lens.end());
-#endif
-  return q_cu_seq_lens;
-}
-
-}  // namespace
 
 RecMultiRoundBatchInputBuilder::RecMultiRoundBatchInputBuilder(
     const BatchInputData& data,
@@ -135,14 +111,8 @@ void RecMultiRoundBatchInputBuilder::process_single_sequence(
   int32_t offset = is_mtp_decode_ ? -1 : 0;
   base_state.max_seq_len = std::max(base_state.max_seq_len, seq_len);
   base_state.q_max_seq_len = std::max(base_state.q_max_seq_len, q_seq_len);
-#if defined(USE_NPU)
-  base_state.seq_lens.push_back(seq_len);
-  base_state.q_seq_lens.push_back(q_seq_len);
-#elif defined(USE_MLU) || defined(USE_CUDA) || defined(USE_ILU) || \
-    defined(USE_DCU)
-  base_state.seq_lens.push_back(base_state.seq_lens.back() + seq_len);
-  base_state.q_seq_lens.push_back(base_state.q_seq_lens.back() + q_seq_len);
-#endif
+  append_seq_len_by_layout(base_state.seq_lens, seq_len);
+  append_seq_len_by_layout(base_state.q_seq_lens, q_seq_len);
 
   // Call our enhanced method to process tokens and positions
   // This handles both regular decode and step-level decode cases
@@ -298,13 +268,11 @@ ForwardInput RecMultiRoundBatchInputBuilder::state_to_forward_input() {
   ForwardInput forward_input;
 
   // Create tensors (same as BatchInputBuilder)
-  forward_input.token_ids =
-      torch::tensor(state.flatten_tokens_vec, torch::kInt);
+  forward_input.token_ids = make_cpu_tensor(state.flatten_tokens_vec);
   forward_input.token_ids_host = forward_input.token_ids;
 
   if (!use_mrope_) {
-    forward_input.positions =
-        torch::tensor(state.flatten_positions_vec, torch::kInt);
+    forward_input.positions = make_cpu_tensor(state.flatten_positions_vec);
   } else {
     forward_input.positions = torch::cat(state.mrope_positions_vec, 1);
   }
@@ -315,27 +283,23 @@ ForwardInput RecMultiRoundBatchInputBuilder::state_to_forward_input() {
   input_params.meta.num_sequences = state.block_tables_vec.size();
   input_params.meta.kv_max_seq_len = state.max_seq_len;
   input_params.meta.q_max_seq_len = state.q_max_seq_len;
-  input_params.attention.device.kv_seq_lens =
-      torch::tensor(state.seq_lens, torch::kInt);
-  input_params.attention.device.q_seq_lens =
-      torch::tensor(state.q_seq_lens, torch::kInt);
-  std::vector<int32_t> q_cu_seq_lens =
-      build_q_cu_seq_lens_vec(state.q_seq_lens);
-  input_params.attention.device.q_cu_seq_lens =
-      torch::tensor(q_cu_seq_lens, torch::kInt);
+  input_params.attention.device.kv_seq_lens = make_cpu_tensor(state.seq_lens);
+  input_params.attention.device.q_seq_lens = make_cpu_tensor(state.q_seq_lens);
+  std::vector<int32_t> q_cu_seq_lens = prepare_q_cu_seq_lens(state.q_seq_lens);
+  input_params.attention.device.q_cu_seq_lens = make_cpu_tensor(q_cu_seq_lens);
   input_params.attention.host.kv_seq_lens = std::move(state.seq_lens);
   input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens);
   input_params.attention.host.q_seq_lens = std::move(state.q_seq_lens);
   input_params.attention.device.new_cache_slots =
-      torch::tensor(state.new_token_slot_ids, torch::kInt);
+      make_cpu_tensor(state.new_token_slot_ids);
 
   // for flashinfer
   input_params.attention.device.paged_kv_indptr =
-      torch::tensor(state.paged_kv_indptr, torch::kInt);
+      make_cpu_tensor(state.paged_kv_indptr);
   input_params.attention.device.paged_kv_indices =
-      torch::tensor(state.paged_kv_indices, torch::kInt);
+      make_cpu_tensor(state.paged_kv_indices);
   input_params.attention.device.paged_kv_last_page_len =
-      torch::tensor(state.paged_kv_last_page_len, torch::kInt);
+      make_cpu_tensor(state.paged_kv_last_page_len);
 
   // Setup multimodal data
   input_params.multimodal.mm_data.batch(mm_data_vec_);
@@ -354,7 +318,7 @@ ForwardInput RecMultiRoundBatchInputBuilder::state_to_forward_input() {
   input_params.embedding.linear_state_ids = std::move(state.linear_state_ids);
   if (!input_params.embedding.linear_state_ids.empty()) {
     input_params.embedding.linear_state_indices =
-        torch::tensor(input_params.embedding.linear_state_ids, torch::kInt);
+        make_pinned_cpu_tensor(input_params.embedding.linear_state_ids);
   }
   input_params.embedding.extra_token_ids = std::move(state.extra_token_ids);
 

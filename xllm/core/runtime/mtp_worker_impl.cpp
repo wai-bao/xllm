@@ -59,6 +59,7 @@ limitations under the License.
 #include "runtime/llm_worker_impl.h"
 #include "util/pretty_print.h"
 #include "util/slice.h"
+#include "util/tensor_helper.h"
 #include "util/timer.h"
 #include "util/utils.h"
 
@@ -234,14 +235,8 @@ void bind_expanded_spec_verify_graph_input(ModelInputParams& input_params,
   }
 
   if (!kv_lens_already_bound) {
-    torch::Tensor expanded_kv_seq_lens_host =
-        torch::tensor(input_params.graph.expanded_kv_seq_lens_vec,
-                      torch::TensorOptions()
-                          .dtype(torch::kInt)
-                          .device(torch::kCPU)
-                          .pinned_memory(true));
     input_params.graph.expanded_kv_seq_lens =
-        expanded_kv_seq_lens_host.to(device, /*non_blocking=*/true);
+        async_h2d_tensor(input_params.graph.expanded_kv_seq_lens_vec, device);
   }
 
   // ATB consumes this tensor as dense row-major storage. Keep the generic
@@ -1400,8 +1395,7 @@ void MTPWorkerImpl::prepare_prefill_inputs(const ForwardInput& input,
     new_token_ids.emplace_back(extra_token_ids[i]);
   }
   prefill_input.device_tensors_ready = false;
-  prefill_input.token_ids_host =
-      specBuilder::make_cpu_int_tensor(new_token_ids);
+  prefill_input.token_ids_host = make_pinned_cpu_tensor(new_token_ids);
   prefill_input.token_ids = safe_to(prefill_input.token_ids_host,
                                     prefill_input.positions.options(),
                                     /*non_blocking=*/true);
@@ -3031,11 +3025,11 @@ void MTPWorkerImpl::update_decode_step_input(
                                    ? state.token_id
                                    : input_token_id);
     positions_vec.emplace_back(current_position);
-    specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
+    append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
   }
 
-  input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
+  input.token_ids_host = make_pinned_cpu_tensor(token_ids_vec);
+  input.positions_host = make_pinned_cpu_tensor(positions_vec);
   input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
   input.device_tensors_ready = false;
 }
@@ -3256,15 +3250,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   if (use_chunked_prefill_spec_verify_path()) {
     input_params.embedding.input_embedding = torch::Tensor();
     input_params.is_spec_verify = true;
-    if (!input_params.attention.host.q_seq_lens.empty()) {
-      std::vector<int32_t> q_cu_seq_lens_vec;
-      q_cu_seq_lens_vec.reserve(input_params.meta.num_sequences + 1);
-      q_cu_seq_lens_vec.emplace_back(0);
-      for (int32_t q_len : input_params.attention.host.q_seq_lens) {
-        q_cu_seq_lens_vec.emplace_back(q_cu_seq_lens_vec.back() + q_len);
-      }
-      input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens_vec);
-    }
+    input_params.rebuild_q_cu_seq_lens_with_leading_zero();
     accepted_prefix_lengths.assign(num_sequences, 1);
     if (embedding_cache_ != nullptr &&
         !input.input_params.embedding.embedding_ids.empty()) {
@@ -3628,15 +3614,7 @@ void MTPWorkerImpl::prepare_validate_inputs(
   if (use_chunked_prefill_spec_verify_path()) {
     input_params.embedding.input_embedding = torch::Tensor();
     input_params.is_spec_verify = true;
-    if (!input_params.attention.host.q_seq_lens.empty()) {
-      std::vector<int32_t> q_cu_seq_lens_vec;
-      q_cu_seq_lens_vec.reserve(num_sequences + 1);
-      q_cu_seq_lens_vec.emplace_back(0);
-      for (int32_t q_len : input_params.attention.host.q_seq_lens) {
-        q_cu_seq_lens_vec.emplace_back(q_cu_seq_lens_vec.back() + q_len);
-      }
-      input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens_vec);
-    }
+    input_params.rebuild_q_cu_seq_lens_with_leading_zero();
     std::vector<int32_t> accepted_prefix_lengths(num_sequences, 1);
     if (embedding_cache_ != nullptr &&
         !input.input_params.embedding.embedding_ids.empty()) {
@@ -3777,7 +3755,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
         buf.out_new_cache_slots.back() = 0;
       }
       add_row(state.token_id, /*position_offset=*/0, state.embedding);
-      specBuilder::append_seq_len_by_layout(buf.out_q_seq_lens, 2);
+      append_seq_len_by_layout(buf.out_q_seq_lens, 2);
       const int32_t kv_len = specBuilder::calc_kv_len(
           base_input.input_params.attention.host.kv_seq_lens,
           seq_id,
@@ -3832,13 +3810,8 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   if (use_chunked_prefill) {
     input_params.meta.num_sequences = num_sequences;
     input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
-    std::vector<int32_t> q_cu_seq_lens_vec;
-    q_cu_seq_lens_vec.reserve(buf.out_q_seq_lens.size());
-    int32_t cumulative_q_len = 0;
-    for (int32_t q_len : buf.out_q_seq_lens) {
-      cumulative_q_len += q_len;
-      q_cu_seq_lens_vec.emplace_back(cumulative_q_len);
-    }
+    std::vector<int32_t> q_cu_seq_lens_vec =
+        cumsum_seq_lens(buf.out_q_seq_lens);
     specBuilder::update_input_params(input_params,
                                      buf,
                                      /*q_max_seq_len=*/2,
@@ -3861,15 +3834,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
                                      /*update_block_tables=*/true);
   }
   if (supports_explicit_spec_verify_replay_update()) {
-    input_params.attention.host.q_cu_seq_lens.clear();
-    input_params.attention.host.q_cu_seq_lens.reserve(
-        input_params.meta.num_sequences + 1);
-    input_params.attention.host.q_cu_seq_lens.emplace_back(0);
-    for (int32_t i = 0; i < input_params.meta.num_sequences; ++i) {
-      input_params.attention.host.q_cu_seq_lens.emplace_back(
-          input_params.attention.host.q_cu_seq_lens.back() +
-          input_params.get_q_seq_len(i));
-    }
+    input_params.rebuild_q_cu_seq_lens_with_leading_zero();
   }
   input_params.attention.rebuild_device_buffer(device_);
 
@@ -3914,7 +3879,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
         idx_options);
   } else {
     params.selected_token_idxes =
-        safe_to(specBuilder::make_cpu_int_tensor(selected_row_idx),
+        safe_to(make_pinned_cpu_tensor(selected_row_idx),
                 idx_options,
                 /*non_blocking=*/true);
   }
@@ -3960,9 +3925,8 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
       << "draft kv slots/positions mismatch";
 
   torch::TensorOptions position_options = input.positions.options();
-  set_positions_tensor(draft_input,
-                       specBuilder::make_cpu_int_tensor(buf.out_positions),
-                       position_options);
+  set_positions_tensor(
+      draft_input, make_pinned_cpu_tensor(buf.out_positions), position_options);
   specBuilder::update_input_params(
       input_params,
       buf,
@@ -3972,15 +3936,7 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
       buf.meta.kv_max_seq_len,
       std::move(buf.out_kv_seq_lens));
   if (supports_explicit_spec_verify_replay_update()) {
-    input_params.attention.host.q_cu_seq_lens.clear();
-    input_params.attention.host.q_cu_seq_lens.reserve(
-        input_params.meta.num_sequences + 1);
-    input_params.attention.host.q_cu_seq_lens.emplace_back(0);
-    for (int32_t i = 0; i < input_params.meta.num_sequences; ++i) {
-      input_params.attention.host.q_cu_seq_lens.emplace_back(
-          input_params.attention.host.q_cu_seq_lens.back() +
-          input_params.get_q_seq_len(i));
-    }
+    input_params.rebuild_q_cu_seq_lens_with_leading_zero();
   }
   input_params.attention.rebuild_device_buffer(device_);
 #if defined(USE_NPU)

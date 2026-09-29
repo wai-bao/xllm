@@ -29,14 +29,6 @@ namespace xllm::specBuilder {
 
 namespace {
 
-// Builds cumulative seq-lens layout: [0, l0, l0+l1, ...].
-void push_cumsum(std::vector<int32_t>& vec, int32_t len) {
-  if (vec.empty()) {
-    vec.emplace_back(0);
-  }
-  vec.emplace_back(vec.back() + len);
-}
-
 Slice<int32_t> get_token_ids(const ForwardInput& input) {
   return tensor_slice(input.token_ids_host);
 }
@@ -234,14 +226,6 @@ int32_t calc_kv_len(const Slice<int32_t>& kv_seq_lens_slice,
       << "seq_id out of range for cumulative layout, seq_id=" << seq_id
       << ", kv_seq_lens_size=" << kv_seq_lens_slice.size();
   return kv_seq_lens_slice[seq_id + 1] - kv_seq_lens_slice[seq_id] + offset;
-#endif
-}
-
-void append_seq_len_by_layout(std::vector<int32_t>& vec, int32_t len) {
-#if defined(USE_NPU)
-  vec.emplace_back(len);
-#else
-  push_cumsum(vec, len);
 #endif
 }
 
@@ -485,18 +469,14 @@ void update_input_params(ModelInputParams& input_params,
   }
 }
 
-torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {
-  return make_pinned_cpu_tensor(values);
-}
-
 void set_token_position_tensors(ForwardInput& input,
                                 const std::vector<int32_t>& token_ids,
                                 const std::vector<int32_t>& positions,
                                 const torch::TensorOptions& token_options,
                                 const torch::TensorOptions& position_options) {
   input.device_tensors_ready = false;
-  input.token_ids_host = make_cpu_int_tensor(token_ids);
-  input.positions_host = make_cpu_int_tensor(positions);
+  input.token_ids_host = make_pinned_cpu_tensor(token_ids);
+  input.positions_host = make_pinned_cpu_tensor(positions);
   input.token_ids =
       safe_to(input.token_ids_host, token_options, /*non_blocking=*/true);
   input.positions =
