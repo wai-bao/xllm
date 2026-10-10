@@ -110,11 +110,8 @@ Worker::Worker(const ParallelArgs& parallel_args,
     }
     CHECK(worker_type == WorkerType::LLM && options.task_type() == "generate" &&
           (!options.enable_speculative_decode() ||
-           ((SpeculativeConfig::is_mtp_algorithm(
-                 options.speculative_algorithm()) ||
-             options.speculative_algorithm() == "DFlash" ||
-             SpeculativeConfig::is_dflash2_algorithm(
-                 options.speculative_algorithm())) &&
+           (SpeculativeConfig::supports_task_pipeline(
+                options.speculative_algorithm()) &&
             !options.enable_adaptive_speculative_decode())) &&
           !options.enable_prefill_piecewise_graph() &&
           options.host_blocks_factor() <= 1.0 &&
@@ -130,7 +127,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
   if (options.enable_speculative_decode()) {
     const std::string& algorithm = options.speculative_algorithm();
     LOG(INFO) << "Speculative decode is enabled, algorithm: " << algorithm;
-    if (algorithm == "Eagle3") {
+    if (SpeculativeConfig::is_eagle3_algorithm(algorithm)) {
       if (worker_type == WorkerType::VLM) {
         impl_ = new Eagle3WorkerImpl<VlmForwardInput>(
             parallel_args, device, options, worker_type);
@@ -138,16 +135,16 @@ Worker::Worker(const ParallelArgs& parallel_args,
         impl_ = new Eagle3WorkerImpl<LlmForwardInput>(
             parallel_args, device, options, worker_type);
       }
-    } else if (algorithm == "DFlash") {
+    } else if (SpeculativeConfig::is_dflash_algorithm(algorithm)) {
       impl_ = new DFlashWorkerImpl(parallel_args, device, options);
     } else if (SpeculativeConfig::is_dflash2_algorithm(algorithm)) {
 #if !defined(USE_NPU)
       LOG(FATAL) << "DFlash2 speculative decoding is only supported on NPU.";
 #endif
       impl_ = new DFlash2WorkerImpl(parallel_args, device, options);
-    } else if (algorithm == "DSpark") {
+    } else if (SpeculativeConfig::is_dspark_algorithm(algorithm)) {
       impl_ = new DSparkWorkerImpl(parallel_args, device, options);
-    } else if (algorithm == "Suffix") {
+    } else if (SpeculativeConfig::is_suffix_algorithm(algorithm)) {
       impl_ = new SuffixWorkerImpl(parallel_args, device, options);
     } else if (SpeculativeConfig::is_mtp_algorithm(algorithm)) {
       if (worker_type == WorkerType::VLM) {

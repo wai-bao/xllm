@@ -53,7 +53,8 @@ namespace {
 
 bool should_use_ssm_engine(const Options& options) {
   return !options.draft_model_path().value_or("").empty() ||
-         (options.speculative_algorithm() == "Suffix" &&
+         (SpeculativeConfig::is_suffix_algorithm(
+              options.speculative_algorithm()) &&
           options.num_speculative_tokens() > 0);
 }
 
@@ -117,11 +118,9 @@ LLMMaster::LLMMaster(const Options& options)
       options_, model_type, options_.nnodes());
 
   if (options_.enable_task_pipeline()) {
-    const std::string& algorithm = options_.speculative_algorithm();
     const bool supported_speculation =
-        SpeculativeConfig::is_mtp_algorithm(algorithm) ||
-        algorithm == "DFlash" ||
-        SpeculativeConfig::is_dflash2_algorithm(algorithm);
+        SpeculativeConfig::supports_task_pipeline(
+            options_.speculative_algorithm());
     CHECK((engine_type == EngineType::LLM ||
            (engine_type == EngineType::SSM && supported_speculation)) &&
           options_.task_type() == "generate" &&
@@ -214,7 +213,8 @@ LLMMaster::LLMMaster(const Options& options)
   } else {
     const std::string draft_model_path =
         options_.draft_model_path().value_or("");
-    const bool use_suffix_spec = options_.speculative_algorithm() == "Suffix";
+    const bool use_suffix_spec = SpeculativeConfig::is_suffix_algorithm(
+        options_.speculative_algorithm());
     CHECK(use_suffix_spec || !draft_model_path.empty())
         << "draft model path is required unless --speculative_algorithm=Suffix";
     engine_options.draft_model_path(draft_model_path)
@@ -275,13 +275,12 @@ LLMMaster::LLMMaster(const Options& options)
         return xtensor_controller_->initialize_model(
             model_loader, num_layers, dp_size, tp_size, master_status);
       };
-  auto initialize_engine = [this, &prepare_model](auto* engine) {
-    CHECK(
-        engine->init(master_status_, prepare_model, kv_transfer_coordinator_));
+  auto initialize_engine = [this, &prepare_model](auto& engine) {
+    CHECK(engine.init(master_status_, prepare_model, kv_transfer_coordinator_));
     if (llm_engine_ != nullptr) {
       CHECK(xtensor_controller_->finish_initialization(master_status_));
     }
-    model_args_ = engine->model_args();
+    model_args_ = engine.model_args();
     if (options_.enable_service_routing()) {
       xservice_client_ = XServiceClient::get_instance();
       CHECK(xservice_client_->init(options_.etcd_addr().value_or(""),
@@ -289,14 +288,12 @@ LLMMaster::LLMMaster(const Options& options)
                                    options_.etcd_namespace().value_or("")))
           << "XServiceClient init fail!";
     }
+    return true;
   };
-  if (!use_ssm_engine) {
-    initialize_engine(llm_engine_.get());
-  } else if (options_.speculative_algorithm() == "Suffix") {
-    initialize_engine(suffix_engine_.get());
-  } else {
-    initialize_engine(speculative_engine_.get());
-  }
+  dispatch_engine(llm_engine_.get(),
+                  suffix_engine_.get(),
+                  speculative_engine_.get(),
+                  initialize_engine);
   task_type_ = options_.task_type();
 
   SchedulerOptions scheduler_options;
@@ -329,41 +326,37 @@ LLMMaster::LLMMaster(const Options& options)
       .max_global_tpot_ms(options_.max_global_tpot_ms())
       .server_idx(options_.server_idx())
       .rec_worker_max_concurrency(options_.rec_worker_max_concurrency());
-  auto create_scheduler = [this, &scheduler_options](auto* engine) {
+  auto create_scheduler = [this, &scheduler_options](auto& engine) {
     scheduler_options.decode_graph_execution_shape(
-        build_decode_graph_execution_shape(engine->options()));
-    return create_continuous_scheduler(
-        engine,
+        build_decode_graph_execution_shape(engine.options()));
+    scheduler_ = create_continuous_scheduler(
+        &engine,
         scheduler_options,
         distributed_worker_manager_,
         llm_engine_ != nullptr ? xtensor_controller_ : nullptr,
         kv_transfer_coordinator_);
+    return true;
   };
-  if (!use_ssm_engine) {
-    scheduler_ = create_scheduler(llm_engine_.get());
-  } else if (options_.speculative_algorithm() == "Suffix") {
-    scheduler_ = create_scheduler(suffix_engine_.get());
-  } else {
-    scheduler_ = create_scheduler(speculative_engine_.get());
-  }
+  dispatch_engine(llm_engine_.get(),
+                  suffix_engine_.get(),
+                  speculative_engine_.get(),
+                  create_scheduler);
 
   if (options_.enable_service_routing()) {
     auto& instance_info = scheduler_->get_instance_info();
     XServiceClient::get_instance()->register_instance(instance_info);
   }
 
-  auto initialize_tokenizer = [this](auto* engine) {
-    chat_template_ = ChatTemplate::create(engine->tokenizer_args(),
-                                          model_args_.model_type());
-    tokenizer_ = engine->tokenizer()->clone();
+  auto initialize_tokenizer = [this](auto& engine) {
+    chat_template_ =
+        ChatTemplate::create(engine.tokenizer_args(), model_args_.model_type());
+    tokenizer_ = engine.tokenizer()->clone();
+    return true;
   };
-  if (!use_ssm_engine) {
-    initialize_tokenizer(llm_engine_.get());
-  } else if (options_.speculative_algorithm() == "Suffix") {
-    initialize_tokenizer(suffix_engine_.get());
-  } else {
-    initialize_tokenizer(speculative_engine_.get());
-  }
+  dispatch_engine(llm_engine_.get(),
+                  suffix_engine_.get(),
+                  speculative_engine_.get(),
+                  initialize_tokenizer);
   Tokenizer* request_tokenizer = tokenizer_.get();
   threadpool_ = std::make_unique<ThreadPool>(
       /*num_threads=*/options_.num_request_handling_threads(),

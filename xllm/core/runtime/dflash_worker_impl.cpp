@@ -90,7 +90,7 @@ runtime::Options draft_options(const runtime::Options& options) {
   // DSpark sizes its attention window from num_speculative_tokens; other
   // DFlash-style drafts still run one step at a time.
   const int32_t draft_num_speculative_tokens =
-      options.speculative_algorithm() == "DSpark"
+      SpeculativeConfig::is_dspark_algorithm(options.speculative_algorithm())
           ? options.num_speculative_tokens()
           : 0;
   runtime::Options opts = options;

@@ -31,12 +31,47 @@ class JsonReader;
 
 class SpeculativeConfig final {
  public:
+  inline static constexpr std::string_view kEagle3Algorithm = "Eagle3";
+  inline static constexpr std::string_view kDFlashAlgorithm = "DFlash";
   inline static constexpr std::string_view kDFlash2Algorithm = "DFlash2";
+  inline static constexpr std::string_view kDSparkAlgorithm = "DSpark";
+  inline static constexpr std::string_view kSuffixAlgorithm = "Suffix";
+  inline static constexpr std::string_view kMtpAlgorithm = "MTP";
 
   SpeculativeConfig() = default;
   ~SpeculativeConfig() = default;
 
   static SpeculativeConfig& get_instance();
+
+  // The single spelling decision per algorithm; python/model_executor
+  // keeps its own parallel sets until the C++ runtime starts.
+  static bool is_eagle3_algorithm(std::string_view algorithm) {
+    return boost::iequals(algorithm, kEagle3Algorithm);
+  }
+
+  static bool is_dflash_algorithm(std::string_view algorithm) {
+    return boost::iequals(algorithm, kDFlashAlgorithm);
+  }
+
+  static bool is_dflash2_algorithm(std::string_view algorithm) {
+    return boost::iequals(algorithm, kDFlash2Algorithm);
+  }
+
+  static bool is_dspark_algorithm(std::string_view algorithm) {
+    return boost::iequals(algorithm, kDSparkAlgorithm);
+  }
+
+  static bool is_suffix_algorithm(std::string_view algorithm) {
+    return boost::iequals(algorithm, kSuffixAlgorithm);
+  }
+
+  static bool is_mtp_algorithm(std::string_view algorithm) {
+    return boost::iequals(algorithm, kMtpAlgorithm);
+  }
+  static bool supports_task_pipeline(std::string_view algorithm) {
+    return is_mtp_algorithm(algorithm) || is_dflash_algorithm(algorithm) ||
+           is_dflash2_algorithm(algorithm);
+  }
 
   // Whether a speculative algorithm requires the target model to capture
   // intermediate-layer aux hidden states to drive the draft (Eagle3 and
@@ -47,33 +82,23 @@ class SpeculativeConfig final {
   // process, which reads its own Options rather than this global config, can
   // classify without an initialized singleton.
   static bool requires_aux_hidden_capture(std::string_view algorithm) {
-    return algorithm == "Eagle3" || algorithm == "DFlash" ||
-           is_dflash2_algorithm(algorithm) || algorithm == "DSpark";
-  }
-
-  static bool is_dflash2_algorithm(std::string_view algorithm) {
-    return boost::iequals(algorithm, kDFlash2Algorithm);
-  }
-
-  static bool is_mtp_algorithm(std::string_view algorithm) {
-    return boost::iequals(algorithm, "MTP");
+    return is_eagle3_algorithm(algorithm) || is_dflash_algorithm(algorithm) ||
+           is_dflash2_algorithm(algorithm) || is_dspark_algorithm(algorithm);
   }
 
   // True for the block-diffusion draft algorithms (DFlash, DSpark) that record
   // validate metrics inline per-seq and drive the adaptive per-seq varlen
-  // prune. Case-insensitive so it matches however the flag was cased. MTP is
-  // classified separately via is_mtp_algorithm; callers that also accept MTP
-  // must OR the two.
+  // prune. MTP is classified separately via is_mtp_algorithm; callers that
+  // also accept MTP must OR the two.
   static bool is_block_diffusion_algorithm(std::string_view algorithm) {
-    return boost::iequals(algorithm, "dflash") ||
-           is_dflash2_algorithm(algorithm) ||
-           boost::iequals(algorithm, "dspark");
+    return is_dflash_algorithm(algorithm) || is_dflash2_algorithm(algorithm) ||
+           is_dspark_algorithm(algorithm);
   }
 
   static bool supports_host_kv_cache(std::string_view algorithm) {
     return is_mtp_algorithm(algorithm) ||
            is_block_diffusion_algorithm(algorithm) ||
-           boost::iequals(algorithm, "Eagle3");
+           is_eagle3_algorithm(algorithm);
   }
 
   // True for the algorithms whose draft path can emit dense per-token
@@ -83,9 +108,8 @@ class SpeculativeConfig final {
   // dense proposal only when probabilistic rejection requires it.
   static bool is_probabilistic_draft_sampling_supported(
       std::string_view algorithm) {
-    return is_mtp_algorithm(algorithm) || boost::iequals(algorithm, "DSpark") ||
-           is_dflash2_algorithm(algorithm) ||
-           boost::iequals(algorithm, "Eagle3");
+    return is_mtp_algorithm(algorithm) || is_dspark_algorithm(algorithm) ||
+           is_dflash2_algorithm(algorithm) || is_eagle3_algorithm(algorithm);
   }
 
   void from_flags();

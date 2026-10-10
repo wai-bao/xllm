@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config_validation.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "framework/chat_template/jinja_chat_template.h"
 #include "framework/model/model_args.h"
@@ -56,7 +57,8 @@ namespace xllm {
 namespace {
 
 bool should_use_vlm_speculative_engine(const Options& options) {
-  return options.speculative_algorithm() != "Suffix" &&
+  return !SpeculativeConfig::is_suffix_algorithm(
+             options.speculative_algorithm()) &&
          !options.draft_model_path().value_or("").empty();
 }
 
