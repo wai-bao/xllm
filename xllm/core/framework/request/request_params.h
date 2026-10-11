@@ -48,7 +48,7 @@ enum class ResponseFormatType : int8_t {
 // core/framework/request/request_state.h respectively. Forward-declared here so
 // the projection helpers below don't drag those (torch-heavy) headers into
 // every translation unit that only needs RequestParams.
-struct RequestSamplingParam;
+class RequestSamplingParam;
 struct SchedulerParam;
 class Tokenizer;
 
@@ -180,6 +180,10 @@ class RequestParams final {
 
   // whether to get the embeddings of the tokens. used by embeddings model.
   bool is_embeddings = false;
+
+  // Qwen3 reranker request: the sampler replaces the logprobs output with the
+  // P(yes | {yes, no}) verdict score. Set by the RerankRequest factory.
+  bool is_rerank = false;
 
   // the list of strings to stop generating further tokens.
   std::optional<std::vector<std::string>> stop;

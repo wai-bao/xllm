@@ -46,6 +46,7 @@ class SpeculativeRuntimeOutput:
     logprobs: torch.Tensor | None = None
     top_logprobs: torch.Tensor | None = None
     top_tokens: torch.Tensor | None = None
+    # Selected committed-token probabilities [batch, K+1], only when requested.
     target_probs: torch.Tensor | None = None
 
 

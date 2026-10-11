@@ -24,7 +24,9 @@ cc_library(
     dflash2_sampling.h
     draft_proposal.h
     draft_sampling_mode.h
+    draft_sampling_prepare.h
     sampling_params.h
+    verify_mode.h
     logits_utils.h
     gumbel_sampling.h
     rejection_sampler.h
@@ -34,6 +36,7 @@ cc_library(
     rec_constrained_decoding.h
   SRCS
     dspark_sampling.cpp
+    draft_proposal.cpp
     dflash2_sampling.cpp
     sampling_params.cpp
     logits_utils.cpp

@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/speculative/embedding_cache.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/framework/speculative/mtp_json_object_state.h"
+#include "framework/sampling/draft_proposal.h"
 #include "runtime/draft_model_spec_worker_impl.h"
 
 namespace xllm {
@@ -86,6 +87,7 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
   using DraftModelSpecWorkerImpl<TargetInput>::dtype_;
   using DraftModelSpecWorkerImpl<TargetInput>::embedding_cache_;
   using DraftModelSpecWorkerImpl<TargetInput>::impl_;
+  using DraftModelSpecWorkerImpl<TargetInput>::maybe_broadcast_spec_tokens;
   using DraftModelSpecWorkerImpl<TargetInput>::options_;
   using DraftModelSpecWorkerImpl<TargetInput>::parallel_args_;
   using DraftModelSpecWorkerImpl<TargetInput>::prepare_stream_;
@@ -94,7 +96,6 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
   using DraftModelSpecWorkerImpl<TargetInput>::enable_schedule_overlap;
   using DraftModelSpecWorkerImpl<
       TargetInput>::estimate_kv_cache_capacity_with_draft;
-  using DraftModelSpecWorkerImpl<TargetInput>::force_greedy_draft_sampling;
   using DraftModelSpecWorkerImpl<TargetInput>::get_optimization_config;
   using DraftModelSpecWorkerImpl<
       TargetInput>::sync_dp_global_token_nums_after_prune;
@@ -145,20 +146,16 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
       const std::vector<int32_t>* pruned_prefix_lengths,
       const detail::JsonDraftValidationScratch* json_scratch);
 
-  virtual SampleOutput validate(
-      const SamplingParameters& sampling_params,
-      const std::vector<ForwardOutput>& draft_outputs,
-      const ForwardOutput& target_output,
-      int32_t num_speculative_tokens,
-      // No default: Google Style bans default args on virtuals — they resolve
-      // statically from the declared base type, so an override changing the
-      // default would silently diverge when called through a base reference.
-      // Callers must pass nullptr explicitly for the static path.
-      const std::vector<int32_t>* pruned_prefix_lengths,
-      const std::vector<uint8_t>& invalid_draft);
+  SampleOutput validate(const SamplingParameters& sampling_params,
+                        const std::vector<ForwardOutput>& draft_outputs,
+                        const ForwardOutput& target_output,
+                        int32_t num_speculative_tokens,
+                        const std::vector<int32_t>* pruned_prefix_lengths,
+                        const std::vector<uint8_t>& invalid_draft);
 
   // Hook for algorithm-specific draft output post-processing during decode.
-  virtual void process_draft_sample_output(SampleOutput& sample_output);
+  // Default is a no-op; Eagle3 overrides it to map draft ids to target ids.
+  virtual void process_draft_sample_output(SampleOutput& /*sample_output*/) {}
 
   virtual void check_draft_input_embedding(const torch::Tensor& /*embedding*/,
                                            const std::string& /*phase*/) const {
@@ -182,7 +179,6 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
   // prepare inputs for draft model at Prefill phase.
   void prepare_prefill_inputs(const TargetInput& inputs,
                               LlmForwardInput& prefill_inputs);
-  void prepare_draft_sampling(SamplingParameters& sampling_params) const;
   bool supports_explicit_spec_verify_replay_update() const;
   bool should_use_explicit_spec_verify_replay_update(
       const TargetInput& input) const;
@@ -308,6 +304,20 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
                                      const SampleOutput& validate_output,
                                      int32_t num_speculative_tokens);
   bool adaptive_enabled() const;
+
+  // Greedy adaptive drafts need selected-token confidence, not a dense q.
+  bool needs_adaptive_controller_probs() const {
+    return adaptive_enabled() && !supports_explicit_spec_verify_replay_update();
+  }
+
+  // The draft-side sampling preparation policy of this worker: every draft
+  // entry point (prefill, extend, decode) applies the same mode and adaptive
+  // selected-probs contract. The greedy validate path builds its own
+  // parameters and stays outside this wrapper.
+  void prepare_mtp_draft_sampling(SamplingParameters& params) const {
+    prepare_draft_sampling(
+        params, draft_sampling_mode_, needs_adaptive_controller_probs());
+  }
 
  protected:
   // Rejection sampling produces accepted state on the compute stream.  Keep

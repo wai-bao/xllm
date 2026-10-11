@@ -42,12 +42,10 @@ void apply_selector_temperatures(torch::Tensor& logits,
                                  const torch::Tensor& temperatures,
                                  int64_t batch_size);
 
-// Single-row Gumbel-max sampling over log-probabilities: argmax(log_probs + g)
-// draws from exactly categorical(exp(log_probs)), so logits MUST already be
-// normalized (e.g. log_softmax output). Returns sampled class indices
-// [batch_size] on the logits device. Stays on the current stream and never
-// blocks the host, which is what makes it ACL-graph safe.
-torch::Tensor gumbel_argmax(const torch::Tensor& log_probs,
+// Gumbel-max over logits draws from their categorical softmax. Row-wise
+// normalization does not change argmax, so logits need not be normalized.
+// Returns class indices on the logits device without blocking the host.
+torch::Tensor gumbel_argmax(const torch::Tensor& logits,
                             const torch::Tensor& gumbel_noise);
 
 }  // namespace xllm

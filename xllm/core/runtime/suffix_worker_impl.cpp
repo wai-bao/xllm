@@ -18,8 +18,8 @@ limitations under the License.
 #include <algorithm>
 
 #include "common/metrics.h"
-#include "core/framework/speculative/spec_verify.h"
-#include "framework/sampling/sampling_params.h"
+#include "framework/sampling/draft_sampling_prepare.h"
+#include "framework/sampling/rejection_sampler.h"
 #include "util/slice.h"
 #include "util/tensor_helper.h"
 #include "util/timer.h"
@@ -59,6 +59,22 @@ runtime::Options SuffixTargetOptions(const runtime::Options& options) {
   opts.enable_schedule_overlap(false);
   return opts;
 }
+
+// Suffix decoding always verifies greedily. A default-constructed
+// SamplingParameters IS the greedy policy (the struct defaults are the
+// single source), so only the do_sample mask needs forcing; the score
+// flags pass through from the request (whitelist: a new score/output flag
+// must be added here to survive verification).
+SamplingParameters forced_greedy_verify_params(
+    const SamplingParameters& request) {
+  SamplingParameters verify_params;
+  verify_params.do_sample = request.do_sample;
+  force_greedy_dispatch(verify_params);
+  verify_params.logprobs = request.logprobs;
+  verify_params.max_top_logprobs = request.max_top_logprobs;
+  verify_params.return_probs = request.return_probs;
+  return verify_params;
+}
 }  // namespace
 
 SuffixWorkerImpl::SuffixWorkerImpl(const ParallelArgs& parallel_args,
@@ -93,11 +109,11 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_empty(
 
 std::optional<ForwardOutput> SuffixWorkerImpl::step_prefill(
     const LlmForwardInput& input) {
-  // run the target model to get first token and hidden states
   ForwardOutput output;
   {
     AUTO_COUNTER(speculative_execution_latency_seconds_target);
-    output = impl_->step_async(input).get().value();
+    // run the target model to get first token and hidden states
+    output = std::move(impl_->step_async(input)).get().value();
   }
 
   const auto& input_params = input.input_params;
@@ -197,8 +213,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   const torch::Tensor& input_token_ids = input.token_ids_host;
   Slice<int32_t> input_tokens_slice = tensor_slice(input_token_ids);
 
-  // Records before the target forward so it stays out of this window.
-  Timer draft_timer;
+  Timer timer;
 
   std::vector<int32_t> draft_tokens_flat;
   draft_tokens_flat.reserve(num_sequences * num_speculative_tokens);
@@ -258,6 +273,11 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
 
   LlmForwardInput validate_input;
   prepare_validate_inputs(input, validate_input);
+  // Suffix verification is greedy; the target sampler still owns penalties
+  // and token constraints before the shared verifier consumes its logits.
+  prepare_draft_sampling(validate_input.sampling_params,
+                         DraftSamplingMode::GREEDY);
+
   auto& validate_token_ids = validate_input.token_ids;
   for (int32_t i = 0; i < num_speculative_tokens; ++i) {
     std::vector<int32_t> draft_col;
@@ -273,12 +293,12 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   }
 
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
-              draft_timer.elapsed_seconds());
+              timer.elapsed_seconds());
 
   ForwardOutput target_output;
   {
     AUTO_COUNTER(speculative_execution_latency_seconds_target);
-    target_output = impl_->step_async(validate_input).get().value();
+    target_output = std::move(impl_->step_async(validate_input)).get().value();
   }
 
   torch::Tensor draft_token_ids =
@@ -361,6 +381,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   val_output.next_tokens = to_cpu_contiguous(val_output.next_tokens);
   return finalize_verify_output(std::move(target_output),
                                 std::move(val_output),
+                                input.sampling_params,
                                 /*pruned_prefix_lengths=*/nullptr,
                                 input.json_object_states);
 }
@@ -369,7 +390,6 @@ SampleOutput SuffixWorkerImpl::validate(
     const SamplingParameters& sampling_params,
     const DraftProposal& draft_proposal,
     const ForwardOutput& target_output) {
-  (void)sampling_params;
   const int32_t num_val_tokens = options_.num_speculative_tokens() + 1;
   const int32_t batch_size =
       static_cast<int32_t>(draft_proposal.token_ids().size(/*dim=*/0));
@@ -379,16 +399,18 @@ SampleOutput SuffixWorkerImpl::validate(
            static_cast<int64_t>(batch_size) * num_val_tokens)
       << "suffix validate logits shape mismatch";
 
-  auto target_logits =
-      target_output.logits.view({batch_size, num_val_tokens, vocab_size});
-
-  auto greedy_do_sample = torch::zeros({batch_size}, torch::kBool);
-  return spec_verify::run_rejection_sampling({.do_sample = greedy_do_sample,
-                                              .all_random_sample = false,
-                                              .all_greedy_sample = true},
-                                             draft_proposal,
-                                             target_logits,
-                                             target_output);
+  const auto target_logits = target_output.sample_output.logits.view(
+      {batch_size, num_val_tokens, vocab_size});
+  // Suffix decoding always verifies greedily: forced_greedy_verify_params is
+  // the single enumeration of the score flags the verify passes through.
+  return RejectionSampler::verify(forced_greedy_verify_params(sampling_params),
+                                  draft_proposal,
+                                  target_logits,
+                                  target_output.sample_output.next_tokens.view(
+                                      {batch_size, num_val_tokens}),
+                                  /*draft_lengths=*/{},
+                                  /*invalid_draft=*/{},
+                                  target_output.sample_output.embeddings);
 }
 
 }  // namespace xllm

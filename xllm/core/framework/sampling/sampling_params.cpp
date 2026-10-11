@@ -171,6 +171,7 @@ void SamplingParameters::init(
   bool logprobs = false;
   int64_t max_top_logprobs = 0;
   bool is_embeddings = false;
+  bool is_rerank = false;
   int32_t num_return_sequences = 0;
   for (const auto* p : req_sampling_params) {
     frequency_penalties.push_back(p->frequency_penalty);
@@ -183,6 +184,7 @@ void SamplingParameters::init(
     min_p.emplace_back(p->temperature == 0 ? 0.0F : p->min_p);
     logprobs = logprobs || p->logprobs;
     is_embeddings = is_embeddings || p->is_embeddings;
+    is_rerank = is_rerank || p->is_rerank;
     max_top_logprobs = std::max(max_top_logprobs, p->top_logprobs);
     num_return_sequences =
         std::max(num_return_sequences, p->num_return_sequences);
@@ -294,6 +296,7 @@ void SamplingParameters::init(
   this->logprobs = logprobs;
   this->max_top_logprobs = max_top_logprobs;
   this->is_embeddings = is_embeddings;
+  this->is_rerank = is_rerank;
   this->num_return_sequences = num_return_sequences;
   if (this->do_sample.defined()) {
     this->all_random_sample = this->do_sample.all().item<bool>();
@@ -363,6 +366,7 @@ SamplingParameters SamplingParameters::to(const torch::Device& device,
   params.return_probs = return_probs;
   params.max_top_logprobs = max_top_logprobs;
   params.is_embeddings = is_embeddings;
+  params.is_rerank = is_rerank;
   params.num_return_sequences = num_return_sequences;
 
   params.use_beam_search = use_beam_search;
@@ -420,6 +424,7 @@ void SamplingParameters::concat(const SamplingParameters& param) {
   max_top_logprobs = std::max(max_top_logprobs, param.max_top_logprobs);
   num_return_sequences =
       std::max(num_return_sequences, param.num_return_sequences);
+  is_rerank = is_rerank || param.is_rerank;
 }
 
 }  // namespace xllm

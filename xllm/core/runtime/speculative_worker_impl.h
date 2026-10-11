@@ -23,9 +23,13 @@ limitations under the License.
 #include <vector>
 
 #include "common/macros.h"
-#include "framework/sampling/rejection_sampler.h"
+#include "core/platform/stream.h"
+#include "framework/parallel_state/parallel_args.h"
+#include "framework/sampling/draft_sampling_prepare.h"
+#include "framework/sampling/sampling_params.h"
 #include "runtime/options.h"
 #include "runtime/worker_impl.h"
+#include "util/tensor_helper.h"
 
 namespace xllm {
 
@@ -44,12 +48,22 @@ void scale_speculative_parallel_token_counts(VlmModelParams& params,
 
 // Shared tail of run_validate: marks the output as a speculative decode
 // verify result, attaches the row metadata, clears embeddings, and installs
-// the validation sample output.
+// the validation sample output. Score flags are set from sampling_params, the
+// same source as plain decode.
 ForwardOutput finalize_verify_output(
     ForwardOutput target_output,
     SampleOutput val_output,
+    const SamplingParameters& sampling_params,
     const std::vector<int32_t>* pruned_prefix_lengths,
     const std::vector<JsonObjectGrammarState>& json_object_states);
+
+// The process group with authority over sampled-token broadcast: TP when
+// published, the world group otherwise. The single named home for a policy
+// shared by every speculative worker.
+inline ProcessGroup* spec_broadcast_group(const ParallelArgs& parallel_args) {
+  return parallel_args.tp_group_ != nullptr ? parallel_args.tp_group_
+                                            : parallel_args.process_group_;
+}
 
 // Base class for all speculative decoding workers.
 // Provides common logic: target model management, step dispatch, and
@@ -140,13 +154,29 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   virtual std::optional<ForwardOutput> step_empty(
       const TargetInput& inputs) = 0;
 
-  // Common helper: update sampling params for validation
+  // Common helper: update sampling params for validation. Repeats is either a
+  // scalar token count (uniform width) or a per-sequence token count.
+  template <typename Repeats>
   void update_sampling_params(SamplingParameters& sampling_params,
-                              const int32_t num_val_tokens,
-                              const int32_t total_num_val_tokens);
-  void update_sampling_params(SamplingParameters& sampling_params,
-                              const std::vector<int32_t>& per_seq_val_tokens,
-                              const int32_t total_num_val_tokens);
+                              const Repeats& repeats,
+                              const int32_t total_num_val_tokens) {
+    suppress_score_outputs(sampling_params);
+    // Alias sample_idxes to selected_token_idxes rather than issuing a second
+    // identical arange: only decode batches reach speculative validation.
+    sampling_params.sample_idxes = sampling_params.selected_token_idxes =
+        arange_indices(total_num_val_tokens, device_);
+    if constexpr (std::is_integral_v<std::decay_t<Repeats>>) {
+      sampling_params.repeat_tensors(static_cast<int64_t>(repeats));
+    } else {
+      sampling_params.repeat_tensors(async_h2d_tensor(
+          std::vector<int64_t>(repeats.begin(), repeats.end()), device_));
+    }
+  }
+
+  // One guarded broadcast keeping draft/verify tokens consistent across the
+  // consensus group (see should_broadcast_spec_tokens).
+  void maybe_broadcast_spec_tokens(torch::Tensor& tokens,
+                                   VerifyMode verify_mode);
 
   // prepare inputs for target model at Decode phase (validation).
   void prepare_validate_inputs(const TargetInput& inputs,

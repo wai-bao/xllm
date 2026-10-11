@@ -303,8 +303,10 @@ class TaskExecutionPipeline final {
   bool launch_unified_block(SpeculativeSlot& slot);
   void launch_block_draft(SpeculativeSlot& slot);
   void write_block_context(SpeculativeSlot& slot, bool prefill);
-  void synchronize_samples(const TokenResultTensors& result);
-  void synchronize_tokens(torch::Tensor& tokens, bool all_greedy);
+  void synchronize_samples(const TokenResultTensors& result,
+                           const SamplingParameters& params);
+  void synchronize_tokens(torch::Tensor& tokens, VerifyMode verify_mode);
+  void broadcast_consensus(torch::Tensor& tokens);
   static Status plan_parallel(const ParallelInput& input,
                               uint32_t dp_size,
                               uint32_t dp_rank,
@@ -314,6 +316,16 @@ class TaskExecutionPipeline final {
                               bool& run_models,
                               bool& decode);
   bool block_draft() const;
+  // Central predicate for DSPARK-specific handling: all member kind==DSPARK
+  // sites route through it so the per-algorithm exception stays enumerable.
+  // create() compares capacity.kind directly — the pipeline object (and
+  // thus this predicate) does not exist during validation.
+  bool is_dspark() const;
+  // Per-request field repeat count for block drafts (callers guard on
+  // block_draft()): every request row repeats to the full block width,
+  // except DSPARK, whose block drafts sample row zero only (zero repeats
+  // leaves the fields unrepeated).
+  uint32_t block_draft_row_repeats() const;
   uint32_t context_hidden_size() const;
   void release_outputs(SpeculativeSlot& slot);
 
@@ -331,7 +343,6 @@ class TaskExecutionPipeline final {
   Stream prepare_stream_;
   Stream task_stream_;
   Stream result_stream_;
-  Sampler sampler_;
   // Device reads/writes use only task_stream_. Consume never changes this.
   torch::Tensor previous_tokens_;
   // Prepare and Launch have separate thread-owned descriptors. IDs advance

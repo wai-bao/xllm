@@ -18,6 +18,10 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include "core/framework/model/causal_lm.h"
+#include "core/framework/sampling/draft_sampling_mode.h"
+#include "core/framework/sampling/sampling_params.h"
+
 namespace xllm {
 namespace {
 
@@ -42,12 +46,11 @@ TEST(DFlash2SamplingTest, GreedyFollowsPreviouslySelectedCandidate) {
   params.temperatures = torch::zeros({1});
   const auto result = sample_dflash2_path(candidates,
                                           params,
-                                          torch::zeros({1, 2, 2}),
-                                          /*vocab_size=*/8,
-                                          /*need_dense_probs=*/false);
-  EXPECT_TRUE(torch::equal(result.token_ids,
+                                          DraftSamplingMode::PROBABILISTIC,
+                                          torch::zeros({1, 2, 2}));
+  EXPECT_TRUE(torch::equal(result.token_ids(),
                            torch::tensor({5, 3}, torch::kInt64).view({1, 2})));
-  EXPECT_FALSE(result.dense_probs.defined());
+  EXPECT_FALSE(result.logits().has_value());
 }
 
 TEST(DFlash2SamplingTest, MixedRowsPreserveExactProposalDistribution) {
@@ -63,25 +66,18 @@ TEST(DFlash2SamplingTest, MixedRowsPreserveExactProposalDistribution) {
   const auto noise =
       torch::tensor({0.0f, 0.0f, 0.0f, 0.0f, 5.0f, 0.0f, 0.0f, 0.0f})
           .view({2, 2, 2});
-  const auto result = sample_dflash2_path(candidates,
-                                          params,
-                                          noise,
-                                          /*vocab_size=*/8,
-                                          /*need_dense_probs=*/true);
+  const auto result = sample_dflash2_path(
+      candidates, params, DraftSamplingMode::PROBABILISTIC, noise);
   EXPECT_TRUE(
-      torch::equal(result.token_ids,
+      torch::equal(result.token_ids(),
                    torch::tensor({5, 3, 2, 7}, torch::kInt64).view({2, 2})));
-  auto expected = torch::zeros({2, 2, 8});
-  expected.index_put_({0, 0, 5}, 1.0f);
-  expected.index_put_({0, 1, 3}, 1.0f);
-  const auto first = torch::softmax(torch::tensor({0.0f, 1.0f}), 0);
-  const auto second = torch::softmax(torch::tensor({0.0f, 1.5f}), 0);
-  expected.index_put_({1, 0, 2}, first[0]);
-  expected.index_put_({1, 0, 5}, first[1]);
-  expected.index_put_({1, 1, 3}, second[0]);
-  expected.index_put_({1, 1, 7}, second[1]);
-  EXPECT_TRUE(torch::allclose(result.dense_probs, expected));
-  EXPECT_TRUE(torch::allclose(result.dense_probs.sum(-1), torch::ones({2, 2})));
+  ASSERT_EQ(result.logits()->sizes(), torch::IntArrayRef({2, 2, 2}));
+  EXPECT_TRUE(torch::equal(result.vocab_ids(), candidates.candidate_ids));
+  EXPECT_TRUE(torch::allclose(result.logits()->index({1}),
+                              torch::tensor({{0.0f, 1.0f}, {0.0f, 1.5f}})));
+  EXPECT_TRUE(
+      torch::equal(result.sampled_indices(),
+                   torch::tensor({1, 0, 0, 1}, torch::kLong).view({2, 2})));
 }
 
 TEST(DFlash2SamplingTest, RandomRowsReturnConditionalSoftmaxForRejection) {
@@ -92,15 +88,15 @@ TEST(DFlash2SamplingTest, RandomRowsReturnConditionalSoftmaxForRejection) {
   params.do_sample = torch::ones({1}, torch::kBool);
   const auto result = sample_dflash2_path(candidates,
                                           params,
-                                          torch::zeros({1, 2, 2}),
-                                          /*vocab_size=*/8,
-                                          /*need_dense_probs=*/true);
+                                          DraftSamplingMode::PROBABILISTIC,
+                                          torch::zeros({1, 2, 2}));
   const auto probabilities = torch::softmax(torch::tensor({4.0f, 0.0f}), 0);
-  EXPECT_FLOAT_EQ(result.dense_probs.index({0, 1, 3}).item<float>(),
+  const auto actual = torch::softmax(result.logits().value(), -1);
+  EXPECT_FLOAT_EQ(actual.index({0, 1, 0}).item<float>(),
                   probabilities[0].item<float>());
-  EXPECT_FLOAT_EQ(result.dense_probs.index({0, 1, 7}).item<float>(),
+  EXPECT_FLOAT_EQ(actual.index({0, 1, 1}).item<float>(),
                   probabilities[1].item<float>());
-  EXPECT_TRUE(torch::allclose(result.dense_probs.sum(-1), torch::ones({1, 2})));
+  EXPECT_TRUE(torch::allclose(actual.sum(-1), torch::ones({1, 2})));
 }
 }  // namespace
 }  // namespace xllm

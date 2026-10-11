@@ -15,23 +15,18 @@ limitations under the License.
 
 #pragma once
 
-#include "core/framework/model/causal_lm.h"
-#include "core/framework/sampling/sampling_params.h"
+#include "core/framework/sampling/draft_proposal.h"
+#include "core/framework/sampling/draft_sampling_mode.h"
 
 namespace xllm {
 
-struct DFlash2SampleOutput {
-  torch::Tensor token_ids;
-  torch::Tensor dense_probs;
-};
+struct DFlash2CandidateOutput;
+class SamplingParameters;
 
-// Walk the trained selector path. Dense proposal probabilities preserve exact
-// rejection recovery for random rows; greedy rows remain delta proposals.
-DFlash2SampleOutput sample_dflash2_path(
-    const DFlash2CandidateOutput& candidates,
-    const SamplingParameters& sampling_params,
-    const torch::Tensor& gumbel_noise,
-    int64_t vocab_size,
-    bool need_dense_probs);
+// Walk the trained selector and return its canonical rejection proposal.
+DraftProposal sample_dflash2_path(const DFlash2CandidateOutput& candidates,
+                                  const SamplingParameters& sampling_params,
+                                  DraftSamplingMode mode,
+                                  const torch::Tensor& gumbel_noise);
 
 }  // namespace xllm

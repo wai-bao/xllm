@@ -1745,8 +1745,6 @@ TEST(BatchTest, ReorderedMtpAcceptedRowsCommitToOwningSequences) {
       torch::tensor({{10, 11, 12, 13, 14}, {0, 1, 9, 3, 4}}, torch::kInt64);
   const torch::Tensor target_token_ids =
       torch::tensor({{10, 11, 12, 13, 14}, {0, 1, 2, 3, 4}}, torch::kInt64);
-  const torch::Tensor bonus_token_ids =
-      torch::tensor({{15}, {5}}, torch::kInt64);
   torch::Tensor target_logits = torch::zeros({2, 6, 16}, torch::kFloat32);
   for (int64_t row = 0; row < target_token_ids.size(0); ++row) {
     for (int64_t step = 0; step < target_token_ids.size(1); ++step) {
@@ -1754,18 +1752,18 @@ TEST(BatchTest, ReorderedMtpAcceptedRowsCommitToOwningSequences) {
           {row, step, target_token_ids.index({row, step}).item<int64_t>()},
           20.0F);
     }
-    target_logits.index_put_(
-        {row, 5, bonus_token_ids.index({row, 0}).item<int64_t>()}, 20.0F);
   }
+  const torch::Tensor bonus_token_ids =
+      torch::tensor({{15}, {5}}, torch::kInt64);
   const torch::Tensor do_sample = torch::tensor({false, false}, torch::kBool);
-  RejectionSampler rejection_sampler(do_sample,
-                                     /*all_random_sample=*/false,
-                                     /*all_greedy_sample=*/true,
-                                     /*logprobs=*/false,
-                                     /*max_top_logprobs=*/0);
+  SamplingParameters verify_params;
+  verify_params.do_sample = do_sample;
   DraftProposal draft_proposal = DraftProposal(draft_token_ids);
-  const SampleOutput accepted_output = rejection_sampler.forward(
-      draft_proposal, target_logits, /*mask_out_rejected_tokens=*/true);
+  // Greedy verify matches the pre-sampled target tokens directly.
+  const auto target_tokens = torch::tensor(
+      {{10, 11, 12, 13, 14, 15}, {0, 1, 2, 3, 4, 5}}, torch::kInt64);
+  const SampleOutput accepted_output = RejectionSampler::verify(
+      verify_params, draft_proposal, target_logits, target_tokens);
   EXPECT_TRUE(torch::equal(
       accepted_output.next_tokens,
       torch::tensor({{10, 11, 12, 13, 14, 15}, {0, 1, 2, -1, -1, -1}},

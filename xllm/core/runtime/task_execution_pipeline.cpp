@@ -560,8 +560,7 @@ Status TaskExecutionPipeline::validate(const Slot& slot,
     return status;
   }
   const auto& sampling = input.sampling_params;
-  if (sampling.return_probs ||
-      (!sampling.logprobs && sampling.max_top_logprobs != 0)) {
+  if (sampling.return_probs || sampling.inconsistent_top_logprobs()) {
     return invalid("Ordinary LLM requires consistent token result options.");
   }
   if (input.input_params.meta.batch_forward_type.is_empty()) {
@@ -748,7 +747,12 @@ void TaskExecutionPipeline::launch(uint32_t slot_id) {
       params.selected_token_idxes.numel() != 0) {
     slot.logits = model_.logits(slot.model_output.hidden_states,
                                 params.selected_token_idxes);
-    slot.sample_output = sampler_.forward(slot.logits, params);
+    // Native top-k/top-p consumes top-p in the logits dtype. Retain the
+    // conversion through Consume so asynchronous sampler reads stay valid.
+    if (params.top_k.defined() && params.top_p.defined()) {
+      params.top_p = params.top_p.to(slot.logits.scalar_type());
+    }
+    slot.sample_output = Sampler::forward(slot.logits, params);
     const auto& result = slot.buffer->device_result();
     result.tokens.copy_(slot.sample_output.next_tokens);
     if (result.logprobs.defined()) {
@@ -759,7 +763,7 @@ void TaskExecutionPipeline::launch(uint32_t slot_id) {
       result.top_logprobs.copy_(slot.sample_output.top_logprobs);
     }
     if (capacity_.cp_sampling_group != nullptr) {
-      synchronize_samples(result);
+      synchronize_samples(result, params);
     }
   }
   // The independent buffer survives Consume and immediate Slot reuse. Copy

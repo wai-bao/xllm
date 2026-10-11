@@ -15,12 +15,15 @@ limitations under the License.
 
 #include "core/runtime/speculative_worker_impl.h"
 
+#include <vector>
+
 #include "common/global_flags.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_utils.h"
 #include "core/framework/speculative/spec_input_builder.h"
 #include "core/framework/speculative/verify_layout.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
+#include "framework/sampling/draft_sampling_prepare.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/vlm_worker_impl.h"
 #include "util/slice.h"
@@ -29,8 +32,45 @@ limitations under the License.
 #include "util/utils.h"
 
 namespace xllm {
-
 namespace {
+
+// Orthogonal CP x TP publishes disjoint tp_group_ and cp_group_ axes, so a
+// sampled token needs consensus along both; single-group backends do not.
+bool use_orthogonal_cp_consensus(const ParallelArgs& parallel_args) {
+  return parallel_args.cp_size() > 1 && parallel_args.tp_group_ != nullptr &&
+         parallel_args.cp_group_ != nullptr &&
+         parallel_args.cp_group_ != parallel_args.tp_group_;
+}
+
+// Speculative state is replicated across every model rank within one DP
+// replica. With orthogonal CP x TP, tp_group_ covers only one CP shard, while
+// cp_group_ connects the same TP rank across CP shards. Broadcast along both
+// axes so every replica caches and consumes the same sampled token, without
+// crossing into another DP replica through the world group.
+void broadcast_spec_tokens(torch::Tensor& tokens,
+                           const ParallelArgs& parallel_args) {
+  // DeepSeek-V4 TORCH publishes orthogonal TP and CP groups. Other backends
+  // retain their existing single-group speculative broadcast behavior.
+  if (!use_orthogonal_cp_consensus(parallel_args)) {
+    tokens =
+        broadcast_tokens_in_group(tokens, spec_broadcast_group(parallel_args));
+    return;
+  }
+
+  tokens = broadcast_tokens_in_group(tokens, parallel_args.tp_group_);
+  tokens = broadcast_tokens_in_group(tokens, parallel_args.cp_group_);
+}
+
+// One guarded broadcast: keeps draft/verify tokens consistent across the
+// consensus group, gated by the orthogonal-CP consensus requirement or the
+// spec-token-broadcast flag for sampled (non-greedy) tokens.
+bool should_broadcast_spec_tokens(const ParallelArgs& parallel_args,
+                                  bool enable_spec_token_broadcast,
+                                  VerifyMode verify_mode) {
+  return use_orthogonal_cp_consensus(parallel_args) ||
+         (enable_spec_token_broadcast && verify_mode != VerifyMode::GREEDY);
+}
+
 template <typename Params>
 bool should_run_speculative_decode_impl(const Params& params) {
   if (!params.meta.batch_forward_type.is_decode()) {
@@ -249,89 +289,36 @@ SpeculativeWorkerImpl<TargetInput>::update_input_by_last_step_output(
 ForwardOutput finalize_verify_output(
     ForwardOutput target_output,
     SampleOutput val_output,
+    const SamplingParameters& sampling_params,
     const std::vector<int32_t>* pruned_prefix_lengths,
     const std::vector<JsonObjectGrammarState>& json_object_states) {
   target_output.spec_verify_layouts = make_verify_layouts(
       val_output.next_tokens, pruned_prefix_lengths, json_object_states);
   // The verify output replaces sample_output wholesale, so only its own
-  // embeddings need clearing.
+  // embeddings need clearing. The score flags come straight from the request
+  // parameters — the same source as plain decode (llm_worker_impl) — so an
+  // empty-but-requested logprobs tensor never flips the flag.
   val_output.embeddings = torch::Tensor();
+  target_output.logprobs = sampling_params.logprobs;
+  target_output.max_top_logprobs = sampling_params.max_top_logprobs;
   target_output.sample_output = std::move(val_output);
   return target_output;
 }
 
 template <typename TargetInput>
-void SpeculativeWorkerImpl<TargetInput>::update_sampling_params(
-    SamplingParameters& sampling_params,
-    const int32_t num_val_tokens,
-    const int32_t total_num_val_tokens) {
-  const torch::Tensor selected_token_idxes =
-      arange_indices(total_num_val_tokens, device_);
-
-  // sample_idxes equals to selected_token_idxes since only process decode batch
-  sampling_params.selected_token_idxes = selected_token_idxes;
-  sampling_params.sample_idxes = selected_token_idxes;
-
-  repeat_interleave_if_defined(sampling_params.frequency_penalties,
-                               num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.presence_penalties,
-                               num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.repetition_penalties,
-                               num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.temperatures, num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.top_p, num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.min_p, num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.logits_bias, num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.seeds, num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.seed_offsets, num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.top_k, num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.unique_token_ids,
-                               num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.unique_token_counts,
-                               num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.unique_token_ids_lens,
-                               num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.do_sample, num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.filter_mask, num_val_tokens);
-  repeat_interleave_if_defined(sampling_params.filter_bitmask, num_val_tokens);
-}
-
-template <typename TargetInput>
-void SpeculativeWorkerImpl<TargetInput>::update_sampling_params(
-    SamplingParameters& sampling_params,
-    const std::vector<int32_t>& per_seq_val_tokens,
-    const int32_t total_num_val_tokens) {
-  const torch::Tensor selected_token_idxes =
-      arange_indices(total_num_val_tokens, device_);
-  sampling_params.selected_token_idxes = selected_token_idxes;
-  // Alias sample_idxes to selected_token_idxes rather than issuing a second
-  // identical arange.
-  sampling_params.sample_idxes = sampling_params.selected_token_idxes;
-
-  torch::Tensor repeats_tensor =
-      async_h2d_tensor(std::vector<int64_t>(per_seq_val_tokens.begin(),
-                                            per_seq_val_tokens.end()),
-                       device_);
-  repeat_interleave_if_defined(sampling_params.frequency_penalties,
-                               repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.presence_penalties,
-                               repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.repetition_penalties,
-                               repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.temperatures, repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.top_p, repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.min_p, repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.logits_bias, repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.seeds, repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.seed_offsets, repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.top_k, repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.unique_token_ids,
-                               repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.unique_token_counts,
-                               repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.unique_token_ids_lens,
-                               repeats_tensor);
-  repeat_interleave_if_defined(sampling_params.do_sample, repeats_tensor);
+void SpeculativeWorkerImpl<TargetInput>::maybe_broadcast_spec_tokens(
+    torch::Tensor& tokens,
+    VerifyMode verify_mode) {
+  if (!should_broadcast_spec_tokens(
+          parallel_args_,
+          get_optimization_config().enable_spec_token_broadcast,
+          verify_mode)) {
+    return;
+  }
+  // Unconditional guard: re-entering the already-current stream is a cheap
+  // save/restore, so callers never track their stream context.
+  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+  broadcast_spec_tokens(tokens, parallel_args_);
 }
 
 template <typename TargetInput>
@@ -339,8 +326,6 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
     const TargetInput& input,
     TargetInput& validate_input) {
   validate_input = input.to(device_, dtype_);
-  validate_input.skip_sampling_for_logits_only = true;
-  validate_input.skip_process_logits = true;
   validate_input.runtime.device_tensors_ready = false;
   auto& input_params = validate_input.input_params;
   torch::TensorOptions token_options = validate_input.token_ids.options();
@@ -478,8 +463,6 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
     TargetInput& validate_input,
     const std::vector<int32_t>& per_seq_val_tokens) {
   validate_input = input.to(device_, dtype_);
-  validate_input.skip_sampling_for_logits_only = true;
-  validate_input.skip_process_logits = true;
   validate_input.runtime.device_tensors_ready = false;
   auto& input_params = validate_input.input_params;
   torch::TensorOptions token_options = validate_input.token_ids.options();

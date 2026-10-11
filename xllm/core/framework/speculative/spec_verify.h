@@ -19,10 +19,7 @@ limitations under the License.
 
 namespace xllm {
 
-class DraftProposal;
 class GraphInputView;
-class SampleOutput;
-class ForwardOutput;
 
 namespace spec_verify {
 
@@ -54,17 +51,6 @@ torch::Tensor materialize_speculative_verify_tokens(
 torch::Tensor materialize_graph_speculative_verify_tokens(
     const torch::Tensor& tokens,
     const GraphInputView& graph_input);
-
-struct SamplerPolicy {
-  torch::Tensor do_sample;
-  bool all_random_sample = false;
-  bool all_greedy_sample = false;
-};
-
-SampleOutput run_rejection_sampling(const SamplerPolicy& policy,
-                                    const DraftProposal& draft_proposal,
-                                    const torch::Tensor& target_logits,
-                                    const ForwardOutput& target_output);
 
 }  // namespace spec_verify
 

@@ -58,6 +58,22 @@ struct DecodeRestoreEntry {
   absl::Time started_at;
 };
 
+// The scheduler->engine callback pair: one shared definition for the
+// production scheduler constructors and the test peer, so the wiring
+// cannot drift between them.
+struct EngineCallbacks {
+  std::function<ForwardOutput(BatchGroup&)> step;
+  std::function<void(BatchGroup&)> update_result;
+};
+
+template <typename EngineT>
+EngineCallbacks make_engine_callbacks(EngineT* engine) {
+  return {[engine](BatchGroup& batches) { return engine->step(batches); },
+          [engine](BatchGroup& batches) {
+            engine->update_last_step_result(batches);
+          }};
+}
+
 // BatchMode captures the scheduling policy configuration.
 // The concrete SchedulerPolicy subclass is selected based on these fields:
 //   - enable_mix_batch=false → PrefillFirstPolicy (exclusive batch)
@@ -298,26 +314,21 @@ class ContinuousScheduler : public ContinuousSchedulerBase {
       { typed_engine->step(batch) } -> std::same_as<ForwardOutput>;
       { typed_engine->update_last_step_result(batch) } -> std::same_as<void>;
     }
-      : ContinuousSchedulerBase(
-            engine,
-            options,
-            [engine](BatchGroup& batch) { return engine->step(batch); },
-            [engine](BatchGroup& batch) {
-              engine->update_last_step_result(batch);
-            },
-            std::move(model_residency_coordinator),
-            std::move(distributed_worker_manager)),
-        engine_(engine) {}
+      : ContinuousScheduler(engine,
+                            options,
+                            make_engine_callbacks(engine),
+                            std::move(model_residency_coordinator),
+                            std::move(distributed_worker_manager)) {}
 
   template <typename TargetEngine>
     requires std::same_as<EngineType, Engine> &&
-                 requires(TargetEngine* typed_engine, BatchGroup& batch) {
-                   static_cast<Engine*>(typed_engine);
-                   { typed_engine->step(batch) } -> std::same_as<ForwardOutput>;
-                   {
-                     typed_engine->update_last_step_result(batch)
-                   } -> std::same_as<void>;
-                 }
+             requires(TargetEngine* typed_engine, BatchGroup& batch) {
+               static_cast<Engine*>(typed_engine);
+               { typed_engine->step(batch) } -> std::same_as<ForwardOutput>;
+               {
+                 typed_engine->update_last_step_result(batch)
+               } -> std::same_as<void>;
+             }
   ContinuousScheduler(
       TargetEngine* engine,
       const Options& options,
@@ -325,21 +336,29 @@ class ContinuousScheduler : public ContinuousSchedulerBase {
           nullptr,
       std::shared_ptr<DistributedWorkerManager> distributed_worker_manager =
           nullptr)
-      : ContinuousSchedulerBase(
-            static_cast<Engine*>(engine),
-            options,
-            [engine](BatchGroup& batch) { return engine->step(batch); },
-            [engine](BatchGroup& batch) {
-              engine->update_last_step_result(batch);
-            },
-            std::move(model_residency_coordinator),
-            std::move(distributed_worker_manager)),
-        engine_(static_cast<Engine*>(engine)) {}
+      : ContinuousScheduler(static_cast<Engine*>(engine),
+                            options,
+                            make_engine_callbacks(engine),
+                            std::move(model_residency_coordinator),
+                            std::move(distributed_worker_manager)) {}
 
   ~ContinuousScheduler() override = default;
 
- protected:
-  EngineType* engine_;
+ private:
+  // Delegating constructor (the DisaggPDScheduler pattern): binds the
+  // callback pair exactly once before forwarding to the base.
+  ContinuousScheduler(
+      Engine* engine,
+      const Options& options,
+      EngineCallbacks callbacks,
+      std::shared_ptr<ModelResidencyCoordinator> model_residency_coordinator,
+      std::shared_ptr<DistributedWorkerManager> distributed_worker_manager)
+      : ContinuousSchedulerBase(engine,
+                                options,
+                                std::move(callbacks.step),
+                                std::move(callbacks.update_result),
+                                std::move(model_residency_coordinator),
+                                std::move(distributed_worker_manager)) {}
 };
 
 }  // namespace xllm

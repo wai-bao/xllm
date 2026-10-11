@@ -35,8 +35,7 @@ TEST(SamplerControlsTest, GreedyHonorsBiasAndAllowedTokenMask) {
   auto params = make_sampling_params(1, false);
   params.logits_bias = torch::tensor({{-INFINITY, 10.0F, 0.0F}});
   torch::Tensor logits = torch::tensor({{100.0F, 1.0F, 2.0F}});
-  Sampler sampler;
-  EXPECT_EQ(sampler.forward(logits, params).next_tokens[0].item<int64_t>(), 1);
+  EXPECT_EQ(Sampler::forward(logits, params).next_tokens[0].item<int64_t>(), 1);
 }
 
 TEST(SamplerControlsTest, ReportsRawLogprobsBeforeConstraints) {
@@ -45,15 +44,23 @@ TEST(SamplerControlsTest, ReportsRawLogprobsBeforeConstraints) {
   params.max_top_logprobs = 2;
   params.logits_bias = torch::tensor({{-INFINITY, 0.0F, 10.0F}});
   torch::Tensor logits = torch::tensor({{4.0F, 2.0F, 1.0F}});
-  const torch::Tensor expected = torch::log_softmax(logits, -1);
-  Sampler sampler;
-  const auto result = sampler.forward(logits, params);
+  // Scores come from the processed logits (after bias/penalties), the same
+  // distribution the sampler draws from.
+  const torch::Tensor expected =
+      torch::log_softmax(logits + params.logits_bias, -1);
+  const auto result = Sampler::forward(logits, params);
   EXPECT_EQ(result.next_tokens[0].item<int64_t>(), 2);
   EXPECT_NEAR(
       result.logprobs[0].item<float>(), expected[0][2].item<float>(), 1e-6);
-  EXPECT_EQ(result.top_tokens[0][0].item<int64_t>(), 0);
+  // Top rows rank the biased distribution: token 2 (bias +10) first, then
+  // token 1; the -inf-biased token 0 falls out of the top-2 entirely.
+  EXPECT_EQ(result.top_tokens[0][0].item<int64_t>(), 2);
+  EXPECT_EQ(result.top_tokens[0][1].item<int64_t>(), 1);
   EXPECT_NEAR(result.top_logprobs[0][0].item<float>(),
-              expected[0][0].item<float>(),
+              expected[0][2].item<float>(),
+              1e-6);
+  EXPECT_NEAR(result.top_logprobs[0][1].item<float>(),
+              expected[0][1].item<float>(),
               1e-6);
 }
 
@@ -66,8 +73,7 @@ TEST(SamplerControlsTest, AppliesRepetitionBeforePresenceAndFrequency) {
   params.frequency_penalties = torch::tensor({1.0F});
   params.presence_penalties = torch::tensor({1.0F});
   torch::Tensor logits = torch::tensor({{6.0F, 1.5F}});
-  Sampler sampler;
-  EXPECT_EQ(sampler.forward(logits, params).next_tokens[0].item<int64_t>(), 1);
+  EXPECT_EQ(Sampler::forward(logits, params).next_tokens[0].item<int64_t>(), 1);
   EXPECT_NEAR(logits[0][0].item<float>(), 1.0F, 1e-6);
 }
 
@@ -81,9 +87,8 @@ TEST(SamplerControlsTest, SeededSamplingIsIndependentOfBatchPosition) {
   torch::Tensor logits = torch::arange(32, torch::kFloat).unsqueeze(0) / 20;
   torch::Tensor batch_logits =
       torch::cat({torch::zeros_like(logits), logits}, 0);
-  Sampler sampler;
-  const auto alone = sampler.forward(logits, one);
-  const auto together = sampler.forward(batch_logits, batch);
+  const auto alone = Sampler::forward(logits, one);
+  const auto together = Sampler::forward(batch_logits, batch);
   EXPECT_EQ(alone.next_tokens[0].item<int64_t>(),
             together.next_tokens[1].item<int64_t>());
 }
@@ -96,9 +101,8 @@ TEST(SamplerControlsTest, SeededSamplingDoesNotChangeGlobalGenerator) {
   const auto& generator =
       torch::globalContext().defaultGenerator(torch::Device(torch::kCPU));
   const torch::Tensor before = generator.get_state().clone();
-  Sampler sampler;
-  const auto first = sampler.forward(logits, params);
-  const auto second = sampler.forward(logits, params);
+  const auto first = Sampler::forward(logits, params);
+  const auto second = Sampler::forward(logits, params);
   EXPECT_TRUE(torch::equal(first.next_tokens, second.next_tokens));
   EXPECT_TRUE(torch::equal(before, generator.get_state()));
 }
@@ -108,12 +112,17 @@ TEST(SamplerControlsTest, MinPRemovesLowProbabilityCandidates) {
   params.seeds = torch::tensor({42}, torch::kLong);
   params.seed_offsets = torch::tensor({0}, torch::kLong);
   params.min_p = torch::tensor({0.5F});
+  // probs now carry only the selected token's probability ([B], the same
+  // shape as logprobs), so the filter is verified through sampling: with
+  // p < 0.5 removed, every draw lands on token 0.
+  params.return_probs = true;
   torch::Tensor logits = torch::tensor({{2.0F, 1.0F, 0.0F}});
-  Sampler sampler;
-  const auto result = sampler.forward(logits, params);
-  EXPECT_EQ(result.next_tokens[0].item<int64_t>(), 0);
-  EXPECT_EQ(result.probs[0][1].item<float>(), 0);
-  EXPECT_EQ(result.probs[0][2].item<float>(), 0);
+  for (int32_t offset = 0; offset < 20; ++offset) {
+    params.seed_offsets = torch::tensor({offset}, torch::kLong);
+    const auto result = Sampler::forward(logits, params);
+    EXPECT_EQ(result.next_tokens[0].item<int64_t>(), 0);
+    EXPECT_GT(result.probs[0].item<float>(), 0.9F);
+  }
 }
 
 }  // namespace

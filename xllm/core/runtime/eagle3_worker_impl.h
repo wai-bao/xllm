@@ -48,7 +48,7 @@ class Eagle3WorkerImpl final : public MTPWorkerImpl<TargetInput> {
   using MTPWorkerImpl<TargetInput>::uses_embedded_eagle3_draft;
 
   // EAGLE-3 specific draft output post-processing during decode:
-  // selected prob extraction + draft->target token id mapping.
+  // draft->target token id mapping with compact proposal support.
   void process_draft_sample_output(SampleOutput& sample_output) override;
 
   void check_draft_input_embedding(const torch::Tensor& embedding,

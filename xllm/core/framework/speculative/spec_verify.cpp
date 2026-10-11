@@ -20,8 +20,6 @@ limitations under the License.
 #include <algorithm>
 
 #include "framework/model/model_input_params.h"
-#include "framework/sampling/rejection_sampler.h"
-#include "runtime/forward_params.h"
 
 namespace xllm {
 
@@ -98,27 +96,6 @@ torch::Tensor materialize_graph_speculative_verify_tokens(
           : tokens;
   return materialize_speculative_verify_tokens(
       verify_tokens, graph_input.spec_verify_draft_token_sources);
-}
-
-SampleOutput run_rejection_sampling(const SamplerPolicy& policy,
-                                    const DraftProposal& draft_proposal,
-                                    const torch::Tensor& target_logits,
-                                    const ForwardOutput& target_output) {
-  const RejectionSampler sampler(policy.do_sample,
-                                 policy.all_random_sample,
-                                 policy.all_greedy_sample,
-                                 target_output.logprobs,
-                                 target_output.max_top_logprobs);
-
-  SampleOutput sample_output =
-      sampler.forward(draft_proposal,
-                      target_logits,
-                      /*mask_out_rejected_tokens=*/true);
-
-  const torch::Tensor& embeddings = target_output.sample_output.embeddings;
-  sample_output.embeddings = embeddings.view(
-      {target_logits.size(0), target_logits.size(1), embeddings.size(-1)});
-  return sample_output;
 }
 
 }  // namespace spec_verify

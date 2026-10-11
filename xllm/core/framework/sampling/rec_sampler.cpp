@@ -24,7 +24,6 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "core/framework/config/beam_search_config.h"
-#include "core/framework/config/model_config.h"
 #include "core/framework/config/rec_config.h"
 #include "core/framework/sampling/logits_utils.h"
 #include "core/framework/sampling/sampler.h"
@@ -47,14 +46,17 @@ static inline bool use_air_log_softmax_env() {
   return enabled;
 }
 
-// Check if fast path sampling can be used for multi-round pipeline.
+// Check if fast path sampling can be used for multi-round pipeline. The
+// request-level is_rerank flag subsumes the global qwen3 reranker gate:
+// rerank batches disqualify themselves without disabling the fast path for
+// every other batch on the same deployment.
 static inline bool can_use_fast_path(const SamplingParameters& params) {
   return params.use_beam_search && params.logprobs &&
          ::xllm::RecConfig::get_instance().enable_rec_fast_sampler() &&
          params.max_top_logprobs > 0 && !params.top_p.defined() &&
-         !params.min_p.defined() &&
-         !::xllm::ModelConfig::get_instance().enable_qwen3_reranker() &&
-         ::xllm::RecConfig::get_instance().max_decode_rounds() > 0;
+         !params.min_p.defined() && !params.is_rerank &&
+         ::xllm::RecConfig::get_instance().max_decode_rounds() > 0 &&
+         params.verify_mode() == VerifyMode::RANDOM;
 }
 
 static inline torch::Tensor log_softmax_last_dim(
@@ -132,10 +134,7 @@ static inline void sample_top_candidates(const torch::Tensor& probs,
 }  // namespace
 
 RecSampler::RecSampler(RecPipelineType pipeline_type)
-    : sampler_(std::make_unique<Sampler>()),
-      strategy_(create_sampling_strategy(pipeline_type, *sampler_)) {
-  LOG(INFO) << "RecSampler initialized with Sampler delegate.";
-}
+    : strategy_(create_sampling_strategy(pipeline_type)) {}
 
 SampleOutput RecSampler::forward(torch::Tensor& logits,
                                  const SamplingParameters& params,
@@ -147,17 +146,16 @@ SampleOutput RecSampler::forward(torch::Tensor& logits,
 // --- SamplingStrategy factory ---
 
 std::unique_ptr<RecSampler::SamplingStrategy>
-RecSampler::create_sampling_strategy(RecPipelineType type,
-                                     const Sampler& sampler) {
+RecSampler::create_sampling_strategy(RecPipelineType type) {
   switch (type) {
     case RecPipelineType::kLlmRecMultiRoundPipeline:
-      return std::make_unique<MultiRoundFastPathSamplingStrategy>(sampler);
+      return std::make_unique<MultiRoundFastPathSamplingStrategy>();
     case RecPipelineType::kLlmRecDefault:
     case RecPipelineType::kLlmRecWithMmData:
-      return std::make_unique<DefaultSamplingStrategy>(sampler);
+      return std::make_unique<DefaultSamplingStrategy>();
     case RecPipelineType::kOneRecDefault:
     case RecPipelineType::kOneRecXAttentionPipeline:
-      return std::make_unique<OneRecConstrainedSamplingStrategy>(sampler);
+      return std::make_unique<OneRecConstrainedSamplingStrategy>();
     default:
       LOG(FATAL) << "Unknown RecPipelineType: " << static_cast<int32_t>(type);
       __builtin_unreachable();
@@ -166,24 +164,16 @@ RecSampler::create_sampling_strategy(RecPipelineType type,
 
 // --- DefaultSamplingStrategy ---
 
-RecSampler::DefaultSamplingStrategy::DefaultSamplingStrategy(
-    const Sampler& sampler)
-    : sampler_(sampler) {}
-
 SampleOutput RecSampler::DefaultSamplingStrategy::forward(
     torch::Tensor& logits,
     const SamplingParameters& params,
     const torch::Tensor& filter_mask,
     const RecSamplingContext* context) const {
   UNUSED_PARAMETER(context);
-  return sampler_.forward(logits, params, filter_mask);
+  return Sampler::forward(logits, params, filter_mask);
 }
 
 // --- OneRecConstrainedSamplingStrategy ---
-
-RecSampler::OneRecConstrainedSamplingStrategy::
-    OneRecConstrainedSamplingStrategy(const Sampler& sampler)
-    : sampler_(sampler) {}
 
 SampleOutput RecSampler::OneRecConstrainedSamplingStrategy::forward(
     torch::Tensor& logits,
@@ -202,9 +192,10 @@ SampleOutput RecSampler::OneRecConstrainedSamplingStrategy::forward(
     }
   }
 
-  if (!(params.use_beam_search && params.all_random_sample && params.logprobs &&
-        params.max_top_logprobs > 0)) {
-    return sampler_.forward(logits, params, filter_mask);
+  // can_use_fast_path enumerates every eligibility condition once; falling
+  // back here also covers rerank batches and non-RANDOM verify modes.
+  if (!can_use_fast_path(params)) {
+    return Sampler::forward(logits, params, filter_mask);
   }
 
   if (params.repetition_penalties.defined()) {
@@ -276,11 +267,13 @@ SampleOutput RecSampler::OneRecConstrainedSamplingStrategy::forward(
   CHECK_EQ(sample_logits.size(0), params.do_sample.size(0));
 
   SampleOutput output;
-  auto probs =
-      torch::softmax(sample_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
-  output.probs = probs.to(logits.dtype());
+  output.logits = sample_logits;
+  // probs ≡ logprobs.exp(): one full-vocab normalization serves both the
+  // multinomial input and the returned scores (same identity the greedy
+  // sampler path in sampler.cpp relies on).
   auto logprobs =
       torch::log_softmax(sample_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
+  auto probs = logprobs.exp();
 
   const int64_t vocab_size = probs.size(-1);
   const int64_t top_count = std::min<int64_t>(params.max_top_logprobs,
@@ -291,14 +284,13 @@ SampleOutput RecSampler::OneRecConstrainedSamplingStrategy::forward(
       output.top_tokens.select(/*dim=*/1, /*index=*/0).to(torch::kLong);
   output.logprobs =
       output.top_logprobs.select(/*dim=*/1, /*index=*/0).contiguous();
+  // Same emission contract as the main sampler: probs ≡ logprobs.exp() cast
+  // to the logits dtype.
+  emit_selected_scores(output, params, output.logprobs, logits.scalar_type());
   return output;
 }
 
 // --- MultiRoundFastPathSamplingStrategy ---
-
-RecSampler::MultiRoundFastPathSamplingStrategy::
-    MultiRoundFastPathSamplingStrategy(const Sampler& sampler)
-    : sampler_(sampler) {}
 
 SampleOutput RecSampler::MultiRoundFastPathSamplingStrategy::forward(
     torch::Tensor& logits,
@@ -310,7 +302,7 @@ SampleOutput RecSampler::MultiRoundFastPathSamplingStrategy::forward(
   const bool use_fast_path = can_use_fast_path(params);
 
   if (!use_fast_path) {
-    return sampler_.forward(logits, params);
+    return Sampler::forward(logits, params);
   }
 
   LOG_FIRST_N(INFO, 1) << "RecSampler fast path activated.";

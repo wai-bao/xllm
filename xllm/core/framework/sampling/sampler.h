@@ -22,30 +22,16 @@ limitations under the License.
 
 namespace xllm {
 
+// Stateless: request-level flags arrive through SamplingParameters. Every
+// entry point is static — hold no instances.
 class Sampler final {
  public:
-  Sampler() = default;
-
-  // operator() allows us to use the module as a function.
-  template <typename... Args>
-  auto operator()(Args&&... args) const {
-    return this->forward(::std::forward<Args>(args)...);
-  }
-
-  // logits: [batch_size, vocab_size]
-  SampleOutput forward(
+  // logits: [batch_size, vocab_size]. The penalties and filter stages mutate
+  // logits in place; the mutation travels through the reference, not `this`.
+  static SampleOutput forward(
       torch::Tensor& logits,
       const SamplingParameters& params,
-      const torch::Tensor& filter_mask = torch::Tensor()) const;
-
-  // In-place sampling transforms on [batch_size, vocab_size] logits:
-  // logits bias, repetition/frequency/presence penalties, temperature,
-  // min-p, top-k/top-p, and the token filter mask/bitmask. Shared by normal
-  // decode and logits-only speculative verify so both consume the same
-  // distribution.
-  static torch::Tensor process_logits(torch::Tensor& logits,
-                                      const SamplingParameters& params,
-                                      const torch::Tensor& filter_mask = {});
+      const torch::Tensor& filter_mask = torch::Tensor());
 
   // helper functions
   // probs: [..., vocab_size]

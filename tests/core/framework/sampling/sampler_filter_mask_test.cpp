@@ -51,8 +51,7 @@ TEST(SamplerFilterMaskTest, GreedySamplingHonorsMixedRows) {
   torch::Tensor logits =
       torch::tensor({{1.0F, 100.0F, 2.0F}, {1.0F, 2.0F, 100.0F}});
 
-  Sampler sampler;
-  SampleOutput output = sampler.forward(logits, params);
+  SampleOutput output = Sampler::forward(logits, params);
 
   EXPECT_EQ(output.next_tokens.index({0}).item<int64_t>(), 2);
   EXPECT_EQ(output.next_tokens.index({1}).item<int64_t>(), 1);
@@ -74,8 +73,7 @@ TEST(SamplerFilterMaskTest, RandomSamplingCannotSelectDisallowedToken) {
   params = params.to(device, torch::kFloat32);
   logits = logits.to(device);
 
-  Sampler sampler;
-  SampleOutput output = sampler.forward(logits, params);
+  SampleOutput output = Sampler::forward(logits, params);
 
   EXPECT_EQ(output.next_tokens.index({0}).item<int64_t>(), 1);
 }
@@ -87,8 +85,7 @@ TEST(SamplerFilterMaskTest, PackedMaskFiltersCallerLogitsInPlace) {
                     torch::TensorOptions().dtype(torch::kInt32));
   torch::Tensor logits = torch::tensor({{1.0F, 100.0F, 2.0F, 100.0F}});
 
-  Sampler sampler;
-  SampleOutput output = sampler.forward(logits, params);
+  SampleOutput output = Sampler::forward(logits, params);
 
   EXPECT_EQ(output.next_tokens.index({0}).item<int64_t>(), 2);
   EXPECT_EQ(logits.index({0, 0}).item<float>(), 1.0F);

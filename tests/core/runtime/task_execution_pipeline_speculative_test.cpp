@@ -140,7 +140,7 @@ class CountingModel final : public CausalLM {
     const auto next =
         hidden.index_select(0, selected.to(torch::kInt64)).to(torch::kInt64) +
         1;
-    auto output = torch::full({selected.numel(), 32}, -20.0, options_);
+    auto output = torch::full({selected.numel(), kVocabSize}, -20.0, options_);
     output.scatter_(/*dim=*/1, next, /*value=*/20.0);
     return output;
   }
@@ -180,6 +180,7 @@ class CountingModel final : public CausalLM {
   std::vector<bool> context_warmup;
 
  private:
+  static constexpr int64_t kVocabSize = 32;
   torch::TensorOptions options_;
 };
 

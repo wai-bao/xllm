@@ -18,20 +18,14 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include "common/metrics.h"
+#include "core/framework/model/causal_lm.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/sampling/dflash2_sampling.h"
+#include "framework/sampling/draft_sampling_prepare.h"
 #include "framework/sampling/gumbel_sampling.h"
 #include "util/timer.h"
 
 namespace xllm {
-
-DFlash2WorkerImpl::DFlash2WorkerImpl(const ParallelArgs& parallel_args,
-                                     const torch::Device& device,
-                                     const runtime::Options& options)
-    : DFlashWorkerImpl(parallel_args, device, options),
-      sampling_process_group_(parallel_args.tp_group_ != nullptr
-                                  ? parallel_args.tp_group_
-                                  : parallel_args.process_group_) {}
 
 DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
     const LlmForwardInput& input,
@@ -62,11 +56,7 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
   c10::StreamGuard noise_guard = compute_stream_->set_stream_guard();
   SamplingParameters draft_sampling_params =
       input.sampling_params.to(draft_impl_->device(), torch::kFloat32);
-  if (draft_sampling_mode_ == DraftSamplingMode::GREEDY) {
-    force_greedy_draft_sampling(draft_sampling_params);
-  }
-  const bool need_dense_probs = draft_probs_required(
-      draft_sampling_mode_, draft_sampling_params.all_greedy_sample);
+  prepare_draft_sampling(draft_sampling_params, draft_sampling_mode_);
   torch::Tensor gumbel_noise = sample_gumbel_noise(batch_size,
                                                    num_speculative_tokens,
                                                    selector_top_k,
@@ -75,11 +65,8 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
   // Cross-rank RNG divergence must not fork the sampled path: unify the noise
   // once from rank 0.  The edge logits are TP-replicated, so identical noise
   // yields identical argmax on every rank for all steps.
-  if (sampling_process_group_ != nullptr &&
-      sampling_process_group_->world_size() > 1) {
-    gumbel_noise = gumbel_noise.contiguous();
-    sampling_process_group_->broadcast(gumbel_noise, /*root_rank=*/0);
-  }
+  gumbel_noise = broadcast_tokens_in_group(
+      gumbel_noise, spec_broadcast_group(parallel_args_));
 
   query_input.skip_sampling_for_logits_only = true;
   query_input.return_selected_hidden = true;
@@ -109,28 +96,17 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
        num_speculative_tokens,
        draft_output->selected_hidden.size(-1)});
 
-  DFlash2SampleOutput sampled;
+  DraftProposal sampled;
   {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     DFlash2CandidateOutput candidates = draft_impl_->dflash2_candidates(
         hidden_states, unary_logits, anchor_token_ids);
-    sampled = sample_dflash2_path(candidates,
-                                  draft_sampling_params,
-                                  gumbel_noise,
-                                  unary_logits.size(/*dim=*/-1),
-                                  need_dense_probs);
+    sampled = sample_dflash2_path(
+        candidates, draft_sampling_params, draft_sampling_mode_, gumbel_noise);
   }
 
   DraftBlock draft_block;
-  if (sampled.dense_probs.defined()) {
-    // Probabilistic DFlash2 paths retain the dense proposal distribution so
-    // rejection recovery stays exact.
-    draft_block.proposal = DraftProposal(std::move(sampled.token_ids),
-                                         std::move(sampled.dense_probs));
-  } else {
-    // Greedy proposals are delta distributions and need no [B, N, V] tensor.
-    draft_block.proposal = DraftProposal(std::move(sampled.token_ids));
-  }
+  draft_block.proposal = std::move(sampled);
   draft_block.retained_inputs = take_retained_inputs(*draft_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               draft_timer.elapsed_seconds());

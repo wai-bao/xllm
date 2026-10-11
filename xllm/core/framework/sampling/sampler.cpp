@@ -26,11 +26,10 @@ limitations under the License.
 #include <torch_npu/csrc/aten/NPUGeneratorImpl.h>
 #endif
 
-#include "common/global_flags.h"
-#include "core/framework/config/model_config.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/sampling/logits_utils.h"
 #include "core/framework/sampling/sampling_params.h"
+#include "core/kernels/ops_api.h"
 
 namespace xllm {
 namespace {
@@ -55,13 +54,77 @@ torch::Generator make_sampling_generator(const torch::Device& device) {
   return generator.clone();
 }
 
+// Per-request seeded sampling: rows with a seed >= 0 draw from a private
+// generator (independent of the global RNG); seed == -1 falls back to the
+// global stream, and greedy rows take the argmax. Row-by-row because the
+// per-row generator API leaves no batched form. One D2H transfer per tensor
+// up front, then host-local reads: per-row .item() would issue a device
+// sync on every access.
+torch::Tensor seeded_random_sample(const torch::Tensor& probs,
+                                   const SamplingParameters& params) {
+  const auto seeds = to_cpu_contiguous(params.seeds);
+  const auto offsets = to_cpu_contiguous(params.seed_offsets);
+  const auto sample_rows = to_cpu_contiguous(params.do_sample);
+  const auto seeds_a = seeds.accessor<int64_t, 1>();
+  const auto offsets_a = offsets.accessor<int64_t, 1>();
+  const auto sample_a = sample_rows.accessor<bool, 1>();
+  std::vector<torch::Tensor> rows;
+  rows.reserve(probs.size(0));
+  for (int64_t row = 0; row < probs.size(0); ++row) {
+    const torch::Tensor probabilities = probs.select(0, row);
+    if (!sample_a[row]) {
+      rows.emplace_back(probabilities.argmax(-1).view({1}));
+      continue;
+    }
+    const int64_t seed = seeds_a[row];
+    if (seed == -1) {
+      rows.emplace_back(
+          Sampler::random_sample(probabilities.unsqueeze(0)).view({1}));
+      continue;
+    }
+    // A private generator keeps this request independent from the global RNG.
+    auto generator = make_sampling_generator(probs.device());
+    generator.set_current_seed(sampling_seed(seed, offsets_a[row]));
+    rows.emplace_back(probabilities.multinomial(/*num_samples=*/1,
+                                                /*replacement=*/false,
+                                                generator));
+  }
+  return torch::cat(rows, /*dim=*/0);
+}
+
+// Qwen3-reranker verdict token ids ("no", "yes") in the served tokenizer
+// vocabulary; the sampler reads the P(yes | {yes, no}) verdict score from
+// these columns instead of logprobs.
+constexpr int64_t kRerankNoTokenId = 2152;
+constexpr int64_t kRerankYesTokenId = 9693;
+
+// Reranker requests sample greedily and carry the verdict score in place of
+// logprobs. The fast path and general path both reach here — rerank requests
+// set no top_k/top_p or filter masks, so both stages see the same logits.
+SampleOutput reranker_output(const torch::Tensor& sample_logits) {
+  SampleOutput output;
+  output.next_tokens = Sampler::greedy_sample(sample_logits).to(torch::kLong);
+  output.logits = sample_logits;
+  // P(yes | {yes, no}) = sigmoid(yes - no): algebraically equal to the
+  // two-column softmax·exp, one [B] allocation instead of stack +
+  // log_softmax + select + exp. Verdict columns read as strided scalars: no
+  // device index tensor, no H2D copy.
+  output.logprobs =
+      (sample_logits.select(/*dim=*/1, /*index=*/kRerankYesTokenId) -
+       sample_logits.select(/*dim=*/1, /*index=*/kRerankNoTokenId))
+          .to(torch::kFloat32)
+          .sigmoid_();
+  return output;
+}
+
 }  // namespace
 
-torch::Tensor Sampler::process_logits(torch::Tensor& logits,
-                                      const SamplingParameters& params,
-                                      const torch::Tensor& filter_mask) {
+SampleOutput Sampler::forward(torch::Tensor& logits,
+                              const SamplingParameters& params,
+                              const torch::Tensor& filter_mask) {
   const torch::Tensor& effective_filter_mask =
       filter_mask.defined() ? filter_mask : params.filter_mask;
+  SampleOutput output;
   if (params.logits_bias.defined()) {
     logits.add_(params.logits_bias);
   }
@@ -92,24 +155,27 @@ torch::Tensor Sampler::process_logits(torch::Tensor& logits,
   if (use_sample_indices) {
     sample_logits = logits.index_select(/*dim=*/0, params.sample_idxes);
     if (params.temperatures.defined()) {
-      sample_temperatures =
-          params.temperatures.index_select(/*dim=*/0, params.sample_idxes);
+      sample_temperatures = params.temperatures.index_select(
+          /*dim=*/0, params.sample_idxes);
     }
     if (params.top_k.defined()) {
-      sample_top_k = params.top_k.index_select(/*dim=*/0, params.sample_idxes);
+      sample_top_k = params.top_k.index_select(
+          /*dim=*/0, params.sample_idxes);
     }
     if (params.top_p.defined()) {
-      sample_top_p = params.top_p.index_select(/*dim=*/0, params.sample_idxes);
+      sample_top_p = params.top_p.index_select(
+          /*dim=*/0, params.sample_idxes);
     }
     if (params.min_p.defined()) {
       sample_min_p = params.min_p.index_select(/*dim=*/0, params.sample_idxes);
     }
     if (sample_filter_bitmask.defined()) {
-      sample_filter_bitmask =
-          sample_filter_bitmask.index_select(/*dim=*/0, params.sample_idxes);
+      sample_filter_bitmask = sample_filter_bitmask.index_select(
+          /*dim=*/0, params.sample_idxes);
     }
   }
-  if (params.top_k.defined() && params.top_p.defined()) {
+
+  if (sample_top_k.defined() && sample_top_p.defined()) {
     // Native top-k/top-p consumes top-p in the logits dtype.
     sample_top_p = sample_top_p.to(sample_logits.scalar_type());
   }
@@ -130,6 +196,39 @@ torch::Tensor Sampler::process_logits(torch::Tensor& logits,
     sample_logits.add_(effective_filter_mask);
   }
 
+  const VerifyMode mode = params.verify_mode();
+  // Rerank requests: greedy verdict score replaces the logprobs output. One
+  // dispatch before any processing covers both entry shapes: rerank batches
+  // carry no top_k/top_p or filter masks, so the processing stages below are
+  // no-ops for them either way.
+  if (params.is_rerank && mode == VerifyMode::GREEDY) {
+    return reranker_output(sample_logits);
+  }
+  const bool needs_scores = params.needs_scores();
+  // The fast path samples raw logits; any modifier that would rewrite them
+  // before sampling (min_p included) must fall through to the general path so
+  // the sampled token and its scores stay consistent.
+  const bool needs_score_processing =
+      needs_scores &&
+      (sample_temperatures.defined() || sample_top_k.defined() ||
+       sample_top_p.defined() || sample_min_p.defined());
+  if (mode == VerifyMode::GREEDY && params.max_top_logprobs == 0 &&
+      !use_sample_indices && !filter_mask.defined() &&
+      !needs_score_processing) {
+    auto sample_indices = greedy_sample(sample_logits).to(torch::kLong);
+    output.next_tokens = sample_indices;
+    output.logits = sample_logits;
+    if (needs_scores) {
+      // Same score-gather contract as the general path: one owner in
+      // logits_utils, one emission owner in emit_selected_scores.
+      const auto log_probs =
+          compute_selected_logprobs(sample_logits, sample_indices);
+      emit_selected_scores(output, params, log_probs, logits.scalar_type());
+    }
+    return output;
+  }
+
+  // apply temperatures, top-k and top-p
   if (sample_temperatures.defined()) {
     apply_temperatures(sample_logits, sample_temperatures);
   }
@@ -142,127 +241,59 @@ torch::Tensor Sampler::process_logits(torch::Tensor& logits,
   } else {
     logits = sample_logits;
   }
-  return sample_logits;
-}
-
-SampleOutput Sampler::forward(torch::Tensor& logits,
-                              const SamplingParameters& params,
-                              const torch::Tensor& filter_mask) const {
-  SampleOutput output;
-  // vLLM reports probabilities from the unmodified model distribution.
-  const torch::Tensor raw_logprobs =
-      params.logprobs && !params.use_beam_search
-          ? torch::log_softmax(logits, /*dim=*/-1, torch::kFloat32)
-          : torch::Tensor();
-
-  const bool use_sample_indices =
-      params.selected_token_idxes.numel() != params.sample_idxes.numel();
-
-  torch::Tensor sample_logits = process_logits(logits, params, filter_mask);
-
-  if (params.all_greedy_sample && !params.logprobs && !params.return_probs &&
-      !use_sample_indices && !filter_mask.defined()) {
-    output.next_tokens = greedy_sample(sample_logits).to(torch::kLong);
-    return output;
-  }
-
-  if (params.all_greedy_sample && !params.logprobs && params.return_probs &&
-      !use_sample_indices && !filter_mask.defined()) {
-    torch::Tensor sample_indices =
-        greedy_sample(sample_logits).to(torch::kLong);
-    torch::Tensor selected_logits =
-        sample_logits.gather(/*dim=*/-1, sample_indices.view({-1, 1}))
-            .to(torch::kFloat32);
-    torch::Tensor log_probs =
-        selected_logits - torch::logsumexp(sample_logits,
-                                           /*dim=*/-1,
-                                           /*keepdim=*/true);
-    output.next_tokens = sample_indices;
-    output.probs = log_probs.exp().view({-1}).to(logits.dtype());
-    return output;
-  }
 
   CHECK(params.do_sample.defined()) << "params.do_sample must be defined";
-  CHECK_EQ(params.do_sample.dim(), 1)
-      << "params.do_sample must be 1D [num_seqs], got "
-      << params.do_sample.sizes();
+  CHECK_EQ(params.do_sample.dim(), 1) << "params.do_sample must be 1D "
+                                         "[num_seqs], got "
+                                      << params.do_sample.sizes();
   // same batch size
   CHECK_EQ(sample_logits.size(0), params.do_sample.size(0));
 
-  auto probs =
-      torch::softmax(sample_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
-  torch::Tensor samples;
-  if (params.seeds.defined() && !params.all_greedy_sample) {
-    torch::Tensor seeds = params.seeds;
-    torch::Tensor offsets = params.seed_offsets;
-    if (use_sample_indices) {
-      seeds = seeds.index_select(0, params.sample_idxes);
-      offsets = offsets.index_select(0, params.sample_idxes);
-    }
-    seeds = seeds.to(torch::kCPU);
-    offsets = offsets.to(torch::kCPU);
-    const torch::Tensor sample_rows = params.do_sample.to(torch::kCPU);
-    std::vector<torch::Tensor> rows;
-    rows.reserve(probs.size(0));
-    for (int64_t row = 0; row < probs.size(0); ++row) {
-      const torch::Tensor probabilities = probs.select(0, row);
-      if (!sample_rows[row].item<bool>()) {
-        rows.emplace_back(probabilities.argmax(-1).view({1}));
-        continue;
-      }
-      const int64_t seed = seeds[row].item<int64_t>();
-      if (seed == -1) {
-        rows.emplace_back(random_sample(probabilities.unsqueeze(0)).view({1}));
-        continue;
-      }
-      // A private generator keeps this request independent from the global RNG.
-      auto generator = make_sampling_generator(probs.device());
-      generator.set_current_seed(
-          sampling_seed(seed, offsets[row].item<int64_t>()));
-      rows.emplace_back(probabilities.multinomial(/*num_samples=*/1,
-                                                  /*replacement=*/false,
-                                                  generator));
-    }
-    samples = torch::cat(rows, /*dim=*/0);
-  } else if (params.all_random_sample) {
-    samples = random_sample(probs);
-  } else if (params.all_greedy_sample) {
-    samples = greedy_sample(probs);
-  } else {
-    // mixed sample, sample both then choose based on do_sample
-    auto random = random_sample(probs);
-    auto greedy = greedy_sample(probs);
-    samples = torch::where(params.do_sample, random, greedy);
-  }
-  auto sample_indices = samples.to(torch::kLong);
-  output.probs = probs.to(logits.dtype());
-  output.next_tokens = sample_indices;
+  // Sampling needs probabilities (multinomial/vendor kernels reject the log
+  // domain); argmax is domain-invariant, so a fully greedy batch samples
+  // straight from the logits.
+  // Materialize only the distributions requested by sampling or consumers.
+  const bool need_probs = mode != VerifyMode::GREEDY;
+  torch::Tensor logprobs;
+  torch::Tensor probs;
 
   if (params.logprobs) {
-    if (::xllm::ModelConfig::get_instance().enable_qwen3_reranker()) {
-      int32_t false_id = 2152;  // "no"
-      int32_t true_id = 9693;   // "yes"
-      auto indices =
-          torch::tensor({false_id, true_id}, torch::kLong).to(samples.device());
-      sample_logits = sample_logits.index_select(/*dim=*/1, indices);
-      auto logprobs = torch::log_softmax(
-          sample_logits, /*dim=*/1, /*dtype=*/torch::kFloat32);
-      logprobs = logprobs.index({torch::indexing::Slice(), 1});
-      output.logprobs = logprobs.view({-1}).exp();
-      return output;
+    logprobs = torch::log_softmax(sample_logits,
+                                  /*dim=*/-1,
+                                  /*dtype=*/torch::kFloat32);
+    if (need_probs) {
+      probs = logprobs.exp();
     }
-    // log_softmax is equivalent to log(softmax) but more numerically stable
-    const torch::Tensor logprobs =
-        raw_logprobs.defined()
-            ? (use_sample_indices
-                   ? raw_logprobs.index_select(0, params.sample_idxes)
-                   : raw_logprobs)
-            : torch::log_softmax(sample_logits, /*dim=*/-1, torch::kFloat32);
-    // select the logprobs for each sequence
-    auto selected_logprobs =
-        logprobs.gather(/*dim=*/-1, sample_indices.view({-1, 1}));
-    output.logprobs = selected_logprobs.view({-1});
+  } else if (need_probs) {
+    probs = torch::softmax(sample_logits,
+                           /*dim=*/-1,
+                           /*dtype=*/torch::kFloat32);
+  }
+  torch::Tensor samples;
+  if (mode == VerifyMode::GREEDY) {
+    samples = greedy_sample(sample_logits);
+  } else if (params.seeds.defined()) {
+    // seeded_random_sample dispatches per row: greedy rows argmax inside, so
+    // the result is complete for MIXED batches — no full-vocab argmax + where.
+    samples = seeded_random_sample(probs, params);
+  } else {
+    const torch::Tensor random = random_sample(probs);
+    samples = mode == VerifyMode::MIXED
+                  ? torch::where(
+                        params.do_sample, random, greedy_sample(sample_logits))
+                  : random;
+  }
+  const auto sample_indices = samples.to(torch::kLong);
+  output.next_tokens = sample_indices;
+  output.logits = sample_logits;
 
+  // One selected-score gather serves both outputs (probs ≡ logprobs.exp()).
+  const auto selected_scores =
+      needs_scores ? compute_selected_scores(
+                         logprobs, sample_logits, sample_indices, probs)
+                   : torch::Tensor();
+  emit_selected_scores(output, params, selected_scores, logits.scalar_type());
+  if (params.logprobs) {
     if (params.max_top_logprobs > 0) {
       // max_top_logprobs is the batch-wide max, so one request asking for more
       // than the vocabulary would make topk throw and fail every request in the

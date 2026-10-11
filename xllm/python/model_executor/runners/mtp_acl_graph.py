@@ -76,6 +76,14 @@ class MtpSamplingPlan:
         if self.max_top_logprobs < 0:
             raise ValueError("max_top_logprobs must be nonnegative")
 
+    def needs_scores(self) -> bool:
+        """Whether any consumer needs committed or top-k scores."""
+        return self.return_probs or self.logprobs or self.max_top_logprobs > 0
+
+    def needs_selected_scores(self) -> bool:
+        """Whether any consumer needs committed-token scores."""
+        return self.return_probs or self.logprobs
+
 
 class MtpRoleAdapter:
     """Role-scoped body adapter for one composite MTP graph.
@@ -463,14 +471,10 @@ class MtpGraphRecipe(nn.Module):
         target_hidden = target_output.hidden
         if target_hidden.ndim != 2 or target_hidden.shape[0] != self.batch_size * (self.speculative_tokens + 1):
             raise ValueError("target hidden must have one row per target verification token")
-        use_target_greedy = self.target_greedy is not None and (
-            self.target_sampling is None
-            or not (
-                self.target_sampling.return_probs
-                or self.target_sampling.logprobs
-                or self.target_sampling.max_top_logprobs
-            )
-        )
+        # The score-flag enumeration lives on MtpSamplingPlan alone: new
+        # score outputs join its predicates, never a call-site copy.
+        needs_scores = self.target_sampling is not None and self.target_sampling.needs_scores()
+        use_target_greedy = self.target_greedy is not None and not needs_scores
         target_logits = None if use_target_greedy else self.target_logits(target_hidden)
         if target_logits is not None and target_logits.shape != (
             self.batch_size * (self.speculative_tokens + 1),
@@ -480,16 +484,12 @@ class MtpGraphRecipe(nn.Module):
         target_probs = None
         target_log_normalizer = None
         if use_target_greedy:
+            assert self.target_greedy is not None
             target_tokens = self.target_greedy(target_hidden).reshape(self.batch_size, self.speculative_tokens + 1)
         else:
+            assert target_logits is not None
             target_tokens = target_logits.argmax(dim=-1).reshape(self.batch_size, self.speculative_tokens + 1)
-            if self.target_sampling is not None and self.target_sampling.return_probs:
-                target_probs = torch.softmax(target_logits.float(), dim=-1).reshape(
-                    self.batch_size, self.speculative_tokens + 1, self.vocab_size
-                )
-            if self.target_sampling is not None and (
-                self.target_sampling.logprobs or self.target_sampling.max_top_logprobs
-            ):
+            if needs_scores:
                 # Only committed and top-k scores leave the graph. A scalar
                 # normalizer per row avoids a full-vocabulary log-prob tensor.
                 target_log_normalizer = torch.logsumexp(target_logits.float(), dim=-1).reshape(
@@ -506,13 +506,15 @@ class MtpGraphRecipe(nn.Module):
             if target_log_normalizer is not None
             else None
         )
-        if score_rows is not None and self.target_sampling is not None and self.target_sampling.logprobs:
+        if score_rows is not None and self.target_sampling is not None and self.target_sampling.needs_selected_scores():
             committed_indices = committed_tokens.clamp_min(0).unsqueeze(-1)
             selected_scores = score_rows.gather(-1, committed_indices).float() - target_log_normalizer
-            committed_log_probs = selected_scores.squeeze(-1)
-            committed_log_probs = torch.where(
-                committed_tokens.ge(0), committed_log_probs, torch.zeros_like(committed_log_probs)
-            )
+            selected_log_probs = selected_scores.squeeze(-1)
+            committed_mask = committed_tokens.ge(0)
+            if self.target_sampling.return_probs:
+                target_probs = torch.where(committed_mask, selected_log_probs.exp(), 0)
+            if self.target_sampling.logprobs:
+                committed_log_probs = torch.where(committed_mask, selected_log_probs, 0)
         if score_rows is not None and self.target_sampling is not None and self.target_sampling.max_top_logprobs > 0:
             top_width = min(self.target_sampling.max_top_logprobs, self.vocab_size)
             target_top_log_probs, target_top_tokens = score_rows.topk(top_width, dim=-1)

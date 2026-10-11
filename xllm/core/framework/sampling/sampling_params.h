@@ -21,14 +21,28 @@ limitations under the License.
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
+#include "framework/sampling/verify_mode.h"
+#include "util/tensor_helper.h"  // repeat_interleave_if_defined
+
 namespace xllm {
+
+// Requests asking for top logprobs must also enable logprobs. Free function
+// so scalar-only callers (result binding) share the member predicate's
+// semantics.
+inline bool inconsistent_top_logprobs(bool logprobs, int64_t top_logprobs) {
+  return !logprobs && top_logprobs != 0;
+}
 
 struct Token;
 
-struct RequestSamplingParam {
+// A class (not struct) per the code style: it carries behavior
+// (enable_beam_search / top_logprobs_vocab_error) beyond plain aggregation.
+class RequestSamplingParam final {
+ public:
   float frequency_penalty = 0.0;
   float presence_penalty = 0.0;
   float repetition_penalty = 1.0;
@@ -47,6 +61,7 @@ struct RequestSamplingParam {
   int64_t top_logprobs = 0;
   bool do_sample = false;
   bool is_embeddings = false;
+  bool is_rerank = false;
   bool json_object = false;
   int32_t beam_width = 0;
   int32_t num_return_sequences = 0;
@@ -101,7 +116,11 @@ struct RequestSamplingParam {
   }
 };
 
-struct SamplingParameters {
+// A class (not struct) per the code style: it carries behavior
+// (init/to/concat/verify_mode) beyond plain
+// aggregation; no aggregate initialization of it exists, so the public
+// data members stay directly initializable.
+class SamplingParameters final {
  public:
   void init(const std::vector<const RequestSamplingParam*>& req_sampling_params,
             const std::vector<int32_t>& selected_token_idxes,
@@ -116,6 +135,76 @@ struct SamplingParameters {
 
   // concat two SamplingParameters into one
   void concat(const SamplingParameters& param);
+
+  // The batch-level greedy/random/mixed dispatch mode. Greedy takes priority
+  // when an empty do_sample leaves both flags true.
+  VerifyMode verify_mode() const {
+    if (all_greedy_sample) {
+      return VerifyMode::GREEDY;
+    }
+    return all_random_sample ? VerifyMode::RANDOM : VerifyMode::MIXED;
+  }
+
+  // Whether any optional sampling-modifier tensor is defined for this batch:
+  // the single enumeration for callers that gate on "plain greedy, nothing
+  // else requested" (graph capture, replay reuse). A new modifier field must
+  // join this list, not per-caller copies. Seeds are excluded deliberately:
+  // they are consumed only by RANDOM/MIXED sampling, and every caller of
+  // this predicate already gates on GREEDY — including them would silently
+  // drop seeded-but-greedy batches (e.g. benchmark defaults) from graph
+  // capture.
+  bool has_sampling_modifiers() const {
+    return temperatures.defined() || top_k.defined() || top_p.defined() ||
+           min_p.defined() || logits_bias.defined() ||
+           frequency_penalties.defined() || presence_penalties.defined() ||
+           repetition_penalties.defined() || unique_token_ids.defined() ||
+           unique_token_counts.defined() || unique_token_ids_lens.defined() ||
+           filter_mask.defined() || filter_bitmask.defined();
+  }
+
+  // Whether any consumer needs selected-token scores (logprobs or probs).
+  // The single owner of the score-request predicate: gating sites (sampler,
+  // rejection sampler, consensus sync) must read this, not per-caller copies.
+  bool needs_scores() const { return logprobs || return_probs; }
+
+  // Requests asking for top logprobs must also enable logprobs: the single
+  // owner of the request-consistency predicate shared by admission checks
+  // and the result binding. The free-function form also serves callers
+  // (slot_buffer) that hold plain scalars instead of a SamplingParameters.
+  bool inconsistent_top_logprobs() const {
+    return xllm::inconsistent_top_logprobs(logprobs, max_top_logprobs);
+  }
+
+  // Repeat every per-request tensor field along dim 0 for speculative
+  // validation: the one enumeration of the repeatable field list. Repeats is
+  // either a scalar count (uniform width) or a per-sequence tensor. A zero
+  // scalar count leaves the fields unrepeated (skip the empty dispatch).
+  template <typename Repeats>
+  void repeat_tensors(const Repeats& repeats) {
+    if constexpr (std::is_integral_v<std::decay_t<Repeats>>) {
+      if (repeats == 0) {
+        return;
+      }
+    }
+    repeat_interleave_if_defined(frequency_penalties, repeats);
+    repeat_interleave_if_defined(presence_penalties, repeats);
+    repeat_interleave_if_defined(repetition_penalties, repeats);
+    repeat_interleave_if_defined(temperatures, repeats);
+    repeat_interleave_if_defined(top_p, repeats);
+    repeat_interleave_if_defined(min_p, repeats);
+    repeat_interleave_if_defined(logits_bias, repeats);
+    repeat_interleave_if_defined(seeds, repeats);
+    repeat_interleave_if_defined(seed_offsets, repeats);
+    repeat_interleave_if_defined(top_k, repeats);
+    repeat_interleave_if_defined(unique_token_ids, repeats);
+    repeat_interleave_if_defined(unique_token_counts, repeats);
+    repeat_interleave_if_defined(unique_token_ids_lens, repeats);
+    repeat_interleave_if_defined(do_sample, repeats);
+    // Today's JSON path installs per-request masks after the repeat, so this
+    // is a no-op; any future per-request filter source must join this list.
+    repeat_interleave_if_defined(filter_mask, repeats);
+    repeat_interleave_if_defined(filter_bitmask, repeats);
+  }
 
   // selected tokens are tokens for sampling the next token,
   // including the generated tokens and the last prompt token
@@ -185,12 +274,14 @@ struct SamplingParameters {
   // whether to output logprobs for each generated token.
   bool logprobs = false;
 
-  // whether downstream validation needs sampled probabilities even when the
-  // request itself does not ask for logprobs.
+  // Whether a consumer needs selected-token probabilities.
   bool return_probs = false;
 
   // whether to get the embeddings of the tokens. used by embeddings model.
   bool is_embeddings = false;
+
+  // whether any request in the batch is a Qwen3 rerank request.
+  bool is_rerank = false;
 
   // max number of top logprobs in the batch.
   // only used when logprobs is true.
@@ -224,7 +315,14 @@ class SampleOutput final {
   // [num_seq, ...] LongTensor
   torch::Tensor next_tokens;
 
-  // [num_seq, ...] FloatTensor
+  // Actual post-processor sampling logits. Tensor handles retain the sampling
+  // storage without caching a normalized distribution.
+  torch::Tensor logits;
+  // Compact proposal support and its sampled indices, when tokens are remapped.
+  torch::Tensor vocab_ids;
+  torch::Tensor sampled_indices;
+
+  // Selected-token probabilities, computed only for explicit score consumers.
   torch::Tensor probs;
 
   // [num_seq, ...] FloatTensor

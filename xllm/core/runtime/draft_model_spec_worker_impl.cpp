@@ -403,19 +403,6 @@ bool DraftModelSpecWorkerImpl<TargetInput>::allocate_kv_cache_with_transfer(
 #endif
 
 template <typename TargetInput>
-void DraftModelSpecWorkerImpl<TargetInput>::force_greedy_draft_sampling(
-    SamplingParameters& sampling_params) {
-  if (sampling_params.do_sample.defined()) {
-    sampling_params.do_sample = torch::zeros_like(sampling_params.do_sample);
-  }
-  sampling_params.all_random_sample = false;
-  sampling_params.all_greedy_sample = true;
-  sampling_params.logprobs = false;
-  sampling_params.max_top_logprobs = 0;
-  sampling_params.return_probs = false;
-}
-
-template <typename TargetInput>
 TargetInput
 DraftModelSpecWorkerImpl<TargetInput>::update_input_by_last_step_output(
     TargetInput& inputs) {

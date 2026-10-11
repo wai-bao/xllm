@@ -14,7 +14,8 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
-#include "core/framework/sampling/rejection_sampler.h"
+#include "core/framework/sampling/draft_proposal.h"
+#include "core/framework/sampling/sampling_params.h"
 #include "core/runtime/task_execution_pipeline.h"
 
 namespace xllm {
@@ -93,6 +94,12 @@ struct TaskExecutionPipeline::SpeculativeSlot {
     ModelOutput output;
     torch::Tensor logits;
     SampleOutput sampled;
+    // The unified draft contract for block drafts: every mode publishes the
+    // complete proposal here. Probabilistic runs carry their sampled logits;
+    // greedy runs carry a zero-copy token view of slot.proposal. Multi-step
+    // drafts leave it unset — verification stacks the per-step
+    // SampleOutputs via DraftProposal::from_steps.
+    DraftProposal proposal;
   };
 
   struct Bootstrap {
@@ -121,7 +128,6 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   std::unique_ptr<SlotBuffer> validate_input;
   std::unique_ptr<MtpContextView> state;
   std::optional<Sampling> target_sampling;
-  std::unique_ptr<RejectionSampler> rejection;
   std::vector<std::unique_ptr<Draft>> drafts;
   std::vector<int32_t> upper_positions;
   std::vector<int32_t> upper_kv_lengths;

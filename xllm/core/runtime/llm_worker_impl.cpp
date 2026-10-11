@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
 #include "framework/model/model_args.h"
 #include "framework/model/model_input_params.h"
+#include "framework/sampling/sampler.h"
 #if defined(USE_CUDA) || defined(USE_ILU) || defined(USE_MUSA)
 #include "layers/cuda/flashinfer_workspace.h"
 #endif
@@ -359,12 +360,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     output.do_sample = sampling_params.do_sample;
     output.logprobs = sampling_params.logprobs;
     output.max_top_logprobs = sampling_params.max_top_logprobs;
-    if (input.skip_sampling_for_logits_only) {
-      if (input.skip_process_logits) {
-        Sampler::process_logits(logits, sampling_params);
-      }
-    } else {
-      auto sample_output = sampler_->forward(logits, sampling_params);
+    if (!input.skip_sampling_for_logits_only) {
+      auto sample_output = Sampler::forward(logits, sampling_params);
       // beam search kernel
       BeamSearchOutput beam_search_output;
       if (sampling_params.use_beam_search &&

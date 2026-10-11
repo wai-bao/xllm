@@ -21,6 +21,65 @@ limitations under the License.
 
 namespace xllm {
 
+NormalizedLogits normalized_logits(const torch::Tensor& logits) {
+  torch::Tensor values = logits.to(torch::kFloat32);
+  torch::Tensor normalizer = torch::logsumexp(values, -1);
+  return {std::move(values), std::move(normalizer)};
+}
+
+torch::Tensor selected_logprobs(const NormalizedLogits& normalized,
+                                const torch::Tensor& token_ids) {
+  const auto& values = normalized.values;
+  const auto& normalizer = normalized.normalizer;
+  return values
+             .take_along_dim(
+                 token_ids.to(torch::kLong).clamp_min(0).unsqueeze(-1), -1)
+             .squeeze(-1) -
+         normalizer;
+}
+
+torch::Tensor compute_selected_logprobs(const torch::Tensor& logits,
+                                        const torch::Tensor& token_ids) {
+  // Gather-first: only the selected values materialize in FP32. The row
+  // normalizer reduces the raw-dtype logits in one pass (logsumexp
+  // accumulates in FP32 internally), so no dense [.., V] FP32 copy exists.
+  const auto selected =
+      logits
+          .take_along_dim(token_ids.to(torch::kLong).clamp_min(0).unsqueeze(-1),
+                          -1)
+          .to(torch::kFloat32);
+  const auto normalizer = torch::logsumexp(logits, -1);
+  return selected.squeeze(-1) - normalizer;
+}
+
+torch::Tensor compute_selected_scores(const torch::Tensor& logprobs,
+                                      const torch::Tensor& logits,
+                                      const torch::Tensor& sample_indices,
+                                      const torch::Tensor& probs) {
+  if (logprobs.defined()) {
+    return logprobs.gather(-1, sample_indices.view({-1, 1}));
+  }
+  if (probs.defined()) {
+    return probs.gather(-1, sample_indices.view({-1, 1})).log();
+  }
+  return compute_selected_logprobs(logits, sample_indices);
+}
+
+void emit_selected_scores(SampleOutput& output,
+                          const SamplingParameters& params,
+                          const torch::Tensor& scores,
+                          torch::Dtype logits_dtype) {
+  // Reshape to the emitted token shape (not a blind flatten): plain sampling
+  // scores arrive [num_seqs] (or [num_seqs, 1]); verify scores arrive
+  // [batch, width]. token_at CHECKs logprobs against next_tokens' shape.
+  if (params.return_probs) {
+    output.probs = scores.exp().to(logits_dtype).view_as(output.next_tokens);
+  }
+  if (params.logprobs) {
+    output.logprobs = scores.view_as(output.next_tokens);
+  }
+}
+
 void apply_frequency_presence_penalties(
     torch::Tensor& logits,
     const torch::Tensor& unique_token_ids,

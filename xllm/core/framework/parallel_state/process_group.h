@@ -189,6 +189,23 @@ class ProcessGroup {
 #endif
 };
 
+// Broadcast a tensor within one process group; no-op for a single rank, an
+// undefined tensor, or a null group. Value semantics: temporaries are safe
+// (pass by move or reassign — `tokens = broadcast_tokens_in_group(
+// std::move(tokens), group)`). The returned tensor must be consumed: a
+// dropped result is a silently unsynchronized broadcast.
+[[nodiscard]] inline torch::Tensor broadcast_tokens_in_group(
+    torch::Tensor tokens,
+    ProcessGroup* process_group) {
+  if (process_group == nullptr || process_group->world_size() <= 1 ||
+      !tokens.defined()) {
+    return tokens;
+  }
+  tokens = tokens.contiguous();
+  process_group->broadcast(tokens, /*root_rank=*/0);
+  return tokens;
+}
+
 std::unique_ptr<xllm::ProcessGroup> create_process_group(
     int32_t rank,
     int32_t world_size,

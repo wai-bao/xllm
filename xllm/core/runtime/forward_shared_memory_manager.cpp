@@ -67,14 +67,6 @@ namespace {
 template <typename T>
 constexpr size_t type_size = sizeof(T);
 
-constexpr size_t sampling_param_fixed_size() {
-  return 6 * type_size<float>  // frequency_penalty, presence_penalty,
-                               // repetition_penalty, temperature, top_p, min_p
-         + 2 * type_size<int64_t>   // top_k, top_logprobs
-         + 3 * type_size<bool>      // logprobs, do_sample, is_embeddings
-         + 2 * type_size<int32_t>;  // beam_width, num_return_sequences
-}
-
 constexpr size_t swap_block_info_fixed_size() {
   return type_size<int32_t> * 2;  // src_block_id + dst_block_id
 }
@@ -111,6 +103,8 @@ constexpr PackedInputDomain packed_input_domain() {
   return PackedInputDomain::LLM;
 }
 constexpr uint64_t kPackedInputMagic = 0x584c4c4d494e5032;
+// Schema 6 field set: sampling controls (return_probs, is_rerank) and the
+// audio sampling-rate parameter.
 constexpr uint16_t kPackedInputSchemaVersion = 6;
 constexpr uint32_t kPackedInputHeaderBytes = 40;
 
@@ -440,8 +434,9 @@ size_t get_sampling_params_size(const SamplingParameters& params) {
   total += get_tensor_size(params.sample_idxes);
   total += get_tensor_size(params.do_sample);
   total += get_tensor_size(params.acc_logprob);
-  total += type_size<bool> * 5    // all_random_sample + all_greedy_sample +
-                                  // logprobs + is_embeddings + use_beam_search
+  total += type_size<bool> * 7  // all_random_sample + all_greedy_sample +
+                                // logprobs + return_probs
+                                // + is_embeddings + is_rerank + use_beam_search
            + type_size<int64_t>   // max_top_logprobs
            + type_size<int32_t>;  // num_return_sequences
   return total;
@@ -639,38 +634,6 @@ inline void write_tensor(RawInputSerializeContext& context,
   const uint64_t aligned_bytes =
       get_aligned_tensor_arena_bytes(tensor_data_bytes);
   write_padding(context.tensor_arena, aligned_bytes - tensor_data_bytes);
-}
-
-inline void write_sampling_param(char*& buffer,
-                                 const RequestSamplingParam& param) {
-  char* ptr = buffer;
-  *reinterpret_cast<float*>(ptr) = param.frequency_penalty;
-  ptr += type_size<float>;
-  *reinterpret_cast<float*>(ptr) = param.presence_penalty;
-  ptr += type_size<float>;
-  *reinterpret_cast<float*>(ptr) = param.repetition_penalty;
-  ptr += type_size<float>;
-  *reinterpret_cast<float*>(ptr) = param.temperature;
-  ptr += type_size<float>;
-  *reinterpret_cast<float*>(ptr) = param.top_p;
-  ptr += type_size<float>;
-  *reinterpret_cast<float*>(ptr) = param.min_p;
-  ptr += type_size<float>;
-  *reinterpret_cast<int64_t*>(ptr) = param.top_k;
-  ptr += type_size<int64_t>;
-  *reinterpret_cast<bool*>(ptr) = param.logprobs;
-  ptr += type_size<bool>;
-  *reinterpret_cast<int64_t*>(ptr) = param.top_logprobs;
-  ptr += type_size<int64_t>;
-  *reinterpret_cast<bool*>(ptr) = param.do_sample;
-  ptr += type_size<bool>;
-  *reinterpret_cast<bool*>(ptr) = param.is_embeddings;
-  ptr += type_size<bool>;
-  *reinterpret_cast<int32_t*>(ptr) = param.beam_width;
-  ptr += type_size<int32_t>;
-  *reinterpret_cast<int32_t*>(ptr) = param.num_return_sequences;
-  ptr += type_size<int32_t>;
-  buffer = ptr;
 }
 
 template <typename T>
@@ -1738,38 +1701,6 @@ inline void read_2d_vector(const char*& buffer,
   }
 }
 
-inline void read_sampling_param(const char*& buffer,
-                                RequestSamplingParam& param) {
-  const char* ptr = buffer;
-  param.frequency_penalty = *reinterpret_cast<const float*>(ptr);
-  ptr += type_size<float>;
-  param.presence_penalty = *reinterpret_cast<const float*>(ptr);
-  ptr += type_size<float>;
-  param.repetition_penalty = *reinterpret_cast<const float*>(ptr);
-  ptr += type_size<float>;
-  param.temperature = *reinterpret_cast<const float*>(ptr);
-  ptr += type_size<float>;
-  param.top_p = *reinterpret_cast<const float*>(ptr);
-  ptr += type_size<float>;
-  param.min_p = *reinterpret_cast<const float*>(ptr);
-  ptr += type_size<float>;
-  param.top_k = *reinterpret_cast<const int64_t*>(ptr);
-  ptr += type_size<int64_t>;
-  param.logprobs = *reinterpret_cast<const bool*>(ptr);
-  ptr += type_size<bool>;
-  param.top_logprobs = *reinterpret_cast<const int64_t*>(ptr);
-  ptr += type_size<int64_t>;
-  param.do_sample = *reinterpret_cast<const bool*>(ptr);
-  ptr += type_size<bool>;
-  param.is_embeddings = *reinterpret_cast<const bool*>(ptr);
-  ptr += type_size<bool>;
-  param.beam_width = *reinterpret_cast<const int32_t*>(ptr);
-  ptr += type_size<int32_t>;
-  param.num_return_sequences = *reinterpret_cast<const int32_t*>(ptr);
-  ptr += type_size<int32_t>;
-  buffer = ptr;
-}
-
 inline void read_instance_info(const char*& buffer, InstanceInfo& info) {
   read_string(buffer, info.name);
   read_string(buffer, info.rpc_address);
@@ -2764,7 +2695,9 @@ inline void deserialize_forward_input_payload(
     read_data(context, sampling_params.all_random_sample);
     read_data(context, sampling_params.all_greedy_sample);
     read_data(context, sampling_params.logprobs);
+    read_data(context, sampling_params.return_probs);
     read_data(context, sampling_params.is_embeddings);
+    read_data(context, sampling_params.is_rerank);
     read_data(context, sampling_params.max_top_logprobs);
     read_data(context, sampling_params.num_return_sequences);
     read_data(context, sampling_params.use_beam_search);
@@ -3091,7 +3024,9 @@ inline void serialize_forward_input_sections(
     write_data(context.descriptor, sampling_params.all_random_sample);
     write_data(context.descriptor, sampling_params.all_greedy_sample);
     write_data(context.descriptor, sampling_params.logprobs);
+    write_data(context.descriptor, sampling_params.return_probs);
     write_data(context.descriptor, sampling_params.is_embeddings);
+    write_data(context.descriptor, sampling_params.is_rerank);
     write_data(context.descriptor, sampling_params.max_top_logprobs);
     write_data(context.descriptor, sampling_params.num_return_sequences);
     write_data(context.descriptor, sampling_params.use_beam_search);

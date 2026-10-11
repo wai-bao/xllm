@@ -119,9 +119,6 @@ int64_t Eagle3WorkerImpl<TargetInput>::get_embedding_placeholder_size() const {
 template <typename TargetInput>
 void Eagle3WorkerImpl<TargetInput>::process_draft_sample_output(
     SampleOutput& sample_output) {
-  // Keep probability compression behavior fully aligned with MTP.
-  MTPWorkerImpl<TargetInput>::process_draft_sample_output(sample_output);
-
   // EAGLE-3 specific: map draft token IDs to target token IDs.
   if (!use_draft_token_mapping_ || !hot_token_id_.defined() ||
       !sample_output.next_tokens.defined() ||
@@ -129,17 +126,9 @@ void Eagle3WorkerImpl<TargetInput>::process_draft_sample_output(
     return;
   }
 
-  // Scatter q so the (p-q)+ residual keeps full target mass where the draft
-  // cannot propose (q=0), letting rejection sampling align q with p.
-  if (sample_output.probs.defined()) {
-    const int64_t target_vocab_size = context_.get_model_args().vocab_size();
-    torch::Tensor full_vocab_probs =
-        torch::zeros({sample_output.probs.size(0), target_vocab_size},
-                     sample_output.probs.options());
-    full_vocab_probs.index_put_({torch::indexing::Slice(), hot_token_id_},
-                                sample_output.probs);
-    sample_output.probs = full_vocab_probs;
-  }
+  // Keep q in the draft vocabulary; recovery expands only the rejected row.
+  sample_output.sampled_indices = sample_output.next_tokens;
+  sample_output.vocab_ids = hot_token_id_;
 
   sample_output.next_tokens =
       hot_token_id_.index_select(0, sample_output.next_tokens);

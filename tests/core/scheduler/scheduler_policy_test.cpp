@@ -36,6 +36,7 @@ limitations under the License.
 #include "distributed_runtime/engine.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/model/model_args.h"
+#include "profile/profile_manager_test_peer.h"
 #include "util/utils.h"
 
 namespace xllm {
@@ -656,7 +657,8 @@ TEST(SchedulerPolicyTest, UnifiedRetryRefreshesHostRestoreBeforeChunkSizing) {
   auto profile_engine = std::make_unique<FakeEngine>(512, 128);
   ProfileManager::Options profile_options;
   profile_options.max_tokens_per_batch(16384).max_seqs_per_batch(16);
-  ProfileManager profile_manager(profile_engine.get(), profile_options);
+  auto profile_manager =
+      ProfileManagerTestPeer::make(profile_engine.get(), profile_options);
 
   std::vector<std::shared_ptr<Request>> requests =
       generate_request({static_cast<int32_t>(kPromptTokens),
@@ -686,7 +688,7 @@ TEST(SchedulerPolicyTest, UnifiedRetryRefreshesHostRestoreBeforeChunkSizing) {
       .running_sequences = running_sequences,
       .running_sequences_budgets = running_sequence_budgets,
       .kv_cache_manager = &block_manager_pool,
-      .profile_manager = &profile_manager,
+      .profile_manager = profile_manager.get(),
       .output_dispatcher = nullptr,
       .model_args = model_args,
       .last_step_prefill = last_step_prefill,
@@ -830,7 +832,8 @@ TEST(SchedulerPolicyTest, DefersWhileAsyncBlockReleaseIsPending) {
   auto profile_engine = std::make_unique<FakeEngine>(256, 128);
   ProfileManager::Options profile_options;
   profile_options.max_tokens_per_batch(16384).max_seqs_per_batch(16);
-  ProfileManager profile_manager(profile_engine.get(), profile_options);
+  auto profile_manager =
+      ProfileManagerTestPeer::make(profile_engine.get(), profile_options);
 
   std::vector<std::shared_ptr<Request>> requests = generate_request(
       {34025}, {2}, std::nullopt, std::nullopt, /*max_context_len=*/40000);
@@ -854,7 +857,7 @@ TEST(SchedulerPolicyTest, DefersWhileAsyncBlockReleaseIsPending) {
       .running_sequences = running_sequences,
       .running_sequences_budgets = running_sequence_budgets,
       .kv_cache_manager = &block_manager_pool,
-      .profile_manager = &profile_manager,
+      .profile_manager = profile_manager.get(),
       .output_dispatcher = nullptr,
       .model_args = model_args,
       .last_step_prefill = last_step_prefill,

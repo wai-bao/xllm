@@ -847,6 +847,7 @@ class SlotSamplingInputTest
               binding_->sampling_params().all_random_sample);
     EXPECT_EQ(reference.logprobs, binding_->sampling_params().logprobs);
     EXPECT_EQ(reference.return_probs, binding_->sampling_params().return_probs);
+    EXPECT_EQ(reference.is_rerank, binding_->sampling_params().is_rerank);
     EXPECT_EQ(reference.max_top_logprobs,
               binding_->sampling_params().max_top_logprobs);
     ASSERT_EQ(aclrtSynchronizeStream(launch_->get_stream()->stream()),
@@ -922,6 +923,7 @@ TEST_P(SlotSamplingInputTest, FixedAddressesSurviveShapeAndFeatureChanges) {
   for (int32_t round = 0; round < 16; ++round) {
     SCOPED_TRACE(round);
     SamplingParameters input = make_input(1 + round % 4, 1 + round % 7);
+    input.is_rerank = round % 2 != 0;
     if (round == 15) {
       input.top_k.fill_(/*value=*/-7);
     }
@@ -1074,7 +1076,7 @@ TEST_P(SlotSamplingInputTest,
 TEST_P(SlotSamplingInputTest,
        RealSamplerMatchesTokensProbabilitiesAndRngProgress) {
   const torch::Tensor original_rng = rng_state();
-  for (int32_t mode = 0; mode < 7; ++mode) {
+  for (int32_t mode = 0; mode < 8; ++mode) {
     SCOPED_TRACE(mode);
     SamplingParameters input = make_input(/*rows=*/4, /*width=*/6);
     if (mode == 0 || mode == 5) {
@@ -1113,7 +1115,7 @@ TEST_P(SlotSamplingInputTest,
     auto guard = launch_->set_stream_guard();
     torch::Tensor old_logits = initial_logits.clone();
     const torch::Tensor start_rng = rng_state();
-    const SampleOutput expected = Sampler().forward(old_logits, legacy);
+    const SampleOutput expected = Sampler::forward(old_logits, legacy);
     ASSERT_EQ(aclrtSynchronizeStream(launch_->get_stream()->stream()),
               ACL_SUCCESS);
     const torch::Tensor end_rng = rng_state();
@@ -1123,13 +1125,14 @@ TEST_P(SlotSamplingInputTest,
     handoff();
     torch::Tensor new_logits = initial_logits.clone();
     const SampleOutput actual =
-        Sampler().forward(new_logits, binding_->sampling_params());
+        Sampler::forward(new_logits, binding_->sampling_params());
     ASSERT_EQ(aclrtSynchronizeStream(launch_->get_stream()->stream()),
               ACL_SUCCESS);
     EXPECT_TRUE(torch::equal(end_rng, rng_state()));
     expect_equal(old_logits, new_logits);
     expect_equal(expected.next_tokens, actual.next_tokens);
     expect_equal(expected.probs, actual.probs);
+    expect_equal(expected.logits, actual.logits);
     expect_equal(expected.logprobs, actual.logprobs);
     expect_equal(expected.top_logprobs, actual.top_logprobs);
     expect_equal(expected.top_tokens, actual.top_tokens);

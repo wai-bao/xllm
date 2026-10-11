@@ -19,22 +19,15 @@ limitations under the License.
 
 namespace xllm {
 
-class ProcessGroup;
-
 class DFlash2WorkerImpl final : public DFlashWorkerImpl {
  public:
-  DFlash2WorkerImpl(const ParallelArgs& parallel_args,
-                    const torch::Device& device,
-                    const runtime::Options& options);
+  using DFlashWorkerImpl::DFlashWorkerImpl;
 
   ~DFlash2WorkerImpl() override = default;
 
  protected:
   DraftBlock run_decode_draft(const LlmForwardInput& input,
                               LlmForwardInput& validate_input) override;
-
- private:
-  ProcessGroup* sampling_process_group_ = nullptr;
 };
 
 }  // namespace xllm

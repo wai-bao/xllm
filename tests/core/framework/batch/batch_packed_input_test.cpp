@@ -857,6 +857,8 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackRestoresSampleIdxes) {
   input.sampling_params.filter_bitmask =
       torch::tensor({{static_cast<int32_t>(0x5)}},
                     torch::TensorOptions().dtype(torch::kInt32));
+  input.sampling_params.is_rerank = true;
+  input.sampling_params.return_probs = true;
 
   proto::PackedForwardInput packed_input;
   ASSERT_TRUE(input.to_packed_proto(&packed_input));
@@ -874,6 +876,8 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackRestoresSampleIdxes) {
                                                     false));
   ASSERT_TRUE(unpacked_input.sampling_params.sample_idxes.defined());
   EXPECT_EQ(unpacked_input.input_host_sample_count, 1);
+  EXPECT_TRUE(unpacked_input.sampling_params.is_rerank);
+  EXPECT_TRUE(unpacked_input.sampling_params.return_probs);
   EXPECT_TRUE(tensor_equals_vector<int32_t>(
       unpacked_input.sampling_params.sample_idxes, {0}));
   EXPECT_TRUE(torch::equal(unpacked_input.sampling_params.min_p,
@@ -935,7 +939,7 @@ TEST(BatchPackedInputTest, NativeDomainsRejectUnsupportedPackedSchemas) {
 
   for (const auto& packed_input : packed_inputs) {
     ASSERT_GE(packed_input.payload().size(), 40u);
-    for (int32_t version : {0, 2, 4, 127}) {
+    for (int32_t version : {0, 2, 4, 5, 127}) {
       SCOPED_TRACE(version);
       std::string payload = packed_input.payload();
       payload[8] = static_cast<char>(version);

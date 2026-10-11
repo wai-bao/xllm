@@ -99,6 +99,7 @@ message DisaggRequest {
   repeated StopSequence bad_words_token_ids = 48;
   repeated int32 all_stop_token_ids = 49;
   int64 vocab_size = 50;
+  bool is_rerank = 51;
 
 }
 

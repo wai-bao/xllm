@@ -19,25 +19,11 @@ limitations under the License.
 
 #include <algorithm>
 
+#include "core/framework/sampling/logits_utils.h"
 #include "core/util/tensor_helper.h"
 
 namespace xllm {
 namespace adaptive_pruning {
-
-torch::Tensor build_pruned_prefix_masks(
-    const std::vector<int32_t>& pruned_prefix_lengths,
-    int32_t num_speculative_tokens,
-    const torch::Device& device) {
-  const int32_t num_val_tokens = num_speculative_tokens + 1;
-  torch::Tensor prefix_lengths =
-      async_h2d_tensor(
-          pruned_prefix_lengths,
-          torch::TensorOptions().dtype(torch::kLong).device(device))
-          .clamp(0, num_speculative_tokens);
-  torch::Tensor positions =
-      torch::arange(num_val_tokens, prefix_lengths.options());
-  return positions.unsqueeze(/*dim=*/0).gt(prefix_lengths.unsqueeze(/*dim=*/1));
-}
 
 torch::Tensor selected_probs_by_step(
     const std::vector<ForwardOutput>& draft_outputs) {
@@ -45,42 +31,22 @@ torch::Tensor selected_probs_by_step(
   std::vector<torch::Tensor> probs_steps;
   probs_steps.reserve(draft_outputs.size());
   int64_t batch_size = -1;
-  const auto gather_selected = [](const torch::Tensor& values,
-                                  const torch::Tensor& index) {
-    return values.gather(/*dim=*/-1, index.view({-1, 1}).to(torch::kLong))
-        .squeeze(/*dim=*/-1);
-  };
   for (const ForwardOutput& draft_output : draft_outputs) {
     torch::Tensor probs = draft_output.sample_output.probs;
     if (!probs.defined()) {
-      // Fallback: compute selected probs from logits+next_tokens on the fly.
-      // This bypasses the sampler's greedy fast-path which skips probs
-      // assignment. Avoids triggering model-side kernel paths (e.g. Qwen3.5
-      // CausalConv1d) that a sampler-side return_probs=true would touch.
-      const torch::Tensor& logits = draft_output.logits;
-      const torch::Tensor& next_tokens = draft_output.sample_output.next_tokens;
+      // Normalize only the selected score when the controller needs it.
+      const auto& sampled = draft_output.sample_output;
+      const torch::Tensor& logits = sampled.logits;
+      const torch::Tensor& next_tokens = sampled.next_tokens;
       CHECK(logits.defined() && next_tokens.defined())
           << "adaptive pruning fallback needs draft logits and next_tokens";
       CHECK_EQ(logits.dim(), 2)
           << "adaptive pruning expects draft logits [batch,vocab], got "
           << logits.sizes();
-      // Compute p_selected = exp(logit_selected - logsumexp(logits)) without
-      // materializing the dense [batch, vocab] softmax. logsumexp is a
-      // reduction to [batch]; the gather picks one column of logits. This
-      // saves batch*vocab fp32 (≈39 MiB at batch=64, vocab=152k) per draft
-      // step, executed on every adaptive decode.
-      const torch::Tensor logits_f32 = logits.to(torch::kFloat32);
-      const torch::Tensor logsumexp = torch::logsumexp(logits_f32, /*dim=*/-1);
-      const torch::Tensor selected_logits =
-          gather_selected(logits_f32, next_tokens);
-      probs = torch::exp(selected_logits - logsumexp).to(logits.dtype());
-    } else if (probs.dim() == 2 && probs.size(1) != 1) {
-      const torch::Tensor& next_tokens = draft_output.sample_output.next_tokens;
-      CHECK(next_tokens.defined())
-          << "adaptive pruning dense draft probs need next_tokens";
-      CHECK_EQ(probs.size(0), next_tokens.numel())
-          << "adaptive pruning dense draft prob batch mismatch";
-      probs = gather_selected(probs, next_tokens);
+      const auto& indices = sampled.sampled_indices.defined()
+                                ? sampled.sampled_indices
+                                : next_tokens;
+      probs = compute_selected_logprobs(logits, indices).exp();
     }
     CHECK(probs.dim() == 1 || probs.dim() == 2)
         << "adaptive pruning expects draft probs [batch] or [batch,1], got "
@@ -112,7 +78,7 @@ bool has_selected_probs_by_step(
       continue;  // ok
     }
     // Fallback: selected_probs_by_step will compute from logits+next_tokens.
-    const torch::Tensor& logits = draft_output.logits;
+    const torch::Tensor& logits = draft_output.sample_output.logits;
     const torch::Tensor& next_tokens = draft_output.sample_output.next_tokens;
     if (!logits.defined() || !next_tokens.defined()) {
       return false;
@@ -156,68 +122,6 @@ std::vector<ForwardOutput> truncate_draft_outputs(
   return truncated_outputs;
 }
 
-void apply_pruned_prefix_lengths(SampleOutput& sample_output,
-                                 int32_t num_speculative_tokens,
-                                 const torch::Tensor& drop_mask) {
-  CHECK(sample_output.next_tokens.defined())
-      << "validate output tokens are undefined";
-  CHECK_EQ(sample_output.next_tokens.dim(), 2)
-      << "validate output tokens should be [batch, width]";
-  const int32_t batch_size =
-      static_cast<int32_t>(sample_output.next_tokens.size(0));
-  const int32_t num_val_tokens = num_speculative_tokens + 1;
-  CHECK_EQ(sample_output.next_tokens.size(1), num_val_tokens)
-      << "validate output width mismatch";
-  sample_output.next_tokens.masked_fill_(drop_mask, -1);
-
-  if (sample_output.logprobs.defined()) {
-    CHECK_EQ(sample_output.logprobs.dim(), 2)
-        << "validate output logprobs should be [batch, width]";
-    CHECK_EQ(sample_output.logprobs.size(0), batch_size)
-        << "validate logprob batch mismatch";
-    CHECK_EQ(sample_output.logprobs.size(1), num_val_tokens)
-        << "validate logprob width mismatch";
-    sample_output.logprobs.masked_fill_(
-        drop_mask.to(sample_output.logprobs.device()), 0);
-  }
-
-  if (sample_output.top_tokens.defined()) {
-    CHECK(sample_output.top_logprobs.defined())
-        << "top_logprobs must be defined when top_tokens are defined";
-    CHECK_EQ(sample_output.top_tokens.dim(), 3)
-        << "validate top_tokens should be [batch, width, top_k]";
-    CHECK_EQ(sample_output.top_logprobs.dim(), 3)
-        << "validate top_logprobs should be [batch, width, top_k]";
-    CHECK_EQ(sample_output.top_tokens.size(0), batch_size)
-        << "validate top_tokens batch mismatch";
-    CHECK_EQ(sample_output.top_tokens.size(1), num_val_tokens)
-        << "validate top_tokens width mismatch";
-    CHECK_EQ(sample_output.top_logprobs.size(0), batch_size)
-        << "validate top_logprobs batch mismatch";
-    CHECK_EQ(sample_output.top_logprobs.size(1), num_val_tokens)
-        << "validate top_logprobs width mismatch";
-    const torch::Tensor top_drop_mask =
-        drop_mask.to(sample_output.top_tokens.device()).unsqueeze(/*dim=*/-1);
-    sample_output.top_tokens.masked_fill_(top_drop_mask, 0);
-    sample_output.top_logprobs.masked_fill_(
-        top_drop_mask.to(sample_output.top_logprobs.device()), 0);
-  }
-
-  if (!sample_output.embeddings.defined()) {
-    return;
-  }
-  CHECK_EQ(sample_output.embeddings.dim(), 3)
-      << "validate output embeddings should be [batch, width, hidden]";
-  CHECK_EQ(sample_output.embeddings.size(0), batch_size)
-      << "validate embedding batch mismatch";
-  CHECK_EQ(sample_output.embeddings.size(1), num_val_tokens)
-      << "validate embedding width mismatch";
-
-  const torch::Tensor embedding_drop_mask =
-      drop_mask.to(sample_output.embeddings.device()).unsqueeze(/*dim=*/-1);
-  sample_output.embeddings.masked_fill_(embedding_drop_mask, 0);
-}
-
 void scatter_varlen_target_output_to_dense(
     ForwardOutput& target_output,
     const std::vector<int32_t>& per_seq_val_tokens,
@@ -244,7 +148,7 @@ void scatter_varlen_target_output_to_dense(
   // draft[0] (anchor row) and col (seq_tokens - 1) is the per-seq bonus.
   // Trailing cols [seq_tokens, max_val_tokens) stay padded, so the bonus lands
   // at col (seq_tokens - 1), NOT the fixed last column; validate() and
-  // apply_pruned_prefix_lengths therefore read the bonus/cut position per-seq.
+  // verification therefore reads the bonus/cut position per-seq.
   std::vector<int64_t> dst_indices_vec;
   dst_indices_vec.reserve(static_cast<size_t>(total_tokens));
   for (int32_t i = 0; i < batch_size; ++i) {
@@ -256,14 +160,13 @@ void scatter_varlen_target_output_to_dense(
   torch::Tensor dst_indices =
       async_h2d_tensor(dst_indices_vec, target_output.logits.device());
 
-  // Logits pad to [B*max_val_tokens, V]. Only the padding rows need the -inf
-  // sentinel (strictly-rejecting distribution); using empty + a targeted
-  // index_fill_ over the complement of dst_indices avoids paying vocab_size ×
-  // padded_total writes when most rows get overwritten by index_copy_.
-  torch::Tensor padded_logits =
-      torch::empty({padded_total, vocab_size}, target_output.logits.options());
+  // Padded rows are excluded by each request's verification length; using
+  // empty + a targeted index_fill_ over the complement of dst_indices avoids
+  // paying a full padded_total row write when most rows get overwritten by
+  // index_copy_.
+  torch::Tensor pad_indices;
   if (dst_indices_vec.size() < static_cast<size_t>(padded_total)) {
-    std::vector<bool> valid(static_cast<size_t>(padded_total), false);
+    std::vector<uint8_t> valid(static_cast<size_t>(padded_total), 0);
     for (int64_t idx : dst_indices_vec) {
       valid[static_cast<size_t>(idx)] = true;
     }
@@ -275,22 +178,51 @@ void scatter_varlen_target_output_to_dense(
         pad_indices_vec.push_back(i);
       }
     }
-    torch::Tensor pad_indices =
+    pad_indices =
         async_h2d_tensor(pad_indices_vec, target_output.logits.device());
-    padded_logits.index_fill_(/*dim=*/0, pad_indices, -1e9);
   }
-  padded_logits.index_copy_(/*dim=*/0, dst_indices, target_output.logits);
+  // Scatter one [total_tokens, ...] tensor into a padded
+  // [padded_total, ...] buffer: fill only the padded rows, then copy the rest.
+  // The row axis is replaced by padded_total; trailing axes are preserved.
+  auto pad_rows = [&](const torch::Tensor& src,
+                      double pad_value) -> torch::Tensor {
+    std::vector<int64_t> sizes{padded_total};
+    sizes.insert(sizes.end(), src.sizes().begin() + 1, src.sizes().end());
+    torch::Tensor padded = torch::empty(sizes, src.options());
+    if (pad_indices.defined()) {
+      padded.index_fill_(/*dim=*/0, pad_indices, pad_value);
+    }
+    padded.index_copy_(/*dim=*/0, dst_indices, src);
+    return padded;
+  };
+  torch::Tensor padded_logits =
+      pad_rows(target_output.logits, /*pad_value=*/-1e9);
+  const auto& processed = target_output.sample_output.logits;
+  if (processed.defined()) {
+    target_output.sample_output.logits =
+        processed.is_same(target_output.logits)
+            ? padded_logits
+            : pad_rows(processed, /*pad_value=*/0);
+  }
   target_output.logits = padded_logits;
 
-  if (target_output.sample_output.embeddings.defined()) {
-    const int32_t hidden_size =
-        static_cast<int32_t>(target_output.sample_output.embeddings.size(-1));
-    torch::Tensor padded_embeddings =
-        torch::zeros({padded_total, hidden_size},
-                     target_output.sample_output.embeddings.options());
-    padded_embeddings.index_copy_(
-        /*dim=*/0, dst_indices, target_output.sample_output.embeddings);
-    target_output.sample_output.embeddings = padded_embeddings;
+  // Keep the sampled outputs aligned with the dense token layout; every
+  // one of them pads with 0.
+  auto& sample = target_output.sample_output;
+  if (sample.next_tokens.defined()) {
+    sample.next_tokens = pad_rows(sample.next_tokens, /*pad_value=*/0);
+  }
+  if (sample.embeddings.defined()) {
+    sample.embeddings = pad_rows(sample.embeddings, /*pad_value=*/0);
+  }
+  if (sample.logprobs.defined()) {
+    sample.logprobs = pad_rows(sample.logprobs, /*pad_value=*/0);
+  }
+  if (sample.top_tokens.defined()) {
+    sample.top_tokens = pad_rows(sample.top_tokens, /*pad_value=*/0);
+  }
+  if (sample.top_logprobs.defined()) {
+    sample.top_logprobs = pad_rows(sample.top_logprobs, /*pad_value=*/0);
   }
 }
 

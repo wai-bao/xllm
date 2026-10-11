@@ -32,6 +32,7 @@ limitations under the License.
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/rec_config.h"
 #include "framework/model/model_input_params.h"
+#include "framework/sampling/sampler.h"
 #include "util/rec_model_utils.h"
 #include "util/tensor_helper.h"
 #if defined(USE_CUDA)
@@ -524,7 +525,7 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
   // driver prepare model output
   SampleOutput sample_output;
   if (sampling_params.selected_token_idxes.defined()) {
-    sample_output = runtime_.worker.sampler_->forward(logits, sampling_params);
+    sample_output = Sampler::forward(logits, sampling_params);
     output.logits = logits;
 
     // beam search kernel
@@ -914,8 +915,7 @@ bool RecWorkerImpl::OneRecXAttentionWorkPipeline::can_use_device_constraints(
          sampling_params.selected_token_idxes.numel() ==
              sampling_params.sample_idxes.numel() &&
          sampling_params.do_sample.defined() &&
-         sampling_params.all_greedy_sample &&
-         !sampling_params.all_random_sample &&
+         sampling_params.verify_mode() == VerifyMode::GREEDY &&
          sampling_params.use_beam_search && sampling_params.logprobs &&
          sampling_params.max_top_logprobs > 0 &&
          sampling_params.max_top_logprobs == beam_width &&

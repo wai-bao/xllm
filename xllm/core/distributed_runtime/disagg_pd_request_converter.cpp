@@ -58,6 +58,7 @@ RequestSamplingParam make_disagg_sampling_param(
   sampling_param.logprobs = req.logprobs();
   sampling_param.top_logprobs = req.top_logprobs();
   sampling_param.is_embeddings = req.is_embeddings();
+  sampling_param.is_rerank = req.is_rerank();
   sampling_param.json_object = req.json_object();
   return sampling_param;
 }

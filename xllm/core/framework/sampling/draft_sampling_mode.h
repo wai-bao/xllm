@@ -21,6 +21,8 @@ limitations under the License.
 #include <cstdint>
 #include <string_view>
 
+#include "framework/sampling/verify_mode.h"
+
 namespace xllm {
 
 enum class DraftSamplingMode : int8_t {
@@ -45,9 +47,10 @@ inline DraftSamplingMode parse_draft_sampling_mode(std::string_view mode) {
   return DraftSamplingMode::GREEDY;
 }
 
-inline bool draft_probs_required(DraftSamplingMode mode,
-                                 bool all_greedy_sample) {
-  return mode == DraftSamplingMode::PROBABILISTIC && !all_greedy_sample;
+inline bool draft_logits_required(DraftSamplingMode mode,
+                                  VerifyMode verify_mode) {
+  return mode == DraftSamplingMode::PROBABILISTIC &&
+         verify_mode != VerifyMode::GREEDY;
 }
 
 }  // namespace xllm

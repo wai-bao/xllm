@@ -17,16 +17,19 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include "core/framework/model/causal_lm.h"
+#include "core/framework/sampling/draft_sampling_mode.h"
 #include "core/framework/sampling/gumbel_sampling.h"
+#include "core/framework/sampling/sampling_params.h"
 
 namespace xllm {
 
-DFlash2SampleOutput sample_dflash2_path(
-    const DFlash2CandidateOutput& candidates,
-    const SamplingParameters& sampling_params,
-    const torch::Tensor& gumbel_noise,
-    int64_t vocab_size,
-    bool need_dense_probs) {
+DraftProposal sample_dflash2_path(const DFlash2CandidateOutput& candidates,
+                                  const SamplingParameters& sampling_params,
+                                  DraftSamplingMode mode,
+                                  const torch::Tensor& gumbel_noise) {
+  const bool need_logits =
+      draft_logits_required(mode, sampling_params.verify_mode());
   CHECK_EQ(candidates.candidate_ids.dim(), 3);
   CHECK_EQ(candidates.edge_logits.dim(), 4);
   const int64_t batch_size = candidates.candidate_ids.size(0);
@@ -40,81 +43,62 @@ DFlash2SampleOutput sample_dflash2_path(
   const torch::TensorOptions float_options =
       torch::TensorOptions().dtype(torch::kFloat32).device(device);
 
-  // Pre-compute log_softmax(edge_logits / temperature) for every step at
-  // once.  The previous implementation re-scaled and re-normalized the
-  // gathered row inside each step through the generic sampler, which lowered
-  // to an AICPU multinomial plus a per-step consensus broadcast and left the
-  // compute stream idle between steps.  Gumbel-max over the same
-  // log-probabilities draws from exactly the same distribution:
-  //   argmax(log_softmax(logits / T) + g) ~ categorical(softmax(logits / T))
-  // and greedy rows (zeroed noise) collapse to plain argmax.  Target-side
-  // truncation, penalties, and grammar constraints are applied by
-  // verification and must not be applied a second time to the selector's
-  // top-k candidate distribution.
-  torch::Tensor edge_log_probs = candidates.edge_logits.to(torch::kFloat32);
+  // A row-wise normalizer does not change Gumbel-max. Retain the selected
+  // conditional logits and compact candidate support for lazy verification.
+  torch::Tensor edge_logits = candidates.edge_logits.to(torch::kFloat32);
   if (sampling_params.temperatures.defined()) {
     apply_selector_temperatures(
-        edge_log_probs, sampling_params.temperatures, batch_size);
+        edge_logits, sampling_params.temperatures, batch_size);
   }
-  edge_log_probs = torch::log_softmax(edge_log_probs, /*dim=*/-1);
 
   torch::Tensor token_ids =
       torch::empty({batch_size, num_steps}, candidates.candidate_ids.options());
-  torch::Tensor candidate_probs;
-  if (need_dense_probs) {
-    candidate_probs =
-        torch::empty({batch_size, num_steps, top_k}, float_options);
+  torch::Tensor path_logits;
+  if (need_logits) {
+    path_logits = torch::empty({batch_size, num_steps, top_k}, float_options);
   }
+  torch::Tensor path_indices =
+      need_logits ? torch::empty_like(token_ids) : torch::Tensor();
   torch::Tensor previous_indices =
       torch::zeros({batch_size}, candidates.candidate_ids.options());
 
-  using ISlice = torch::indexing::Slice;
   for (int64_t step = 0; step < num_steps; ++step) {
-    torch::Tensor edge = edge_log_probs.select(/*dim=*/1, /*index=*/step);
+    torch::Tensor edge = edge_logits.select(/*dim=*/1, /*index=*/step);
     torch::Tensor gather_indices = previous_indices.view({batch_size, 1, 1})
                                        .expand({batch_size, 1, top_k});
-    torch::Tensor row_log_probs =
-        edge.gather(/*dim=*/1, gather_indices).squeeze(/*dim=*/1);
+    // Gather straight into the stored path slice (the same
+    // slice-destination pattern the dspark chain uses): no per-step
+    // [B, top_k] temporary, no copy back.
+    torch::Tensor row_logits;
+    if (need_logits) {
+      row_logits = path_logits.select(/*dim=*/1, /*index=*/step).unsqueeze(1);
+      torch::gather_out(row_logits, edge, /*dim=*/1, gather_indices);
+      row_logits = row_logits.squeeze(/*dim=*/1);
+    } else {
+      row_logits = edge.gather(/*dim=*/1, gather_indices).squeeze(/*dim=*/1);
+    }
     torch::Tensor sampled_indices = gumbel_argmax(
-        row_log_probs, gumbel_noise.select(/*dim=*/1, /*index=*/step));
+        row_logits, gumbel_noise.select(/*dim=*/1, /*index=*/step));
 
     torch::Tensor step_candidates =
         candidates.candidate_ids.select(/*dim=*/1, /*index=*/step);
     torch::Tensor sampled_tokens =
         step_candidates.gather(/*dim=*/1, sampled_indices.view({-1, 1}))
             .view({-1});
-    if (need_dense_probs) {
-      // Random rows expose the full softmax over the top-k candidates;
-      // deterministic rows expose a one-hot at the selected candidate.
-      torch::Tensor step_probs;
-      if (sampling_params.all_random_sample) {
-        step_probs = row_log_probs.exp();
-      } else {
-        torch::Tensor greedy_probs =
-            torch::zeros({batch_size, top_k}, float_options);
-        greedy_probs.scatter_(/*dim=*/1,
-                              sampled_indices.view({-1, 1}),
-                              /*value=*/1.0);
-        step_probs =
-            torch::where(sampling_params.do_sample.view({batch_size, 1}),
-                         row_log_probs.exp(),
-                         greedy_probs);
-      }
-      candidate_probs.index_put_({ISlice(), step, ISlice()}, step_probs);
+    if (need_logits) {
+      path_indices.select(/*dim=*/1, /*index=*/step).copy_(sampled_indices);
     }
-    token_ids.index_put_({ISlice(), step}, sampled_tokens);
+    token_ids.select(/*dim=*/1, /*index=*/step).copy_(sampled_tokens);
     previous_indices = sampled_indices;
   }
 
-  if (!need_dense_probs) {
-    return {.token_ids = std::move(token_ids), .dense_probs = torch::Tensor()};
+  if (!need_logits) {
+    return DraftProposal(std::move(token_ids));
   }
-  torch::Tensor dense_probs =
-      torch::zeros({batch_size, num_steps, vocab_size}, float_options);
-  dense_probs.scatter_(
-      /*dim=*/-1, candidates.candidate_ids, candidate_probs);
-  return {.token_ids = std::move(token_ids),
-          .dense_probs = std::move(dense_probs)};
+  return DraftProposal(std::move(token_ids),
+                       std::move(path_logits),
+                       candidates.candidate_ids,
+                       std::move(path_indices));
 }
 
 }  // namespace xllm

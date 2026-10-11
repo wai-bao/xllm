@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/framework/speculative/mtp_utils.h"
 #include "core/runtime/options.h"
 #include "platform/platform.h"
+#include "profile_manager_test_peer.h"
 #include "runtime/decode_graph_bucket.h"
 #include "scheduler/profile/decode_graph_warmup_plan.h"
 #include "scheduler/profile/graph_warmup.h"
@@ -673,10 +674,10 @@ TEST(GraphWarmupTest, MarksOrdinaryProfileRequestsAsSyntheticLoad) {
   RecordingProfileEngine engine;
   ProfileManager::Options options;
   options.max_tokens_per_batch(4).max_seqs_per_batch(1).dp_size(1);
-  ProfileManager profile_manager(&engine, options);
+  auto profile_manager = ProfileManagerTestPeer::make(&engine, options);
   engine.reset_profile_markers();
 
-  profile_manager.run_request(/*token_length=*/4, /*prefix_length=*/0);
+  profile_manager->run_request(/*token_length=*/4, /*prefix_length=*/0);
 
   EXPECT_TRUE(engine.all_requests_marked());
 }
@@ -694,12 +695,12 @@ TEST(GraphWarmupTest, DecodeProfileUsesConfiguredSpeculativeGeometry) {
       .instance_role(InstanceRole::DECODE)
       .decode_graph_execution_shape(
           build_decode_graph_execution_shape(target_options));
-  ProfileManager profile_manager(&engine, options);
+  auto profile_manager = ProfileManagerTestPeer::make(&engine, options);
 
-  profile_manager.profile_decode_step_time(/*token_length=*/5,
-                                           /*batch_size=*/1,
-                                           /*min_context_len=*/5,
-                                           /*max_context_len=*/5);
+  profile_manager->profile_decode_step_time(/*token_length=*/5,
+                                            /*batch_size=*/1,
+                                            /*min_context_len=*/5,
+                                            /*max_context_len=*/5);
 
   // Five context tokens plus four decode tokens need three four-token blocks.
   EXPECT_EQ(engine.observed_kv_capacities(), (std::vector<size_t>{12, 12, 12}));
@@ -727,7 +728,7 @@ TEST(GraphWarmupTest, OrdinaryStepsWarmBucketsAndDrainBeforeReleasingKv) {
         .enable_profile_step_time(false)
         .enable_profile_kv_blocks(false)
         .instance_role(InstanceRole::DECODE);
-    ProfileManager profile_manager(&engine, options);
+    auto profile_manager = ProfileManagerTestPeer::make(&engine, options);
     EXPECT_EQ(engine.observed_batches(), (std::vector<int32_t>{4, 2, 1}));
     EXPECT_EQ(engine.pending_steps(), 0);
     EXPECT_EQ(engine.block_manager_pool()->num_used_blocks(), used_blocks);

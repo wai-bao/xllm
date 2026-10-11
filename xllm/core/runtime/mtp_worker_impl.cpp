@@ -16,6 +16,9 @@ limitations under the License.
 #include "core/runtime/mtp_worker_impl.h"
 
 #include <glog/logging.h>
+
+#include "framework/sampling/draft_sampling_prepare.h"
+#include "framework/sampling/rejection_sampler.h"
 #if defined(USE_NPU)
 #include <acl/acl.h>
 #include <c10/core/DeviceType.h>
@@ -119,56 +122,7 @@ bool has_active_dp_tokens(const Input& input) {
   });
 }
 
-void broadcast_tokens_in_group(torch::Tensor& tokens,
-                               ProcessGroup* process_group,
-                               int32_t root_rank = 0) {
-  if (process_group == nullptr || process_group->world_size() <= 1 ||
-      !tokens.defined()) {
-    return;
-  }
-  tokens = tokens.contiguous();
-  process_group->broadcast(tokens, root_rank);
-}
-
-bool should_broadcast_spec_tokens(const ParallelArgs& parallel_args,
-                                  bool enable_spec_token_broadcast,
-                                  bool all_greedy_sample) {
-  const bool use_orthogonal_cp_consensus =
-      parallel_args.cp_size() > 1 && parallel_args.tp_group_ != nullptr &&
-      parallel_args.cp_group_ != nullptr &&
-      parallel_args.cp_group_ != parallel_args.tp_group_;
-  return use_orthogonal_cp_consensus ||
-         (enable_spec_token_broadcast && !all_greedy_sample);
-}
-
 constexpr int64_t kMaxSpecVerifyGraphUpdateBlockTableWidth = (1 << 15) - 1;
-
-// Speculative state is replicated across every model rank within one DP
-// replica. With orthogonal CP x TP, tp_group_ covers only one CP shard, while
-// cp_group_ connects the same TP rank across CP shards. Broadcast along both
-// axes so every replica caches and consumes the same sampled token, without
-// crossing into another DP replica through the world group.
-void broadcast_spec_tokens(torch::Tensor& tokens,
-                           const ParallelArgs& parallel_args) {
-  // DeepSeek-V4 TORCH publishes orthogonal TP and CP groups. Other backends
-  // retain their existing single-group speculative broadcast behavior.
-  ProcessGroup* tp_group = parallel_args.tp_group_ != nullptr
-                               ? parallel_args.tp_group_
-                               : parallel_args.process_group_;
-  const bool use_orthogonal_cp_consensus =
-      parallel_args.cp_size() > 1 && parallel_args.tp_group_ != nullptr &&
-      parallel_args.cp_group_ != nullptr &&
-      parallel_args.cp_group_ != parallel_args.tp_group_;
-  if (!use_orthogonal_cp_consensus) {
-    broadcast_tokens_in_group(tokens, tp_group);
-    return;
-  }
-
-  broadcast_tokens_in_group(tokens, parallel_args.tp_group_);
-  if (parallel_args.cp_group_ != parallel_args.tp_group_) {
-    broadcast_tokens_in_group(tokens, parallel_args.cp_group_);
-  }
-}
 
 template <typename Input>
 void record_metadata_ready_event(Stream& stream, Input& input) {
@@ -492,7 +446,6 @@ ParallelArgs mtp_draft_parallel_args(const ParallelArgs& parallel_args,
 
 }  // namespace
 
-using adaptive_pruning::apply_pruned_prefix_lengths;
 using adaptive_pruning::clamp_prefix_lengths;
 using adaptive_pruning::has_selected_probs_by_step;
 using adaptive_pruning::max_pruned_prefix_length;
@@ -859,9 +812,7 @@ template <typename TargetInput>
   capacity.index_topk = args.index_topk();
   capacity.reuse_topk = args.index_share_for_mtp_iteration();
   if (get_optimization_config().enable_spec_token_broadcast) {
-    capacity.common.sampling_group = parallel_args_.tp_group_ != nullptr
-                                         ? parallel_args_.tp_group_
-                                         : parallel_args_.process_group_;
+    capacity.common.sampling_group = spec_broadcast_group(parallel_args_);
   }
   capacity.draft_sampling_mode = draft_sampling_mode_;
   status = TaskExecutionPipeline::create(threadpool_,
@@ -1277,7 +1228,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_prefill(
     const TargetInput& input) {
   flush_pending_target_context();
 
-  Timer target_timer;
+  Timer timer;
   TargetInput target_prepared;
   LlmForwardInput draft_prepared;
 
@@ -1285,7 +1236,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_prefill(
   ForwardOutput output =
       run_worker_no_sync(*impl_, input, target_prepared).value();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
-              target_timer.elapsed_seconds());
+              timer.elapsed_seconds());
 
   // MTP path that depends on hidden states.
   LlmForwardInput prefill_input;
@@ -1301,12 +1252,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_prefill(
     // CP shard samples independently unless this token is synchronized across
     // both axes; caching divergent tokens makes the first decode input disagree
     // with the non-driver CP shard's DecodeState.
-    if (should_broadcast_spec_tokens(
-            parallel_args_,
-            get_optimization_config().enable_spec_token_broadcast,
-            input.sampling_params.all_greedy_sample)) {
-      broadcast_spec_tokens(output.sample_output.next_tokens, parallel_args_);
-    }
+    maybe_broadcast_spec_tokens(output.sample_output.next_tokens,
+                                input.sampling_params.verify_mode());
     if (embeddings.defined()) {
       prefill_input.input_params.embedding.input_embedding = embeddings.clone();
     }
@@ -1321,7 +1268,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_prefill(
     }
   }
   // generate kv cache for draft model
-  Timer draft_timer;
+  timer.reset();
   ForwardOutput draft_output =
       run_worker_no_sync(*draft_impl_, prefill_input, draft_prepared).value();
   {
@@ -1329,7 +1276,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_prefill(
     process_draft_sample_output(draft_output.sample_output);
   }
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
-              draft_timer.elapsed_seconds());
+              timer.elapsed_seconds());
 
   if (input.sampling_params.selected_token_idxes.defined()) {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
@@ -1355,7 +1302,7 @@ void MTPWorkerImpl<TargetInput>::prepare_prefill_inputs(
     LlmForwardInput& prefill_input) {
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
   prefill_input = make_llm_draft_input(input).to(device_, dtype_);
-  prepare_draft_sampling(prefill_input.sampling_params);
+  prepare_mtp_draft_sampling(prefill_input.sampling_params);
   clear_ready_events(prefill_input);
   // Draft prefill consumes target hidden states, not vision inputs.
   auto& input_params = prefill_input.input_params;
@@ -1392,21 +1339,6 @@ void MTPWorkerImpl<TargetInput>::prepare_prefill_inputs(
                                     /*non_blocking=*/true);
   prefill_input.runtime.device_tensors_ready = true;
   finish_metadata_prepare(*prepare_stream_, prefill_input);
-}
-
-template <typename TargetInput>
-void MTPWorkerImpl<TargetInput>::prepare_draft_sampling(
-    SamplingParameters& sampling_params) const {
-  if (draft_sampling_mode_ == DraftSamplingMode::GREEDY) {
-    force_greedy_draft_sampling(sampling_params);
-  } else {
-    sampling_params.logprobs = false;
-    sampling_params.max_top_logprobs = 0;
-    // Qwen3.5 derives adaptive probabilities from logits instead.
-    sampling_params.return_probs =
-        !sampling_params.all_greedy_sample ||
-        (adaptive_enabled() && !supports_explicit_spec_verify_replay_update());
-  }
 }
 
 template <typename TargetInput>
@@ -1483,8 +1415,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
   detail::JsonDraftValidationScratch json_scratch;
   const bool has_json_object_states = !input.json_object_states.empty();
   std::vector<uint8_t> json_invalid_suffix;
-  // Records before the validate tail so its phases stay out of this window.
-  Timer draft_timer;
+  Timer timer;
   CHECK(embedding_cache_ != nullptr) << "MTP embedding cache is not allocated";
 
   prepare_draft_input(input);
@@ -1704,13 +1635,9 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
             draft_outputs.back().mtp_topk_state, draft_sampling_params);
       }
       // Keep draft tokens consistent across the consensus group.
-      if (should_broadcast_spec_tokens(
-              parallel_args_,
-              get_optimization_config().enable_spec_token_broadcast,
-              draft_sampling_params.all_greedy_sample)) {
-        SampleOutput& draft_sample = draft_outputs.back().sample_output;
-        broadcast_spec_tokens(draft_sample.next_tokens, parallel_args_);
-      }
+      SampleOutput& draft_sample = draft_outputs.back().sample_output;
+      maybe_broadcast_spec_tokens(draft_sample.next_tokens,
+                                  draft_sampling_params.verify_mode());
       process_draft_sample_output(draft_outputs.back().sample_output);
     }
     bool halt_json_draft = false;
@@ -1799,7 +1726,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
     record_current_metadata_ready_event(current_draft_input, *compute_stream_);
   }
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
-              draft_timer.elapsed_seconds());
+              timer.elapsed_seconds());
   if (use_adaptive_speculative_decode) {
     return run_adaptive_validate(
         input, draft_outputs, validate_input, num_speculative_tokens);
@@ -2103,8 +2030,9 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
 
 // Run target model validate with per-seq variable-length support.
 // When all seqs have the same val_tokens (uniform case), uses zero-copy view.
-// When variable-length, pads logits to [batch * max_val_tokens, vocab] for
-// RejectionSampler compatibility, with -inf at padding positions.
+// When variable-length, pads logits to [batch * max_val_tokens, vocab] in
+// the dense layout; padded rows are excluded by each request's verification
+// length.
 template <typename TargetInput>
 std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
     const TargetInput& input,
@@ -2114,7 +2042,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
     const std::vector<int32_t>& per_seq_val_tokens,
     const std::vector<int32_t>* pruned_prefix_lengths,
     const detail::JsonDraftValidationScratch* json_scratch) {
-  Timer target_timer;
+  Timer timer;
   TargetInput target_prepared;
   fill_validate_input_from_draft_outputs(input,
                                          draft_outputs,
@@ -2133,7 +2061,6 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
   }
   sync_dp_global_token_nums_after_prune(validate_input.input_params,
                                         local_total_val_tokens);
-
   ForwardOutput target_output;
   if (uses_embedded_eagle3_draft()) {
     target_output =
@@ -2147,24 +2074,23 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
                         .value();
   }
   COUNTER_ADD(speculative_execution_latency_seconds_target,
-              target_timer.elapsed_seconds());
+              timer.elapsed_seconds());
 
   const int32_t batch_size = static_cast<int32_t>(per_seq_val_tokens.size());
   const int32_t max_val_tokens = num_speculative_tokens + 1;
   const int32_t total_tokens =
       static_cast<int32_t>(target_output.logits.size(0));
-  const int32_t vocab_size =
-      static_cast<int32_t>(target_output.logits.size(-1));
   const int64_t padded_total =
       static_cast<int64_t>(batch_size) * max_val_tokens;
 
-  // For the uniform fast path we only need to reinterpret target_output.logits
-  // as `[padded_total, vocab]` — no ForwardOutput copy required. Only the
-  // variable-length slow path materializes a separate padded output.
+  // Only the variable-length slow path materializes a separate padded
+  // output; the uniform fast path passes target_output through unchanged
+  // (validate reads sample_output logits/tokens directly).
   std::optional<ForwardOutput> padded_target_output_slow;
   const bool needs_padding =
       (total_tokens != static_cast<int32_t>(padded_total));
   if (needs_padding) {
+    // Slow path: per-seq variable-length, scatter into padded layout.
     padded_target_output_slow.emplace(target_output);
     adaptive_pruning::scatter_varlen_target_output_to_dense(
         *padded_target_output_slow,
@@ -2172,17 +2098,6 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
         batch_size,
         max_val_tokens);
   }
-  // Uniform fast path uses a scoped local ForwardOutput whose only diff is
-  // logits viewed to [padded_total, vocab]; slow path uses the materialized
-  // padded copy above. Both are const-ref'd into validate() below.
-  ForwardOutput uniform_target_view;
-  if (!needs_padding) {
-    uniform_target_view = target_output;
-    uniform_target_view.logits =
-        target_output.logits.view({padded_total, vocab_size});
-  }
-  const ForwardOutput& target_output_for_validate =
-      needs_padding ? *padded_target_output_slow : uniform_target_view;
 
   const bool prelaunch_next_first_draft =
       pruned_prefix_lengths == nullptr && can_prelaunch_next_first_draft(input);
@@ -2200,29 +2115,27 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
   }
 
   // verify the proposals with target and update the batch
+  timer.reset();
   SampleOutput val_output;
   {
-    AUTO_COUNTER(speculative_execution_latency_seconds_validation);
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-    val_output = validate(input.sampling_params,
-                          draft_outputs,
-                          target_output_for_validate,
-                          num_speculative_tokens,
-                          pruned_prefix_lengths,
-                          validate_input.json_object_invalid_draft);
+    val_output =
+        validate(input.sampling_params,
+                 draft_outputs,
+                 needs_padding ? *padded_target_output_slow : target_output,
+                 num_speculative_tokens,
+                 pruned_prefix_lengths,
+                 validate_input.json_object_invalid_draft);
   }
+  COUNTER_ADD(speculative_execution_latency_seconds_validation,
+              timer.elapsed_seconds());
 
   if (pruned_prefix_lengths != nullptr || uses_embedded_eagle3_draft()) {
     // Adaptive pruning path: per-seq validate width is variable, which is
     // incompatible with the async handoff's fixed-width base-state derivation.
     // Use the synchronous tail: unify tokens, then write target context inline.
-    if (should_broadcast_spec_tokens(
-            parallel_args_,
-            get_optimization_config().enable_spec_token_broadcast,
-            input.sampling_params.all_greedy_sample)) {
-      c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-      broadcast_spec_tokens(val_output.next_tokens, parallel_args_);
-    }
+    maybe_broadcast_spec_tokens(val_output.next_tokens,
+                                input.sampling_params.verify_mode());
 
     const int32_t ret = compute_stream_->synchronize();
     CHECK_EQ(ret, 0) << "failed to synchronize MTP compute stream, ret=" << ret;
@@ -2236,6 +2149,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
     }
     return finalize_verify_output(std::move(target_output),
                                   std::move(val_output),
+                                  input.sampling_params,
                                   pruned_prefix_lengths,
                                   input.json_object_states);
   }
@@ -2259,12 +2173,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
 
     // Catch-all for cross-rank RNG divergence: unify accepted tokens before
     // deriving any device-resident state used by the next draft iteration.
-    if (should_broadcast_spec_tokens(
-            parallel_args_,
-            get_optimization_config().enable_spec_token_broadcast,
-            input.sampling_params.all_greedy_sample)) {
-      broadcast_spec_tokens(val_output.next_tokens, parallel_args_);
-    }
+    maybe_broadcast_spec_tokens(val_output.next_tokens,
+                                input.sampling_params.verify_mode());
 
     base_positions = validate_positions.view({batch_size, num_val_tokens})
                          .select(/*dim=*/1, /*index=*/0)
@@ -2397,6 +2307,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
   }
   return finalize_verify_output(std::move(target_output),
                                 std::move(val_output),
+                                input.sampling_params,
                                 /*pruned_prefix_lengths=*/nullptr,
                                 input.json_object_states);
 }
@@ -2796,14 +2707,6 @@ bool MTPWorkerImpl<TargetInput>::adaptive_enabled() const {
 }
 
 template <typename TargetInput>
-void MTPWorkerImpl<TargetInput>::process_draft_sample_output(
-    SampleOutput& sample_output) {
-  if (draft_sampling_mode_ == DraftSamplingMode::GREEDY) {
-    sample_output.probs = torch::Tensor();
-  }
-}
-
-template <typename TargetInput>
 void MTPWorkerImpl<TargetInput>::update_decode_step_input(
     TargetInput& input,
     const std::vector<EmbeddingCache::DecodeState>& last_states) const {
@@ -2927,8 +2830,6 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
   validate_input = input.clone();
   clear_ready_events(validate_input);
   validate_input.runtime.device_tensors_ready = false;
-  validate_input.skip_sampling_for_logits_only = true;
-  validate_input.skip_process_logits = true;
   auto& input_params = validate_input.input_params;
   input_params.embedding.input_embedding = torch::Tensor();
   torch::TensorOptions token_options = validate_input.token_ids.options();
@@ -3092,26 +2993,14 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
   // for sampling, penalties, multi-sequence batches and other backends.
   const bool use_stable_greedy_validate_sampling =
       use_explicit_spec_verify_replay_update &&
-      validate_sampling_params.all_greedy_sample &&
+      validate_sampling_params.verify_mode() == VerifyMode::GREEDY &&
       validate_sampling_params.selected_token_idxes.defined() &&
       validate_sampling_params.selected_token_idxes.numel() == 1 &&
       validate_sampling_params.sample_idxes.defined() &&
       validate_sampling_params.sample_idxes.numel() == 1 &&
       validate_sampling_params.do_sample.defined() &&
       validate_sampling_params.do_sample.numel() == 1 &&
-      !validate_sampling_params.frequency_penalties.defined() &&
-      !validate_sampling_params.presence_penalties.defined() &&
-      !validate_sampling_params.repetition_penalties.defined() &&
-      !validate_sampling_params.temperatures.defined() &&
-      !validate_sampling_params.top_p.defined() &&
-      !validate_sampling_params.min_p.defined() &&
-      !validate_sampling_params.seed_offsets.defined() &&
-      !validate_sampling_params.seeds.defined() &&
-      !validate_sampling_params.logits_bias.defined() &&
-      !validate_sampling_params.top_k.defined() &&
-      !validate_sampling_params.unique_token_ids.defined() &&
-      !validate_sampling_params.unique_token_counts.defined() &&
-      !validate_sampling_params.unique_token_ids_lens.defined();
+      !validate_sampling_params.has_sampling_modifiers();
   if (use_stable_greedy_validate_sampling) {
     if (!mtp_validate_greedy_indices_.defined() ||
         mtp_validate_greedy_indices_.numel() != total_num_val_tokens) {
@@ -3124,9 +3013,10 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
     validate_sampling_params.selected_token_idxes =
         mtp_validate_greedy_indices_;
     validate_sampling_params.sample_idxes = mtp_validate_greedy_indices_;
-    validate_sampling_params.do_sample = mtp_validate_greedy_do_sample_;
-    validate_sampling_params.all_random_sample = false;
-    validate_sampling_params.all_greedy_sample = true;
+    prepare_draft_sampling(validate_sampling_params,
+                           DraftSamplingMode::GREEDY,
+                           /*need_selected_probs=*/false,
+                           mtp_validate_greedy_do_sample_);
   } else {
     update_sampling_params(
         validate_sampling_params, num_val_tokens, total_num_val_tokens);
@@ -3379,8 +3269,6 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
   validate_input = input.clone();
   clear_ready_events(validate_input);
   validate_input.runtime.device_tensors_ready = false;
-  validate_input.skip_sampling_for_logits_only = true;
-  validate_input.skip_process_logits = true;
   auto& input_params = validate_input.input_params;
   input_params.embedding.input_embedding = torch::Tensor();
   torch::TensorOptions token_options = validate_input.token_ids.options();
@@ -3589,7 +3477,7 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_extend_inputs(
     prepare_stream_->wait_stream(*compute_stream_);
   }
   extend_input = make_llm_draft_input(base_input);
-  prepare_draft_sampling(extend_input.sampling_params);
+  prepare_mtp_draft_sampling(extend_input.sampling_params);
   clear_ready_events(extend_input);
   extend_input.runtime.device_tensors_ready = false;
   auto& input_params = extend_input.input_params;
@@ -3834,7 +3722,7 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_inputs(
     int32_t position_offset) {
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
   draft_input = make_llm_draft_input(input);
-  prepare_draft_sampling(draft_input.sampling_params);
+  prepare_mtp_draft_sampling(draft_input.sampling_params);
   clear_ready_events(draft_input);
   draft_input.runtime.device_tensors_ready = false;
 
@@ -3907,21 +3795,16 @@ SampleOutput MTPWorkerImpl<TargetInput>::validate(
     int32_t num_speculative_tokens,
     const std::vector<int32_t>* pruned_prefix_lengths,
     const std::vector<uint8_t>& invalid_draft) {
-  std::vector<torch::Tensor> draft_token_ids_steps;
-  std::vector<torch::Tensor> draft_probs_steps;
-  draft_token_ids_steps.reserve(draft_outputs.size());
-  draft_probs_steps.reserve(draft_outputs.size());
-  for (const auto& draft_output : draft_outputs) {
-    draft_token_ids_steps.emplace_back(draft_output.sample_output.next_tokens);
-    draft_probs_steps.emplace_back(draft_output.sample_output.probs);
+  const bool need_draft_logits = draft_logits_required(
+      draft_sampling_mode_, sampling_params.verify_mode());
+  std::vector<const SampleOutput*> steps;
+  steps.reserve(draft_outputs.size());
+  for (const auto& output : draft_outputs) {
+    steps.push_back(&output.sample_output);
   }
+  DraftProposal draft_proposal =
+      DraftProposal::from_steps(steps, need_draft_logits);
 
-  DraftProposal draft_proposal = specBuilder::build_validate_proposal(
-      draft_token_ids_steps,
-      draft_probs_steps,
-      /*draft_probs_required=*/
-      draft_probs_required(draft_sampling_mode_,
-                           sampling_params.all_greedy_sample));
   return validate(sampling_params,
                   draft_proposal,
                   target_output,
@@ -3938,20 +3821,24 @@ SampleOutput MTPWorkerImpl<TargetInput>::validate(
     int32_t num_speculative_tokens,
     const std::vector<int32_t>* pruned_prefix_lengths,
     const std::vector<uint8_t>& invalid_draft) {
+  const int32_t num_target_tokens =
+      target_output.sample_output.next_tokens.numel();
   const int32_t num_val_tokens = num_speculative_tokens + 1;
-  const int32_t batch_size =
-      static_cast<int32_t>(draft_proposal.token_ids().size(0));
-  const int32_t vocab_size = target_output.logits.size(/*dim=*/-1);
-
+  CHECK_EQ(num_target_tokens % num_val_tokens, 0);
+  const int32_t batch_size = num_target_tokens / num_val_tokens;
+  const auto& processed_logits = target_output.sample_output.logits;
+  CHECK(processed_logits.defined());
+  const int32_t vocab_size = processed_logits.size(-1);
   const bool step_major_validate_layout = uses_step_major_validate_layout();
+  torch::Tensor target_next_tokens = target_output.sample_output.next_tokens;
   torch::Tensor target_logits;
-  torch::Tensor target_embeddings;
+  torch::Tensor target_embeddings = target_output.sample_output.embeddings;
   if (step_major_validate_layout) {
+    target_next_tokens = target_next_tokens.view({num_val_tokens, batch_size})
+                             .transpose(/*dim0=*/0, /*dim1=*/1);
     target_logits =
-        target_output.logits.view({num_val_tokens, batch_size, vocab_size})
-            .permute({1, 0, 2})
-            .contiguous();
-    target_embeddings = target_output.sample_output.embeddings;
+        processed_logits.view({num_val_tokens, batch_size, vocab_size})
+            .permute({1, 0, 2});
     if (target_embeddings.defined()) {
       target_embeddings =
           target_embeddings
@@ -3961,48 +3848,32 @@ SampleOutput MTPWorkerImpl<TargetInput>::validate(
     }
   } else {
     target_logits =
-        target_output.logits.view({batch_size, num_val_tokens, vocab_size});
+        processed_logits.view({batch_size, num_val_tokens, vocab_size});
   }
-
-  // Grammar-invalid draft positions carry the -1 sentinel directly in the
-  // proposal token ids; the rejection sampler rejects negative ids.
-  torch::Tensor validation_token_ids;
-  if (!invalid_draft.empty()) {
-    CHECK_EQ(invalid_draft.size(),
-             static_cast<size_t>(batch_size * (num_val_tokens - 1)))
-        << "MTP invalid draft mask shape mismatch";
-    torch::Tensor invalid_mask =
-        async_h2d_tensor(invalid_draft, draft_proposal.token_ids().device())
-            .view({batch_size, num_val_tokens - 1})
-            .to(torch::kBool);
-    validation_token_ids =
-        draft_proposal.token_ids().masked_fill(invalid_mask, /*sentinel=*/-1);
-  }
-  SampleOutput sample_output = spec_verify::run_rejection_sampling(
-      {.do_sample = sampling_params.do_sample,
-       .all_random_sample = sampling_params.all_random_sample,
-       .all_greedy_sample = sampling_params.all_greedy_sample},
-      DraftProposal(validation_token_ids.defined() ? validation_token_ids
-                                                   : draft_proposal.token_ids(),
-                    draft_proposal.draft_probs()),
-      target_logits,
-      target_output);
-  // Only the step-major layout needs the permuted embeddings copy.
-  if (step_major_validate_layout) {
-    sample_output.embeddings = target_embeddings;
-  }
-
+  // The target sampler owns all logit processing, including grammar masks.
+  // Workers only adapt model layouts and upload host validation metadata.
+  torch::Tensor lengths;
   if (pruned_prefix_lengths != nullptr) {
-    const torch::Tensor pruning_masks =
-        adaptive_pruning::build_pruned_prefix_masks(
-            *pruned_prefix_lengths,
-            num_speculative_tokens,
-            sample_output.next_tokens.device());
-    apply_pruned_prefix_lengths(
-        sample_output, num_speculative_tokens, pruning_masks);
+    // Verify clamps to [0, num_steps] per row and converts the int32
+    // upload to int64 alongside its clamp.
+    lengths =
+        async_h2d_tensor(*pruned_prefix_lengths, target_next_tokens.device());
   }
-
-  return sample_output;
+  torch::Tensor invalid_mask;
+  if (!invalid_draft.empty()) {
+    invalid_mask = async_h2d_tensor(invalid_draft, target_next_tokens.device())
+                       .view({batch_size, num_val_tokens - 1});
+  }
+  return RejectionSampler::verify(
+      sampling_params,
+      draft_proposal,
+      target_logits,
+      target_next_tokens.view({batch_size, num_val_tokens}),
+      lengths,
+      invalid_mask,
+      // Step-major embeddings arrive already adapted to [B, W, H]; the
+      // batch-major branch adapts inside verify, so one path covers both.
+      target_embeddings);
 }
 
 template class MTPWorkerImpl<LlmForwardInput>;

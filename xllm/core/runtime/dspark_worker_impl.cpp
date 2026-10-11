@@ -25,18 +25,11 @@ limitations under the License.
 #include "core/framework/sampling/dspark_sampling.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "framework/parallel_state/process_group.h"
+#include "framework/sampling/draft_sampling_prepare.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/timer.h"
 
 namespace xllm {
-
-DSparkWorkerImpl::DSparkWorkerImpl(const ParallelArgs& parallel_args,
-                                   const torch::Device& device,
-                                   const runtime::Options& options)
-    : DFlashWorkerImpl(parallel_args, device, options),
-      sampling_process_group_(parallel_args.tp_group_ != nullptr
-                                  ? parallel_args.tp_group_
-                                  : parallel_args.process_group_) {}
 
 DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
     const LlmForwardInput& input,
@@ -106,12 +99,11 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
            num_speculative_tokens,
            draft_output->selected_hidden.size(-1)});
     } else {
-      // The current lm_head backend did not surface selected_hidden. Fall
-      // back to sampler-gathered probs as the adaptive signal — ConfidenceHead
-      // stays a nice-to-have; adaptive pruning still works (a little coarser).
+      // Without ConfidenceHead input the existing controller keeps the full
+      // validation width; it does not substitute proposal probabilities.
       LOG_FIRST_N(WARNING, 1)
           << "DSpark: draft did not expose selected_hidden; ConfidenceHead "
-          << "disabled for adaptive pruning, using proposal probs.";
+          << "disabled for adaptive pruning, keeping full validation width.";
     }
   }
 
@@ -119,9 +111,10 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::run_decode_draft(
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     SamplingParameters sampling_params_on_device = input.sampling_params.to(
         base_logits.device(), base_logits.scalar_type());
-    if (draft_sampling_mode_ == DraftSamplingMode::GREEDY) {
-      force_greedy_draft_sampling(sampling_params_on_device);
-    }
+    // prepare_draft_sampling owns all draft-loop entries: under GREEDY it
+    // forces the dispatch flags independent of the request's do_sample, and
+    // it always suppresses score outputs.
+    prepare_draft_sampling(sampling_params_on_device, draft_sampling_mode_);
     return sample_block(
         base_logits, last_hidden, anchor_token_ids, sampling_params_on_device);
   }();
@@ -154,13 +147,13 @@ DSparkWorkerImpl::BlockSample DSparkWorkerImpl::sample_block(
     CHECK_EQ(last_hidden.size(1), num_speculative_tokens)
         << "DSpark last_hidden n_spec mismatch.";
   }
-  const bool need_draft_probs = draft_probs_required(
-      draft_sampling_mode_, sampling_params.all_greedy_sample);
+  const bool need_draft_logits = draft_logits_required(
+      draft_sampling_mode_, sampling_params.verify_mode());
   auto proposal = sample_dspark_block(
       base_logits,
       anchor_token_ids,
       sampling_params,
-      need_draft_probs,
+      need_draft_logits,
       [this](const torch::Tensor& previous) {
         return draft_impl_->dspark_markov_bias(previous);
       },
@@ -168,6 +161,8 @@ DSparkWorkerImpl::BlockSample DSparkWorkerImpl::sample_block(
         synchronize_sampled_token_ids(tokens, sampling_params);
       });
   const auto& token_ids = proposal.token_ids();
+  // Filled after the sample loop by a single batched ConfidenceHead call;
+  // stays undefined when confidence is disabled.
   torch::Tensor confidence_probs;
 
   // ConfidenceHead over the whole block, batched. Equivalent to computing it
@@ -196,12 +191,11 @@ DSparkWorkerImpl::BlockSample DSparkWorkerImpl::sample_block(
 void DSparkWorkerImpl::synchronize_sampled_token_ids(
     torch::Tensor& sampled_token_ids,
     const SamplingParameters& sampling_params) const {
-  if (sampling_params.all_greedy_sample || sampling_process_group_ == nullptr ||
-      sampling_process_group_->world_size() <= 1) {
+  if (sampling_params.verify_mode() == VerifyMode::GREEDY) {
     return;
   }
-  sampled_token_ids = sampled_token_ids.contiguous();
-  sampling_process_group_->broadcast(sampled_token_ids, /*root_rank=*/0);
+  sampled_token_ids = broadcast_tokens_in_group(
+      sampled_token_ids, spec_broadcast_group(parallel_args_));
 }
 
 }  // namespace xllm

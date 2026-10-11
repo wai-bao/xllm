@@ -31,18 +31,21 @@ torch::Tensor sample_gumbel_noise(int64_t batch_size,
   CHECK_GT(num_classes, 0);
   const torch::TensorOptions float_options =
       torch::TensorOptions().dtype(torch::kFloat32).device(device);
-  if (sampling_params.all_greedy_sample) {
+  const VerifyMode mode = sampling_params.verify_mode();
+  if (mode == VerifyMode::GREEDY) {
     return torch::zeros({batch_size, num_steps, num_classes}, float_options);
   }
   CHECK(sampling_params.do_sample.defined())
       << "Gumbel sampling requires do_sample to be defined";
 
-  // Gumbel(0, 1) = -log(-log(U)), U ~ Uniform(0, 1).
-  torch::Tensor uniform =
+  // Gumbel(0, 1) = -log(-log(U)), U ~ Uniform(0, 1). The fresh random tensor
+  // is private, so the whole chain runs in place: zero temporaries.
+  torch::Tensor gumbel =
       torch::rand({batch_size, num_steps, num_classes}, float_options);
-  uniform.clamp_min_(std::numeric_limits<float>::min());
-  torch::Tensor gumbel = uniform.log().neg().log().neg();
-  if (!sampling_params.all_random_sample) {
+  gumbel.clamp_min_(std::numeric_limits<float>::min());
+  gumbel.log_().neg_().log_().neg_();
+  if (mode == VerifyMode::MIXED) {
+    // Greedy rows use zero noise so argmax is unchanged.
     torch::Tensor greedy_mask =
         sampling_params.do_sample.to(device, torch::kBool)
             .logical_not()
@@ -66,9 +69,9 @@ void apply_selector_temperatures(torch::Tensor& logits,
   logits.div_(scaled);
 }
 
-torch::Tensor gumbel_argmax(const torch::Tensor& log_probs,
+torch::Tensor gumbel_argmax(const torch::Tensor& logits,
                             const torch::Tensor& gumbel_noise) {
-  return (log_probs + gumbel_noise).argmax(/*dim=*/-1);
+  return (logits + gumbel_noise).argmax(/*dim=*/-1);
 }
 
 }  // namespace xllm

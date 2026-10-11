@@ -22,14 +22,13 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/mtp_topk_state.h"
-#include "core/framework/sampling/draft_proposal.h"
 #include "util/slice.h"
 
 namespace xllm {
 
 class ModelInputParams;
 class LlmForwardInput;
-struct SamplingParameters;
+class SamplingParameters;
 
 namespace specBuilder {
 
@@ -201,11 +200,6 @@ void set_token_position_tensors(Input& input,
 MtpTopkStatePtr select_mtp_topk_state_for_next_step(
     const MtpTopkStatePtr& state,
     const SamplingParameters& sampling_params);
-
-DraftProposal build_validate_proposal(
-    const std::vector<torch::Tensor>& draft_token_ids_steps,
-    const std::vector<torch::Tensor>& draft_probs_steps,
-    bool draft_probs_required);
 
 }  // namespace specBuilder
 

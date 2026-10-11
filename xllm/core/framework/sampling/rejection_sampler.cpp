@@ -16,12 +16,11 @@ limitations under the License.
 
 #include "rejection_sampler.h"
 
-#include <ATen/core/TensorBody.h>
-#include <ATen/ops/stack.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
 
-#include <optional>
+#include <algorithm>
+#include <limits>
 
 #include "sampler.h"
 
@@ -34,270 +33,319 @@ limitations under the License.
 namespace xllm {
 
 namespace {
-// index_select that supports multiple dimensions index
-torch::Tensor index_select_2d(const torch::Tensor& input,
-                              int64_t dim,
-                              const torch::Tensor& index) {
-  return input.gather(dim, index.unsqueeze(dim)).squeeze(dim);
-}
 
 torch::Tensor normalize_recovered_probs(torch::Tensor recovered_probs) {
   const auto sums = recovered_probs.sum(/*dim=*/-1, /*keepdim=*/true);
-  // A zero residual has no valid normalization; fall back to uniform.
+  // A zero residual has no valid normalization; fall back to uniform. The
+  // clamp keeps ratios untouched for positive sums; renormalize below fixes
+  // the clamped rows.
   const double uniform_prob =
       1.0 / static_cast<double>(recovered_probs.size(-1));
-  recovered_probs.div_(sums.clamp_min(1e-6));
+  recovered_probs.div_(sums.clamp_min(std::numeric_limits<float>::min()));
   recovered_probs.masked_fill_(sums <= 0, uniform_prob);
   return recovered_probs;
 }
 
-torch::Tensor sample_recovered_tokens(
-    const DraftProposal& draft_proposal,
-    const torch::Tensor& target_probs,
-    const torch::Tensor& clamped_draft_token_ids) {
-  const std::optional<torch::Tensor>& draft_probs =
-      draft_proposal.draft_probs();
+// [B, 1] per-request first-reject index; the appended zero column sends
+// fully-accepted rows past the last draft slot so the bonus column survives
+// the mask.
+torch::Tensor first_reject_index(const torch::Tensor& accepted) {
+  const auto combined =
+      torch::constant_pad_nd(accepted.to(torch::kInt64), {0, 1}, 0);
+  return combined.argmin(/*dim=*/1, /*keepdim=*/true);
+}
+
+// Only the first rejection needs a full target distribution. For compact
+// proposals, subtract q on its support without expanding it to [B, N, V].
+// The caller's shared normalization, when available, replaces the softmax:
+// recovered = exp(values - normalizer) at the reject slot, one gather on an
+// already-normalized pair instead of a fresh full-vocab softmax.
+torch::Tensor resample_first_reject(const DraftProposal& proposal,
+                                    const torch::Tensor& target_logits,
+                                    const torch::Tensor& reject_index,
+                                    const NormalizedLogits* normalized) {
+  const auto& tokens = proposal.token_ids();
+  const auto row_slot = reject_index.clamp_max(tokens.size(1) - 1);
+  const auto slot = row_slot.unsqueeze(-1);
   torch::Tensor recovered_probs;
-  if (draft_probs.has_value()) {
-    recovered_probs = target_probs.sub(draft_probs.value()).clamp_min_(0);
+  if (normalized != nullptr) {
+    // In-place on the fresh gather: no chained [B, 1, V] temporaries.
+    auto values = normalized->values.take_along_dim(slot, 1);
+    recovered_probs =
+        values.sub_(normalized->normalizer.take_along_dim(slot.squeeze(-1), 1))
+            .exp_();
   } else {
-    recovered_probs = target_probs.clone();
-    recovered_probs.scatter_(
-        /*dim=*/-1, clamped_draft_token_ids.unsqueeze(-1), /*value=*/0);
+    recovered_probs = torch::softmax(
+        target_logits.take_along_dim(slot, 1), -1, torch::kFloat32);
   }
-  // Sentinel-carrying positions are force-rejected; they recover from the
-  // full target distribution instead of the residual.
-  recovered_probs =
-      torch::where(draft_proposal.token_ids().unsqueeze(/*dim=*/-1).ge(0),
-                   recovered_probs,
-                   target_probs);
-  return Sampler::random_sample(normalize_recovered_probs(recovered_probs));
+  if (proposal.is_greedy()) {
+    recovered_probs.scatter_(-1, tokens.gather(1, row_slot).unsqueeze(-1), 0);
+  } else {
+    const auto q = torch::softmax(
+        proposal.logits()->take_along_dim(slot, 1), -1, torch::kFloat32);
+    if (proposal.vocab_ids().defined()) {
+      recovered_probs.scatter_add_(
+          -1, proposal.support_at(slot, q).to(torch::kLong), -q);
+      recovered_probs.clamp_min_(0);
+    } else {
+      recovered_probs.sub_(q).clamp_min_(0);
+    }
+  }
+  return Sampler::random_sample(normalize_recovered_probs(recovered_probs))
+      .to(tokens.scalar_type());
 }
 
-torch::Tensor mask_out_after_first_reject(
-    const torch::Tensor& accepted_bool,
-    const torch::Tensor& accepted_token_ids) {
-  const auto accepted_mask =
-      RejectionSampler::build_accepted_mask(accepted_bool);
-  return torch::where(accepted_mask,
-                      accepted_token_ids,
-                      torch::full_like(accepted_token_ids, -1));
+// Selected-token logprobs for the verify output. The negative-token
+// clamp/mask convention lives here alone: rejected positions gather from
+// row 0 and are zeroed afterwards, so every caller of this helper (logprobs
+// output, probs output) shares one definition. With the caller's shared
+// normalization the top-k tail reads the dense pair; a null pointer (greedy
+// scores-only batches, no top-k) takes the gather-first path and never
+// materializes the dense FP32 copy.
+void populate_selected_scores(SampleOutput& output,
+                              const NormalizedLogits* normalized,
+                              const torch::Tensor& target_logits,
+                              int64_t max_top_logprobs) {
+  if (normalized != nullptr) {
+    output.logprobs = selected_logprobs(*normalized, output.next_tokens);
+  } else {
+    output.logprobs =
+        compute_selected_logprobs(target_logits, output.next_tokens);
+  }
+  output.logprobs.masked_fill_(output.next_tokens.lt(0), 0);
+  if (normalized != nullptr && max_top_logprobs > 0) {
+    const int64_t k = std::min(max_top_logprobs, normalized->values.size(-1));
+    auto [top_values, top_indices] = normalized->values.topk(k, -1);
+    output.top_logprobs = top_values - normalized->normalizer.unsqueeze(-1);
+    output.top_tokens = top_indices;
+  }
 }
 
-std::tuple<torch::Tensor, torch::Tensor> finalize_random_sample(
-    const torch::Tensor& accepted,
-    const torch::Tensor& recovered_token_ids,
-    const torch::Tensor& draft_token_ids,
-    const torch::Tensor& bonus_token_ids,
-    bool mask_out_rejected_tokens) {
-  auto combined = torch::where(accepted, draft_token_ids, recovered_token_ids);
-  auto accepted_token_ids = torch::cat({combined, bonus_token_ids}, /*dim=*/-1);
-  torch::Tensor masked_accepted_token_ids;
-  if (mask_out_rejected_tokens) {
-    masked_accepted_token_ids =
-        mask_out_after_first_reject(accepted, accepted_token_ids);
-  }
-  return {accepted_token_ids, masked_accepted_token_ids};
+// Prefix-mask [B, n_tokens + 1] token ids: each row keeps its positions
+// 0..reject_index and becomes -1 afterwards. The sentinel index n_tokens from
+// first_reject_index lets fully-accepted rows keep the appended bonus column.
+// In-place on the caller's freshly built tensor (both call sites pass a local
+// torch::cat result): no [B, N+1] temporary.
+torch::Tensor mask_out_after_first_reject(torch::Tensor accepted_token_ids,
+                                          const torch::Tensor& reject_index) {
+  const int64_t n_tokens = accepted_token_ids.size(1) - 1;
+  const auto indices =
+      torch::arange(n_tokens + 1, reject_index.device()).unsqueeze(/*dim=*/0);
+  accepted_token_ids.masked_fill_(indices.gt(reject_index), -1);
+  return accepted_token_ids;
 }
 
 }  // namespace
 
-RejectionSampler::RejectionSampler(const torch::Tensor& do_sample,
-                                   bool all_random_sample,
-                                   bool all_greedy_sample,
-                                   bool logprobs,
-                                   int64_t max_top_logprobs)
-    : logprobs_(logprobs),
-      max_top_logprobs_(max_top_logprobs),
-      all_random_sample_(all_random_sample),
-      all_greedy_sample_(all_greedy_sample) {
-  CHECK(do_sample.defined());
-  // Keep a private expanded view and do not mutate the caller-owned tensor.
-  // The same SamplingParameters object is reused later by MTP draft extend.
-  // An in-place unsqueeze here corrupts Sampler::forward() mixed-mode shape
-  // assumptions and can broadcast sampled token ids into 2D.
-  do_sample_ = do_sample.unsqueeze(/*dim=*/-1);
+torch::Tensor RejectionSampler::random_sample(
+    const DraftProposal& proposal,
+    const torch::Tensor& target_logits,
+    const torch::Tensor& uniform_rand,
+    const torch::Tensor& bonus_token_ids,
+    const NormalizedLogits* normalized) {
+  const auto& tokens = proposal.token_ids();
+  if (tokens.size(1) == 0) {
+    return bonus_token_ids;
+  }
+  // One FP32 materialization of the target logits serves both the acceptance
+  // gather here and the score outputs in verify: normalized (when provided)
+  // is the caller's full-width [B, N+1, V] pass over the same logits, so the
+  // draft-position gather slices the N draft columns out of it; the
+  // standalone path normalizes alone.
+  torch::Tensor log_acceptance;
+  if (normalized != nullptr) {
+    // The caller's pass covers [B, N+1, V]; the draft-position gather slices
+    // the N draft columns via zero-copy narrow views of the shared pair.
+    log_acceptance =
+        selected_logprobs({normalized->values.narrow(1, 0, tokens.size(1)),
+                           normalized->normalizer.narrow(1, 0, tokens.size(1))},
+                          tokens);
+  } else {
+    log_acceptance = compute_selected_logprobs(target_logits, tokens);
+  }
+  if (!proposal.is_greedy()) {
+    const auto& indices =
+        proposal.vocab_ids().defined() ? proposal.sampled_indices() : tokens;
+    log_acceptance -=
+        compute_selected_logprobs(proposal.logits().value(), indices);
+  }
+  // uniform_rand arrives already in the log domain from the dispatch caller.
+  const auto accepted = uniform_rand < log_acceptance;
+  const auto reject_index = first_reject_index(accepted);
+  const auto recovered =
+      resample_first_reject(proposal, target_logits, reject_index, normalized);
+  return mask_out_after_first_reject(
+      torch::cat({torch::where(accepted, tokens, recovered), bonus_token_ids},
+                 -1),
+      reject_index);
 }
 
-SampleOutput RejectionSampler::forward(const DraftProposal& draft_proposal,
-                                       const torch::Tensor& target_logits,
-                                       bool mask_out_rejected_tokens) const {
-  draft_proposal.validate(
-      /*expected_batch_size=*/do_sample_.size(0),
-      /*expected_vocab_size=*/target_logits.size(-1),
-      /*expected_num_speculative_tokens=*/target_logits.size(1) - 1);
-  const torch::Tensor& draft_token_ids = draft_proposal.token_ids();
-
-  torch::Tensor bonus_token_ids;
-  torch::Tensor target_probs;
-  torch::Tensor full_greedy_token_ids;
-  if (all_greedy_sample_) {
-    full_greedy_token_ids = Sampler::greedy_sample(target_logits);
-    bonus_token_ids =
-        full_greedy_token_ids.select(/*dim=*/1, -1).unsqueeze(/*dim=*/-1);
-  } else {
-    const torch::Tensor full_probs =
-        torch::softmax(target_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
-    bonus_token_ids =
-        Sampler::random_sample(full_probs.select(/*dim=*/1, -1).contiguous())
-            .to(torch::kLong)
-            .view({target_logits.size(0), 1});
-    target_probs = full_probs.slice(
-        /*dim=*/1, /*start=*/0, /*end=*/target_logits.size(1) - 1);
-    if (!all_random_sample_) {
-      full_greedy_token_ids = Sampler::greedy_sample(target_logits);
-      const torch::Tensor greedy_bonus =
-          full_greedy_token_ids.select(/*dim=*/1, -1).unsqueeze(/*dim=*/-1);
-      bonus_token_ids = torch::where(do_sample_, bonus_token_ids, greedy_bonus);
+SampleOutput RejectionSampler::verify(const SamplingParameters& params,
+                                      const DraftProposal& proposal,
+                                      const torch::Tensor& target_logits,
+                                      const torch::Tensor& target_tokens,
+                                      const torch::Tensor& draft_lengths,
+                                      const torch::Tensor& invalid_draft,
+                                      const torch::Tensor& target_embeddings) {
+  CHECK_EQ(target_tokens.dim(), 2);
+  CHECK_EQ(target_logits.dim(), 3);
+  CHECK_EQ(target_logits.size(0), target_tokens.size(0));
+  CHECK_EQ(target_logits.size(1), target_tokens.size(1));
+  CHECK_EQ(params.do_sample.numel(), target_tokens.size(0));
+  const int64_t batch_size = target_tokens.size(0);
+  const int64_t num_steps = target_tokens.size(1) - 1;
+  proposal.validate(batch_size, target_logits.size(-1), num_steps);
+  torch::Tensor cut;
+  const bool has_cut = draft_lengths.defined() || invalid_draft.defined();
+  auto bonus = target_tokens.narrow(1, num_steps, 1);
+  if (has_cut) {
+    const auto cut_options = target_tokens.options().dtype(torch::kLong);
+    if (draft_lengths.defined()) {
+      CHECK_EQ(draft_lengths.numel(), batch_size);
+      cut = draft_lengths.to(cut_options)
+                .view({batch_size, 1})
+                .clamp(0, num_steps);
     }
+    if (invalid_draft.defined()) {
+      CHECK_EQ(invalid_draft.sizes(), proposal.token_ids().sizes());
+      const auto invalid_reject = first_reject_index(
+          ~invalid_draft.to(target_tokens.device(), torch::kBool));
+      cut =
+          cut.defined() ? torch::minimum(cut, invalid_reject) : invalid_reject;
+    }
+    bonus = target_tokens.gather(1, cut);
   }
-  const torch::Tensor greedy_target_token_ids =
-      full_greedy_token_ids.defined()
-          ? full_greedy_token_ids.narrow(
-                /*dim=*/1,
-                /*start=*/0,
-                /*length=*/target_logits.size(1) - 1)
-          : torch::Tensor();
-
-  torch::Tensor accepted_token_ids;
-  torch::Tensor masked_accepted_token_ids;
-
-  auto random_sample_dispatch =
-      [&]() -> std::tuple<torch::Tensor, torch::Tensor> {
-    const torch::Tensor uniform_rand =
-        torch::rand(draft_token_ids.sizes(), target_probs.options());
-    return random_sample(draft_proposal,
-                         target_probs,
-                         uniform_rand,
-                         bonus_token_ids,
-                         mask_out_rejected_tokens);
-  };
-
-  auto greedy_sample_dispatch =
-      [&]() -> std::tuple<torch::Tensor, torch::Tensor> {
-    CHECK_EQ(greedy_target_token_ids.sizes(), draft_token_ids.sizes())
-        << "target and draft token shapes must match";
-    // Grammar-invalid drafts carry the -1 sentinel, which never equals a
-    // target argmax, so the comparison itself forces the rejection.
-#if defined(USE_NPU)
-    if (greedy_target_token_ids.device().type() ==
-        c10::DeviceType::PrivateUse1) {
-      return kernel::npu::tilelang::greedy_prefix_verify(
-          draft_token_ids,
-          greedy_target_token_ids,
-          bonus_token_ids,
-          mask_out_rejected_tokens);
-    }
-#endif
-    torch::Tensor greedy_accepted =
-        torch::cat({greedy_target_token_ids, bonus_token_ids}, /*dim=*/-1);
-    torch::Tensor greedy_masked;
-    if (mask_out_rejected_tokens) {
-      auto accepted = (greedy_target_token_ids == draft_token_ids);
-      greedy_masked = mask_out_after_first_reject(accepted, greedy_accepted);
-    }
-    return {greedy_accepted, greedy_masked};
-  };
-
-  if (all_greedy_sample_) {
-    std::tie(accepted_token_ids, masked_accepted_token_ids) =
-        greedy_sample_dispatch();
-  } else if (all_random_sample_) {
-    std::tie(accepted_token_ids, masked_accepted_token_ids) =
-        random_sample_dispatch();
-  } else {
-    // mixed sample, sample both then choose based on do_sample_
-    auto [random, masked_random] = random_sample_dispatch();
-    auto [greedy, masked_greedy] = greedy_sample_dispatch();
-    accepted_token_ids = torch::where(do_sample_, random, greedy);
-    if (mask_out_rejected_tokens) {
-      masked_accepted_token_ids =
-          torch::where(do_sample_, masked_random, masked_greedy);
-    }
-  }
-
   SampleOutput output;
-  output.next_tokens =
-      mask_out_rejected_tokens ? masked_accepted_token_ids : accepted_token_ids;
-
-  if (logprobs_) {
-    // log_softmax is equivalent to log(softmax) but more numerically stable
-    // [batch_size, n_speculative_tokens + 1, vocab_size]
-    auto target_logprobs = torch::log_softmax(
-        target_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
-
-    // select the logprobs for each sequence
-    const auto selected_logprobs =
-        index_select_2d(target_logprobs, /*dim=*/-1, accepted_token_ids);
-    // output.probs = selected_probs;
-    output.logprobs = selected_logprobs;
-
-    if (max_top_logprobs_ > 0) {
-      auto [values, indices] =
-          target_logprobs.topk(max_top_logprobs_, /*dim=*/-1);
-      output.top_logprobs = values;
-      output.top_tokens = indices;
+  // Coerce the draft ids to the target device once at the shared entry: both
+  // the token-match fast path and the logits rejection path need it. Every
+  // member .to() short-circuits to shared storage on a matching device, so
+  // the copy is only paid when actually needed.
+  const DraftProposal coerced = proposal.coerce_to(target_tokens);
+  const torch::Tensor& draft_token_ids = coerced.token_ids();
+  // The bonus row is sampled by the target worker and does not participate in
+  // rejection sampling, so drop it before scoring draft positions.
+  const torch::Tensor target_draft_logits =
+      target_logits.narrow(1, 0, num_steps);
+  // Fresh random tensor, log taken in place to avoid a second [B, N]
+  // allocation; -log(U) ~ Exp(1) is the acceptance threshold's other side.
+  const auto draw_acceptance_noise = [&]() -> torch::Tensor {
+    return torch::rand(draft_token_ids.sizes(),
+                       target_logits.options().dtype(torch::kFloat32))
+        .log_();
+  };
+  // Dense [B, N+1, V] FP32 normalization ownership: built only when some
+  // consumer needs the full width — top-k scores, or the RANDOM/MIXED
+  // acceptance gather and first-reject recovery that share it (one
+  // materialization per step, never normalized twice). A greedy
+  // scores-only batch consumes just the selected gather and takes the
+  // gather-first path with no dense copy; without scores nothing
+  // materializes at all.
+  const bool needs_scores = params.needs_scores();
+  const bool needs_dense_normalization =
+      needs_scores && (params.max_top_logprobs > 0 ||
+                       params.verify_mode() != VerifyMode::GREEDY);
+  const std::optional<NormalizedLogits> normalized =
+      needs_dense_normalization
+          ? std::make_optional(normalized_logits(target_logits))
+          : std::nullopt;
+  // The greedy leg's target rows and the score-bearing normalization are
+  // shared across verify-mode arms; hoist them so the arms stay in sync.
+  const NormalizedLogits* normalized_scores =
+      normalized ? &*normalized : nullptr;
+  const torch::Tensor target_draft_tokens =
+      target_tokens.narrow(1, 0, num_steps);
+  switch (params.verify_mode()) {
+    case VerifyMode::GREEDY:
+      // Greedy batches match target token ids directly instead of
+      // re-deriving them from the logits.
+      output.next_tokens = greedy_sample_from_token_ids(
+          draft_token_ids, target_draft_tokens, bonus);
+      break;
+    case VerifyMode::RANDOM:
+      output.next_tokens = random_sample(coerced,
+                                         target_draft_logits,
+                                         draw_acceptance_noise(),
+                                         bonus,
+                                         normalized_scores);
+      break;
+    case VerifyMode::MIXED: {
+      // Mixed batch: sample both paths, then choose per row from do_sample.
+      // The greedy leg reads the target sampler's own greedy rows out of
+      // target_tokens (they are argmax of the same logits) instead of paying
+      // a full-vocab argmax; the do_sample rows overwrite them below.
+      const auto random = random_sample(coerced,
+                                        target_draft_logits,
+                                        draw_acceptance_noise(),
+                                        bonus,
+                                        normalized_scores);
+      const auto greedy = greedy_sample_from_token_ids(
+          draft_token_ids, target_draft_tokens, bonus);
+      output.next_tokens =
+          torch::where(params.do_sample.unsqueeze(-1), random, greedy);
+      break;
     }
+  }
+  if (has_cut) {
+    // An earlier rejection wins. Only a still-reachable boundary is replaced
+    // by its independently sampled target token; positions past the cut take
+    // the shared -1 sentinel, applied in place (one masked_fill launch).
+    const auto columns =
+        torch::arange(num_steps + 1, cut.options()).view({1, -1});
+    output.next_tokens =
+        torch::where((columns == cut) & output.next_tokens.ge(0),
+                     target_tokens,
+                     output.next_tokens);
+    output.next_tokens.masked_fill_(columns > cut, -1);
+  }
+  // Score outputs share one definition of the rejected-position convention:
+  // populate_selected_scores clamps the gather to row 0 and zeroes the mask,
+  // and probs ≡ logprobs.exp() wherever both exist. The logprobs field stays
+  // undefined unless the request asked for it (downstream padding and
+  // serialization branch on its definedness).
+  if (needs_scores) {
+    // The null normalization is the greedy scores-only case (no top-k):
+    // populate_selected_scores takes the gather-first path for it.
+    populate_selected_scores(
+        output, normalized_scores, target_logits, params.max_top_logprobs);
+    // probs ≡ logprobs.exp() under the shared emission contract; exp(0) at
+    // a rejected slot would read as certainty 1.0, so re-mask it.
+    emit_selected_scores(
+        output, params, output.logprobs, target_logits.scalar_type());
+    if (output.probs.defined()) {
+      output.probs.masked_fill_(output.next_tokens.lt(0), 0);
+    }
+    if (!params.logprobs) {
+      output.logprobs = torch::Tensor();
+    }
+  }
+  // The verify output carries the target's embeddings as a batch-major
+  // [B, n_spec + 1, H] view; callers never re-attach them.
+  if (target_embeddings.defined()) {
+    output.embeddings = target_embeddings.view({target_tokens.size(0),
+                                                target_tokens.size(1),
+                                                target_embeddings.size(-1)});
   }
   return output;
 }
 
-// build mask from accepted matrix
-// for example: [[1, 1, 0, 1],   ->   [[1, 1, 1, 0, 0],
-//               [1, 0, 0, 0]]         [1, 1, 0, 0, 0]]
-torch::Tensor RejectionSampler::build_accepted_mask(
-    const torch::Tensor& accepted) {
-  // build the mask for the first rejected token
-  const auto batch_size = accepted.size(0);
-  const auto n_tokens = accepted.size(1);
-
-  // use LongTensor since argmax does not support bool
-  auto accepted_int64 = accepted.to(torch::kInt64);
-  auto bonus_mask = torch::zeros({batch_size, 1}, accepted_int64.options());
-  auto combined_mask = torch::cat({accepted_int64, bonus_mask}, /*dim=*/-1);
-  // [batch_size, 1]
-  auto first_rejected_mask =
-      (1 - combined_mask).argmax(/*dim=*/1, /*keepdim=*/true);
-
-  // [1, n_speculative_tokens + 1]
-  auto indices =
-      torch::arange(n_tokens + 1, accepted.device()).unsqueeze(/*dim=*/0);
+torch::Tensor RejectionSampler::greedy_sample_from_token_ids(
+    const torch::Tensor& draft_token_ids,
+    const torch::Tensor& target_token_ids,
+    const torch::Tensor& bonus_token_ids) {
+  CHECK_EQ(target_token_ids.sizes(), draft_token_ids.sizes())
+      << "target and draft token shapes must match";
+#if defined(USE_NPU)
+  if (target_token_ids.device().type() == c10::DeviceType::PrivateUse1) {
+    return kernel::npu::tilelang::greedy_prefix_verify(
+        draft_token_ids, target_token_ids, bonus_token_ids);
+  }
+#endif
   // [batch_size, n_speculative_tokens + 1]
-  auto accepted_mask = indices <= first_rejected_mask;
-  return accepted_mask;
-}
-
-std::tuple<torch::Tensor, torch::Tensor> RejectionSampler::random_sample(
-    const DraftProposal& draft_proposal,
-    const torch::Tensor& target_probs,
-    const torch::Tensor& uniform_rand,
-    const torch::Tensor& bonus_token_ids,
-    bool mask_out_rejected_tokens) {
-  const torch::Tensor& draft_token_ids = draft_proposal.token_ids();
-  const std::optional<torch::Tensor>& draft_probs =
-      draft_proposal.draft_probs();
-  const torch::Tensor clamped_draft_token_ids = draft_token_ids.clamp_min(0);
-  auto selected_target_probs =
-      index_select_2d(target_probs, /*dim=*/-1, clamped_draft_token_ids);
-
-  // Greedy proposals use q(token)=1.
-  torch::Tensor acceptance_probs =
-      draft_probs.has_value()
-          ? selected_target_probs / index_select_2d(draft_probs.value(),
-                                                    /*dim=*/-1,
-                                                    clamped_draft_token_ids)
-          : selected_target_probs;
-  auto accepted =
-      (uniform_rand < acceptance_probs).logical_and(draft_token_ids.ge(0));
-
-  auto recovered_token_ids = sample_recovered_tokens(
-      draft_proposal, target_probs, clamped_draft_token_ids);
-
-  return finalize_random_sample(accepted,
-                                recovered_token_ids,
-                                clamped_draft_token_ids,
-                                bonus_token_ids,
-                                mask_out_rejected_tokens);
+  torch::Tensor accepted_token_ids =
+      torch::cat({target_token_ids, bonus_token_ids}, /*dim=*/-1);
+  const auto accepted = (target_token_ids == draft_token_ids);
+  return mask_out_after_first_reject(accepted_token_ids,
+                                     first_reject_index(accepted));
 }
 
 }  // namespace xllm

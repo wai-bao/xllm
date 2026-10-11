@@ -57,12 +57,12 @@ TEST(GumbelSamplingTest, MasksGreedyRowsInMixedBatch) {
 }
 
 TEST(DraftSamplingModeTest, RequiresProbabilitiesOnlyForRandomDrafts) {
-  EXPECT_FALSE(draft_probs_required(DraftSamplingMode::GREEDY,
-                                    /*all_greedy_sample=*/false));
-  EXPECT_FALSE(draft_probs_required(DraftSamplingMode::PROBABILISTIC,
-                                    /*all_greedy_sample=*/true));
-  EXPECT_TRUE(draft_probs_required(DraftSamplingMode::PROBABILISTIC,
-                                   /*all_greedy_sample=*/false));
+  EXPECT_FALSE(
+      draft_logits_required(DraftSamplingMode::GREEDY, VerifyMode::RANDOM));
+  EXPECT_FALSE(draft_logits_required(DraftSamplingMode::PROBABILISTIC,
+                                     VerifyMode::GREEDY));
+  EXPECT_TRUE(draft_logits_required(DraftSamplingMode::PROBABILISTIC,
+                                    VerifyMode::RANDOM));
 }
 
 }  // namespace xllm

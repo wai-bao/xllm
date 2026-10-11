@@ -15,17 +15,16 @@ limitations under the License.
 
 #include "core/framework/sampling/dspark_sampling.h"
 
-#include <vector>
-
+#include "core/framework/sampling/draft_sampling_prepare.h"
 #include "core/framework/sampling/sampler.h"
 
 namespace xllm {
 
 DraftProposal sample_dspark_block(
-    const torch::Tensor& base_logits,
+    torch::Tensor base_logits,
     const torch::Tensor& anchor_token_ids,
     SamplingParameters sampling,
-    bool need_draft_probs,
+    bool need_draft_logits,
     const std::function<torch::Tensor(const torch::Tensor&)>& markov_bias,
     const std::function<void(torch::Tensor&)>& synchronize_tokens,
     torch::Tensor tokens) {
@@ -41,9 +40,7 @@ DraftProposal sample_dspark_block(
   sampling.selected_token_idxes =
       torch::empty({0}, anchor_token_ids.options().dtype(torch::kInt32));
   sampling.sample_idxes = sampling.selected_token_idxes;
-  sampling.return_probs = need_draft_probs;
-  sampling.logprobs = false;
-  sampling.max_top_logprobs = 0;
+  suppress_score_outputs(sampling);
   sampling.use_beam_search = false;
   if (!tokens.defined()) {
     tokens = torch::empty({rows, steps}, anchor_token_ids.options());
@@ -52,25 +49,39 @@ DraftProposal sample_dspark_block(
     CHECK_EQ(tokens.scalar_type(), torch::kInt64);
     CHECK_EQ(tokens.device(), base_logits.device());
   }
-  std::vector<torch::Tensor> probabilities;
-  probabilities.reserve(need_draft_probs ? steps : 0);
-  Sampler sampler;
+  // Write each step's sampled logits straight into the [B, steps, V] result
+  // slice instead of stacking per-step tensors afterwards: the stack would
+  // allocate a second [B, steps, V] buffer while every step tensor is still
+  // alive.
+  torch::Tensor stacked_logits =
+      need_draft_logits
+          ? torch::empty({rows, steps, vocab}, base_logits.options())
+          : torch::Tensor();
   auto previous = anchor_token_ids;
   for (int64_t step = 0; step < steps; ++step) {
     auto bias = markov_bias(previous);
     CHECK_EQ(bias.sizes(), torch::IntArrayRef({rows, vocab}))
         << "DSpark reduced vocabulary requires draft-to-target remapping.";
-    auto step_logits = base_logits.select(1, step) + bias;
-    auto sampled = sampler.forward(step_logits, sampling);
+    // Sample in place inside the stacked slice when logits are needed: the
+    // sampler mutates its input through the reference, so the per-step [B, V]
+    // temporary (select + bias) and the post-sample copy both disappear.
+    // The greedy path mutates base_logits directly (out-of-place before).
+    torch::Tensor step_input = need_draft_logits
+                                   ? stacked_logits.select(1, step)
+                                   : base_logits.select(1, step);
+    if (need_draft_logits) {
+      // One fused kernel writes bias + base into the private stacked slice.
+      torch::add_out(step_input, base_logits.select(1, step), bias);
+    } else {
+      step_input.add_(bias);
+    }
+    auto sampled = Sampler::forward(step_input, sampling);
     synchronize_tokens(sampled.next_tokens);
     tokens.select(1, step).copy_(sampled.next_tokens);
     previous = sampled.next_tokens;
-    if (need_draft_probs) {
-      probabilities.emplace_back(std::move(sampled.probs));
-    }
   }
-  return need_draft_probs
-             ? DraftProposal(std::move(tokens), torch::stack(probabilities, 1))
+  return need_draft_logits
+             ? DraftProposal(std::move(tokens), std::move(stacked_logits))
              : DraftProposal(std::move(tokens));
 }
 

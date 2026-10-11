@@ -248,7 +248,7 @@ void DisaggPDScheduler::register_instance_info(const std::string& server_name) {
 void DisaggPDScheduler::profile_ttft() {
   LOG(INFO) << "Start profiling TTFT.";
   // get the maximum prefill token length
-  auto& model_args = engine_->model_args();
+  auto& model_args = resource_engine_->model_args();
   int32_t max_context_len = model_args.max_position_embeddings();
   if (!options_.enable_chunked_prefill()) {
     max_context_len =
@@ -270,7 +270,7 @@ void DisaggPDScheduler::profile_ttft() {
 void DisaggPDScheduler::profile_tpot() {
   LOG(INFO) << "Start profiling TPOT.";
   // get the maximum token length
-  auto& model_args = engine_->model_args();
+  auto& model_args = resource_engine_->model_args();
   int32_t max_context_len = model_args.max_position_embeddings();
   if (!options_.enable_chunked_prefill()) {
     max_context_len =
@@ -376,7 +376,7 @@ proto::DisaggPDService_Stub* DisaggPDScheduler::create_rpc_channel(
 
 void DisaggPDScheduler::start_rpc_server() {
   std::unique_ptr<DisaggPDService> service = std::make_unique<DisaggPDService>(
-      this, engine_, KVCacheConfig::get_instance().block_size());
+      this, resource_engine_, KVCacheConfig::get_instance().block_size());
   auto rpc_server =
       ServerRegistry::get_instance().register_server(server_name_);
   if (!rpc_server->start(std::move(service))) {
@@ -627,6 +627,7 @@ void DisaggPDScheduler::dispatch_requests() {
       req->set_logprobs(requests[i]->state().sampling_param.logprobs);
       req->set_top_logprobs(requests[i]->state().sampling_param.top_logprobs);
       req->set_is_embeddings(requests[i]->state().sampling_param.is_embeddings);
+      req->set_is_rerank(requests[i]->state().sampling_param.is_rerank);
       req->set_echo(requests[i]->state().echo);
       req->set_skip_special_tokens(requests[i]->state().skip_special_tokens);
       req->set_include_stop_str_in_output(
@@ -915,7 +916,7 @@ void DisaggPDScheduler::prefill_send_first_generation() {
             group->add_ids(static_cast<uint64_t>(block.id()));
           }
         }
-        if (has_linear_attention_layers(engine_->model_args())) {
+        if (has_linear_attention_layers(resource_engine_->model_args())) {
           const int32_t linear_state_id = sequence->get_linear_state_slot_id();
           CHECK_GE(linear_state_id, 0)
               << "Prefill did not allocate a linear-state slot.";
@@ -1071,7 +1072,8 @@ bool DisaggPDScheduler::release_reservation(const std::string& req_id,
     request = take_waiting_request(req_id);
   }
   for (const auto& sequence : request->sequences()) {
-    engine_->block_manager_pool()->deallocate_without_cache(sequence.get());
+    resource_engine_->block_manager_pool()->deallocate_without_cache(
+        sequence.get());
   }
   return true;
 }
@@ -1103,7 +1105,8 @@ bool DisaggPDScheduler::decode_schedule(
                  << ", reservation_id=" << request->state().pd_reservation_id;
       lock.unlock();
       for (const auto& sequence : request->sequences()) {
-        engine_->block_manager_pool()->deallocate_without_cache(sequence.get());
+        resource_engine_->block_manager_pool()->deallocate_without_cache(
+            sequence.get());
       }
       return false;
     }
@@ -1153,7 +1156,8 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   auto& sequences = request->sequences();
   bool kv_restored = false;
   ScopeGuard release_unqueued_blocks([this, &sequences, &kv_restored] {
-    BlockManagerPool* block_manager_pool = engine_->block_manager_pool();
+    BlockManagerPool* block_manager_pool =
+        resource_engine_->block_manager_pool();
     for (const auto& sequence : sequences) {
       if (sequence != nullptr) {
         if (kv_restored) {
@@ -1351,7 +1355,8 @@ bool DisaggPDScheduler::try_allocate(Sequence* sequence) {
 
 bool DisaggPDScheduler::exceeds_decode_capacity(Sequence* sequence) const {
   CHECK(sequence != nullptr);
-  const BlockManagerPool* block_manager = engine_->block_manager_pool();
+  const BlockManagerPool* block_manager =
+      resource_engine_->block_manager_pool();
   CHECK(block_manager != nullptr);
   const BlockManagerPool::Options& block_options = block_manager->options();
   if (block_options.enable_virtual_memory() ||

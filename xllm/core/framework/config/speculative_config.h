@@ -87,8 +87,9 @@ class SpeculativeConfig final {
            is_block_diffusion_algorithm(algorithm);
   }
 
-  // DFlash2 carries the dense proposal only when probabilistic rejection
-  // requires it; greedy-only DFlash and Suffix stay out.
+  // True for algorithms that retain sampling logits for exact probabilistic
+  // rejection. DFlash/Suffix use deterministic proposals; DFlash2 retains
+  // conditional selector logits with their compact vocabulary support.
   static bool is_probabilistic_draft_sampling_supported(
       std::string_view algorithm) {
     return is_mtp_algorithm(algorithm) || is_dspark_algorithm(algorithm) ||

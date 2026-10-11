@@ -53,12 +53,8 @@ bool supports_unified_mtp_request(const LlmForwardInput& input, bool adaptive) {
   const SamplingParameters& sampling = input.sampling_params;
   return !adaptive && input.json_object_states.empty() &&
          input.input_params.multi_block_tables.empty() &&
-         sampling.all_greedy_sample && !sampling.use_beam_search &&
-         !sampling.temperatures.defined() && !sampling.top_k.defined() &&
-         !sampling.top_p.defined() && !sampling.frequency_penalties.defined() &&
-         !sampling.presence_penalties.defined() &&
-         !sampling.repetition_penalties.defined() &&
-         !sampling.filter_mask.defined() && !sampling.filter_bitmask.defined();
+         sampling.verify_mode() == VerifyMode::GREEDY &&
+         !sampling.use_beam_search && !sampling.has_sampling_modifiers();
 }
 
 UnifiedMtpWorkerImpl::UnifiedMtpWorkerImpl(const ParallelArgs& parallel_args,

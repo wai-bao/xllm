@@ -180,12 +180,6 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
       LlmForwardInput& validate_input,
       const std::vector<int32_t>& per_seq_val_tokens);
 
-  void process_draft_sample_output(SampleOutput& sample_output);
-
-  // Mirrors sampled tokens to rank 0 under schedule-overlap so every rank
-  // commits the same prefix. No-op for a single rank.
-  void maybe_broadcast_spec_tokens(torch::Tensor& tokens);
-
   void update_decode_step_input(
       LlmForwardInput& input,
       const std::vector<EmbeddingCache::DecodeState>& last_states) const;

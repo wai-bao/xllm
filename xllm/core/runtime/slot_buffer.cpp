@@ -1059,6 +1059,7 @@ void SlotBuffer::prepare_sampling(const SamplingParameters& input) {
         all_values<bool>(input.do_sample, [](bool value) { return !value; });
     prepared.logprobs = input.logprobs;
     prepared.return_probs = input.return_probs;
+    prepared.is_rerank = input.is_rerank;
     prepared.max_top_logprobs = input.max_top_logprobs;
   }
   cpu_do_sample_ = input.do_sample.defined()
@@ -1170,7 +1171,7 @@ Status SlotBuffer::bind_result(uint32_t sequences,
   if (!result_ready_ || sequences > capacity_.max_sample_rows ||
       tokens_per_sequence > capacity_.max_result_width ||
       top_logprobs > capacity_.max_top_logprobs ||
-      (!logprobs && top_logprobs != 0) ||
+      inconsistent_top_logprobs(logprobs, top_logprobs) ||
       (sequences == 0 &&
        (tokens_per_sequence != 0 || top_logprobs != 0 || logprobs)) ||
       (sequences != 0 && tokens_per_sequence == 0)) {

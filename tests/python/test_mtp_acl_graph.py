@@ -379,10 +379,11 @@ def test_role_adapter_b1_uses_a_single_row_view(monkeypatch: pytest.MonkeyPatch)
 
 @pytest.mark.parametrize("steps", [3, 5])
 @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("logprobs,top_width", [(False, 0), (True, 0), (True, 2), (False, 2)])
-def test_greedy_recipe_fast_path_matches_full_probability_recipe(
+@pytest.mark.parametrize(("logprobs", "top_width"), [(False, 0), (True, 0), (True, 2), (False, 2)])
+def test_greedy_recipe_fast_path_matches_requested_selected_scores(
     steps: int, logits_dtype: torch.dtype, logprobs: bool, top_width: int
 ) -> None:
+    """Check lazy selected scores against an independent full softmax oracle."""
     rejects = torch.arange(steps + 1)
     fast = make_recipe(rejects, steps, logits_dtype=logits_dtype)
     reference = make_recipe(rejects, steps, logits_dtype=logits_dtype)
@@ -393,7 +394,11 @@ def test_greedy_recipe_fast_path_matches_full_probability_recipe(
             logprobs=logprobs,
             max_top_logprobs=top_width,
         )
-    inputs = (torch.arange(steps + 1), torch.arange(steps + 1) + 127, torch.arange(steps + 1, dtype=torch.int32) + 128)
+    inputs = (
+        torch.arange(steps + 1),
+        torch.arange(steps + 1) + 127,
+        torch.arange(steps + 1, dtype=torch.int32) + 128,
+    )
     expected = MtpAclGraphRunner(reference, backend="eager").execute(*inputs)
     actual = MtpAclGraphRunner(fast, backend="eager").execute(*inputs)
     for name, tensor in output_tensors(actual).items():
@@ -402,31 +407,35 @@ def test_greedy_recipe_fast_path_matches_full_probability_recipe(
         torch.testing.assert_close(getattr(actual, name), getattr(expected, name))
     assert actual.target_probs is None
 
-    if logprobs or top_width:
-        oracle = scalar_reference(inputs[0].tolist(), inputs[1].tolist(), rejects.tolist(), steps)
-        target_ids = torch.cat((inputs[0].unsqueeze(1), oracle["draft_tokens"]), dim=1).reshape(-1)
-        target_positions = (inputs[1].unsqueeze(1) + torch.arange(steps + 1, dtype=inputs[1].dtype)).reshape(-1)
-        target_hidden = reference.target_forward(target_ids, target_positions, -1, None, None)
-        target_logits = reference.target_logits(target_hidden).reshape(steps + 1, steps + 1, reference.vocab_size)
-        independent_log_probs = torch.log_softmax(target_logits.float(), dim=-1)
-        committed_indices = expected.committed_tokens.clamp_min(0).unsqueeze(-1)
-        independent_committed = independent_log_probs.gather(-1, committed_indices).squeeze(-1)
-        independent_committed = torch.where(
-            expected.committed_tokens.ge(0),
-            independent_committed,
-            torch.zeros_like(independent_committed),
+    oracle = scalar_reference(inputs[0].tolist(), inputs[1].tolist(), rejects.tolist(), steps)
+    target_ids = torch.cat((inputs[0].unsqueeze(1), oracle["draft_tokens"]), dim=1).reshape(-1)
+    target_positions = (inputs[1].unsqueeze(1) + torch.arange(steps + 1, dtype=inputs[1].dtype)).reshape(-1)
+    target_hidden = reference.target_forward(target_ids, target_positions, -1, None, None)
+    assert isinstance(target_hidden, torch.Tensor)
+    target_logits = reference.target_logits(target_hidden).reshape(steps + 1, steps + 1, reference.vocab_size)
+    independent_log_probs = torch.log_softmax(target_logits.float(), dim=-1)
+    committed_indices = expected.committed_tokens.clamp_min(0).unsqueeze(-1)
+    independent_committed = independent_log_probs.gather(-1, committed_indices).squeeze(-1)
+    independent_committed = torch.where(
+        expected.committed_tokens.ge(0),
+        independent_committed,
+        torch.zeros_like(independent_committed),
+    )
+    assert expected.target_probs is not None
+    assert expected.target_probs.shape == expected.committed_tokens.shape
+    independent_probs = torch.where(expected.committed_tokens.ge(0), independent_committed.exp(), 0)
+    torch.testing.assert_close(expected.target_probs, independent_probs, rtol=1e-5, atol=1e-5)
+    if logprobs:
+        torch.testing.assert_close(actual.logprobs, independent_committed, rtol=1e-5, atol=1e-5)
+    if top_width:
+        independent_top_values, independent_top_tokens = independent_log_probs.topk(top_width, dim=-1)
+        torch.testing.assert_close(
+            actual.top_logprobs,
+            independent_top_values,
+            rtol=1e-5,
+            atol=1e-5,
         )
-        if logprobs:
-            torch.testing.assert_close(actual.logprobs, independent_committed, rtol=1e-5, atol=1e-5)
-        if top_width:
-            independent_top_values, independent_top_tokens = independent_log_probs.topk(top_width, dim=-1)
-            torch.testing.assert_close(
-                actual.top_logprobs,
-                independent_top_values,
-                rtol=1e-5,
-                atol=1e-5,
-            )
-            torch.testing.assert_close(actual.top_tokens, independent_top_tokens)
+        torch.testing.assert_close(actual.top_tokens, independent_top_tokens)
     arena_address = fast._position_arena.data_ptr()
     MtpAclGraphRunner(fast, backend="eager").execute(inputs[0], inputs[1] + 4, inputs[2] + 4)
     assert fast._position_arena.data_ptr() == arena_address

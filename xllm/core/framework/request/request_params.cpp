@@ -591,6 +591,7 @@ RequestParams::RequestParams(const proto::RerankRequest& request,
   streaming = false;
   if (::xllm::ModelConfig::get_instance().enable_qwen3_reranker()) {
     logprobs = true;
+    is_rerank = true;
   } else {
     is_embeddings = true;
   }
@@ -866,6 +867,7 @@ RequestSamplingParam RequestParams::to_sampling_param(size_t best_of) const {
   sampling_param.logprobs = logprobs;
   sampling_param.top_logprobs = top_logprobs;
   sampling_param.is_embeddings = is_embeddings;
+  sampling_param.is_rerank = is_rerank;
   if (best_of > n) {
     // enable logprobs for best_of to generate sequence logprob
     sampling_param.logprobs = true;

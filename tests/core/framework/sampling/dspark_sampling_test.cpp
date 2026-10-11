@@ -37,7 +37,7 @@ TEST(DSparkSamplingTest, BatchedMarkovChainUsesConsensusBeforeNextStep) {
       logits,
       anchors,
       params,
-      /*need_draft_probs=*/false,
+      /*need_draft_logits=*/false,
       [&predecessors](const torch::Tensor& previous) {
         predecessors.emplace_back(previous.clone());
         auto bias = torch::zeros({2, 8});
@@ -59,7 +59,7 @@ TEST(DSparkSamplingTest, BatchedMarkovChainUsesConsensusBeforeNextStep) {
       torch::equal(predecessors.at(1), torch::tensor({2, 5}, torch::kInt64)));
   EXPECT_TRUE(
       torch::equal(predecessors.at(2), torch::tensor({3, 6}, torch::kInt64)));
-  EXPECT_FALSE(result.draft_probs().has_value());
+  EXPECT_FALSE(result.logits().has_value());
   EXPECT_EQ(broadcasts, 3);
 }
 
@@ -81,17 +81,17 @@ TEST(DSparkSamplingTest, ProbabilisticProposalKeepsConditionalDistributions) {
       sample_dspark_block(logits,
                           anchors,
                           params,
-                          /*need_draft_probs=*/true,
+                          /*need_draft_logits=*/true,
                           bias,
                           [](torch::Tensor& tokens) {
                             tokens.copy_(torch::tensor({1, 3}, torch::kInt64));
                           });
-  ASSERT_TRUE(result.draft_probs().has_value());
-  EXPECT_TRUE(torch::allclose(result.draft_probs()->select(1, 0),
-                              torch::softmax(bias(anchors), -1)));
-  EXPECT_TRUE(torch::allclose(
-      result.draft_probs()->select(1, 1),
-      torch::softmax(bias(torch::tensor({1, 3}, torch::kInt64)), -1)));
+  ASSERT_TRUE(result.logits().has_value());
+  // Temperature 1.0 with no top-k/p: the processed logits equal the biased
+  // step inputs, so the stacked proposal carries them verbatim.
+  EXPECT_TRUE(torch::allclose(result.logits()->select(1, 0), bias(anchors)));
+  EXPECT_TRUE(torch::allclose(result.logits()->select(1, 1),
+                              bias(torch::tensor({1, 3}, torch::kInt64))));
   EXPECT_FALSE(params.return_probs);
 }
 #endif
