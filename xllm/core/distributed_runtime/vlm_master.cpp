@@ -286,13 +286,6 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
 
   auto finish_engine_initialization = [this](auto* engine) {
     model_args_ = engine->model_args();
-    if (options_.enable_service_routing()) {
-      XServiceClient* xservice_client = XServiceClient::get_instance();
-      CHECK(xservice_client->init(options_.etcd_addr().value_or(""),
-                                  options_.instance_name().value_or(""),
-                                  options_.etcd_namespace().value_or("")))
-          << "XServiceClient init fail!";
-    }
   };
   if (use_speculative_engine) {
     const LLMEngine::ModelInitCallback prepare_draft =
@@ -309,9 +302,10 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
     finish_engine_initialization(speculative_engine_.get());
   } else {
     CHECK(vlm_engine_->init(options_.master_status()));
-    finish_engine_initialization(vlm_engine_.get());
+    model_args_ = vlm_engine_->model_args();
   }
 
+  acquire_service_client();
   SchedulerOptions scheduler_options;
   scheduler_options.max_tokens_per_batch(options.max_tokens_per_batch())
       .max_seqs_per_batch(options.max_seqs_per_batch())
@@ -319,6 +313,8 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
       .max_tokens_per_chunk_for_prefill(
           options.max_tokens_per_chunk_for_prefill())
       .num_speculative_tokens(options_.num_speculative_tokens())
+      .speculative_algorithm(options_.speculative_algorithm())
+      .draft_sampling_mode(options_.draft_sampling_mode())
       .dp_size(options_.dp_size())
       .cp_size(options_.cp_size())
       .enable_disagg_pd(options_.enable_disagg_pd())
@@ -336,6 +332,7 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
         scheduler_ = create_continuous_scheduler(
             engine,
             scheduler_options,
+            xservice_client_,
             engine->get_distributed_worker_manager(),
             /*model_residency_coordinator=*/nullptr,
             kv_transfer_coordinator_);
@@ -344,8 +341,13 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
       speculative_engine_.get());
 
   if (options_.enable_service_routing()) {
-    auto& instance_info = scheduler_->get_instance_info();
-    XServiceClient::get_instance()->register_instance(instance_info);
+    dispatch_engine(
+        [this](auto* engine) {
+          discovery_registration_ =
+              bind_service_registration(scheduler_.get(), engine);
+        },
+        vlm_engine_.get(),
+        speculative_engine_.get());
   }
 
   dispatch_engine(

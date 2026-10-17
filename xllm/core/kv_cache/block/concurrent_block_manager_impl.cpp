@@ -162,6 +162,11 @@ size_t ConcurrentBlockManagerImpl::num_total_blocks() const {
   return inner_->num_total_blocks();
 }
 
+bool ConcurrentBlockManagerImpl::is_block_used(int32_t block_id) const {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  return inner_->is_block_used(block_id);
+}
+
 double ConcurrentBlockManagerImpl::kv_cache_utilization() const {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   return inner_->kv_cache_utilization();

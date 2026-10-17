@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/framework/block/block_manager_pool.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/sampling/json_object_grammar.h"
+#include "core/transport/draft_input_proto.h"
 #include "framework/request/request_output.h"
 #include "scheduler/disagg_pd_scheduler.h"
 #include "util/utils.h"
@@ -38,15 +39,15 @@ namespace xllm {
 
 DisaggPDServiceImpl::DisaggPDServiceImpl(DisaggPDScheduler* scheduler,
                                          Engine* engine,
-                                         int32_t kv_cache_block_tokens)
+                                         int32_t kv_cache_block_tokens,
+                                         std::shared_ptr<XServiceClient> client)
     : scheduler_(scheduler),
       engine_(engine),
       kv_cache_block_tokens_(kv_cache_block_tokens),
-      block_manager_(engine->block_manager_pool()) {
-  xservice_client_ = XServiceClient::get_instance();
-  if (!xservice_client_->initialize_done()) {
+      block_manager_(engine->block_manager_pool()),
+      xservice_client_(std::move(client)) {
+  if (xservice_client_ != nullptr && !xservice_client_->initialize_done()) {
     LOG(FATAL) << "XServiceClient not init.";
-    return;
   }
 }
 
@@ -269,11 +270,15 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
     const proto::DisaggGenerationsRequests* request,
     proto::Status* response) {
   // TODO: we only support one request generation currently
+  bool all_ok = true;
   for (auto& gen : request->multi_gens()) {
-    // Process the first token from the tokens array
+    // Process the first token from the tokens array. A generation without a
+    // token is malformed: reject it and release the waiting request so the
+    // prefill side's reservation and blocks are reclaimed.
     if (gen.tokens().empty()) {
-      response->set_ok(false);
-      return;
+      scheduler_->reject_received_request(gen.req_id());
+      all_ok = false;
+      continue;
     }
 
     const auto& first_token = gen.tokens(0);
@@ -293,10 +298,9 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
                                 proto_group.ids().end());
       source_mappings.emplace_back(std::move(mapping));
     }
-    torch::Tensor mtp_bootstrap_embedding;
-    if (gen.has_mtp_bootstrap_embedding()) {
-      mtp_bootstrap_embedding =
-          util::proto_to_torch(gen.mtp_bootstrap_embedding());
+    std::optional<DraftInput> draft_input;
+    if (gen.has_draft_input()) {
+      draft_input = proto_adapter::draft_input_from_proto(gen.draft_input());
     }
 
     bool success = scheduler_->decode_recv_first_generation(
@@ -315,15 +319,15 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
         std::move(source_mappings),
         gen.dp_size(),
         gen.dp_rank(),
-        mtp_bootstrap_embedding,
-        gen.num_cached_tokens());
+        gen.num_cached_tokens(),
+        std::move(draft_input));
     if (!success) {
       response->set_ok(false);
       return;
     }
   }
 
-  response->set_ok(true);
+  response->set_ok(all_ok);
 }
 
 void DisaggPDServiceImpl::link_instance(

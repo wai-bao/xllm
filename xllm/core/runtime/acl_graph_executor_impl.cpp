@@ -35,13 +35,13 @@ limitations under the License.
 #include <torch_npu/csrc/framework/utils/OpPreparation.h>
 #endif
 #include "core/common/metrics.h"
-#include "core/framework/speculative/spec_verify.h"
 #include "core/kernels/npu/npu_ops_api.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/kernels/ops_api.h"
 #include "core/kv_cache/layout/kv_shard_layout.h"
 #include "core/platform/device.h"
 #include "core/platform/npu/acl_graph_task_update_context.h"
+#include "core/runtime/spec_verify.h"
 #include "core/util/utils.h"
 #include "platform/npu/device_capture_lock.h"
 #include "runtime/decode_graph_bucket.h"

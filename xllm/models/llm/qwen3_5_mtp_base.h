@@ -48,24 +48,29 @@ inline StateDict get_lm_head_dict(const StateDict& state_dict) {
   return StateDict({}, "");
 }
 
+inline void configure_model_args(ModelArgs& args) {
+  const int32_t mtp_num_layers =
+      std::max<int32_t>(args.num_nextn_predict_layers(), 1);
+  args.num_nextn_predict_layers(mtp_num_layers);
+  args.n_layers(mtp_num_layers);
+  args.layer_types(std::vector<std::string>(static_cast<size_t>(mtp_num_layers),
+                                            "full_attention"));
+  args.full_attention_interval(1);
+}
+
 inline bool load_model_args(const JsonReader& json,
                             ModelArgs* args,
-                            const std::string& base_type,
                             const std::string& mtp_type) {
+  // The paired text target owns the base config.
+  const std::string base_type =
+      ModelRegistry::get_mtp_target_model_type(mtp_type);
   ModelArgsLoader base_loader = ModelRegistry::get_model_args_loader(base_type);
   if (base_loader == nullptr || base_loader(json, args) == false) {
     return false;
   }
 
-  int32_t mtp_num_layers = args->num_nextn_predict_layers();
-  if (mtp_num_layers <= 0) {
-    mtp_num_layers = 1;
-  }
   args->model_type(mtp_type);
-  args->num_nextn_predict_layers(mtp_num_layers);
-  args->n_layers(mtp_num_layers);
-  args->layer_types(std::vector<std::string>(
-      static_cast<size_t>(mtp_num_layers), "full_attention"));
+  configure_model_args(*args);
   return true;
 }
 
@@ -253,6 +258,8 @@ class Qwen3_5MtpModelImplBase : public Qwen3HybridModelImplBase {
 
 class Qwen3_5MtpForCausalLMImplBase : public Qwen3HybridForCausalLMImplBase {
  public:
+  bool owns_mtp_draft_weights() const { return true; }
+
   void load_model(std::unique_ptr<ModelLoader> loader) {
     static const std::vector<std::string> kEmbeddingPrefixes = {
         "model.language_model.", "language_model.model.", "model.", ""};
@@ -303,5 +310,27 @@ class Qwen3_5MtpForCausalLMImplBase : public Qwen3HybridForCausalLMImplBase {
  private:
   std::shared_ptr<Qwen3_5MtpModelImplBase> mtp_model_;
 };
+
+// The args loaders carry no platform-specific information, so they live with
+// the shared base instead of being pasted into every platform copy of
+// qwen3_5_mtp.h. models.h activates exactly one of those copies per build.
+REGISTER_MTP_MODEL_PAIR(qwen3_5_text,
+                        qwen3_5_mtp,
+                        qwen3_5_mtp::configure_model_args);
+REGISTER_MTP_MODEL_PAIR(qwen3_5_moe_text,
+                        qwen3_5_moe_mtp,
+                        qwen3_5_mtp::configure_model_args);
+
+REGISTER_MODEL_ARGS_LOADER(qwen3_5_mtp,
+                           [](const JsonReader& json, ModelArgs* args) {
+                             return qwen3_5_mtp::load_model_args(
+                                 json, args, "qwen3_5_mtp");
+                           });
+
+REGISTER_MODEL_ARGS_LOADER(qwen3_5_moe_mtp,
+                           [](const JsonReader& json, ModelArgs* args) {
+                             return qwen3_5_mtp::load_model_args(
+                                 json, args, "qwen3_5_moe_mtp");
+                           });
 
 }  // namespace xllm

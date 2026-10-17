@@ -54,13 +54,6 @@ inline bool configure_glm5_next_mtp_args(ModelArgs& model_args,
   return true;
 }
 
-inline int64_t mtp_hidden_state_width(const ModelArgs& model_args) {
-  if (util::is_deepseek_v4_model_type(model_args.model_type())) {
-    return model_args.hc_mult() * model_args.hidden_size();
-  }
-  return model_args.hidden_size();
-}
-
 inline bool uses_embedded_eagle3_draft(std::string_view algorithm,
                                        const ModelArgs& target_model_args) {
   return SpeculativeConfig::is_eagle3_algorithm(algorithm) &&

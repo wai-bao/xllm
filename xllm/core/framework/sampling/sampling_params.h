@@ -18,11 +18,14 @@ limitations under the License.
 #include <torch/types.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "core/framework/speculative/draft_input.h"
 
 namespace xllm {
 
@@ -203,6 +206,15 @@ struct SamplingParameters {
   bool use_beam_search = false;
 };
 
+// True when any repetition-family penalty tensor is set, i.e. the sampler must
+// build and consult per-token history. Centralizes the predicate shared by the
+// draft/seed sampling paths.
+inline bool has_penalty_params(const SamplingParameters& params) {
+  return params.frequency_penalties.defined() ||
+         params.presence_penalties.defined() ||
+         params.repetition_penalties.defined();
+}
+
 // Draft proposals and acceptances executed by the verifier, before output
 // truncation. Accepted drafts exclude the target replacement/bonus token.
 struct SpeculativeTokenStats {
@@ -246,6 +258,50 @@ class SampleOutput final {
   torch::Tensor selected_embeddings;
 
   std::vector<std::vector<torch::Tensor>> mm_embeddings;
+  std::optional<DraftInput> draft_input;
 };
+
+// Per-row (one sequence each) tensor members of SamplingParameters. Speculative
+// paths repeat or re-index these rows to match expanded token counts; listing
+// the members once keeps the speculative callers from drifting apart.
+inline constexpr std::array<torch::Tensor SamplingParameters::*, 10>
+    kSamplingRowTensors = {&SamplingParameters::frequency_penalties,
+                           &SamplingParameters::presence_penalties,
+                           &SamplingParameters::repetition_penalties,
+                           &SamplingParameters::temperatures,
+                           &SamplingParameters::top_p,
+                           &SamplingParameters::top_k,
+                           &SamplingParameters::unique_token_ids,
+                           &SamplingParameters::unique_token_counts,
+                           &SamplingParameters::unique_token_ids_lens,
+                           &SamplingParameters::do_sample};
+
+// The history-backed subset of kSamplingRowTensors: the store refreshes these
+// from the committed per-request history before every speculative round.
+inline constexpr std::array<torch::Tensor SamplingParameters::*, 3>
+    kSamplingHistoryTensors = {&SamplingParameters::unique_token_ids,
+                               &SamplingParameters::unique_token_counts,
+                               &SamplingParameters::unique_token_ids_lens};
+
+// Draft-only row tensors: appended to kSamplingRowTensors by
+// kSamplingRepeatedRows for draft sampling.
+inline constexpr std::array<torch::Tensor SamplingParameters::*, 4>
+    kDraftOnlyRowTensors = {&SamplingParameters::min_p,
+                            &SamplingParameters::seed_offsets,
+                            &SamplingParameters::seeds,
+                            &SamplingParameters::logits_bias};
+
+// kSamplingRowTensors plus kDraftOnlyRowTensors: draft sampling repeats the
+// full set to match the expanded draft token count.
+inline constexpr auto kSamplingRepeatedRows = [] {
+  std::array<torch::Tensor SamplingParameters::*, 14> rows{};
+  for (size_t i = 0; i < kSamplingRowTensors.size(); ++i) {
+    rows[i] = kSamplingRowTensors[i];
+  }
+  for (size_t i = 0; i < kDraftOnlyRowTensors.size(); ++i) {
+    rows[kSamplingRowTensors.size() + i] = kDraftOnlyRowTensors[i];
+  }
+  return rows;
+}();
 
 }  // namespace xllm

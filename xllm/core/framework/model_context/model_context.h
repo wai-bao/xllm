@@ -21,6 +21,8 @@ limitations under the License.
 #include "layers/npu/buffer/atb_workspace.h"
 #endif
 
+#include <glog/logging.h>
+
 #include <memory>
 #include <string>
 
@@ -32,6 +34,20 @@ limitations under the License.
 #include "framework/parallel_state/parallel_args.h"
 
 namespace xllm {
+
+#if defined(USE_NPU)
+// Creates an ATB context and wraps it for shared ownership; both the LLM and
+// DiT model contexts build theirs through this single failure-checked path.
+inline std::shared_ptr<atb::Context> create_owned_atb_context(
+    const char* what) {
+  atb::Context* context = nullptr;
+  const atb::Status status = atb::CreateContext(&context);
+  CHECK_EQ(status, atb::NO_ERROR) << "Failed to create " << what;
+  CHECK(context != nullptr);
+  return std::shared_ptr<atb::Context>(
+      context, [](atb::Context* owned) { atb::DestroyContext(owned); });
+}
+#endif
 
 // Internal optimization configuration.
 // This struct holds all optimization techniques that are automatically
@@ -65,7 +81,7 @@ class ModelContext {
                const ModelArgs& model_args,
                const QuantArgs& quant_args,
                const torch::TensorOptions& tensor_options,
-               atb::Context* context);
+               std::shared_ptr<atb::Context> context);
 #endif
 
   const ModelArgs& get_model_args() const { return model_args_; }
@@ -99,7 +115,7 @@ class ModelContext {
   ModelContext with_quant_args(const QuantArgs& quant_args) const;
 
 #if defined(USE_NPU)
-  const atb::Context* get_atb_context() const { return context_; }
+  const atb::Context* get_atb_context() const { return context_owner_.get(); }
   std::shared_ptr<AtbWorkspace> get_atb_workspace() const {
     return atb_workspace_;
   }
@@ -134,8 +150,9 @@ class ModelContext {
   std::shared_ptr<ModelStreamRegistry> stream_registry_;
 
 #if defined(USE_NPU)
-  // used for npu atb
-  atb::Context* context_;
+  // used for npu atb; owns the context for the lifetime of every derived
+  // ModelContext sharing it.
+  std::shared_ptr<atb::Context> context_owner_;
   std::shared_ptr<AtbWorkspace> atb_workspace_;
 #endif
 };

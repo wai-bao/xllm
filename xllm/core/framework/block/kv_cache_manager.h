@@ -62,6 +62,10 @@ class KVCacheManager {
   virtual void deallocate(Request* request) = 0;
   virtual void deallocate(std::vector<Sequence*>& sequences) = 0;
   virtual void deallocate(Sequence* sequence) = 0;
+  virtual std::vector<int32_t> take_released_embedding_ids(
+      int32_t /*dp_rank*/) {
+    return {};
+  }
 
   virtual void allocate_shared(Sequence* sequence) = 0;
   // Whether shared matching is needed before sizing the next prefill chunk.

@@ -1390,7 +1390,9 @@ torch::Tensor fused_sigmoid_gating_delta_rule_update(
       params.scale,
       params.use_qk_l2norm_in_kernel,
       params.softplus_beta,
-      params.softplus_threshold);
+      params.softplus_threshold,
+      params.num_accepted_tokens,
+      params.checkpoint_stride);
 #elif defined(USE_MUSA)
   return musa::fused_sigmoid_gating_delta_rule_update(params);
 #else

@@ -385,7 +385,9 @@ TEST_F(LLMRequestFactoryTest, TaskPipelineRejectsJsonObjectBeforeGrammarSetup) {
 
 #if defined(USE_NPU)
 TEST_F(LLMRequestFactoryTest,
-       UnifiedTaskPipelineKeepsJsonObjectChatForLegacyCompatibilityFallback) {
+       UnifiedTaskPipelineRejectsJsonObjectChatAfterWorkerRemoval) {
+  // The unified MTP worker is gone; even with enable_unified_mtp_graph the
+  // task pipeline cannot carry JSON-object chat, so admission must reject.
   options_.enable_task_pipeline(true)
       .num_speculative_tokens(3)
       .draft_model_path(std::string("/fake/draft"))
@@ -396,20 +398,19 @@ TEST_F(LLMRequestFactoryTest,
   CallbackCapture capture;
   RequestParams sp;
   sp.response_format = ResponseFormatType::JSON_OBJECT;
-  const std::vector<Message> messages = {Message("user", std::string("hi"))};
 
-  chat_template_->set_rendered_prompt("rendered prompt </think>");
-  auto request = factory->create(messages,
-                                 /*prompt_tokens=*/std::nullopt,
-                                 sp,
-                                 /*call=*/std::nullopt,
-                                 make_capture_callback(&capture));
+  auto request = factory->create(
+      /*prompt=*/"hello world",
+      /*prompt_tokens=*/std::nullopt,
+      sp,
+      /*call=*/std::nullopt,
+      make_capture_callback(&capture),
+      ChatTemplateGenerationMode::UNKNOWN);
 
-  ASSERT_NE(request, nullptr);
-  EXPECT_FALSE(capture.called);
-  EXPECT_NE(request->state().json_object_grammar, nullptr);
-  EXPECT_FALSE(request->state().json_reasoning_enabled);
-  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+  EXPECT_EQ(request, nullptr);
+  ASSERT_TRUE(capture.status.has_value());
+  EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
 
 TEST_F(LLMRequestFactoryTest, DisabledUnifiedTaskMtpRejectsJsonObject) {
@@ -509,6 +510,71 @@ TEST_F(LLMRequestFactoryTest, RejectsTopLogprobsAboveVocabulary) {
             std::string::npos);
   EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
 }
+
+struct SpeculativeBeamCase {
+  std::string algorithm;
+  int32_t num_speculative_tokens;
+  int32_t beam_width;
+  uint32_t best_of;
+  bool rejected;
+};
+
+class LLMRequestFactorySpeculativeBeamTest
+    : public LLMRequestFactoryTest,
+      public ::testing::WithParamInterface<SpeculativeBeamCase> {};
+
+TEST_P(LLMRequestFactorySpeculativeBeamTest, ValidatesEffectiveBeamSearch) {
+  const auto& test_case = GetParam();
+  auto factory = make_factory();
+  options_.num_speculative_tokens(test_case.num_speculative_tokens)
+      .speculative_algorithm(test_case.algorithm);
+  CallbackCapture capture;
+  RequestParams sp;
+  sp.request_id = "req-speculative-beam";
+  sp.max_tokens = 16;
+  sp.beam_width = test_case.beam_width;
+  sp.best_of = test_case.best_of;
+
+  auto request = factory->create(/*prompt=*/"hello world",
+                                 /*prompt_tokens=*/std::nullopt,
+                                 sp,
+                                 /*call=*/std::nullopt,
+                                 make_capture_callback(&capture));
+
+  if (test_case.rejected) {
+    EXPECT_EQ(request, nullptr);
+    ASSERT_TRUE(capture.called);
+    ASSERT_TRUE(capture.status.has_value());
+    EXPECT_EQ(capture.status->code(), StatusCode::INVALID_ARGUMENT);
+    EXPECT_NE(capture.status->message().find("Beam search"), std::string::npos);
+    EXPECT_NE(capture.status->message().find(test_case.algorithm),
+              std::string::npos);
+    EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 0);
+    return;
+  }
+
+  ASSERT_NE(request, nullptr);
+  EXPECT_FALSE(capture.called);
+  EXPECT_EQ(request->state().sampling_param.beam_width, test_case.beam_width);
+  EXPECT_EQ(request->state().best_of, test_case.best_of);
+  EXPECT_EQ(rate_limiter_.get_num_concurrent_requests(), 1);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    DraftInputCarryCompatibility,
+    LLMRequestFactorySpeculativeBeamTest,
+    ::testing::Values(SpeculativeBeamCase{"MTP", 1, 2, 1, true},
+                      SpeculativeBeamCase{"mtp", 1, 2, 1, true},
+                      SpeculativeBeamCase{"Eagle3", 2, 2, 1, true},
+                      SpeculativeBeamCase{"MTP", 1, 0, 1, false},
+                      SpeculativeBeamCase{"MTP", 1, 1, 1, false},
+                      SpeculativeBeamCase{"Eagle3", 1, 0, 1, false},
+                      SpeculativeBeamCase{"Eagle3", 1, 1, 1, false},
+                      SpeculativeBeamCase{"MTP", 0, 2, 1, false},
+                      SpeculativeBeamCase{"Eagle3", 0, 2, 1, false},
+                      SpeculativeBeamCase{"MTP", 2, 0, 3, false},
+                      SpeculativeBeamCase{"Eagle3", 2, 1, 3, false},
+                      SpeculativeBeamCase{"DFlash", 2, 2, 1, false}));
 
 TEST_F(LLMRequestFactoryTest, MessageOverloadFailsWhenTemplateRejects) {
   auto factory = make_factory();

@@ -64,7 +64,7 @@ class DiTModelContext {
   const DiTCacheConfig& get_dit_config() const { return dit_config_; }
 
 #if defined(USE_NPU)
-  const atb::Context* get_atb_context() const { return context_; }
+  const atb::Context* get_atb_context() const { return context_owner_.get(); }
 #endif
 
  private:
@@ -76,8 +76,7 @@ class DiTModelContext {
   std::string model_type_;
 
 #if defined(USE_NPU)
-  // used for npu atb
-  atb::Context* context_;
+  std::shared_ptr<atb::Context> context_owner_;
 #endif
 };
 

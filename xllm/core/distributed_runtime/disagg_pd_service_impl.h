@@ -36,9 +36,11 @@ class DisaggPDScheduler;
 // a class to handle disagg_pd requests
 class DisaggPDServiceImpl {
  public:
-  explicit DisaggPDServiceImpl(DisaggPDScheduler* scheduler,
-                               Engine* engine,
-                               int32_t kv_cache_block_tokens);
+  explicit DisaggPDServiceImpl(
+      DisaggPDScheduler* scheduler,
+      Engine* engine,
+      int32_t kv_cache_block_tokens,
+      std::shared_ptr<XServiceClient> client = nullptr);
   ~DisaggPDServiceImpl() = default;
 
   virtual void decode_recv_new_requests(const proto::DisaggRequests* request,
@@ -68,7 +70,7 @@ class DisaggPDServiceImpl {
   Engine* engine_;                // not owned
   // Token slots per physical KV cache block, before KV split expansion.
   const int32_t kv_cache_block_tokens_;
-  XServiceClient* xservice_client_ = nullptr;
+  std::shared_ptr<XServiceClient> xservice_client_;
   std::mutex json_object_grammar_mutex_;
   std::shared_ptr<const JsonObjectGrammar> json_object_grammar_;
   std::shared_ptr<const JsonObjectGrammar> json_reasoning_grammar_;

@@ -25,6 +25,8 @@ limitations under the License.
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <sstream>
+#include <utility>
 #include <vector>
 
 #include "core/distributed_runtime/distributed_worker_manager.h"
@@ -50,6 +52,12 @@ namespace {
 constexpr absl::Duration kDecodeRestoreTimeout = absl::Seconds(60);
 constexpr char kDecodeRestoreTimeoutMessage[] =
     "Decode request could not reacquire device KV cache within 60 seconds";
+
+bool all_batches_empty(const auto& batches) {
+  return std::all_of(batches.begin(), batches.end(), [](const Batch& batch) {
+    return batch.empty();
+  });
+}
 
 }  // namespace
 
@@ -125,25 +133,6 @@ ContinuousSchedulerBase::ContinuousSchedulerBase(
         cancel_request_queue->submit(std::move(request));
       });
   create_queues(options);
-  if (options_.enable_service_routing()) {
-    // connect to master service
-    xservice_client_ = XServiceClient::get_instance();
-    if (!xservice_client_->initialize_done()) {
-      LOG(FATAL) << "XServiceClient not init.";
-      return;
-    }
-    heartbeat_callback_registration_ = xservice_client_->set_heartbeat_callback(
-        [this](xllm_service::proto::HeartbeatRequest& request) {
-          populate_heartbeat_request(request, !options_.enable_disagg_pd());
-        });
-    if (::xllm::KVCacheConfig::get_instance().enable_virtual_memory() &&
-        !options_.enable_disagg_pd()) {
-      CHECK(distributed_worker_manager_ != nullptr);
-      distributed_worker_manager_->get_cache_info(instance_info_.cluster_ids,
-                                                  instance_info_.addrs,
-                                                  instance_info_.ports);
-    }
-  }
 
   instance_info_.name = options_.instance_name().value_or("");
   instance_info_.type = options_.instance_role().value().to_string();
@@ -158,56 +147,7 @@ ContinuousSchedulerBase::ContinuousSchedulerBase(
   }
 }
 
-void ContinuousSchedulerBase::populate_heartbeat_request(
-    xllm_service::proto::HeartbeatRequest& request,
-    bool include_virtual_memory_info) {
-  request.mutable_load_metrics()->set_gpu_cache_usage_perc(
-      resource_engine_->block_manager_pool()->get_gpu_cache_usage_perc());
-  request.mutable_load_metrics()->set_waiting_requests_num(
-      get_waiting_requests_num());
-
-  std::vector<int64_t> ttft;
-  std::vector<int64_t> tbt;
-  get_latency_metrics(ttft, tbt);
-  if (!ttft.empty()) {
-    request.mutable_latency_metrics()->set_recent_max_ttft(
-        *std::max_element(ttft.begin(), ttft.end()));
-  }
-  if (!tbt.empty()) {
-    request.mutable_latency_metrics()->set_recent_max_tbt(
-        *std::max_element(tbt.begin(), tbt.end()));
-  }
-
-  if (include_virtual_memory_info && model_residency_coordinator_ != nullptr &&
-      ::xllm::KVCacheConfig::get_instance().enable_virtual_memory()) {
-    std::vector<size_t> worker_free_phy_pages;
-    std::unordered_map<std::string, std::vector<WeightSegment>>
-        model_weight_segments;
-    model_residency_coordinator_->get_virtual_memory_info(
-        worker_free_phy_pages, model_weight_segments);
-
-    auto* virtual_memory_info = request.mutable_virtual_memory_info();
-    for (size_t free_pages : worker_free_phy_pages) {
-      virtual_memory_info->add_worker_free_phy_pages(free_pages);
-    }
-    for (const auto& [model_id, segments] : model_weight_segments) {
-      auto& segment_list =
-          (*virtual_memory_info->mutable_model_weight_segments())[model_id];
-      for (const auto& segment : segments) {
-        auto* proto_segment = segment_list.add_segments();
-        proto_segment->set_offset(segment.offset);
-        proto_segment->set_size(segment.size);
-      }
-    }
-  }
-}
-
 ContinuousSchedulerBase::~ContinuousSchedulerBase() {
-  if (xservice_client_ != nullptr) {
-    xservice_client_->clear_heartbeat_callback(
-        heartbeat_callback_registration_);
-  }
-
   // Requests never submitted to the engine own no asynchronous callback and
   // can be cancelled directly, including an offline scheduler never started.
   {
@@ -325,8 +265,9 @@ void ContinuousSchedulerBase::create_queues(const Options& options) {
   }
 }
 
-void ContinuousSchedulerBase::clear_mtp_bootstrap(Request* request) {
-  if (!options_.enable_disagg_pd() || options_.num_speculative_tokens() <= 0 ||
+void clear_speculative_pd_handoff_state(Request* request,
+                                        const SchedulerOptions& options) {
+  if (!options.enable_disagg_pd() || options.num_speculative_tokens() <= 0 ||
       request == nullptr || request->sequences().empty()) {
     return;
   }
@@ -334,7 +275,8 @@ void ContinuousSchedulerBase::clear_mtp_bootstrap(Request* request) {
   if (sequence == nullptr) {
     return;
   }
-  sequence->clear_mtp_bootstrap_embedding();
+  sequence->clear_target_decode_bootstrap();
+  sequence->clear_draft_input();
 }
 
 void ContinuousSchedulerBase::drain_decode_restore_waiting(
@@ -346,7 +288,7 @@ void ContinuousSchedulerBase::drain_decode_restore_waiting(
     CHECK(request != nullptr);
     request->update_connection_status();
     if (request->finished() || request->cancelled()) {
-      clear_mtp_bootstrap(request.get());
+      clear_speculative_pd_handoff_state(request.get(), options_);
       kv_cache_manager_->deallocate(request.get());
       finished.emplace_back(request);
       it = decode_restore_waiting_.erase(it);
@@ -357,7 +299,7 @@ void ContinuousSchedulerBase::drain_decode_restore_waiting(
       continue;
     }
 
-    clear_mtp_bootstrap(request.get());
+    clear_speculative_pd_handoff_state(request.get(), options_);
     kv_cache_manager_->deallocate(request.get());
     output_dispatcher_->process_failed_request(
         request,
@@ -439,8 +381,7 @@ BatchGroup ContinuousSchedulerBase::prepare_batch() {
       running_sequences_budgets_,
       kv_cache_manager_->get_swap_block_transfer_infos());
 
-  bool is_batches_empty = std::all_of(
-      batches.begin(), batches.end(), [](const Batch& b) { return b.empty(); });
+  bool is_batches_empty = all_batches_empty(batches);
   if (!is_batches_empty) {
     COUNTER_ADD(scheduling_latency_seconds, timer.elapsed_seconds());
     kv_cache_manager_->transfer_blocks(batches);
@@ -486,10 +427,7 @@ BatchGroup ContinuousSchedulerBase::schedule_request(
   while (true) {
     apply_cancel_requests();
     batch = prepare_batch();
-    bool all_empty =
-        std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
-          return one_batch.empty();
-        });
+    bool all_empty = all_batches_empty(batch);
     if (!all_empty) {
       return batch;
     }
@@ -526,11 +464,9 @@ void ContinuousSchedulerBase::step(const absl::Duration& timeout) {
   if (!options_.enable_schedule_overlap()) {
     // get a new batch of requests
     BatchGroup batch = schedule_request(timeout);
-    bool all_empty =
-        std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
-          return one_batch.empty();
-        });
+    bool all_empty = all_batches_empty(batch);
     if (all_empty) {
+      resource_engine_->flush_released_requests();
       return;
     }
 
@@ -547,15 +483,10 @@ void ContinuousSchedulerBase::step_with_schedule_overlap(
     const absl::Duration& timeout) {
   // get a new batch of requests
   BatchGroup batch = schedule_request(timeout);
-  bool cur_batch_all_empty =
-      std::all_of(batch.begin(), batch.end(), [](const Batch& one_batch) {
-        return one_batch.empty();
-      });
-  bool last_batch_all_empty = std::all_of(
-      last_batch_.begin(), last_batch_.end(), [](const Batch& one_batch) {
-        return one_batch.empty();
-      });
+  bool cur_batch_all_empty = all_batches_empty(batch);
+  bool last_batch_all_empty = all_batches_empty(last_batch_);
   if (cur_batch_all_empty && last_batch_all_empty) {
+    resource_engine_->flush_released_requests();
     return;
   }
 
@@ -594,6 +525,9 @@ void ContinuousSchedulerBase::step_with_schedule_overlap(
   last_running_sequences_ = running_sequences_;
   last_running_requests_ = running_requests_;
   is_first_step_ = false;
+  if (cur_batch_all_empty) {
+    resource_engine_->flush_released_requests();
+  }
 }
 
 void ContinuousSchedulerBase::generate() {
@@ -604,10 +538,7 @@ void ContinuousSchedulerBase::generate() {
     // build a batch of requests/sequences
     const auto timeout = absl::Milliseconds(50);
     BatchGroup batch = schedule_request(timeout);
-    batch_empty = true;
-    for (auto& b : batch) {
-      batch_empty &= b.empty();
-    }
+    batch_empty = all_batches_empty(batch);
     if (batch_empty) {
       continue;
     }
@@ -621,6 +552,7 @@ void ContinuousSchedulerBase::generate() {
 
   // wait for all responses done
   output_dispatcher_->wait_completion();
+  resource_engine_->flush_released_requests();
 }
 
 void ContinuousSchedulerBase::process_batch_output(

@@ -17,20 +17,29 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <utility>
 #include <vector>
 
 #include "core/framework/sampling/json_object_grammar.h"
+#include "tests/core/framework/speculative/mtp_draft_input_test_utils.h"
 
 namespace xllm {
 namespace {
 
-JsonObjectGrammar make_mtp_grammar() {
-  return JsonObjectGrammar({"{", "\"a\"", ":", "1", "}", "stop"},
-                           /*stop_token_ids=*/{5});
+using test::make_mtp_draft_input_test_grammar;
+
+// Matcher-only fingerprint of a fresh state with `tokens` accepted in order.
+uint64_t replay_fingerprint(const JsonObjectGrammar& grammar,
+                            std::initializer_list<int32_t> tokens) {
+  JsonObjectGrammarState state = grammar.initial_state();
+  for (const int32_t token : tokens) {
+    state.accept_token(token);
+  }
+  return state.fingerprint();
 }
 
 TEST(MtpJsonObjectStateTest, BuildsSequenceMajorRowsForMixedAcceptedDrafts) {
-  JsonObjectGrammar grammar = make_mtp_grammar();
+  JsonObjectGrammar grammar = make_mtp_draft_input_test_grammar();
   const std::vector<JsonObjectGrammarState> initial_states = {
       grammar.initial_state(), JsonObjectGrammarState()};
   std::vector<JsonObjectGrammarState> current_states = initial_states;
@@ -64,8 +73,39 @@ TEST(MtpJsonObjectStateTest, BuildsSequenceMajorRowsForMixedAcceptedDrafts) {
   EXPECT_EQ(initial_states[0].snapshot().token_ids, std::vector<int32_t>({}));
 }
 
+TEST(MtpJsonObjectStateTest, EarlierSnapshotsSurviveLaterDraftSteps) {
+  JsonObjectGrammar grammar = make_mtp_draft_input_test_grammar();
+  std::vector<JsonObjectGrammarState> current_states = {
+      grammar.initial_state()};
+  std::vector<uint8_t> invalid_suffix(1, 0);
+  detail::JsonDraftValidationScratch scratch;
+
+  EXPECT_FALSE(detail::append_json_draft_step(
+      current_states, invalid_suffix, {0}, scratch));
+  EXPECT_FALSE(detail::append_json_draft_step(
+      current_states, invalid_suffix, {1}, scratch));
+
+  ASSERT_EQ(scratch.states_after.size(), 2u);
+  // Snapshots are matcher-only (no committed-token history); fingerprint
+  // equality is the contract validation actually consumes.
+  EXPECT_EQ(scratch.states_after[0][0].fingerprint(),
+            replay_fingerprint(grammar, {0}));
+  EXPECT_EQ(current_states[0].snapshot().token_ids,
+            std::vector<int32_t>({0, 1}));
+
+  std::vector<uint8_t> invalid_draft;
+  const auto validation_states = detail::build_json_validation_states(
+      {grammar.initial_state()}, std::move(scratch), invalid_draft);
+  ASSERT_EQ(validation_states.size(), 3u);
+  EXPECT_EQ(validation_states[1].fingerprint(),
+            replay_fingerprint(grammar, {0}));
+  EXPECT_EQ(validation_states[2].fingerprint(),
+            replay_fingerprint(grammar, {0, 1}));
+  EXPECT_EQ(invalid_draft, std::vector<uint8_t>({0, 0}));
+}
+
 TEST(MtpJsonObjectStateTest, FreezesFirstInvalidDraftAndItsSuffix) {
-  JsonObjectGrammar grammar = make_mtp_grammar();
+  JsonObjectGrammar grammar = make_mtp_draft_input_test_grammar();
   const std::vector<JsonObjectGrammarState> initial_states = {
       grammar.initial_state(), JsonObjectGrammarState()};
   std::vector<JsonObjectGrammarState> current_states = initial_states;
@@ -91,7 +131,7 @@ TEST(MtpJsonObjectStateTest, FreezesFirstInvalidDraftAndItsSuffix) {
 }
 
 TEST(MtpJsonObjectStateTest, PreservesAcceptedPrefixAfterMiddleInvalidDraft) {
-  JsonObjectGrammar grammar = make_mtp_grammar();
+  JsonObjectGrammar grammar = make_mtp_draft_input_test_grammar();
   const std::vector<JsonObjectGrammarState> initial_states = {
       grammar.initial_state()};
   std::vector<JsonObjectGrammarState> current_states = initial_states;
@@ -120,7 +160,7 @@ TEST(MtpJsonObjectStateTest, PreservesAcceptedPrefixAfterMiddleInvalidDraft) {
 }
 
 TEST(MtpJsonObjectStateTest, FiveDraftRowsReplayFromCommittedState) {
-  JsonObjectGrammar grammar = make_mtp_grammar();
+  JsonObjectGrammar grammar = make_mtp_draft_input_test_grammar();
   const std::vector<JsonObjectGrammarState> initial_states = {
       grammar.initial_state()};
   std::vector<JsonObjectGrammarState> current_states = initial_states;
@@ -185,7 +225,7 @@ TEST(MtpJsonObjectStateTest,
 }
 
 TEST(MtpJsonObjectStateTest, ReplaysFiveStepMixedAcceptedOutputRows) {
-  JsonObjectGrammar grammar = make_mtp_grammar();
+  JsonObjectGrammar grammar = make_mtp_draft_input_test_grammar();
   const std::vector<JsonObjectGrammarState> initial_states = {
       grammar.initial_state(), JsonObjectGrammarState()};
   const int64_t accepted_tokens[] = {
@@ -211,7 +251,7 @@ TEST(MtpJsonObjectStateTest, ReplaysFiveStepMixedAcceptedOutputRows) {
 }
 
 TEST(MtpJsonObjectStateTest, ReportsFirstAcceptedOutputMismatchPerSequence) {
-  JsonObjectGrammar grammar = make_mtp_grammar();
+  JsonObjectGrammar grammar = make_mtp_draft_input_test_grammar();
   JsonObjectGrammarState committed_state = grammar.initial_state();
   ASSERT_TRUE(committed_state.accept_token(/*open_object=*/0));
   const std::vector<JsonObjectGrammarState> initial_states = {
@@ -240,10 +280,38 @@ TEST(MtpJsonObjectStateTest, ReportsFirstAcceptedOutputMismatchPerSequence) {
   EXPECT_EQ(mismatches[0].token_offset, 1u);
   EXPECT_EQ(mismatches[0].token_id, 4);
   EXPECT_EQ(mismatches[0].committed_tokens, 2u);
+  JsonObjectGrammarState before_mismatch = committed_state;
+  ASSERT_TRUE(before_mismatch.accept_token(/*key=*/1));
+  EXPECT_EQ(mismatches[0].state_fingerprint, before_mismatch.fingerprint());
+}
+
+TEST(MtpJsonObjectStateTest, LongCommittedHistoryUsesMatcherOnlyReplay) {
+  JsonObjectGrammar grammar({"x", "</think>", "{", "}"},
+                            /*stop_token_ids=*/{},
+                            /*reasoning_end_token_ids=*/{1});
+  JsonObjectGrammarState committed =
+      grammar.initial_state(/*reasoning_phase=*/true);
+  for (int32_t token = 0; token < 1024; ++token) {
+    ASSERT_TRUE(committed.accept_token(/*reasoning_token=*/0));
+  }
+  ASSERT_TRUE(committed.accept_token(/*reasoning_end=*/1));
+  JsonObjectGrammarState matcher = committed.fork_matcher_only();
+  EXPECT_EQ(matcher.committed_token_count(), 0u);
+  EXPECT_EQ(matcher.fingerprint(), committed.fingerprint());
+
+  const int64_t accepted_tokens[] = {2, 1};
+  const auto mismatches = detail::find_json_accepted_token_mismatches(
+      {committed}, accepted_tokens, /*num_rows=*/1, /*row_width=*/2);
+  ASSERT_EQ(mismatches.size(), 1u);
+  EXPECT_EQ(mismatches[0].token_offset, 1u);
+  EXPECT_EQ(mismatches[0].committed_tokens, 1026u);
+  JsonObjectGrammarState before_mismatch = committed;
+  ASSERT_TRUE(before_mismatch.accept_token(/*open_object=*/2));
+  EXPECT_EQ(mismatches[0].state_fingerprint, before_mismatch.fingerprint());
 }
 
 TEST(MtpJsonObjectStateTest, AcceptedOutputOnlyUsesMinusOneAsPadding) {
-  JsonObjectGrammar grammar = make_mtp_grammar();
+  JsonObjectGrammar grammar = make_mtp_draft_input_test_grammar();
   const std::vector<JsonObjectGrammarState> initial_states = {
       grammar.initial_state()};
   const int64_t accepted_tokens[] = {0, -2};

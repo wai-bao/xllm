@@ -23,8 +23,10 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/config/parallel_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_controller.h"
 #include "core/kv_cache/layout/kv_cache_estimation.h"
+#include "framework/speculative/draft_input_model_spec.h"
 #include "framework/speculative/mtp_utils.h"
 #include "llm_engine.h"
 #include "util/utils.h"
@@ -51,14 +53,14 @@ SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
   runtime::Options dist_options = options;
   dist_options.num_decoding_tokens(options.num_speculative_tokens() + 1);
   dist_options.enable_speculative_decode(true);
-  distributed_worker_manager_ =
+  const std::shared_ptr<DistributedWorkerManager> distributed_worker_manager =
       std::make_shared<DistributedWorkerManager>(dist_options);
 
   runtime::Options target_engine_options = options_;
   target_engine_options.num_decoding_tokens(options.num_speculative_tokens() +
                                             1);
   engine_ = std::make_unique<TargetEngine>(target_engine_options,
-                                           distributed_worker_manager_);
+                                           distributed_worker_manager);
 
   if (use_draft_engine_) {
     // draft engine
@@ -74,7 +76,7 @@ SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
         .enable_graph(/*enable_graph=*/false)
         .is_draft_engine(true);
     draft_engine_ = std::make_unique<LLMEngine>(draft_engine_options,
-                                                distributed_worker_manager_);
+                                                distributed_worker_manager);
   }
 }
 
@@ -131,6 +133,11 @@ bool SpeculativeEngineBase<TargetEngine>::init_model(
 
     // check if the max context length are the same
     const auto& draft_model_args = draft_engine_->model_args();
+    if (SpeculativeConfig::produces_draft_input(
+            options_.speculative_algorithm())) {
+      draft_input_spec_ = DraftInputModelSpec{
+          draft_input_hidden_width(draft_model_args), draft_engine_->dtype_};
+    }
     if (model_args_.max_position_embeddings() !=
         draft_model_args.max_position_embeddings()) {
       LOG(WARNING) << "draft and target models have different max context "

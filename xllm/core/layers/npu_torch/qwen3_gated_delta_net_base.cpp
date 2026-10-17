@@ -383,6 +383,23 @@ torch::Tensor run_causal_conv1d_graph_update(
   return output;
 }
 
+// Shared validation preamble for the dense GDN spec-verify wrappers: inputs
+// must be packed into cumulative per-sequence rows of equal length.
+void check_dense_spec_verify_inputs(
+    int64_t batch_size,
+    int64_t seq_len,
+    const torch::Tensor& cu_seq_lens,
+    const std::vector<int32_t>& q_seq_lens_vec) {
+  CHECK_EQ(cu_seq_lens.numel(), batch_size + 1)
+      << "GDN spec verify cu_seq_lens must be cumulative.";
+  CHECK_EQ(q_seq_lens_vec.size(), static_cast<size_t>(batch_size))
+      << "GDN spec verify q_seq_lens_vec must be per sequence.";
+  for (const int32_t q_seq_len : q_seq_lens_vec) {
+    CHECK_EQ(q_seq_len, seq_len)
+        << "GDN spec verify expects dense same-length validate tokens.";
+  }
+}
+
 torch::Tensor run_spec_verify_gated_delta_rule(
     torch::Tensor query,
     torch::Tensor key,
@@ -399,15 +416,8 @@ torch::Tensor run_spec_verify_gated_delta_rule(
   const int64_t batch_size = value.size(0);
   const int64_t seq_len = value.size(1);
   const int64_t total_seq_len = batch_size * seq_len;
-  CHECK_EQ(cu_seq_lens.numel(), batch_size + 1)
-      << "GDN spec verify cu_seq_lens must be cumulative.";
-  CHECK_EQ(q_seq_lens_vec.size(), static_cast<size_t>(batch_size))
-      << "GDN spec verify q_seq_lens_vec must be per sequence.";
-  for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-    CHECK_EQ(q_seq_lens_vec[batch_idx], seq_len)
-        << "Qwen3.5 spec verify fused recurrent path expects dense "
-           "same-length validate tokens.";
-  }
+  check_dense_spec_verify_inputs(
+      batch_size, seq_len, cu_seq_lens, q_seq_lens_vec);
 
   xllm::kernel::FusedRecurrentGatedDeltaRuleParams params;
   params.q = query.reshape({1, total_seq_len, query.size(-2), query.size(-1)})
@@ -433,6 +443,53 @@ torch::Tensor run_spec_verify_gated_delta_rule(
       xllm::kernel::fused_recurrent_gated_delta_rule(params);
   return output_and_state.first.view(
       {batch_size, seq_len, value.size(-2), value.size(-1)});
+}
+
+torch::Tensor run_spec_verify_fused_sigmoid_gdn(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    torch::Tensor& ssm_cache,
+    const torch::Tensor& logical_state_indices,
+    const torch::Tensor& num_accepted_tokens,
+    const torch::Tensor& cu_seq_lens,
+    const std::vector<int32_t>& q_seq_lens_vec,
+    int64_t checkpoint_stride,
+    double scale) {
+  const int64_t batch_size = value.size(0);
+  const int64_t seq_len = value.size(1);
+  const int64_t total_seq_len = batch_size * seq_len;
+  check_dense_spec_verify_inputs(
+      batch_size, seq_len, cu_seq_lens, q_seq_lens_vec);
+  CHECK_EQ(logical_state_indices.dim(), 1);
+  CHECK_EQ(logical_state_indices.numel(), batch_size);
+
+  xllm::kernel::FusedSigmoidGatingDeltaRuleUpdateParams params;
+  params.A_log = A_log.contiguous();
+  params.a = a.reshape({1, total_seq_len, a.size(-1)}).contiguous();
+  params.dt_bias = dt_bias.contiguous();
+  params.q = query.reshape({1, total_seq_len, query.size(-2), query.size(-1)})
+                 .contiguous();
+  params.k =
+      key.reshape({1, total_seq_len, key.size(-2), key.size(-1)}).contiguous();
+  params.v = value.reshape({1, total_seq_len, value.size(-2), value.size(-1)})
+                 .contiguous();
+  params.b = b.reshape({1, total_seq_len, b.size(-1)}).contiguous();
+  params.initial_state_source = ssm_cache;
+  params.initial_state_indices = logical_state_indices.contiguous();
+  params.checkpoint_stride = checkpoint_stride;
+  params.num_accepted_tokens =
+      num_accepted_tokens.to(value.device(), torch::kInt32).contiguous();
+  params.cu_seqlens = cu_seq_lens.to(torch::kInt32).contiguous();
+  params.scale = static_cast<float>(scale);
+  params.use_qk_l2norm_in_kernel = true;
+
+  auto output = xllm::kernel::fused_sigmoid_gating_delta_rule_update(params);
+  return output.view({batch_size, seq_len, value.size(-2), value.size(-1)});
 }
 
 }  // namespace
@@ -611,8 +668,13 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       get_linear_state_indices(input_params, device);
   const int64_t checkpoint_stride =
       get_checkpoint_stride(conv_cache, ssm_cache);
-  torch::Tensor linear_state_base_indices =
-      build_linear_state_base_indices(logical_state_indices, checkpoint_stride);
+  const bool use_fused_sigmoid_gdn_verify =
+      fla_ssm_state_layout && use_spec_verify;
+  torch::Tensor linear_state_base_indices;
+  if (!use_fused_sigmoid_gdn_verify) {
+    linear_state_base_indices = build_linear_state_base_indices(
+        logical_state_indices, checkpoint_stride);
+  }
   auto graph_context = input_params.graph.acl_graph_task_update_context;
   const bool register_conv1d_graph_update =
       graph_context != nullptr && graph_context->capturing;
@@ -780,8 +842,14 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   torch::Tensor g;
   torch::Tensor beta;
   // Compute gated delta net decay and beta terms.
-  if (use_spec_verify || attn_metadata.is_chunked_prefill ||
-      checkpoint_stride > 1) {
+  // The Qwen3.5 FLA checkpoint stride is a storage detail during ordinary
+  // prefill. Changing its gating arithmetic for MTP prefill shifts target
+  // logits before the first draft is validated. Keep it identical to
+  // target-only prefill. Other checkpoint paths keep pointwise gating.
+  if (!use_fused_sigmoid_gdn_verify &&
+      (use_spec_verify || attn_metadata.is_chunked_prefill ||
+       (checkpoint_stride > 1 &&
+        (!attn_metadata.is_prefill || !fla_ssm_state_layout)))) {
     beta = torch::sigmoid(b);
     torch::Tensor A_log_exp = A_log_.exp();
     torch::Tensor a_float = a.to(torch::kFloat32);
@@ -802,7 +870,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     std::tie(g, beta) = xllm::kernel::fused_gdn_gating(gdn_params);
     g = g.squeeze(0).contiguous().view({batch_size, seq_len, a.size(-1)});
     beta = beta.squeeze(0).contiguous().view({batch_size, seq_len, b.size(-1)});
-  } else if (!use_fused_sigmoid_gdn_decode) {
+  } else if (!use_fused_sigmoid_gdn_decode && !use_fused_sigmoid_gdn_verify) {
     xllm::kernel::FusedGdnGatingParams gdn_params;
     gdn_params.A_log = A_log_;
     gdn_params.a = a.view({-1, a.size(-1)});
@@ -824,29 +892,49 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
         input_params.num_accepted_tokens.to(device, torch::kInt32),
         batch_size,
         "num_accepted_tokens");
-    torch::Tensor spec_linear_state_base_indices =
-        expand_sequence_tensor_to_batch(
-            linear_state_base_indices, batch_size, "linear_state_base_indices");
-    torch::Tensor step_offsets =
-        torch::arange(seq_len,
-                      torch::TensorOptions()
-                          .dtype(spec_linear_state_base_indices.dtype())
-                          .device(device));
-    torch::Tensor checkpoint_indices =
-        spec_linear_state_base_indices.unsqueeze(1) + step_offsets;
+    torch::Tensor spec_state_indices = expand_sequence_tensor_to_batch(
+        use_fused_sigmoid_gdn_verify ? logical_state_indices
+                                     : linear_state_base_indices,
+        batch_size,
+        "spec_state_indices");
     double scale = 1.0 / std::sqrt(static_cast<float>(processed_q.size(-1)));
-    core_attn_out =
-        run_spec_verify_gated_delta_rule(processed_q,
-                                         processed_k,
-                                         processed_v,
-                                         g,
-                                         beta,
-                                         ssm_cache,
-                                         checkpoint_indices,
-                                         spec_num_accepted_tokens,
-                                         attn_metadata.q_cu_seq_lens,
-                                         attn_metadata.q_seq_lens_vec,
-                                         scale);
+    if (use_fused_sigmoid_gdn_verify) {
+      core_attn_out =
+          run_spec_verify_fused_sigmoid_gdn(processed_q,
+                                            processed_k,
+                                            processed_v,
+                                            a,
+                                            b,
+                                            A_log_,
+                                            dt_bias_,
+                                            ssm_cache,
+                                            spec_state_indices,
+                                            spec_num_accepted_tokens,
+                                            attn_metadata.q_cu_seq_lens,
+                                            attn_metadata.q_seq_lens_vec,
+                                            checkpoint_stride,
+                                            scale);
+    } else {
+      torch::Tensor step_offsets =
+          torch::arange(seq_len,
+                        torch::TensorOptions()
+                            .dtype(spec_state_indices.dtype())
+                            .device(device));
+      torch::Tensor checkpoint_indices =
+          spec_state_indices.unsqueeze(1) + step_offsets;
+      core_attn_out =
+          run_spec_verify_gated_delta_rule(processed_q,
+                                           processed_k,
+                                           processed_v,
+                                           g,
+                                           beta,
+                                           ssm_cache,
+                                           checkpoint_indices,
+                                           spec_num_accepted_tokens,
+                                           attn_metadata.q_cu_seq_lens,
+                                           attn_metadata.q_seq_lens_vec,
+                                           scale);
+    }
   } else if (is_any_prefill) {
     CHECK_GE(attn_metadata.q_seq_lens_vec.size(),
              static_cast<size_t>(batch_size))

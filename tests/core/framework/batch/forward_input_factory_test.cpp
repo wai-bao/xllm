@@ -215,9 +215,6 @@ TEST(ForwardInputFactoryTest, DpMetadataIsIndependentAcrossRanksAndCalls) {
   const std::vector<int32_t> sequence_counts = {1, 1, 0};
   const std::vector<int32_t> json_active = {0, 1, 0};
   const std::vector<int32_t> is_decode = {0, 0, 0};
-  const std::vector<uint64_t> generations =
-      inputs.front().input_params.parallel.dp_global_batch_generations;
-  ASSERT_EQ(generations.size(), 3u);
   for (const auto& input : inputs) {
     const auto& parallel = input.input_params.parallel;
     EXPECT_EQ(parallel.dp_global_token_nums, token_counts);
@@ -226,7 +223,6 @@ TEST(ForwardInputFactoryTest, DpMetadataIsIndependentAcrossRanksAndCalls) {
     EXPECT_EQ(parallel.dp_global_kv_max_seq_lens, token_counts);
     EXPECT_EQ(parallel.dp_global_json_object_active, json_active);
     EXPECT_EQ(parallel.dp_is_decode, is_decode);
-    EXPECT_EQ(parallel.dp_global_batch_generations, generations);
   }
 
   auto& last_parallel = inputs.back().input_params.parallel;
@@ -236,7 +232,6 @@ TEST(ForwardInputFactoryTest, DpMetadataIsIndependentAcrossRanksAndCalls) {
   ASSERT_EQ(last_parallel.dp_global_kv_max_seq_lens.size(), 3u);
   ASSERT_EQ(last_parallel.dp_global_json_object_active.size(), 3u);
   ASSERT_EQ(last_parallel.dp_is_decode.size(), 3u);
-  ASSERT_EQ(last_parallel.dp_global_batch_generations.size(), 3u);
   last_parallel.dp_global_token_nums[0] = 9;
   EXPECT_EQ(last_parallel.raw_dp_global_token_nums, token_counts);
   last_parallel.raw_dp_global_token_nums[1] = 8;
@@ -246,213 +241,169 @@ TEST(ForwardInputFactoryTest, DpMetadataIsIndependentAcrossRanksAndCalls) {
   last_parallel.dp_global_kv_max_seq_lens[1] = 6;
   last_parallel.dp_global_json_object_active[1] = 0;
   last_parallel.dp_is_decode[2] = 1;
-  last_parallel.dp_global_batch_generations[0] = 99;
 
-  auto expect_first_rank_metadata = [&] {
-    const auto& parallel = inputs.front().input_params.parallel;
-    EXPECT_EQ(parallel.dp_global_token_nums, token_counts);
-    EXPECT_EQ(parallel.raw_dp_global_token_nums, token_counts);
-    EXPECT_EQ(parallel.dp_global_sequence_nums, sequence_counts);
-    EXPECT_EQ(parallel.dp_global_kv_max_seq_lens, token_counts);
-    EXPECT_EQ(parallel.dp_global_json_object_active, json_active);
-    EXPECT_EQ(parallel.dp_is_decode, is_decode);
-    EXPECT_EQ(parallel.dp_global_batch_generations, generations);
-  };
-  expect_first_rank_metadata();
+  auto expect_first_rank_metadata =
+      [&] {
+        const auto& parallel = inputs.front().input_params.parallel;
+        EXPECT_EQ(parallel.dp_global_token_nums, token_counts);
+        EXPECT_EQ(parallel.raw_dp_global_token_nums, token_counts);
+        EXPECT_EQ(parallel.dp_global_sequence_nums, sequence_counts);
+        EXPECT_EQ(parallel.dp_global_kv_max_seq_lens, token_counts);
+        EXPECT_EQ(parallel.dp_global_json_object_active, json_active);
+        EXPECT_EQ(parallel.dp_is_decode, is_decode);
+        expect_first_rank_metadata();
 
-  BatchGroup empty_batches(3);
-  std::vector<LlmForwardInput> next_inputs;
-  factory.create_inputs(
-      empty_batches, ModelArgs(), next_inputs, is_graph_warmup);
-  ASSERT_EQ(next_inputs.size(), 3u);
-  for (const auto& input : next_inputs) {
-    const auto& parallel = input.input_params.parallel;
-    EXPECT_EQ(parallel.dp_global_token_nums, is_decode);
-    EXPECT_EQ(parallel.raw_dp_global_token_nums, is_decode);
-    EXPECT_EQ(parallel.dp_global_sequence_nums, is_decode);
-    EXPECT_EQ(parallel.dp_global_kv_max_seq_lens, is_decode);
-    EXPECT_EQ(parallel.dp_global_json_object_active, is_decode);
-    EXPECT_EQ(parallel.dp_is_decode, is_decode);
-    ASSERT_EQ(parallel.dp_global_batch_generations.size(), 3u);
-    EXPECT_NE(parallel.dp_global_batch_generations[0], 99u);
-  }
-  expect_first_rank_metadata();
-  EXPECT_EQ(last_parallel.dp_global_token_nums,
-            (std::vector<int32_t>{9, 3, 0}));
-  EXPECT_EQ(last_parallel.raw_dp_global_token_nums,
-            (std::vector<int32_t>{2, 8, 0}));
-  EXPECT_EQ(last_parallel.dp_global_sequence_nums,
-            (std::vector<int32_t>{7, 1, 0}));
-  EXPECT_EQ(last_parallel.dp_global_kv_max_seq_lens,
-            (std::vector<int32_t>{2, 6, 0}));
-  EXPECT_EQ(last_parallel.dp_global_json_object_active, is_decode);
-  EXPECT_EQ(last_parallel.dp_is_decode, (std::vector<int32_t>{0, 0, 1}));
-  EXPECT_EQ(last_parallel.dp_global_batch_generations[0], 99u);
-}
+        BatchGroup empty_batches(3);
+        std::vector<LlmForwardInput> next_inputs;
+        factory.create_inputs(
+            empty_batches, ModelArgs(), next_inputs, is_graph_warmup);
+        ASSERT_EQ(next_inputs.size(), 3u);
+        for (const auto& input : next_inputs) {
+          const auto& parallel = input.input_params.parallel;
+          EXPECT_EQ(parallel.dp_global_token_nums, is_decode);
+          EXPECT_EQ(parallel.raw_dp_global_token_nums, is_decode);
+          EXPECT_EQ(parallel.dp_global_sequence_nums, is_decode);
+          EXPECT_EQ(parallel.dp_global_kv_max_seq_lens, is_decode);
+          EXPECT_EQ(parallel.dp_global_json_object_active, is_decode);
+          EXPECT_EQ(parallel.dp_is_decode, is_decode);
+        }
+        expect_first_rank_metadata();
+        EXPECT_EQ(last_parallel.dp_global_token_nums,
+                  (std::vector<int32_t>{9, 3, 0}));
+        EXPECT_EQ(last_parallel.raw_dp_global_token_nums,
+                  (std::vector<int32_t>{2, 8, 0}));
+        EXPECT_EQ(last_parallel.dp_global_sequence_nums,
+                  (std::vector<int32_t>{7, 1, 0}));
+        EXPECT_EQ(last_parallel.dp_global_kv_max_seq_lens,
+                  (std::vector<int32_t>{2, 6, 0}));
+        EXPECT_EQ(last_parallel.dp_global_json_object_active, is_decode);
+        EXPECT_EQ(last_parallel.dp_is_decode, (std::vector<int32_t>{0, 0, 1}));
+      }
 
-TEST(ForwardInputFactoryTest, EmptyRanksInheritGraphDecodeMetadata) {
-  BlockManager::Options manager_options;
-  manager_options.num_blocks(8).block_size(4);
-  BlockManagerImpl manager(manager_options);
-  Sequence decode = make_sequence({1, 2}, "decode");
-  add_kv_block(&decode, &manager);
-  decode.kv_state().set_kv_cache_tokens_num(2);
-  decode.append_token(Token(3));
+  TEST(ForwardInputFactoryTest, EmptyRanksInheritGraphDecodeMetadata) {
+    BlockManager::Options manager_options;
+    manager_options.num_blocks(8).block_size(4);
+    BlockManagerImpl manager(manager_options);
+    Sequence decode = make_sequence({1, 2}, "decode");
+    add_kv_block(&decode, &manager);
+    decode.kv_state().set_kv_cache_tokens_num(2);
+    decode.append_token(Token(3));
 
-  BatchGroup batches(2);
-  batches[0] = make_batch(&decode);
+    BatchGroup batches(2);
+    batches[0] = make_batch(&decode);
 
-  ScopedGraphMode graph_mode(/*enabled=*/true);
-  auto factory = make_factory(/*dp_size=*/2);
-  std::vector<LlmForwardInput> inputs;
-  bool is_graph_warmup = false;
-  factory.create_inputs(batches, ModelArgs(), inputs, is_graph_warmup);
+    ScopedGraphMode graph_mode(/*enabled=*/true);
+    auto factory = make_factory(/*dp_size=*/2);
+    std::vector<LlmForwardInput> inputs;
+    bool is_graph_warmup = false;
+    factory.create_inputs(batches, ModelArgs(), inputs, is_graph_warmup);
 
-  ASSERT_EQ(inputs.size(), 2u);
-  EXPECT_EQ(inputs[0].input_params.parallel.dp_global_token_nums,
-            (std::vector<int32_t>{1, 0}));
-  EXPECT_TRUE(inputs[1].input_params.meta.batch_forward_type.is_decode());
-  EXPECT_EQ(inputs[0].input_params.parallel.dp_is_decode,
-            (std::vector<int32_t>{1, 1}));
-  EXPECT_EQ(inputs[1].input_params.parallel.dp_is_decode,
-            (std::vector<int32_t>{1, 1}));
-}
-
-TEST(ForwardInputFactoryTest, PropagatesGraphWarmupAndHandlesAllEmptyGroup) {
-  BlockManager::Options manager_options;
-  manager_options.num_blocks(8).block_size(4);
-  BlockManagerImpl manager(manager_options);
-  Sequence warmup = make_sequence({1, 2}, "warmup", /*is_graph_warmup=*/true);
-  add_kv_block(&warmup, &manager);
-
-  BatchGroup warmup_batches(2);
-  warmup_batches[0] = make_batch(&warmup);
-  auto factory = make_factory(/*dp_size=*/2);
-  std::vector<LlmForwardInput> warmup_inputs;
-  bool warmup_is_graph_warmup = false;
-  factory.create_inputs(
-      warmup_batches, ModelArgs(), warmup_inputs, warmup_is_graph_warmup);
-  EXPECT_TRUE(warmup_is_graph_warmup);
-  for (const auto& input : warmup_inputs) {
-    EXPECT_TRUE(input.input_params.meta.is_graph_warmup);
+    ASSERT_EQ(inputs.size(), 2u);
+    EXPECT_EQ(inputs[0].input_params.parallel.dp_global_token_nums,
+              (std::vector<int32_t>{1, 0}));
+    EXPECT_TRUE(inputs[1].input_params.meta.batch_forward_type.is_decode());
+    EXPECT_EQ(inputs[0].input_params.parallel.dp_is_decode,
+              (std::vector<int32_t>{1, 1}));
+    EXPECT_EQ(inputs[1].input_params.parallel.dp_is_decode,
+              (std::vector<int32_t>{1, 1}));
   }
 
-  BatchGroup empty_batches(2);
-  std::vector<LlmForwardInput> empty_inputs;
-  bool empty_is_graph_warmup = true;
-  factory.create_inputs(
-      empty_batches, ModelArgs(), empty_inputs, empty_is_graph_warmup);
-  EXPECT_FALSE(empty_is_graph_warmup);
-  EXPECT_EQ(empty_inputs[0].input_params.parallel.dp_global_token_nums,
-            (std::vector<int32_t>{0, 0}));
-  for (const auto& input : empty_inputs) {
-    EXPECT_TRUE(input.input_params.meta.batch_forward_type.is_empty());
-    EXPECT_TRUE(input.input_params.parallel.dp_is_decode.empty() ||
-                input.input_params.parallel.dp_is_decode ==
-                    (std::vector<int32_t>{0, 0}));
+  TEST(ForwardInputFactoryTest, PropagatesGraphWarmupAndHandlesAllEmptyGroup) {
+    BlockManager::Options manager_options;
+    manager_options.num_blocks(8).block_size(4);
+    BlockManagerImpl manager(manager_options);
+    Sequence warmup = make_sequence({1, 2}, "warmup", /*is_graph_warmup=*/true);
+    add_kv_block(&warmup, &manager);
+
+    BatchGroup warmup_batches(2);
+    warmup_batches[0] = make_batch(&warmup);
+    auto factory = make_factory(/*dp_size=*/2);
+    std::vector<LlmForwardInput> warmup_inputs;
+    bool warmup_is_graph_warmup = false;
+    factory.create_inputs(
+        warmup_batches, ModelArgs(), warmup_inputs, warmup_is_graph_warmup);
+    EXPECT_TRUE(warmup_is_graph_warmup);
+    for (const auto& input : warmup_inputs) {
+      EXPECT_TRUE(input.input_params.meta.is_graph_warmup);
+    }
+
+    BatchGroup empty_batches(2);
+    std::vector<LlmForwardInput> empty_inputs;
+    bool empty_is_graph_warmup = true;
+    factory.create_inputs(
+        empty_batches, ModelArgs(), empty_inputs, empty_is_graph_warmup);
+    EXPECT_FALSE(empty_is_graph_warmup);
+    EXPECT_EQ(empty_inputs[0].input_params.parallel.dp_global_token_nums,
+              (std::vector<int32_t>{0, 0}));
+    for (const auto& input : empty_inputs) {
+      EXPECT_TRUE(input.input_params.meta.batch_forward_type.is_empty());
+      EXPECT_TRUE(input.input_params.parallel.dp_is_decode.empty() ||
+                  input.input_params.parallel.dp_is_decode ==
+                      (std::vector<int32_t>{0, 0}));
+    }
   }
-}
 
-TEST(ForwardInputFactoryTest, KeepsOneInputPerDpRankForContextParallelism) {
-  BlockManager::Options manager_options;
-  manager_options.num_blocks(8).block_size(4);
-  BlockManagerImpl first_manager(manager_options);
-  BlockManagerImpl second_manager(manager_options);
-  Sequence first = make_sequence({1, 2}, "first");
-  Sequence second = make_sequence({3, 4}, "second");
-  add_kv_block(&first, &first_manager);
-  add_kv_block(&second, &second_manager);
+  TEST(ForwardInputFactoryTest, KeepsOneInputPerDpRankForContextParallelism) {
+    BlockManager::Options manager_options;
+    manager_options.num_blocks(8).block_size(4);
+    BlockManagerImpl first_manager(manager_options);
+    BlockManagerImpl second_manager(manager_options);
+    Sequence first = make_sequence({1, 2}, "first");
+    Sequence second = make_sequence({3, 4}, "second");
+    add_kv_block(&first, &first_manager);
+    add_kv_block(&second, &second_manager);
 
-  BatchGroup batches(2);
-  batches[0] = make_batch(&first);
-  batches[1] = make_batch(&second);
-  auto factory = make_factory(/*dp_size=*/2, /*cp_size=*/3);
-  std::vector<LlmForwardInput> inputs;
-  bool is_graph_warmup = false;
-  factory.create_inputs(batches, ModelArgs(), inputs, is_graph_warmup);
+    BatchGroup batches(2);
+    batches[0] = make_batch(&first);
+    batches[1] = make_batch(&second);
+    auto factory = make_factory(/*dp_size=*/2, /*cp_size=*/3);
+    std::vector<LlmForwardInput> inputs;
+    bool is_graph_warmup = false;
+    factory.create_inputs(batches, ModelArgs(), inputs, is_graph_warmup);
 
-  ASSERT_EQ(inputs.size(), 2u);
-  EXPECT_EQ(inputs[0].input_params.meta.num_sequences, 1);
-  EXPECT_EQ(inputs[1].input_params.meta.num_sequences, 1);
-}
+    ASSERT_EQ(inputs.size(), 2u);
+    EXPECT_EQ(inputs[0].input_params.meta.num_sequences, 1);
+    EXPECT_EQ(inputs[1].input_params.meta.num_sequences, 1);
+  }
 
-TEST(ForwardInputFactoryTest, TracksEmbeddingGenerationAcrossBatchSteps) {
-  BlockManagerPool::Options manager_options;
-  manager_options.num_blocks(8)
-      .block_size(4)
-      .num_embedding_blocks(8)
-      .num_speculative_tokens(1)
-      .max_seqs_per_batch(8);
-  BlockManagerPool first_manager(manager_options);
-  BlockManagerPool second_manager(manager_options);
-  Sequence first = make_sequence({1, 2}, "request-a");
-  Sequence second = make_sequence({3, 4}, "request-b");
-  ASSERT_TRUE(first_manager.allocate(&first));
-  ASSERT_TRUE(second_manager.allocate(&second));
+  TEST(ForwardInputFactoryTest, EnforcesDeepseekV4BatchTokenBudget) {
+    BlockManager::Options manager_options;
+    manager_options.num_blocks(8).block_size(4);
+    BlockManagerImpl manager(manager_options);
+    Sequence sequence = make_sequence({1, 2, 3}, "dsv4");
+    add_kv_block(&sequence, &manager);
+    BatchGroup batches(1);
+    batches[0] = make_batch(&sequence);
 
-  auto factory = make_factory(/*dp_size=*/1);
-  BatchGroup first_batches(1);
-  first_batches[0] = make_batch(&first);
-  std::vector<LlmForwardInput> first_inputs;
-  bool first_is_graph_warmup = false;
-  factory.create_inputs(
-      first_batches, ModelArgs(), first_inputs, first_is_graph_warmup);
-  ASSERT_EQ(
-      first_inputs[0].input_params.parallel.dp_global_batch_generations.size(),
-      1u);
-  const uint64_t first_generation =
-      first_inputs[0].input_params.parallel.dp_global_batch_generations[0];
-  EXPECT_GE(first_generation, 1u);
+    ModelArgs args;
+    args.model_type("deepseek_v4");
+    auto factory = make_factory(/*dp_size=*/1,
+                                /*cp_size=*/1,
+                                /*max_tokens_per_batch=*/3);
+    std::vector<LlmForwardInput> inputs;
+    bool is_graph_warmup = false;
+    factory.create_inputs(batches, args, inputs, is_graph_warmup);
+    ASSERT_EQ(inputs[0].input_params.parallel.dp_global_token_nums,
+              (std::vector<int32_t>{3}));
+    EXPECT_EQ(inputs[0].host_token_ids().numel(), 3);
+  }
 
-  BatchGroup second_batches(1);
-  second_batches[0] = make_batch(&second);
-  std::vector<LlmForwardInput> second_inputs;
-  bool second_is_graph_warmup = false;
-  factory.create_inputs(
-      second_batches, ModelArgs(), second_inputs, second_is_graph_warmup);
-  EXPECT_GT(
-      second_inputs[0].input_params.parallel.dp_global_batch_generations[0],
-      first_generation);
-}
+  TEST(ForwardInputFactoryTest, PreparationAdvancesSequenceKvCursor) {
+    BlockManager::Options manager_options;
+    manager_options.num_blocks(8).block_size(4);
+    BlockManagerImpl manager(manager_options);
+    Sequence sequence = make_sequence({1, 2, 3}, "cursor");
+    add_kv_block(&sequence, &manager);
+    EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 0u);
 
-TEST(ForwardInputFactoryTest, EnforcesDeepseekV4BatchTokenBudget) {
-  BlockManager::Options manager_options;
-  manager_options.num_blocks(8).block_size(4);
-  BlockManagerImpl manager(manager_options);
-  Sequence sequence = make_sequence({1, 2, 3}, "dsv4");
-  add_kv_block(&sequence, &manager);
-  BatchGroup batches(1);
-  batches[0] = make_batch(&sequence);
-
-  ModelArgs args;
-  args.model_type("deepseek_v4");
-  auto factory = make_factory(/*dp_size=*/1,
-                              /*cp_size=*/1,
-                              /*max_tokens_per_batch=*/3);
-  std::vector<LlmForwardInput> inputs;
-  bool is_graph_warmup = false;
-  factory.create_inputs(batches, args, inputs, is_graph_warmup);
-  ASSERT_EQ(inputs[0].input_params.parallel.dp_global_token_nums,
-            (std::vector<int32_t>{3}));
-  EXPECT_EQ(inputs[0].host_token_ids().numel(), 3);
-}
-
-TEST(ForwardInputFactoryTest, PreparationAdvancesSequenceKvCursor) {
-  BlockManager::Options manager_options;
-  manager_options.num_blocks(8).block_size(4);
-  BlockManagerImpl manager(manager_options);
-  Sequence sequence = make_sequence({1, 2, 3}, "cursor");
-  add_kv_block(&sequence, &manager);
-  EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 0u);
-
-  BatchGroup batches(1);
-  batches[0] = make_batch(&sequence);
-  auto factory = make_factory(/*dp_size=*/1);
-  std::vector<LlmForwardInput> inputs;
-  bool is_graph_warmup = false;
-  factory.create_inputs(batches, ModelArgs(), inputs, is_graph_warmup);
-  EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 3u);
-}
+    BatchGroup batches(1);
+    batches[0] = make_batch(&sequence);
+    auto factory = make_factory(/*dp_size=*/1);
+    std::vector<LlmForwardInput> inputs;
+    bool is_graph_warmup = false;
+    factory.create_inputs(batches, ModelArgs(), inputs, is_graph_warmup);
+    EXPECT_EQ(sequence.kv_state().kv_cache_tokens_num(), 3u);
+  }
 
 }  // namespace
 }  // namespace xllm

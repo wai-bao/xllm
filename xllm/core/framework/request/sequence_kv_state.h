@@ -142,7 +142,8 @@ class KVCacheState {
 
   // Per-sequence embedding-row block (BlockType::EMBEDDING): returns the
   // EMBEDDING block id, or -1 when absent. Used for embedding_ids export
-  // (spec-decode EmbeddingCache). Other block types read via blocks(type).
+  // (spec-decode target/seed state stores). Other block types read via
+  // blocks(type).
   int32_t get_embedding_block_id() const;
 
   // Linear-state live slot id (BlockType::LINEAR), or -1 when absent.

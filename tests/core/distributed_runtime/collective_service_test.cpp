@@ -17,28 +17,29 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <string>
+
 namespace xllm {
 namespace {
 
-TEST(CollectiveServiceTest, RendezvousNeedsNoDeviceOrCommunicator) {
-  // Address discovery must work before device/communicator initialization.
-  CollectiveService service(/*total_num=*/2);
-  proto::AddressInfo worker;
-  proto::CommUniqueIdList response;
-  worker.set_global_rank(1);
-  worker.set_address("127.0.0.1:9001");
-  service.Sync(nullptr, &worker, &response, nullptr);
-  EXPECT_EQ(response.comm_unique_ids_size(), 0);
-
-  worker.set_global_rank(0);
-  worker.set_address("127.0.0.1:9000");
-  service.Sync(nullptr, &worker, &response, nullptr);
-  EXPECT_EQ(response.comm_unique_ids_size(), 0);
-
-  const auto addresses = service.wait();
-  ASSERT_EQ(addresses.size(), 2);
-  EXPECT_EQ(addresses.at(0), "127.0.0.1:9000");
-  EXPECT_EQ(addresses.at(1), "127.0.0.1:9001");
+TEST(CollectiveServiceTest, RegistersWorkersWithoutUnusedCommunicationRoots) {
+  for (int32_t world_size : {1, 2}) {
+    CollectiveService service(world_size);
+    for (int32_t rank = 0; rank < world_size; ++rank) {
+      proto::AddressInfo request;
+      request.set_global_rank(rank);
+      request.set_address("worker-" + std::to_string(rank));
+      proto::CommUniqueIdList response;
+      service.Sync(nullptr, &request, &response, nullptr);
+      EXPECT_EQ(response.comm_unique_ids_size(), 0);
+    }
+    const auto addresses = service.wait();
+    ASSERT_EQ(addresses.size(), world_size);
+    for (int32_t rank = 0; rank < world_size; ++rank) {
+      EXPECT_EQ(addresses.at(rank), "worker-" + std::to_string(rank));
+    }
+  }
 }
 
 }  // namespace

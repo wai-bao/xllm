@@ -32,6 +32,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/common/global_flags.h"
 #include "core/distributed_runtime/master.h"
+#include "core/distributed_runtime/request_state_cleanup.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/model_config.h"
@@ -418,6 +419,11 @@ ForwardOutput VLMEngine::step(BatchGroup& batch) {
 
   COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
   return {};
+}
+
+void VLMEngine::flush_released_requests() {
+  flush_released_request_state(
+      *kv_cache_manager_, worker_clients_, dp_local_tp_size_);
 }
 
 void VLMEngine::update_last_step_result(BatchGroup& last_batch) {

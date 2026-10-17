@@ -86,6 +86,7 @@ class FakeEngine : public Engine {
   }
   const ModelArgs& model_args() const override { return model_args_; }
   const TokenizerArgs& tokenizer_args() const { NOT_IMPLEMENTED(); }
+
   bool init() override { return true; }
 
  private:

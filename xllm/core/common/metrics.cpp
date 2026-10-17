@@ -297,8 +297,8 @@ DEFINE_COUNTER(speculative_num_draft_tokens_plain_total,
                "Draft speculative tokens from plain rows");
 DEFINE_COUNTER(speculative_unified_graph_executions_total,
                "Successful unified Python MTP graph executions");
-DEFINE_COUNTER(speculative_legacy_decode_steps_total,
-               "MTP decode steps handled by the legacy path");
+DEFINE_COUNTER(speculative_pipeline_invalid_draft_input_rows_total,
+               "Task-pipeline draft-input rows degraded to no-draft decode");
 
 // proto metrics
 DEFINE_COUNTER(proto_latency_seconds_proto2i,

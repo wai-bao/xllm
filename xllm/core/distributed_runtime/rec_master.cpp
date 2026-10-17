@@ -27,6 +27,7 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "common/types.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/parallel_config_validation.h"
 #include "core/framework/multimodal/mm_data.h"
 #if defined(USE_NPU)
@@ -140,16 +141,7 @@ RecMaster::RecMaster(const Options& options) : Master(options) {
     LOG(ERROR) << "Unsupported rec model_type: " << model_args_.model_type();
   }
 
-  if (options_.enable_service_routing()) {
-    XServiceClient* xservice_client = XServiceClient::get_instance();
-    if (!xservice_client->init(options_.etcd_addr().value_or(""),
-                               options_.instance_name().value_or(""),
-                               options_.etcd_namespace().value_or(""))) {
-      LOG(FATAL) << "XServiceClient init fail!";
-      return;
-    }
-  }
-
+  acquire_service_client();
   SchedulerOptions scheduler_options;
   scheduler_options.max_tokens_per_batch(options_.max_tokens_per_batch())
       .max_seqs_per_batch(options_.max_seqs_per_batch())
@@ -162,6 +154,7 @@ RecMaster::RecMaster(const Options& options) : Master(options) {
       .enable_disagg_pd(options_.enable_disagg_pd())
       .enable_schedule_overlap(options_.enable_schedule_overlap())
       .enable_chunked_prefill(options_.enable_chunked_prefill())
+      .instance_name(options_.instance_name())
       .instance_role(options_.instance_role())
       .kv_cache_transfer_mode(options_.kv_cache_transfer_mode())
       .enable_service_routing(options_.enable_service_routing())
@@ -169,6 +162,8 @@ RecMaster::RecMaster(const Options& options) : Master(options) {
       .rec_worker_max_concurrency(options_.rec_worker_max_concurrency());
   scheduler_ =
       create_fixed_steps_scheduler(rec_engine_.get(), scheduler_options);
+  discovery_registration_ =
+      bind_service_registration(scheduler_.get(), rec_engine_.get());
 
   chat_template_ = nullptr;
   // Initialize chat template and tokenizer for LlmRec (Qwen3).

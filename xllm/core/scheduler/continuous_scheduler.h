@@ -32,7 +32,6 @@ limitations under the License.
 #include "core/common/macros.h"
 #include "core/common/types.h"
 #include "core/distributed_runtime/engine.h"
-#include "core/distributed_runtime/xservice_client.h"
 #include "core/framework/batch/batch_factory.h"
 #include "core/framework/batch/batch_group.h"
 #include "core/framework/block/kv_cache_manager.h"
@@ -135,12 +134,7 @@ class ContinuousSchedulerBase : public Scheduler {
           nullptr,
       std::shared_ptr<DistributedWorkerManager> distributed_worker_manager =
           nullptr);
-
-  void clear_mtp_bootstrap(Request* request);
   void drain_prefetch_pipeline();
-  void populate_heartbeat_request(
-      xllm_service::proto::HeartbeatRequest& request,
-      bool include_virtual_memory_info);
   // Caller holds prefetch_admission_mutex_ for both admission operations.
   virtual size_t num_queued_requests() const;
   virtual bool enqueue_ready_request(std::shared_ptr<Request> request);
@@ -249,10 +243,6 @@ class ContinuousSchedulerBase : public Scheduler {
   // tokenizer
   std::unique_ptr<Tokenizer> tokenizer_;
 
-  XServiceClient* xservice_client_ = nullptr;
-  XServiceClient::HeartbeatCallbackRegistration
-      heartbeat_callback_registration_ = 0;
-
   // params for enable_schedule_overlap case
   BatchGroup last_batch_;
   std::vector<std::shared_ptr<Request>> last_running_requests_;
@@ -341,5 +331,11 @@ class ContinuousScheduler : public ContinuousSchedulerBase {
  protected:
   EngineType* engine_;
 };
+
+// Clears the target bootstrap marker and any carried draft input on a request's
+// primary sequence. Shared by ContinuousScheduler and SchedulerPolicy so the
+// disagg-PD handoff gate lives in one place.
+void clear_speculative_pd_handoff_state(Request* request,
+                                        const SchedulerOptions& options);
 
 }  // namespace xllm

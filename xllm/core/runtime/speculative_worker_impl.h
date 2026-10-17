@@ -31,6 +31,14 @@ namespace xllm {
 
 class JsonObjectGrammarState;
 
+// Target-model options shared by the speculative algorithms: decode-order
+// schedule overlap stays off, the target is not a draft engine, and aux
+// hidden states are captured for the drafter.
+runtime::Options speculative_target_options(const runtime::Options& options);
+runtime::Options speculative_draft_options(const runtime::Options& options);
+
+class LLMWorkerImpl;
+
 // Returns whether this rank may execute the multi-step speculative decode
 // plan for the current global DP batch.
 bool should_run_speculative_decode(const LlmModelParams& params);

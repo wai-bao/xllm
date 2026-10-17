@@ -71,6 +71,10 @@ struct SchedulerOptions {
   // the number of speculative tokens per step
   PROPERTY(int32_t, num_speculative_tokens) = 0;
 
+  PROPERTY(std::string, speculative_algorithm) = "MTP";
+
+  PROPERTY(std::string, draft_sampling_mode) = "greedy";
+
   // Effective target shape used by decode profiling and graph warmup.
   PROPERTY(runtime::DecodeGraphExecutionShape, decode_graph_execution_shape) = {
   };

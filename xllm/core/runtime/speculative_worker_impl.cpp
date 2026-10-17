@@ -16,19 +16,39 @@ limitations under the License.
 #include "core/runtime/speculative_worker_impl.h"
 
 #include "common/global_flags.h"
+#include "common/metrics.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_utils.h"
-#include "core/framework/speculative/spec_input_builder.h"
 #include "core/framework/speculative/verify_layout.h"
-#include "core/kv_cache/layout/kv_cache_shape.h"
+#include "core/runtime/spec_verify.h"
+#include "core/runtime/speculative_input_builder.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/vlm_worker_impl.h"
 #include "util/slice.h"
 #include "util/tensor_helper.h"
-#include "util/timer.h"
-#include "util/utils.h"
 
 namespace xllm {
+
+runtime::Options speculative_target_options(const runtime::Options& options) {
+  auto opts = options;
+  opts.enable_schedule_overlap(false)
+      .is_draft_engine(false)
+      .enable_graph_aux_hidden_states(true);
+  return opts;
+}
+
+// Draft-model options shared by the speculative algorithms: single-token
+// decoding, no speculative width on the drafter itself, aux hidden states
+// captured for the next proposal.
+runtime::Options speculative_draft_options(const runtime::Options& options) {
+  auto opts = options;
+  opts.enable_schedule_overlap(false)
+      .is_draft_engine(true)
+      .num_decoding_tokens(1)
+      .num_speculative_tokens(0)
+      .enable_graph_aux_hidden_states(true);
+  return opts;
+}
 
 namespace {
 template <typename Params>
@@ -158,9 +178,30 @@ bool SpeculativeWorkerImpl<TargetInput>::allocate_kv_cache_with_transfer(
 
 template <typename TargetInput>
 std::optional<ForwardOutput> SpeculativeWorkerImpl<TargetInput>::step(
-    const TargetInput& input) {
-  auto& mutable_params = input.input_params;
-  set_hierarchy_layer_synchronizer(mutable_params);
+    const TargetInput& raw_input) {
+  // released_embedding_ids is consumed exactly here; every downstream worker
+  // treats it as opaque transport data, so releasing the state never requires
+  // cloning the whole input just to clear the field afterwards.
+  if constexpr (std::is_same_v<TargetInput, LlmForwardInput>) {
+    const auto& released = raw_input.request_state.released_embedding_ids;
+    if (!released.empty()) {
+      release_request_state(released);
+    }
+  }
+  std::optional<TargetInput> cleaned_input;
+  if (hierarchy_kv_cache_transfer_ != nullptr) {
+    std::optional<HostKVLoadHandle> load_handle =
+        hierarchy_kv_cache_transfer_->take_load_handle(
+            raw_input.input_params.meta.batch_id);
+    if (load_handle.has_value()) {
+      cleaned_input.emplace(raw_input.clone());
+      ModelInputParams bound_params(cleaned_input->input_params);
+      HierarchyKVCacheTransfer::bind_load_handle(bound_params,
+                                                 std::move(*load_handle));
+    }
+  }
+  const TargetInput& input =
+      cleaned_input.has_value() ? *cleaned_input : raw_input;
   const bool run_speculative_decode =
       should_run_speculative_decode(input.input_params);
   if (input.input_params.meta.num_sequences == 0 ||

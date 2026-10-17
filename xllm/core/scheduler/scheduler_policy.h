@@ -207,7 +207,6 @@ class SchedulerPolicy {
   void cache_in_batch_prefix(const std::vector<Sequence*>& sequences,
                              const std::vector<size_t>& token_budgets,
                              SchedulerState& state);
-  void clear_mtp_bootstrap(Request* request, const SchedulerState& state);
 
   BatchMode batch_mode_;
   const SchedulerOptions& options_;

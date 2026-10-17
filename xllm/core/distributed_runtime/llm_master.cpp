@@ -250,18 +250,13 @@ LLMMaster::LLMMaster(const Options& options)
           model_residency_coordinator_->finish_initialization(master_status_));
     }
     model_args_ = engine->model_args();
-    if (options_.enable_service_routing()) {
-      xservice_client_ = XServiceClient::get_instance();
-      CHECK(xservice_client_->init(options_.etcd_addr().value_or(""),
-                                   options_.instance_name().value_or(""),
-                                   options_.etcd_namespace().value_or("")))
-          << "XServiceClient init fail!";
-    }
   };
   dispatch_engine(initialize_engine,
                   llm_engine_.get(),
                   suffix_engine_.get(),
                   speculative_engine_.get());
+  acquire_service_client();
+
   task_type_ = options_.task_type();
 
   SchedulerOptions scheduler_options;
@@ -272,6 +267,8 @@ LLMMaster::LLMMaster(const Options& options)
       .max_tokens_per_chunk_for_prefill(
           options_.max_tokens_per_chunk_for_prefill())
       .num_speculative_tokens(options_.num_speculative_tokens())
+      .speculative_algorithm(options_.speculative_algorithm())
+      .draft_sampling_mode(options_.draft_sampling_mode())
       .nnodes(options_.nnodes())
       .dp_size(options_.dp_size())
       .cp_size(options_.cp_size())
@@ -300,6 +297,7 @@ LLMMaster::LLMMaster(const Options& options)
     scheduler_ = create_continuous_scheduler(
         engine,
         scheduler_options,
+        xservice_client_,
         distributed_worker_manager_,
         llm_engine_ != nullptr ? model_residency_coordinator_ : nullptr,
         kv_transfer_coordinator_);
@@ -310,8 +308,14 @@ LLMMaster::LLMMaster(const Options& options)
                   speculative_engine_.get());
 
   if (options_.enable_service_routing()) {
-    auto& instance_info = scheduler_->get_instance_info();
-    XServiceClient::get_instance()->register_instance(instance_info);
+    dispatch_engine(
+        [this](auto* engine) {
+          discovery_registration_ =
+              bind_service_registration(scheduler_.get(), engine);
+        },
+        llm_engine_.get(),
+        suffix_engine_.get(),
+        speculative_engine_.get());
   }
 
   auto initialize_tokenizer = [this](auto* engine) {
@@ -561,20 +565,12 @@ void LLMMaster::generate() {
   running_.store(false, std::memory_order_relaxed);
 }
 
-bool LLMMaster::handle_rpc_response(const RequestOutput& output) {
-  // response to xllm service to avoid the redirect cost.
-  if (xservice_client_ == nullptr) return false;
-  auto return_status = xservice_client_->generations({output});
-  CHECK_EQ(return_status.size(), 1)
-      << "return size of generations is not equal to 1";
-  return return_status[0];
-}
-
 std::vector<bool> LLMMaster::handle_rpc_responses(
     const std::vector<RequestOutput>& outputs) {
   // response to xllm service to avoid the redirect cost.
-  if (xservice_client_ == nullptr)
+  if (!xservice_client_) {
     return std::vector<bool>(outputs.size(), false);
+  }
   return xservice_client_->generations(outputs);
 }
 
@@ -602,13 +598,28 @@ bool LLMMaster::wakeup(const WakeupOptions& options) {
 }
 
 bool LLMMaster::link_p2p(const std::vector<std::string>& remote_addrs) {
-  return distributed_worker_manager_->link_p2p(remote_addrs);
+  auto op = &DistributedWorkerManager::link_p2p;
+  return dispatch_engine(
+      [&remote_addrs, op](auto* engine) {
+        const auto& manager = engine->get_distributed_worker_manager();
+        return manager != nullptr && (manager.get()->*op)(remote_addrs);
+      },
+      llm_engine_.get(),
+      suffix_engine_.get(),
+      speculative_engine_.get());
 }
 
 bool LLMMaster::unlink_p2p(const std::vector<std::string>& remote_addrs) {
-  return distributed_worker_manager_->unlink_p2p(remote_addrs);
+  auto op = &DistributedWorkerManager::unlink_p2p;
+  return dispatch_engine(
+      [&remote_addrs, op](auto* engine) {
+        const auto& manager = engine->get_distributed_worker_manager();
+        return manager != nullptr && (manager.get()->*op)(remote_addrs);
+      },
+      llm_engine_.get(),
+      suffix_engine_.get(),
+      speculative_engine_.get());
 }
-
 bool LLMMaster::start_profile() {
   return dispatch_engine([](auto* engine) { return engine->start_profile(); },
                          llm_engine_.get(),

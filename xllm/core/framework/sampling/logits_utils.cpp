@@ -144,4 +144,15 @@ void apply_top_k_top_p(torch::Tensor& logits,
   apply_top_k_top_p_torch_impl(logits, top_k, top_p);
 }
 
+torch::Tensor selected_softmax_prob(const torch::Tensor& logits,
+                                    const torch::Tensor& selected) {
+  const torch::Tensor float_logits = logits.to(torch::kFloat32);
+  const torch::Tensor selected_logits =
+      float_logits.gather(/*dim=*/-1, selected.reshape({-1, 1}));
+  const torch::Tensor log_probs =
+      selected_logits -
+      torch::logsumexp(float_logits, /*dim=*/-1, /*keepdim=*/true);
+  return log_probs.exp().reshape_as(selected);
+}
+
 }  // namespace xllm

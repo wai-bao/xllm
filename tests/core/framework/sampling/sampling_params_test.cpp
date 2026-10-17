@@ -20,6 +20,8 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include "core/framework/sampling/draft_sampling.h"
+
 namespace xllm {
 
 TEST(SamplingParamsTest, NormalConcat) {
@@ -187,6 +189,64 @@ TEST(SamplingParamsTest, ConcatPreservesMixedPenaltyAndSamplingRows) {
   EXPECT_EQ(first.logits_bias[0].sum().item<float>(), 0.0F);
   EXPECT_FALSE(first.all_random_sample);
   EXPECT_FALSE(first.all_greedy_sample);
+}
+
+TEST(SamplingParamsTest, GreedyDraftDoesNotMutateTargetSamplingTensors) {
+  SamplingParameters target;
+  target.do_sample = torch::tensor({true, false}, torch::kBool);
+  target.all_greedy_sample = false;
+  target.all_random_sample = false;
+  target.logprobs = true;
+  target.max_top_logprobs = 3;
+  target.return_probs = true;
+  target.frequency_penalties = torch::tensor({0.5F, 0.0F});
+  target.sample_idxes = torch::tensor({0, 1}, torch::kInt32);
+  SamplingParameters draft = target;
+
+  configure_draft_sampling(draft,
+                           DraftSamplingMode::GREEDY,
+                           /*require_probs_for_greedy=*/false);
+
+  EXPECT_TRUE(torch::equal(target.do_sample,
+                           torch::tensor({true, false}, torch::kBool)));
+  EXPECT_FALSE(draft.do_sample.any().item<bool>());
+  EXPECT_NE(draft.do_sample.data_ptr(), target.do_sample.data_ptr());
+  EXPECT_EQ(draft.frequency_penalties.data_ptr(),
+            target.frequency_penalties.data_ptr());
+  EXPECT_EQ(draft.sample_idxes.data_ptr(), target.sample_idxes.data_ptr());
+  EXPECT_TRUE(target.logprobs);
+  EXPECT_EQ(target.max_top_logprobs, 3);
+  EXPECT_TRUE(target.return_probs);
+  EXPECT_FALSE(target.all_greedy_sample);
+}
+
+TEST(SamplingParamsTest, DraftSamplingKeepsPipelineMaskAndMixedBatchOwnership) {
+  SamplingParameters target;
+  target.do_sample = torch::tensor({true, false}, torch::kBool);
+  target.all_greedy_sample = false;
+  target.all_random_sample = false;
+  const torch::Tensor greedy_storage = torch::zeros({4}, torch::kBool);
+  const torch::Tensor greedy_rows =
+      greedy_storage.narrow(/*dim=*/0, /*start=*/1, /*length=*/2);
+  SamplingParameters draft = target;
+
+  configure_draft_sampling(draft,
+                           DraftSamplingMode::GREEDY,
+                           /*require_probs_for_greedy=*/false,
+                           greedy_rows);
+  EXPECT_EQ(draft.do_sample.data_ptr(), greedy_rows.data_ptr());
+  EXPECT_FALSE(greedy_storage.any().item<bool>());
+  EXPECT_TRUE(target.do_sample[0].item<bool>());
+
+  draft = target;
+  configure_draft_sampling(draft,
+                           DraftSamplingMode::PROBABILISTIC,
+                           /*require_probs_for_greedy=*/false,
+                           greedy_rows);
+  EXPECT_EQ(draft.do_sample.data_ptr(), target.do_sample.data_ptr());
+  EXPECT_TRUE(draft.return_probs);
+  EXPECT_FALSE(draft.all_greedy_sample);
+  EXPECT_FALSE(draft.all_random_sample);
 }
 
 }  // namespace xllm

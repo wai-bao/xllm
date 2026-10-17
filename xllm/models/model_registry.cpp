@@ -449,6 +449,57 @@ bool ModelRegistry::supports_dcp(const std::string& name) {
   return it != instance->model_registry_.end() && it->second.supports_dcp;
 }
 
+void ModelRegistry::register_mtp_model_pair(
+    const std::string& target,
+    const std::string& draft,
+    std::function<void(ModelArgs&)> args_adapter) {
+  CHECK(!target.empty() && !draft.empty() && target != draft);
+  CHECK(args_adapter != nullptr);
+  auto& registry = get_instance()->model_registry_;
+  auto& target_meta = registry[target];
+  auto& draft_meta = registry[draft];
+  CHECK(target_meta.mtp_draft_model_type.empty() ||
+        target_meta.mtp_draft_model_type == draft);
+  CHECK(draft_meta.mtp_target_model_type.empty() ||
+        draft_meta.mtp_target_model_type == target);
+  target_meta.mtp_draft_model_type = draft;
+  target_meta.mtp_draft_args_adapter = std::move(args_adapter);
+  draft_meta.mtp_target_model_type = target;
+}
+
+std::string ModelRegistry::get_mtp_target_model_type(const std::string& draft) {
+  const auto& registry = get_instance()->model_registry_;
+  const auto it = registry.find(draft);
+  return it == registry.end() ? std::string()
+                              : it->second.mtp_target_model_type;
+}
+
+bool ModelRegistry::convert_to_mtp_draft(ModelArgs& args) {
+  const auto& registry = get_instance()->model_registry_;
+  const auto it = registry.find(args.model_type());
+  if (it == registry.end() || it->second.mtp_draft_model_type.empty()) {
+    return false;
+  }
+  args.model_type(it->second.mtp_draft_model_type);
+  it->second.mtp_draft_args_adapter(args);
+  return true;
+}
+
+void ModelRegistry::register_target_spec_verify_mode(
+    const std::string& name,
+    TargetSpecVerifyMode mode) {
+  get_instance()->model_registry_[name].target_spec_verify_mode = mode;
+}
+
+TargetSpecVerifyMode ModelRegistry::get_target_spec_verify_mode(
+    const std::string& name) {
+  ModelRegistry* instance = get_instance();
+  const auto it = instance->model_registry_.find(name);
+  return it == instance->model_registry_.end()
+             ? TargetSpecVerifyMode::GENERIC
+             : it->second.target_spec_verify_mode;
+}
+
 CausalLMFactory ModelRegistry::get_causallm_factory(const std::string& name) {
   ModelRegistry* instance = get_instance();
 
@@ -583,16 +634,6 @@ std::string resolve_dit_pipeline_type(
 }
 
 }  // namespace util
-
-void ModelRegistry::register_mtp_shared_weight_owner(const std::string& name) {
-  get_instance()->model_registry_[name].owns_mtp_shared_weights = true;
-}
-
-bool ModelRegistry::owns_mtp_shared_weights(const std::string& name) {
-  const auto& models = get_instance()->model_registry_;
-  const auto entry = models.find(name);
-  return entry != models.end() && entry->second.owns_mtp_shared_weights;
-}
 
 std::string ModelRegistry::get_model_backend(const std::string& name) {
   ModelRegistry* instance = get_instance();

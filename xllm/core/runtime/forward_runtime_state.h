@@ -15,11 +15,13 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <torch/types.h>
 
 #include <cstdint>
 #include <vector>
 
+#include "core/platform/stream.h"
 #include "core/platform/stream_event.h"
 
 namespace xllm {
@@ -54,5 +56,31 @@ struct ForwardRuntimeState {
   // handles are local runtime state and are not serialized.
   std::vector<torch::Tensor> retained_device_tensors;
 };
+
+// Marks the input's runtime state as ready on `stream` so consumers on other
+// streams can wait on metadata_ready_event instead of a full synchronize.
+template <typename Input>
+inline void record_metadata_ready_event(Stream& stream, Input& input) {
+  input.runtime.metadata_ready_event = stream.record_event_or_sync();
+}
+
+template <typename Input>
+inline void wait_metadata_ready_event(const Input& input, Stream& stream) {
+  CHECK(stream.wait_event(input.runtime.metadata_ready_event))
+      << "failed to wait metadata ready event";
+}
+
+// Re-arms the ready event on `stream`: waits out the previous event first so
+// the old handle is not replaced while still awaited elsewhere.
+template <typename Input>
+inline void record_current_metadata_ready_event(Input& input, Stream& stream) {
+  wait_metadata_ready_event(input, stream);
+  record_metadata_ready_event(stream, input);
+}
+
+template <typename Input>
+inline void clear_ready_events(Input& input) {
+  input.runtime.metadata_ready_event.reset();
+}
 
 }  // namespace xllm

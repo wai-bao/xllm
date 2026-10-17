@@ -6,6 +6,7 @@ if(USE_NPU)
   cc_test(
     NAME
       model_registry_test
+    NO_NPU_RUNTIME
     SRCS
       model_registry_test.cpp
     DEPS

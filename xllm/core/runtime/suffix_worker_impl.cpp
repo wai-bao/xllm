@@ -18,7 +18,7 @@ limitations under the License.
 #include <algorithm>
 
 #include "common/metrics.h"
-#include "core/framework/speculative/spec_verify.h"
+#include "core/runtime/spec_verify.h"
 #include "framework/sampling/sampling_params.h"
 #include "util/slice.h"
 #include "util/tensor_helper.h"

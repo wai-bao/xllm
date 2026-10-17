@@ -6,29 +6,34 @@ cc_library(
   HDRS
     adaptive_speculative_controller.h
     speculative_profile_registry.h
-    adaptive_pruning_helpers.h
-    spec_input_builder.h
-    mtp_async_input_builder.h
-    mtp_async_state.h
+    draft_input_model_spec.h
+    draft_input_spec_provider.h
     mtp_json_object_state.h
     mtp_utils.h
-    draft_extend_input.h
-    embedding_cache.h
+    draft_input.h
+    draft_input_sampling.h
+    draft_sampling_history.h
+    capture_hidden_mode.h
+    vocab_map.h
+    draft_input_state_store.h
+    target_decode_state_store.h
+    pd_speculative_handoff.h
+    slot_table.h
+    padded_token_row_scan.h
     metrics.h
     verify_layout.h
-    spec_verify.h
   SRCS
     adaptive_speculative_controller.cpp
     speculative_profile_registry.cpp
-    adaptive_pruning_helpers.cpp
-    spec_input_builder.cpp
-    mtp_async_input_builder.cpp
-    mtp_async_state.cpp
-    draft_extend_input.cpp
-    embedding_cache.cpp
+    capture_hidden_mode.cpp
+    draft_input_sampling.cpp
+    draft_sampling_history.cpp
+    vocab_map.cpp
+    draft_input_state_store.cpp
+    target_decode_state_store.cpp
+    pd_speculative_handoff.cpp
     metrics.cpp
     verify_layout.cpp
-    spec_verify.cpp
   DEPS
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
@@ -36,8 +41,6 @@ cc_library(
     :util
     :sampler
     :json_object_grammar
-    :common_layers
     $<$<BOOL:${USE_NPU}>:xllm_ops>
     glog::glog
-    proto::xllm_proto
 )

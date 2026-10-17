@@ -32,6 +32,7 @@ limitations under the License.
 
 #include "core/distributed_runtime/worker_model_codec.h"
 #include "core/framework/batch/forward_input_builder.h"
+#include "core/framework/config/execution_config.h"
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/kv_cache/block/block.h"
@@ -39,6 +40,8 @@ limitations under the License.
 #include "core/kv_cache/block/block_utils.h"
 #include "core/kv_cache/prefix/block_hasher.h"
 #include "core/kv_cache/storage/kv_cache.h"
+#include "core/transport/draft_input_proto.h"
+#include "core/util/scope_guard.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/block/composite_block_manager.h"
 #include "framework/config/beam_search_config.h"
@@ -53,10 +56,15 @@ limitations under the License.
 #include "platform/platform.h"
 #include "runtime/dit_forward_params.h"
 #include "runtime/forward_shared_memory_manager.h"
+#include "tests/core/framework/speculative/mtp_draft_input_test_utils.h"
 #include "util/tensor_helper.h"
 #include "worker.pb.h"
 
 namespace xllm {
+
+using proto_adapter::draft_input_from_proto;
+using proto_adapter::draft_input_to_proto;
+using test::expect_draft_input_equal;
 
 class ForwardInputBuilderTestPeer final {
  public:
@@ -357,6 +365,17 @@ class ScopedJsonObjectOutput final {
  private:
   bool previous_;
 };
+
+DraftInput make_draft_input_for_test(int64_t rows = 1) {
+  const int64_t vocab_size = rows + 2;
+  const float probability = 1.0f / static_cast<float>(vocab_size);
+  return {torch::arange(1, rows + 1, torch::kLong),
+          torch::arange(rows * 2, torch::kFloat32)
+              .view({rows, 2})
+              .to(torch::kBFloat16),
+          torch::full({rows, vocab_size}, probability, torch::kFloat32),
+          torch::full({rows}, probability, torch::kFloat32)};
+}
 
 }  // namespace
 
@@ -665,34 +684,39 @@ TEST(ForwardInputBuilderTest, DSV4PartialBlockIsRepeatedOnNextChunk) {
             2u);
 }
 
-TEST(BatchTest, ProcessSampleOutputStoresMtpBootstrapEmbedding) {
-  BlockManager::Options options;
-  options.num_blocks(8).block_size(4);
-  BlockManagerImpl manager(options);
+TEST(BatchTest, ProcessSampleOutputRetainsSeedWithoutBootstrap) {
+  for (bool with_embeddings : {false, true}) {
+    SCOPED_TRACE(::testing::Message() << "embeddings=" << with_embeddings);
+    BlockManager::Options options;
+    options.num_blocks(8).block_size(4);
+    BlockManagerImpl manager(options);
 
-  Sequence sequence = make_basic_sequence({1, 2, 3});
-  sequence.add_blocks(BlockType::KV, manager.allocate(1));
+    Sequence sequence = make_basic_sequence({1, 2, 3});
+    sequence.add_blocks(BlockType::KV, manager.allocate(1));
 
-  Batch batch(&sequence);
-  (void)batch.prepare_forward_input(
-      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0, ModelArgs());
+    Batch batch(&sequence);
+    (void)batch.prepare_forward_input(
+        /*num_decoding_tokens=*/1,
+        /*min_decoding_batch_size=*/0,
+        ModelArgs());
 
-  SampleOutput output;
-  output.next_tokens = torch::tensor({42}, torch::kInt);
-  output.embeddings = torch::tensor({{3.0f, 4.0f}});
+    SampleOutput output;
+    output.next_tokens = torch::tensor({{42}}, torch::kInt);
+    if (with_embeddings) {
+      output.embeddings = torch::tensor({{3.0f, 4.0f}});
+    }
+    const DraftInput draft_input = make_draft_input_for_test();
+    output.draft_input = draft_input;
 
-  batch.process_sample_output(output, /*replace_fake_token=*/false);
+    batch.process_sample_output(output, /*replace_fake_token=*/false);
 
-  torch::Tensor stored = sequence.get_mtp_bootstrap_embedding();
-  ASSERT_TRUE(stored.defined());
-  EXPECT_TRUE(torch::equal(stored, output.embeddings[0]));
-
-  output.embeddings.fill_(9.0f);
-  EXPECT_TRUE(torch::equal(sequence.get_mtp_bootstrap_embedding(),
-                           torch::tensor({3.0f, 4.0f})));
+    EXPECT_FALSE(sequence.has_target_decode_bootstrap());
+    ASSERT_TRUE(sequence.get_draft_input().has_value());
+    expect_draft_input_equal(*sequence.get_draft_input(), draft_input);
+  }
 }
 
-TEST(BatchTest, ProcessRawOutputStoresMtpBootstrapEmbedding) {
+TEST(BatchTest, ProcessRawOutputDoesNotMarkBootstrap) {
   BlockManager::Options options;
   options.num_blocks(8).block_size(4);
   BlockManagerImpl manager(options);
@@ -707,12 +731,14 @@ TEST(BatchTest, ProcessRawOutputStoresMtpBootstrapEmbedding) {
   RawForwardOutput raw_output;
   raw_output.outputs.push_back(make_raw_sample_output(
       42, std::nullopt, {}, {}, /*embeddings=*/{3.0f, 4.0f}));
+  const DraftInput draft_input = make_draft_input_for_test();
+  raw_output.outputs[0].draft_input = draft_input;
 
   batch.process_sample_output(raw_output, /*replace_fake_token=*/false);
 
-  torch::Tensor stored = sequence.get_mtp_bootstrap_embedding();
-  ASSERT_TRUE(stored.defined());
-  EXPECT_TRUE(torch::equal(stored, torch::tensor({3.0f, 4.0f})));
+  EXPECT_FALSE(sequence.has_target_decode_bootstrap());
+  ASSERT_TRUE(sequence.get_draft_input().has_value());
+  expect_draft_input_equal(*sequence.get_draft_input(), draft_input);
 }
 
 TEST(BatchTest, ProcessRawOutputAccumulatesRequestSpeculativeStats) {
@@ -1099,7 +1125,7 @@ TEST(BatchTest, JsonObjectCommitMismatchSkipsRemainingSampleSlotsAndEmbedding) {
       batch.process_sample_output(raw_output, /*replace_fake_token=*/false));
 
   EXPECT_EQ(sequence.num_tokens(), original_num_tokens);
-  EXPECT_FALSE(sequence.get_mtp_bootstrap_embedding().defined());
+  EXPECT_FALSE(sequence.has_target_decode_bootstrap());
   ASSERT_TRUE(sequence.error_status().has_value());
   EXPECT_TRUE(sequence.finished());
 }
@@ -1162,7 +1188,7 @@ TEST(BatchTest, JsonObjectErrorDiscardsFailedMmEmbeddingWithoutRowShift) {
                            raw_output.outputs[1].mm_embeddings[0]));
 }
 
-TEST(BatchTest, DecodeForwardInputConsumesMtpBootstrap) {
+TEST(BatchTest, DecodeForwardInputConsumesTargetDecodeBootstrap) {
   BlockManagerPool::Options options;
   options.num_blocks(8).block_size(4).enable_disagg_pd(true);
   options.max_seqs_per_batch(1024);
@@ -1176,22 +1202,25 @@ TEST(BatchTest, DecodeForwardInputConsumesMtpBootstrap) {
   sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
   sequence.append_token(Token(42));
 
-  torch::Tensor embedding = torch::tensor({3.0f, 4.0f});
-  sequence.update_mtp_bootstrap_embedding(embedding);
+  sequence.mark_target_decode_bootstrap();
+  const DraftInput draft_input = make_draft_input_for_test();
+  sequence.update_draft_input(draft_input);
 
   Batch batch(&sequence);
   LlmForwardInput forward_input = batch.prepare_forward_input(
       /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0, ModelArgs());
 
-  const auto& embed_params = forward_input.input_params.embedding;
-  EXPECT_EQ(embed_params.mtp_bootstrap_row_idxes, std::vector<int32_t>{0});
-  ASSERT_TRUE(embed_params.mtp_bootstrap_embeddings.defined());
-  EXPECT_TRUE(torch::equal(embed_params.mtp_bootstrap_embeddings,
-                           embedding.unsqueeze(0)));
-  EXPECT_FALSE(sequence.get_mtp_bootstrap_embedding().defined());
+  const auto& request_state = forward_input.request_state;
+  EXPECT_EQ(request_state.target_decode_bootstrap_row_idxes,
+            std::vector<int32_t>{0});
+  EXPECT_FALSE(sequence.has_target_decode_bootstrap());
+  EXPECT_EQ(request_state.draft_input_row_idxes, std::vector<int32_t>{0});
+  ASSERT_TRUE(request_state.draft_input.has_value());
+  expect_draft_input_equal(*request_state.draft_input, draft_input);
+  EXPECT_FALSE(sequence.get_draft_input().has_value());
 }
 
-TEST(BatchTest, DecodeForwardInputMapsSparseMtpBootstrapRows) {
+TEST(BatchTest, DecodeForwardInputMapsSparseTargetDecodeBootstrapRows) {
   BlockManagerPool::Options options;
   options.num_blocks(8).block_size(4).enable_disagg_pd(true);
   options.max_seqs_per_batch(1024);
@@ -1209,18 +1238,55 @@ TEST(BatchTest, DecodeForwardInputMapsSparseMtpBootstrapRows) {
   second.kv_state().set_kv_cache_tokens_num(second.num_prompt_tokens());
   second.append_token(Token(42));
 
-  torch::Tensor embedding = torch::tensor({3.0f, 4.0f});
-  second.update_mtp_bootstrap_embedding(embedding);
+  second.mark_target_decode_bootstrap();
+  const DraftInput draft_input = make_draft_input_for_test();
+  second.update_draft_input(draft_input);
 
   Batch batch({&first, &second});
   LlmForwardInput forward_input = batch.prepare_forward_input(
       /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0, ModelArgs());
 
-  const auto& embed_params = forward_input.input_params.embedding;
-  EXPECT_EQ(embed_params.mtp_bootstrap_row_idxes, std::vector<int32_t>{1});
-  ASSERT_TRUE(embed_params.mtp_bootstrap_embeddings.defined());
-  EXPECT_TRUE(torch::equal(embed_params.mtp_bootstrap_embeddings,
-                           embedding.unsqueeze(0)));
+  const auto& request_state = forward_input.request_state;
+  EXPECT_EQ(request_state.target_decode_bootstrap_row_idxes,
+            std::vector<int32_t>{1});
+  EXPECT_FALSE(second.has_target_decode_bootstrap());
+  EXPECT_EQ(request_state.draft_input_row_idxes, std::vector<int32_t>{1});
+  ASSERT_TRUE(request_state.draft_input.has_value());
+  expect_draft_input_equal(*request_state.draft_input, draft_input);
+  EXPECT_FALSE(second.get_draft_input().has_value());
+}
+
+TEST(BatchTest, TargetDecodeBootstrapSurvivesFakeOverlapToken) {
+  const bool old_enable_schedule_overlap =
+      SchedulerConfig::get_instance().enable_schedule_overlap();
+  SchedulerConfig::get_instance().enable_schedule_overlap(true);
+
+  BlockManagerPool::Options options;
+  options.num_blocks(8).block_size(4).enable_disagg_pd(true);
+  options.max_seqs_per_batch(1024);
+  options.num_speculative_tokens(1);
+  options.num_embedding_blocks(8);
+  BlockManagerPool manager(options, /*dp_size=*/1);
+  RequestSamplingParam sampling_param;
+  StoppingChecker stopping_checker;
+  Sequence sequence = make_overlap_sequence({1, 2, 3},
+                                            /*seq_capacity=*/16,
+                                            &sampling_param,
+                                            &stopping_checker);
+  EXPECT_TRUE(manager.allocate(&sequence));
+  sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
+  sequence.append_token(Token(-1));
+  sequence.mark_target_decode_bootstrap();
+
+  Batch fake_token_batch(&sequence);
+  LlmForwardInput fake_token_input = fake_token_batch.prepare_forward_input(
+      /*num_decoding_tokens=*/1, /*min_decoding_batch_size=*/0, ModelArgs());
+  EXPECT_TRUE(
+      fake_token_input.request_state.target_decode_bootstrap_row_idxes.empty());
+  EXPECT_TRUE(sequence.has_target_decode_bootstrap());
+
+  SchedulerConfig::get_instance().enable_schedule_overlap(
+      old_enable_schedule_overlap);
 }
 
 TEST(BatchTest, NativeVlmPrefillSchedulesOnlyVisibleVisionItems) {
@@ -1453,7 +1519,7 @@ TEST(BatchTest, Basic) {
   EXPECT_EQ(input_params.meta.num_sequences, 4);
   EXPECT_EQ(input_params.meta.q_max_seq_len, 9);
   EXPECT_EQ(input_params.meta.kv_max_seq_len, 16);
-  EXPECT_EQ(input_params.embedding.embedding_ids, std::vector<int32_t>({-1, -1, -1}));
+  EXPECT_EQ(forward_input.input_params.embedding.embedding_ids, std::vector<int32_t>({-1, -1, -1}));
   EXPECT_EQ(input_params.embedding.linear_state_ids,
             std::vector<int32_t>({-1, -1, -1, -1}));
 
@@ -2087,11 +2153,18 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   LlmForwardInput input =
       builder.build_forward_input(/*num_decoding_tokens=*/1,
                                   /*min_decoding_batch_size=*/0);
-  input.input_params.parallel.dp_global_batch_generations = {3, 7};
+  input.input_params.parallel.dp_global_token_nums = {4, 1};
   input.input_params.parallel.dp_global_sequence_nums = {1, 0};
-  input.input_params.embedding.mtp_bootstrap_row_idxes = {0};
-  input.input_params.embedding.mtp_bootstrap_embeddings =
-      torch::tensor({{3.0f, 4.0f}});
+  input.input_params.parallel.raw_dp_global_token_nums = {4, 0};
+  input.input_params.parallel.dp_global_kv_max_seq_lens = {4, 0};
+  input.input_params.parallel.dp_is_decode = {0, 1};
+  input.request_state.target_decode_bootstrap_row_idxes = {0};
+  DraftInput draft_input = make_draft_input_for_test();
+  draft_input.probs = torch::Tensor();
+  draft_input.point_mass_q = true;
+  input.request_state.draft_input = draft_input;
+  input.request_state.draft_input_row_idxes = {0};
+  input.request_state.released_embedding_ids = {2, 3};
   input.sample_sequence_ids = {"req-packed#0"};
   input.sample_prior_output_rows = {3};
   input.sampling_params.filter_bitmask =
@@ -2122,12 +2195,18 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
       find_mapping(round_trip.transfer_kv_infos[0], BlockType::KV);
   EXPECT_EQ(mapping.local_ids, (std::vector<uint64_t>{1}));
   EXPECT_EQ(mapping.remote_ids, (std::vector<uint64_t>{100}));
-  EXPECT_EQ(round_trip.input_params.embedding.mtp_bootstrap_row_idxes,
+  EXPECT_EQ(round_trip.request_state.target_decode_bootstrap_row_idxes,
             std::vector<int32_t>{0});
-  EXPECT_EQ(round_trip.input_params.parallel.dp_global_batch_generations,
-            (std::vector<uint64_t>{3, 7}));
+  EXPECT_EQ(round_trip.input_params.parallel.dp_global_token_nums,
+            (std::vector<int32_t>{4, 1}));
   EXPECT_EQ(round_trip.input_params.parallel.dp_global_sequence_nums,
             (std::vector<int32_t>{1, 0}));
+  EXPECT_EQ(round_trip.input_params.parallel.raw_dp_global_token_nums,
+            (std::vector<int32_t>{4, 0}));
+  EXPECT_EQ(round_trip.input_params.parallel.dp_global_kv_max_seq_lens,
+            (std::vector<int32_t>{4, 0}));
+  EXPECT_EQ(round_trip.input_params.parallel.dp_is_decode,
+            (std::vector<int32_t>{0, 1}));
   EXPECT_EQ(round_trip.sample_sequence_ids,
             std::vector<std::string>{"req-packed#0"});
   EXPECT_EQ(round_trip.sample_prior_output_rows, std::vector<int32_t>{3});
@@ -2135,12 +2214,190 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   EXPECT_TRUE(
       torch::equal(round_trip.sampling_params.filter_bitmask.to(torch::kCPU),
                    input.sampling_params.filter_bitmask));
+  // released_embedding_ids crosses the transport for the worker's per-step
+  // cleanup; draft_input_row_idxes is filled by the request builder after
+  // the SHM read and stays cleared.
+  EXPECT_EQ(round_trip.request_state.released_embedding_ids,
+            std::vector<int32_t>({2, 3}));
+  EXPECT_TRUE(round_trip.request_state.draft_input_row_idxes.empty());
+  ASSERT_TRUE(round_trip.request_state.draft_input.has_value());
+  expect_draft_input_equal(*round_trip.request_state.draft_input, draft_input);
+
+  LlmForwardInput contiguous;
   ASSERT_TRUE(
-      round_trip.input_params.embedding.mtp_bootstrap_embeddings.defined());
-  EXPECT_TRUE(torch::equal(
-      round_trip.input_params.embedding.mtp_bootstrap_embeddings.to(
-          torch::kCPU),
-      torch::tensor({{3.0f, 4.0f}})));
+      input.to_contiguous_input_buffer(torch::Device(torch::kCPU), contiguous));
+  ASSERT_TRUE(contiguous.request_state.draft_input.has_value());
+  expect_draft_input_equal(*contiguous.request_state.draft_input, draft_input);
+  EXPECT_EQ(contiguous.request_state.released_embedding_ids,
+            input.request_state.released_embedding_ids);
+  EXPECT_EQ(contiguous.request_state.target_decode_bootstrap_row_idxes,
+            input.request_state.target_decode_bootstrap_row_idxes);
+  EXPECT_EQ(contiguous.request_state.draft_input_row_idxes,
+            input.request_state.draft_input_row_idxes);
+
+  auto& execution_config = ExecutionConfig::get_instance();
+  const bool original_contiguous =
+      execution_config.use_contiguous_input_buffer();
+  ScopeGuard config_guard([&] {
+    execution_config.use_contiguous_input_buffer(original_contiguous);
+  });
+  execution_config.use_contiguous_input_buffer(false);
+  const LlmForwardInput converted =
+      input.to(torch::Device(torch::kCPU), torch::kFloat);
+  ASSERT_TRUE(converted.request_state.draft_input.has_value());
+  expect_draft_input_equal(*converted.request_state.draft_input, draft_input);
+  EXPECT_EQ(converted.request_state.released_embedding_ids,
+            input.request_state.released_embedding_ids);
+  EXPECT_EQ(converted.request_state.target_decode_bootstrap_row_idxes,
+            input.request_state.target_decode_bootstrap_row_idxes);
+  EXPECT_EQ(converted.request_state.draft_input_row_idxes,
+            input.request_state.draft_input_row_idxes);
+
+  // Reusing the transport destination must retire a previous handoff.
+  input.request_state = {};
+  ASSERT_TRUE(writer_manager.input_write(input));
+  reader_manager.input_read(round_trip, torch::Device(torch::kCPU));
+  EXPECT_TRUE(round_trip.request_state.released_embedding_ids.empty());
+  EXPECT_TRUE(
+      round_trip.request_state.target_decode_bootstrap_row_idxes.empty());
+  EXPECT_TRUE(round_trip.request_state.draft_input_row_idxes.empty());
+  EXPECT_FALSE(round_trip.request_state.draft_input.has_value());
+  ASSERT_TRUE(
+      input.to_contiguous_input_buffer(torch::Device(torch::kCPU), contiguous));
+  EXPECT_FALSE(contiguous.request_state.draft_input.has_value());
+}
+
+TEST(BatchTest, DraftInputProtoOwnsReceivedStorage) {
+  const DraftInput draft_input = make_draft_input_for_test(/*rows=*/2);
+  proto::DraftInput message;
+  ASSERT_TRUE(draft_input_to_proto(draft_input, &message));
+  const auto decoded = draft_input_from_proto(message);
+  ASSERT_TRUE(decoded.has_value());
+
+  DraftInput replacement = clone_draft_input(draft_input);
+  replacement.token_ids.zero_();
+  replacement.hidden_states.zero_();
+  replacement.probs.zero_();
+  replacement.selected_probs.zero_();
+  ASSERT_TRUE(draft_input_to_proto(replacement, &message));
+  expect_draft_input_equal(*decoded, draft_input);
+}
+
+TEST(BatchTest, DraftInputProtoPreservesSparsePointMassSemantics) {
+  DraftInput draft_input = make_draft_input_for_test();
+  draft_input.probs = torch::Tensor();
+  draft_input.point_mass_q = true;
+  proto::DraftInput message;
+  ASSERT_TRUE(draft_input_to_proto(draft_input, &message));
+  EXPECT_FALSE(message.has_probs());
+  EXPECT_TRUE(message.point_mass_q());
+  const auto decoded = draft_input_from_proto(message);
+  ASSERT_TRUE(decoded.has_value());
+  expect_draft_input_equal(*decoded, draft_input);
+
+  message.set_point_mass_q(false);
+  const auto unmarked = draft_input_from_proto(message);
+  ASSERT_TRUE(unmarked.has_value());
+  EXPECT_STREQ(
+      draft_input_import_reason(*unmarked,
+                                /*probabilistic=*/true,
+                                /*vocab_size=*/3,
+                                DraftInputModelSpec{2, torch::kBFloat16}),
+      "probabilistic draft input requires full-vocab probs or "
+      "point-mass q");
+}
+
+TEST(BatchTest, DraftInputProtoPreservesSupportedScalarTypes) {
+  for (torch::ScalarType token_dtype : {torch::kInt, torch::kLong}) {
+    for (torch::ScalarType hidden_dtype :
+         {torch::kHalf, torch::kBFloat16, torch::kFloat, torch::kDouble}) {
+      DraftInput draft_input = make_draft_input_for_test(/*rows=*/2);
+      draft_input.token_ids = draft_input.token_ids.to(token_dtype);
+      draft_input.hidden_states = draft_input.hidden_states.to(hidden_dtype);
+      draft_input.probs = draft_input.probs.to(hidden_dtype);
+      draft_input.selected_probs = draft_input.selected_probs.to(hidden_dtype);
+      proto::DraftInput wire;
+      ASSERT_TRUE(draft_input_to_proto(draft_input, &wire));
+      const auto decoded = draft_input_from_proto(wire);
+      ASSERT_TRUE(decoded.has_value());
+      EXPECT_EQ(decoded->token_ids.scalar_type(), token_dtype);
+      EXPECT_EQ(decoded->hidden_states.scalar_type(), hidden_dtype);
+      expect_draft_input_equal(*decoded, draft_input);
+    }
+  }
+}
+
+TEST(BatchTest, DraftInputProtoRejectsUnknownDatatypeInEveryField) {
+  for (int32_t field = 0; field < 4; ++field) {
+    SCOPED_TRACE(field);
+    proto::DraftInput wire;
+    ASSERT_TRUE(
+        draft_input_to_proto(make_draft_input_for_test(/*rows=*/1), &wire));
+    const std::vector<proto::Tensor*> tensors = {wire.mutable_token_ids(),
+                                                 wire.mutable_hidden_states(),
+                                                 wire.mutable_probs(),
+                                                 wire.mutable_selected_probs()};
+    tensors[field]->set_datatype("UNKNOWN_DTYPE");
+    EXPECT_FALSE(draft_input_from_proto(wire).has_value());
+  }
+}
+
+TEST(BatchTest, DraftInputProtoRejectsSupportedButInvalidFieldDtypes) {
+  for (int32_t field = 0; field < 4; ++field) {
+    SCOPED_TRACE(field);
+    proto::DraftInput wire;
+    ASSERT_TRUE(
+        draft_input_to_proto(make_draft_input_for_test(/*rows=*/1), &wire));
+    std::vector<proto::Tensor*> tensors = {wire.mutable_token_ids(),
+                                           wire.mutable_hidden_states(),
+                                           wire.mutable_probs(),
+                                           wire.mutable_selected_probs()};
+    proto::Tensor* tensor = tensors[field];
+    tensor->set_datatype(field == 0 ? "FP32" : "INT64");
+    tensor->mutable_contents()->Clear();
+    if (field == 0) {
+      tensor->mutable_contents()->add_fp32_contents(1.0F);
+    } else {
+      int64_t elements = 1;
+      for (int64_t dimension : tensor->shape()) {
+        elements *= dimension;
+      }
+      for (int64_t index = 0; index < elements; ++index) {
+        tensor->mutable_contents()->add_int64_contents(1);
+      }
+    }
+    EXPECT_FALSE(draft_input_from_proto(wire).has_value());
+  }
+}
+
+TEST(BatchTest, DraftInputProtoRejectsInvalidShapeAndPayloadBeforeAllocation) {
+  for (int32_t malformed = 0; malformed < 6; ++malformed) {
+    SCOPED_TRACE(malformed);
+    proto::DraftInput wire;
+    ASSERT_TRUE(
+        draft_input_to_proto(make_draft_input_for_test(/*rows=*/1), &wire));
+    auto* hidden = wire.mutable_hidden_states();
+    if (malformed == 0) {
+      hidden->clear_shape();
+      hidden->add_shape(std::numeric_limits<int64_t>::max());
+      hidden->add_shape(std::numeric_limits<int64_t>::max());
+      hidden->set_datatype("FP32");
+      hidden->mutable_contents()->Clear();
+      hidden->mutable_contents()->add_fp32_contents(0.0F);
+    } else if (malformed == 1 || malformed == 2) {
+      hidden->set_shape(1, malformed == 1 ? 0 : -1);
+    } else if (malformed == 3) {
+      hidden->set_datatype("BF16");
+      hidden->mutable_contents()->Clear();
+      hidden->mutable_contents()->set_bytes_contents(
+          std::string(hidden->shape(1) * 2 + 1, '\0'));
+    } else if (malformed == 4) {
+      hidden->clear_contents();
+    } else {
+      hidden->add_shape(1);
+    }
+    EXPECT_FALSE(draft_input_from_proto(wire).has_value());
+  }
 }
 
 TEST(BatchTest, NativeDiTShmRoundTripOwnsTensorSourcesAcrossSegmentOverwrite) {
@@ -2246,9 +2503,11 @@ TEST(BatchTest, ForwardOutputProtoRoundTripPreservesJsonObjectErrors) {
                                                                       {5, 5}};
   const std::vector<JsonObjectOutputError> errors = {
       {"req-error#0", "missing prior sampled output row"}};
+  const DraftInput draft_input = make_draft_input_for_test(/*rows=*/2);
   ForwardOutput forward_output;
   forward_output.sample_output.next_tokens = next_tokens;
   forward_output.json_object_errors = errors;
+  forward_output.sample_output.draft_input = draft_input;
   proto::LLMForwardResponse proto_output;
   ASSERT_TRUE(encode_llm_output(
       forward_output, speculative_token_stats, &proto_output));
@@ -2266,6 +2525,13 @@ TEST(BatchTest, ForwardOutputProtoRoundTripPreservesJsonObjectErrors) {
   EXPECT_EQ(round_trip.json_object_errors[0].sample_sequence_id, "req-error#0");
   EXPECT_EQ(round_trip.json_object_errors[0].message,
             "missing prior sampled output row");
+  for (size_t row = 0; row < round_trip.outputs.size(); ++row) {
+    ASSERT_TRUE(round_trip.outputs[row].draft_input.has_value());
+    expect_draft_input_equal(
+        *round_trip.outputs[row].draft_input,
+        slice_draft_input(
+            draft_input, static_cast<int64_t>(row), /*length=*/1));
+  }
 }
 
 TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
@@ -2286,10 +2552,14 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
                                                                       {4, 4}};
   const std::vector<JsonObjectOutputError> errors = {
       {"req-error#0", "prior token violates json_object grammar"}};
+  DraftInput draft_input = make_draft_input_for_test(/*rows=*/2);
+  draft_input.probs = torch::Tensor();
+  draft_input.point_mass_q = true;
 
   ForwardOutput forward_output;
   forward_output.sample_output.next_tokens = next_tokens;
   forward_output.json_object_errors = errors;
+  forward_output.sample_output.draft_input = draft_input;
   ASSERT_TRUE(
       writer_manager.llm_output_write(forward_output, speculative_token_stats));
 
@@ -2306,6 +2576,23 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
   EXPECT_EQ(round_trip.json_object_errors[0].sample_sequence_id, "req-error#0");
   EXPECT_EQ(round_trip.json_object_errors[0].message,
             "prior token violates json_object grammar");
+  for (size_t row = 0; row < round_trip.outputs.size(); ++row) {
+    ASSERT_TRUE(round_trip.outputs[row].draft_input.has_value());
+    expect_draft_input_equal(
+        *round_trip.outputs[row].draft_input,
+        slice_draft_input(
+            draft_input, static_cast<int64_t>(row), /*length=*/1));
+  }
+  DraftInput overwritten_draft_input = clone_draft_input(draft_input);
+  overwritten_draft_input.hidden_states.fill_(99.0f);
+  overwritten_draft_input.selected_probs.fill_(0.0f);
+  forward_output.sample_output.draft_input = overwritten_draft_input;
+  ASSERT_TRUE(
+      writer_manager.llm_output_write(forward_output, speculative_token_stats));
+  // The first result owns its draft_input even after the transport buffer is
+  // reused.
+  expect_draft_input_equal(*round_trip.outputs[0].draft_input,
+                           slice_draft_input(draft_input, 0, 1));
 }
 
 TEST(BatchTest, ForwardInputBlockCopyKernelFieldsMatchExpectedLayout) {
@@ -3421,6 +3708,7 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateIds) {
   forward_input.input_params.embedding.linear_state_ids = {4, 6};
   forward_input.input_params.embedding.embedding_ids = {2, 7};
   forward_input.input_params.embedding.request_ids = {"mtp-a", "mtp-b"};
+  forward_input.input_params.embedding.extra_token_ids = {13, -1};
 
   TransferKVInfo transfer_info;
   transfer_info.request_id = "dsv4-round-trip";
@@ -3453,6 +3741,8 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateIds) {
             std::vector<int32_t>({2, 7}));
   EXPECT_EQ(from_shm.input_params.embedding.request_ids,
             (std::vector<std::string>{"mtp-a", "mtp-b"}));
+  EXPECT_EQ(from_shm.input_params.embedding.extra_token_ids,
+            (std::vector<int32_t>{13, -1}));
   ASSERT_EQ(from_shm.transfer_kv_infos.size(), 1u);
   EXPECT_EQ(from_shm.transfer_kv_infos[0].request_id, "dsv4-round-trip");
   EXPECT_TRUE(from_shm.transfer_kv_infos[0].rank_local_mapping);

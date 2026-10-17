@@ -136,6 +136,9 @@ class CommChannel {
 
   virtual bool stop_profile();
 
+  virtual bool release_idle_request_state(
+      const std::vector<int32_t>& embedding_ids);
+
  protected:
   bool execute_llm_model_with_brpc(
       const LlmForwardInput& input,

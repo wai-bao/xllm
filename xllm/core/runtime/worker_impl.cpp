@@ -879,6 +879,13 @@ void WorkerImpl::update_last_step_output(
   }
 }
 
+void WorkerImpl::clear_last_step_output() {
+  last_step_output_ = ForwardOutput();
+  last_step_output_valid_ = false;
+  last_step_request_ids_.clear();
+  last_step_sample_sequence_ids_.clear();
+}
+
 template <typename Input>
 bool WorkerImpl::can_use_last_step_output_for_schedule_overlap_impl(
     const Input& input) const {
@@ -1025,7 +1032,6 @@ std::optional<ForwardOutput> WorkerImpl::step_for_schedule_overlap(
     const LlmForwardInput& input) {
   return step_for_schedule_overlap_impl(input);
 }
-
 LlmForwardInput
 WorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
     LlmForwardInput& input) {
@@ -1914,17 +1920,11 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async_impl(
         if (is_driver() || ::xllm::EPLBConfig::get_instance().enable_eplb()) {
           std::unique_lock<std::mutex> lock(mtx_);
           cv_.wait(lock, [this] { return !is_recorded_; });
-          last_step_output_valid_ = false;
-          last_step_output_ = ForwardOutput();
-          last_step_request_ids_.clear();
-          last_step_sample_sequence_ids_.clear();
+          clear_last_step_output();
           is_recorded_ = true;
           cv_.notify_one();
         } else {
-          last_step_output_valid_ = false;
-          last_step_output_ = ForwardOutput();
-          last_step_request_ids_.clear();
-          last_step_sample_sequence_ids_.clear();
+          clear_last_step_output();
         }
       }
       promise.setValue(output);
@@ -1933,14 +1933,31 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async_impl(
   return future;
 }
 
-void WorkerImpl::prepare_task_pipeline_input(const LlmForwardInput& input,
-                                             LlmForwardInput& prepared) {
-  prepare_work_before_execute(input, prepared);
-}
-
-std::optional<ForwardOutput> WorkerImpl::execute_task_pipeline(
-    const LlmForwardInput& prepared) {
-  return step_for_schedule_overlap(prepared);
+folly::SemiFuture<bool> WorkerImpl::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        ids = std::move(embedding_ids),
+                        promise = std::move(promise)]() mutable {
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      CHECK(!is_recorded_) << "Idle cleanup requires consumed worker output";
+    }
+    CHECK(compute_stream_ != nullptr);
+    c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+    release_request_state(ids);
+    CHECK_EQ(compute_stream_->synchronize(), 0)
+        << "Failed to retire idle worker device work";
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      clear_last_step_output();
+    }
+    VLOG(1) << "Released idle request state for " << ids.size()
+            << " embedding slots";
+    promise.setValue(true);
+  });
+  return future;
 }
 
 ForwardOutput WorkerImpl::get_last_step_result() {
@@ -2477,21 +2494,10 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   } else if (options_.enable_speculative_decode() &&
              options_.num_speculative_tokens() == 0 &&
              args.num_nextn_predict_layers() != 0) {
-    const std::string& current_type = args.model_type();
-    const char* mtp_model_type = nullptr;
-    if (current_type == "qwen3_5_text") {
-      mtp_model_type = "qwen3_5_mtp";
-    } else if (current_type == "qwen3_5_moe_text") {
-      mtp_model_type = "qwen3_5_moe_mtp";
-    }
-    if (mtp_model_type != nullptr) {
+    const std::string current_type = args.model_type();
+    if (ModelRegistry::convert_to_mtp_draft(args)) {
       LOG(INFO) << "Overriding draft model_type from " << current_type << " to "
-                << mtp_model_type << " for speculative decoding";
-      args.model_type(mtp_model_type);
-      const int32_t mtp_layers = args.num_nextn_predict_layers();
-      args.n_layers(mtp_layers);
-      args.layer_types(std::vector<std::string>(mtp_layers, "full_attention"));
-      args.full_attention_interval(1);
+                << args.model_type() << " for speculative decoding";
     }
   }
   if (options_.enable_speculative_decode() && !options_.is_draft_engine() &&
@@ -2576,6 +2582,19 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
     LOG(ERROR) << "init_model failed";
     return false;
   }
+
+  // The model owns whether its aux output is a model-specific speculative
+  // feedback tensor. Resolve that capability once after constructing the
+  // model, instead of teaching the generic worker about model families.
+  const bool model_hook =
+      options_.enable_speculative_decode() &&
+      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm()) &&
+      model_ != nullptr && model_->provides_capture_hidden_hook();
+  capture_hidden_mode_ = resolve_capture_hidden_mode(
+      options_.speculative_algorithm(),
+      options_.is_draft_engine() ? CaptureHiddenRole::DRAFT
+                                 : CaptureHiddenRole::TARGET,
+      model_hook);
 
   // Warm JSON grammars off the forward path so the first constrained request
   // does not pay tokenizer.decode over the full vocab under the step lock.

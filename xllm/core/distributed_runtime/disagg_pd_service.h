@@ -28,7 +28,8 @@ class DisaggPDService : public proto::DisaggPDService {
  public:
   explicit DisaggPDService(DisaggPDScheduler* scheduler,
                            Engine* engine,
-                           int32_t kv_cache_block_tokens);
+                           int32_t kv_cache_block_tokens,
+                           std::shared_ptr<XServiceClient> client = nullptr);
   explicit DisaggPDService() {}
   virtual ~DisaggPDService() = default;
 

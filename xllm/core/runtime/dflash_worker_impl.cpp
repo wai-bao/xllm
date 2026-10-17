@@ -31,9 +31,10 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/speculative_config.h"
-#include "core/framework/speculative/adaptive_pruning_helpers.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
 #include "core/framework/speculative/speculative_profile_registry.h"
+#include "core/layers/common/expanded_decode_metadata_builder.h"
+#include "core/runtime/adaptive_pruning_helpers.h"
 #include "framework/model/model_args.h"
 #include "framework/parallel_state/process_group.h"
 #include "framework/sampling/sampling_params.h"
@@ -42,13 +43,12 @@ limitations under the License.
 #endif
 #if defined(USE_NPU)
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
-#include "core/layers/common/expanded_decode_metadata_builder.h"
 #include "core/layers/npu_torch/deepseek_sparse_attention.h"
 #endif
-#include "core/framework/speculative/draft_extend_input.h"
-#include "core/framework/speculative/spec_input_builder.h"
-#include "core/framework/speculative/spec_verify.h"
 #include "core/platform/platform.h"
+#include "core/runtime/spec_verify.h"
+#include "core/runtime/speculative_input_builder.h"
+#include "core/runtime/speculative_output.h"
 #include "core/runtime/task_execution_pipeline.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/json_reader.h"
@@ -79,14 +79,6 @@ void broadcast_spec_tokens(torch::Tensor& tokens,
   pg->broadcast(tokens, root_rank);
 }
 
-runtime::Options target_options(const runtime::Options& options) {
-  runtime::Options opts = options;
-  opts.enable_schedule_overlap(false)
-      .is_draft_engine(false)
-      .enable_graph_aux_hidden_states(true);
-  return opts;
-}
-
 runtime::Options draft_options(const runtime::Options& options) {
   // DSpark sizes its attention window from num_speculative_tokens; other
   // DFlash-style drafts still run one step at a time.
@@ -94,11 +86,8 @@ runtime::Options draft_options(const runtime::Options& options) {
       SpeculativeConfig::is_dspark_algorithm(options.speculative_algorithm());
   const int32_t draft_num_speculative_tokens =
       is_dspark ? options.num_speculative_tokens() : 0;
-  runtime::Options opts = options;
-  opts.enable_schedule_overlap(false)
-      .is_draft_engine(true)
-      .num_decoding_tokens(1)
-      .num_speculative_tokens(draft_num_speculative_tokens)
+  runtime::Options opts = speculative_draft_options(options);
+  opts.num_speculative_tokens(draft_num_speculative_tokens)
       .enable_graph_aux_hidden_states(false);
   if (options.enable_task_pipeline() && !is_dspark) {
     opts.enable_graph(false);
@@ -130,15 +119,6 @@ void repeat_sampling_params(SamplingParameters& sampling_params,
   repeat_interleave_if_defined(sampling_params.unique_token_counts, repeats);
   repeat_interleave_if_defined(sampling_params.unique_token_ids_lens, repeats);
   repeat_interleave_if_defined(sampling_params.do_sample, repeats);
-}
-
-void record_metadata_ready_event(Stream& stream, LlmForwardInput& input) {
-  input.runtime.metadata_ready_event = stream.record_event_or_sync();
-}
-
-void wait_metadata_ready_event(const LlmForwardInput& input, Stream& stream) {
-  CHECK(stream.wait_event(input.runtime.metadata_ready_event))
-      << "failed to wait DFlash metadata ready event";
 }
 
 #if defined(USE_NPU)
@@ -340,7 +320,7 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
           parallel_args,
           device,
           options,
-          target_options(options),
+          speculative_target_options(options),
           WorkerType::LLM,
           [&parallel_args, &device, &options] {
             // The draft consumes the target's aux hidden states, which the
@@ -354,7 +334,7 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
                      "context parallelism (cp_size > 1).";
             }
             return std::make_unique<LLMWorkerImpl>(
-                parallel_args, device, draft_options(options));
+                parallel_args, device, speculative_draft_options(options));
           }) {
   // Adaptive per-seq validate pruning. DP is supported: the worker gathers
   // each rank's true validate token count over the DP group before the target
@@ -573,8 +553,8 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
 
 std::tuple<int64_t, int64_t> DFlashWorkerImpl::estimate_kv_cache_capacity() {
   CHECK(impl_ != nullptr);
-  return estimate_kv_cache_capacity_with_draft(target_options(options_),
-                                               draft_options(options_));
+  return estimate_kv_cache_capacity_with_draft(
+      speculative_target_options(options_), draft_options(options_));
 }
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
@@ -659,7 +639,9 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
 
   const torch::Tensor& embeddings = output.sample_output.embeddings;
   if (embeddings.defined()) {
-    const Slice<int32_t> positions =
+    CHECK(processed_target_input.positions_host.defined())
+        << "DFlash prefill requires processed positions_host.";
+    Slice<int32_t> positions =
         tensor_slice(processed_target_input.positions_host);
     CHECK_EQ(positions.size(), static_cast<size_t>(embeddings.size(0)))
         << "DFlash prefill hidden/position count mismatch.";
@@ -686,7 +668,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
   }
 
   if (input.sampling_params.selected_token_idxes.defined()) {
-    prepare_first_draft_inputs(*embedding_cache_, input, output);
+    prepare_target_prefill_state(*target_state_store_, input, output);
   } else {
     clear_all_output_embeddings(output);
   }
@@ -702,13 +684,19 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
   LlmForwardInput input = raw_input.clone();
   LlmForwardInput validate_input;
 
-  CHECK(embedding_cache_ != nullptr)
-      << "DFlash embedding cache is not allocated";
+  CHECK(target_state_store_ != nullptr)
+      << "DFlash target state store is not allocated";
 
-  prepare_draft_input(input);
+  if (!input.request_state.target_decode_bootstrap_row_idxes.empty()) {
+    target_state_store_->write_target_bootstrap_rows(
+        input.request_state.target_decode_bootstrap_row_idxes,
+        input.input_params.embedding.embedding_ids,
+        input.input_params.embedding.request_ids,
+        input.token_ids_host);
+  }
 
-  std::vector<EmbeddingCache::DecodeState> last_states =
-      embedding_cache_->read_decode_states(
+  std::vector<TargetDecodeStateStore::DecodeState> last_states =
+      target_state_store_->read_decode_states(
           input.input_params.embedding.embedding_ids,
           input.input_params.embedding.request_ids);
   CHECK_EQ(last_states.size(),
@@ -878,7 +866,7 @@ void DFlashWorkerImpl::fill_validate_input_from_draft_outputs_varlen(
 
 std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
     const LlmForwardInput& input,
-    const DraftBlock& draft_block_in,
+    const DraftBlock& draft_block,
     LlmForwardInput& validate_input) {
   Timer target_timer;
   // Adaptive-speculative per-seq varlen validate:
@@ -898,7 +886,6 @@ std::optional<ForwardOutput> DFlashWorkerImpl::run_validate(
   const int32_t default_val_tokens = num_speculative_tokens + 1;
   const int32_t batch_size = input.input_params.meta.num_sequences;
 
-  DraftBlock draft_block = draft_block_in;
   std::vector<int32_t> prefix_lengths =
       compute_adaptive_prefix_lengths(draft_block, input);
   std::vector<int32_t> per_seq_val_tokens;
@@ -1062,7 +1049,7 @@ void DFlashWorkerImpl::maybe_broadcast_spec_tokens(torch::Tensor& tokens) {
 
 void DFlashWorkerImpl::update_decode_step_input(
     LlmForwardInput& input,
-    const std::vector<EmbeddingCache::DecodeState>& last_states) const {
+    const std::vector<TargetDecodeStateStore::DecodeState>& last_states) const {
   const int32_t num_sequences = input.input_params.meta.num_sequences;
   CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
       << "DFlash decode context state count mismatch";
@@ -1090,7 +1077,7 @@ void DFlashWorkerImpl::update_decode_step_input(
     CHECK_LT(static_cast<size_t>(seq_id), input_positions.size())
         << "DFlash decode context position seq_id out of range, seq_id="
         << seq_id;
-    const EmbeddingCache::DecodeState& state = last_states[seq_id];
+    const TargetDecodeStateStore::DecodeState& state = last_states[seq_id];
     const int32_t input_token_id = input_token_ids[seq_id];
     const bool input_is_fake_token = input_token_id < 0;
     // Rewrite fake input tokens to the last committed real token so KV cache
@@ -1117,8 +1104,8 @@ void DFlashWorkerImpl::update_decode_step_input(
     specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
   }
 
-  input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
+  input.token_ids_host = make_pinned_cpu_tensor(token_ids_vec);
+  input.positions_host = make_pinned_cpu_tensor(positions_vec);
   input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
   input.runtime.device_tensors_ready = false;
 }
@@ -1136,35 +1123,36 @@ void DFlashWorkerImpl::prepare_validate_inputs(
   validate_input.input_params.embedding.input_embedding = torch::Tensor();
   if (use_linear_spec_verify) {
     LlmModelParams& input_params = validate_input.input_params;
-    std::vector<int32_t> accepted_prefix_lengths(
-        input.input_params.meta.num_sequences, 1);
-    if (embedding_cache_ != nullptr &&
-        !input.input_params.embedding.embedding_ids.empty()) {
-      accepted_prefix_lengths = embedding_cache_->read_accepted_prefix_lengths(
-          input.input_params.embedding.embedding_ids,
-          input.input_params.embedding.request_ids);
-    }
-    input_params.num_accepted_tokens_host.assign(
-        accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());
-    input_params.num_accepted_tokens =
-        torch::tensor(accepted_prefix_lengths,
-                      validate_input.token_ids.options().dtype(torch::kInt32));
+    const std::vector<int32_t> accepted_prefix_lengths =
+        target_state_store_ != nullptr
+            ? target_state_store_->resolve_accepted_prefix_lengths(
+                  input.input_params.embedding.embedding_ids,
+                  input.input_params.embedding.request_ids,
+                  input.input_params.meta.num_sequences)
+            : std::vector<int32_t>(input.input_params.meta.num_sequences, 1);
+    ModelInputParams input_view(input_params);
+    specBuilder::publish_accepted_prefix_lengths(
+        input_view,
+        accepted_prefix_lengths,
+        validate_input.token_ids.options().dtype(torch::kInt32),
+        /*publish_device_tensor=*/true);
     if (!input_params.attention.host.q_seq_lens.empty()) {
-      std::vector<int32_t> q_cu_seq_lens;
-      q_cu_seq_lens.reserve(input_params.attention.host.q_seq_lens.size() + 1);
-      q_cu_seq_lens.emplace_back(0);
-      for (int32_t q_len : input_params.attention.host.q_seq_lens) {
-        q_cu_seq_lens.emplace_back(q_cu_seq_lens.back() + q_len);
-      }
-      input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens);
+      input_params.attention.host.q_cu_seq_lens =
+          specBuilder::build_cu_seq_lens(
+              input_params.attention.host.q_seq_lens);
     }
     // The generic builder materializes the device buffer before the hybrid
     // cumulative lengths above are canonicalized.  Rebind it so GDN sees
     // [0, q_len_0, ...] rather than the stale pre-verify host layout.
     input_params.attention.rebuild_device_buffer(device_);
 #if defined(USE_NPU)
-    build_dflash_expanded_spec_verify_graph_input(
-        input_params, device_.unwrap(), options_.block_size());
+    if (::xllm::ExecutionConfig::get_instance().enable_graph() &&
+        input_params.is_spec_verify &&
+        input_params.meta.batch_forward_type.is_chunked_prefill()) {
+      ModelInputParams expanded_view(input_params);
+      specBuilder::build_expanded_spec_verify_graph_input(
+          expanded_view, device_.unwrap(), options_.block_size());
+    }
 #endif
   }
   record_metadata_ready_event(*prepare_stream_, validate_input);
@@ -1228,8 +1216,12 @@ void DFlashWorkerImpl::prepare_query_inputs(const LlmForwardInput& input,
   }
   input_params.attention.rebuild_device_buffer(device_);
 
+  torch::TensorOptions idx_options =
+      torch::TensorOptions().dtype(torch::kInt).device(device_);
+  // Pinned-host + async H2D on prepare_stream_ (the file's idiom), so the copy
+  // overlaps instead of a blocking non-pinned transfer every decode step.
   query_input.sampling_params.selected_token_idxes =
-      async_h2d_tensor(selected_idxes, device_.unwrap());
+      async_h2d_tensor(selected_idxes, idx_options);
   query_input.sampling_params.sample_idxes = arange_indices(
       static_cast<int64_t>(selected_idxes.size()), device_.unwrap());
   force_greedy_draft_sampling(query_input.sampling_params);
@@ -1363,13 +1355,10 @@ void DFlashWorkerImpl::write_target_context_to_cache(
       input, context_hidden, positions_device, new_cache_slots_device);
   CHECK(!input.input_params.embedding.embedding_ids.empty())
       << "DFlash target context cache write requires embedding ids";
-  embedding_cache_->write_target_context(
+  target_state_store_->write_target_context(
       input.input_params.embedding.embedding_ids,
       input.input_params.embedding.request_ids,
-      validate_output.next_tokens,
-      validate_output.embeddings,
-      options_.num_speculative_tokens(),
-      /*retain_previous_embedding=*/false);
+      validate_output.next_tokens);
 }
 
 // -----------------------------------------------------------------------------
@@ -1425,19 +1414,11 @@ std::vector<int32_t> DFlashWorkerImpl::compute_adaptive_prefix_lengths(
   }
 
   const int32_t batch_size = input.input_params.meta.num_sequences;
-  std::vector<double> per_seq_kv_lens(static_cast<size_t>(batch_size), 0.0);
-  const Slice<int32_t> kv_seq_lens =
-      input.input_params.attention.host.kv_seq_lens;
-  for (int32_t i = 0; i < batch_size; ++i) {
-    per_seq_kv_lens[static_cast<size_t>(i)] = static_cast<double>(
-        specBuilder::calc_kv_len(kv_seq_lens, i, /*offset=*/0));
-  }
-
   std::vector<int32_t> prefix_lengths =
       adaptive_spec_controller_->select_pruned_prefix_lengths(
           probs_for_controller,
           /*full_draft_time_ms=*/0.0,
-          per_seq_kv_lens);
+          adaptive_pruning::controller_kv_lens(input, batch_size));
   return prefix_lengths;
 }
 

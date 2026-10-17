@@ -100,6 +100,8 @@ class HierarchyKVCacheTransfer final {
       Slice<BlockTransferInfo>& block_transfer_info);
   std::optional<HostKVLoadHandle> take_load_handle(uint64_t batch_id);
   void set_layer_synchronizer(ModelInputParams& params);
+  static void bind_load_handle(ModelInputParams& params,
+                               HostKVLoadHandle handle);
   [[nodiscard]] bool supports_block_type(BlockType block_type) const;
   [[nodiscard]] bool supports_block_type(CacheRole role,
                                          BlockType block_type) const;

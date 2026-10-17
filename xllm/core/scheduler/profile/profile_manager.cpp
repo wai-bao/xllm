@@ -982,10 +982,11 @@ std::shared_ptr<Request> ProfileManager::try_generate_single_decode_request(
       generated_token == eos_token_id ? generated_token + 1 : generated_token;
   sequence->append_token(generated_token);
 
-  // Synthetic decode requests must carry the same bootstrap geometry as real
-  // requests, including the concatenated Target layers consumed by block
-  // drafts.
-  prepare_warmup_decode_sequence(sequence, model_args, num_speculative_tokens);
+  // Speculative decode reads target state before running its first draft.
+  // Give a synthetic request the same token bootstrap as a PD decode request.
+  if (num_speculative_tokens > 0) {
+    sequence->mark_target_decode_bootstrap();
+  }
 
   CHECK(sequence->stage() == SequenceStage::DECODE)
       << "Decode profiling request is not in DECODE stage. total_length: "

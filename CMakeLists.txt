@@ -861,7 +861,7 @@ list(APPEND COMMON_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR})
 list(APPEND COMMON_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/xllm/core)
 # Note: third_party is not added to COMMON_INCLUDE_DIRS to avoid warnings
 # Individual third_party directories are added as SYSTEM headers below
-list(APPEND COMMON_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/etcd_cpp_apiv3)
+list(APPEND COMMON_INCLUDE_DIRS ${XLLM_ETCD_INCLUDE_DIR})
 
 # brpc - mark as system headers to suppress warnings from third-party code
 set(BRPC_OUTPUT_DIR ${CMAKE_BINARY_DIR}/third_party/brpc/output)
@@ -884,6 +884,12 @@ if(USE_CUDA)
   include_directories(SYSTEM ${CUTLASS_INCLUDE_DIR})
   include_directories(SYSTEM ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR})
 endif()
+
+# Build etcd from a patched copy: cancellation-aware auth ctor and request
+# timeouts live in cmake/patches, applied to a fingerprinted source copy so
+# the submodule pin stays at the published commit.
+include(cmake/etcd_dependency.cmake)
+include_directories(SYSTEM ${XLLM_ETCD_INCLUDE_DIR})
 
 # sentencepiece - mark as system headers to suppress warnings from third-party code
 # This must be added before add_subdirectory(third_party) to ensure it takes precedence

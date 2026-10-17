@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <chrono>
 #include <etcd/KeepAlive.hpp>
 #include <etcd/SyncClient.hpp>
 #include <etcd/Watcher.hpp>
@@ -30,11 +31,13 @@ using Callback = std::function<void(const etcd::Response&, const uint64_t&)>;
 class EtcdClient {
  public:
   explicit EtcdClient(const std::string& etcd_addr,
-                      const std::string& etcd_namespace = "");
+                      const std::string& etcd_namespace = "",
+                      std::chrono::milliseconds timeout = {});
   EtcdClient(const std::string& etcd_addr,
              const std::string& username,
              const std::string& password,
-             const std::string& etcd_namespace = "");
+             const std::string& etcd_namespace = "",
+             std::chrono::milliseconds timeout = {});
   ~EtcdClient();
 
   void add_watch(const std::string& key_prefix,
@@ -45,9 +48,17 @@ class EtcdClient {
 
   void stop_watch();
 
+  // Stop watches and lease renewal before the last owner releases this client.
+  // Terminal for registrations and safe to call repeatedly.
+  void stop();
+
+  // Requires a positive TTL and a granted lease before publishing the key.
   bool register_instance(const std::string& key,
                          const std::string& value,
                          const int ttl);
+  // Retire this client's lease without deleting a replacement owner's key.
+  // The caller serializes registration and retirement for the same key.
+  void unregister_instance(const std::string& key);
   bool get(const std::string& key, std::string* value);
 
   bool get_master_service(const std::string& key_prefix, std::string* values);
@@ -69,6 +80,8 @@ class EtcdClient {
   std::mutex watchers_mutex_;
   std::unordered_map<std::string, WatcherInfo> watchers_;
   std::mutex keep_alives_mutex_;
+  std::once_flag stop_once_;
+  bool stopped_ = false;
   std::unordered_map<std::string, std::shared_ptr<etcd::KeepAlive>>
       keep_alives_;
 };

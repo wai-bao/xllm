@@ -29,9 +29,8 @@ namespace xllm {
 namespace layer {
 
 bool is_qwen3_5_model_type(const std::string& model_type) {
-  return model_type == "qwen3_5" || model_type == "qwen3_5_text" ||
-         model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text" ||
-         model_type == "qwen3_5_mtp" || model_type == "qwen3_5_moe_mtp";
+  return is_qwen3_5_target_model_type(model_type) ||
+         is_qwen3_5_draft_model_type(model_type);
 }
 
 bool should_enable_qwen3_5_fia_decode(const std::string& model_type) {

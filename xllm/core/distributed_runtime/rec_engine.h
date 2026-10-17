@@ -56,6 +56,11 @@ class RecEngine : public Engine {
 
   virtual std::vector<int64_t> get_active_activation_memory() const;
 
+  std::shared_ptr<DistributedWorkerManager> get_distributed_worker_manager()
+      const override {
+    return distributed_worker_manager_;
+  }
+
  private:
   // ============================================================
   // RecEnginePipeline: Abstract base class for rec engine execution

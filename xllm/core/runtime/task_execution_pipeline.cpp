@@ -16,6 +16,7 @@ limitations under the License.
 #include "core/runtime/task_execution_pipeline.h"
 
 #include <c10/core/DeviceGuard.h>
+#include <glog/logging.h>
 
 #include <algorithm>
 #include <limits>
@@ -41,10 +42,8 @@ TaskExecutionPipeline::TaskExecutionPipeline(ThreadPool& state_executor,
                                              Executor& executor,
                                              std::vector<KVCache>& kv_caches,
                                              LlmTaskCapacity capacity,
-                                             TaskKVPush push_kv,
-                                             WorkerImpl* worker_pipeline)
-    : worker_pipeline_(worker_pipeline),
-      model_(model),
+                                             TaskKVPush push_kv)
+    : model_(model),
       executor_(executor),
       kv_caches_(kv_caches),
       push_kv_(std::move(push_kv)),
@@ -144,41 +143,6 @@ Status TaskExecutionPipeline::create(
   return Status();
 }
 
-Status TaskExecutionPipeline::create(
-    ThreadPool& state_executor,
-    TaskModel target,
-    WorkerImpl& worker,
-    const LlmTaskCapacity& capacity,
-    std::unique_ptr<TaskExecutionPipeline>& output) {
-  if (state_executor.size() != 1) {
-    return invalid("Task pipeline requires one state thread.");
-  }
-  if (capacity.slot_count == 0 || capacity.slot_count > 2) {
-    return invalid("Worker task pipeline supports one or two slots.");
-  }
-
-  if (!target.executor.supports_prepared_attention_metadata()) {
-    return invalid(
-        "Worker task pipeline requires prepared attention metadata support.");
-  }
-  c10::DeviceGuard guard(target.model.device());
-  auto pipeline = std::unique_ptr<TaskExecutionPipeline>(
-      new TaskExecutionPipeline(state_executor,
-                                target.model,
-                                target.executor,
-                                target.kv_caches,
-                                capacity,
-                                std::move(target.push_kv),
-                                &worker));
-  pipeline->slots_.reserve(capacity.slot_count);
-  for (uint32_t slot_id = 0; slot_id < capacity.slot_count; ++slot_id) {
-    pipeline->slots_.emplace_back(std::make_unique<Slot>());
-  }
-  pipeline->start();
-  output = std::move(pipeline);
-  return Status();
-}
-
 void TaskExecutionPipeline::start() {
   // Start execution only after every Slot and initialization write is ready.
   folly::Promise<std::thread::id> promise;
@@ -216,9 +180,15 @@ Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
       !params.multi_block_tables.empty() || params.mtp_topk_state != nullptr ||
       params.num_accepted_tokens.defined() ||
       !params.num_accepted_tokens_host.empty() ||
-      embedding.input_embedding.defined() || !copy.swap_blocks.empty() ||
-      copy.src_block_indices.defined() || copy.dst_block_indices.defined() ||
-      copy.cum_sum.defined() || params.parallel.cp_plan.enabled() ||
+      embedding.input_embedding.defined() ||
+      embedding.mtp_shifted_token_ids.defined() ||
+      (!source.request_state.target_decode_bootstrap_row_idxes.empty() &&
+       !(speculative && meta.is_graph_warmup)) ||
+      (!speculative && (!source.request_state.draft_input_row_idxes.empty() ||
+                        source.request_state.draft_input.has_value())) ||
+      !copy.swap_blocks.empty() || copy.src_block_indices.defined() ||
+      copy.dst_block_indices.defined() || copy.cum_sum.defined() ||
+      params.parallel.cp_plan.enabled() ||
       params.parallel.layer_wise_load_synchronizer != nullptr ||
       params.expert.expert_load_data.defined() ||
       params.expert.expert_array.defined() ||
@@ -228,10 +198,7 @@ Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
                   "Task pipeline requires CPU input without pre-expanded, "
                   "structured or recurrent state.");
   }
-  if (!speculative && (params.mtp_shifted_token_ids.defined() ||
-                       embedding.mtp_shifted_token_ids.defined() ||
-                       !embedding.mtp_bootstrap_row_idxes.empty() ||
-                       embedding.mtp_bootstrap_embeddings.defined())) {
+  if (!speculative && params.mtp_shifted_token_ids.defined()) {
     return invalid("Ordinary task input cannot carry MTP state.");
   }
   // Full-attention rows use -1 to keep this transport field row-aligned.
@@ -285,8 +252,10 @@ Status TaskExecutionPipeline::validate_input(const LlmForwardInput& source,
   if (meta.num_sequences < 0 || meta.actual_num_sequences < 0 ||
       meta.num_sequences != rows ||
       (speculative &&
-       (embedding.embedding_ids.size() > static_cast<uint64_t>(rows) ||
-        embedding.request_ids.size() != embedding.embedding_ids.size())) ||
+       (source.input_params.embedding.embedding_ids.size() >
+            static_cast<uint64_t>(rows) ||
+        source.input_params.embedding.request_ids.size() !=
+            source.input_params.embedding.embedding_ids.size())) ||
       (meta.actual_num_sequences != 0 && meta.actual_num_sequences != rows) ||
       (empty && rows != 0) ||
       (!empty && (!is_cpu_int_tensor(tokens, /*dimensions=*/1) ||
@@ -425,21 +394,15 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmForwardInput& input) {
   check_external_thread();
   LlmForwardInput unpacked;
   const LlmForwardInput* source = &input;
-  // Worker-owned preparation calls LlmForwardInput::to() on the retained packed
-  // owner and performs the only required unpack/H2D there. Unpacking here
-  // would parse the same payload twice before the worker can consume it.
-  if (input.runtime.input_host_buffer_has_layout &&
-      worker_pipeline_ == nullptr) {
+  if (input.runtime.input_host_buffer_has_layout) {
     CHECK(detail::unpack_from_input_host_buffer(
         input, device_.unwrap(), unpacked));
     source = &unpacked;
   }
   const bool speculative = speculative_capacity_ != nullptr;
-  if (worker_pipeline_ == nullptr) {
-    const Status status = validate_input(*source, capacity_, speculative);
-    if (!status.ok()) {
-      return TaskSubmission{status, 0};
-    }
+  const Status status = validate_input(*source, capacity_, speculative);
+  if (!status.ok()) {
+    return TaskSubmission{status, 0};
   }
   folly::Promise<TaskSubmission> promise;
   auto future = promise.getFuture();
@@ -457,9 +420,7 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmForwardInput& input) {
         const uint32_t slot_id =
             accepted_.empty() ? 0U : 1U - accepted_.front().slot_id;
         CHECK_LT(next_task_id_, std::numeric_limits<uint64_t>::max());
-        Status status = worker_pipeline_ != nullptr
-                            ? prepare_worker(slot_id, *source)
-                            : prepare(slot_id, *source);
+        const Status status = prepare(slot_id, *source);
         if (!status.ok()) {
           promise.setValue(TaskSubmission{std::move(status), 0});
           return;
@@ -470,6 +431,34 @@ TaskSubmission TaskExecutionPipeline::submit(const LlmForwardInput& input) {
         promise.setValue(TaskSubmission{Status(), ticket.task_id});
       });
   return std::move(future).get();
+}
+
+folly::SemiFuture<bool> TaskExecutionPipeline::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  check_external_thread();
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  state_executor_.schedule([this,
+                            ids = std::move(embedding_ids),
+                            promise = std::move(promise)]() mutable {
+    CHECK(accepted_.empty())
+        << "Idle cleanup requires consumed pipeline output";
+    c10::DeviceGuard guard(device_.unwrap());
+    auto stream_guard = task_stream_.set_stream_guard();
+    if (draft_input_state_store_ != nullptr) {
+      draft_input_state_store_->clear(ids);
+    }
+    if (context_ != nullptr) {
+      for (const int32_t id : ids) {
+        CHECK_GT(id, 0);
+        CHECK_LT(id, context_->request_ids_.size());
+        context_->release_slot(id);
+      }
+    }
+    CHECK_EQ(task_stream_.synchronize(), 0);
+    promise.setValue(true);
+  });
+  return future;
 }
 
 folly::Future<TaskResult> TaskExecutionPipeline::take_result_async(
@@ -690,31 +679,7 @@ Status TaskExecutionPipeline::prepare(uint32_t slot_id,
   return Status();
 }
 
-Status TaskExecutionPipeline::prepare_worker(uint32_t slot_id,
-                                             const LlmForwardInput& input) {
-  CHECK(worker_pipeline_ != nullptr);
-  if (slot_id >= slots_.size()) {
-    return invalid("Invalid worker task Slot index.");
-  }
-  Slot& slot = *slots_[slot_id];
-  slot.worker_input_host_buffer = input.runtime.input_host_buffer;
-  worker_pipeline_->prepare_task_pipeline_input(input, slot.worker_input);
-  slot.worker_output.reset();
-  slot.is_warmup = input.input_params.meta.is_graph_warmup;
-  return Status();
-}
-
 void TaskExecutionPipeline::launch(uint32_t slot_id) {
-  if (worker_pipeline_ != nullptr) {
-    CHECK_LT(slot_id, slots_.size());
-    Slot& slot = *slots_[slot_id];
-    slot.worker_output =
-        worker_pipeline_->execute_task_pipeline(slot.worker_input);
-    if (slot.worker_output.has_value()) {
-      slot.worker_output->is_graph_warmup = slot.is_warmup;
-    }
-    return;
-  }
   if (speculative_capacity_) {
     launch_speculative(slot_id);
     return;
@@ -779,28 +744,6 @@ void TaskExecutionPipeline::launch(uint32_t slot_id) {
 }
 
 ForwardOutput TaskExecutionPipeline::consume(uint32_t slot_id) {
-  if (worker_pipeline_ != nullptr) {
-    CHECK_LT(slot_id, slots_.size());
-    Slot& slot = *slots_[slot_id];
-    ForwardOutput output = slot.worker_output.has_value()
-                               ? std::move(*slot.worker_output)
-                               : ForwardOutput{};
-    c10::DeviceGuard guard(device_.unwrap());
-    // Launch completion only means that device work has been enqueued. As
-    // with SlotBuffer retirement, keep the prepared input alive until the
-    // producer is done, even for an output without tokens or retained inputs.
-    const StreamEventPtr& ready =
-        output.ready_event != nullptr
-            ? output.ready_event
-            : slot.worker_input.runtime.metadata_ready_event;
-    if (ready != nullptr) {
-      CHECK(ready->synchronize()) << "Failed to retire worker task input.";
-    }
-    slot.worker_output.reset();
-    slot.worker_input = LlmForwardInput();
-    slot.worker_input_host_buffer = torch::Tensor();
-    return output;
-  }
   if (speculative_capacity_) {
     return consume_speculative(slot_id);
   }
@@ -823,11 +766,6 @@ ForwardOutput TaskExecutionPipeline::consume(uint32_t slot_id) {
 }
 
 void TaskExecutionPipeline::discard(uint32_t slot_id) {
-  if (worker_pipeline_ != nullptr) {
-    // Destruction must obey the same device lifetime boundary as consumption.
-    consume(slot_id);
-    return;
-  }
   if (speculative_capacity_) {
     discard_speculative(slot_id);
     return;
@@ -849,9 +787,6 @@ void TaskExecutionPipeline::release_outputs(Slot& slot) {
 }
 
 uint64_t TaskExecutionPipeline::pinned_bytes() const {
-  if (worker_pipeline_ != nullptr) {
-    return 0;
-  }
   if (speculative_capacity_) {
     return speculative_pinned_bytes();
   }
@@ -863,9 +798,6 @@ uint64_t TaskExecutionPipeline::pinned_bytes() const {
 }
 
 uint64_t TaskExecutionPipeline::device_bytes() const {
-  if (worker_pipeline_ != nullptr) {
-    return 0;
-  }
   if (speculative_capacity_) {
     return speculative_device_bytes();
   }

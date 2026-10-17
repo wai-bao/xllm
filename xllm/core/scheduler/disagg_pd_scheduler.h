@@ -22,7 +22,6 @@ limitations under the License.
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -31,6 +30,8 @@ limitations under the License.
 #include <vector>
 
 #include "core/distributed_runtime/distributed_worker_manager.h"
+#include "core/framework/sampling/draft_sampling_mode.h"
+#include "core/framework/speculative/pd_speculative_handoff.h"
 #include "disagg_pd.pb.h"
 #include "distributed_runtime/xservice_client.h"
 #include "framework/request/request.h"
@@ -43,6 +44,7 @@ limitations under the License.
 namespace xllm {
 
 class KVCacheTransferCoordinator;
+class DraftInputSpecProvider;
 
 inline constexpr int32_t kDecodeAddNewPromptTooLongStatusCode = 413;
 
@@ -72,6 +74,7 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
   DisaggPDScheduler(
       TargetEngine* engine,
       const Options& options,
+      std::shared_ptr<XServiceClient> xservice_client,
       std::shared_ptr<DistributedWorkerManager> distributed_worker_manager,
       std::shared_ptr<ModelResidencyCoordinator> model_residency_coordinator =
           nullptr,
@@ -80,6 +83,7 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
       : DisaggPDScheduler(engine,
                           options,
                           SkipRuntimeStart{},
+                          std::move(xservice_client),
                           std::move(distributed_worker_manager),
                           std::move(model_residency_coordinator),
                           std::move(kv_transfer_coordinator)) {
@@ -118,6 +122,9 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
   // decode-1: for decode recveive new request from prefill
   bool decode_schedule(std::shared_ptr<Request>& request,
                        const std::string& prefill_instance_name);
+  // Reject a handoff before admission, including transport decoding failures.
+  // Removal and resource reclamation are idempotent for duplicate RPCs.
+  void reject_received_request(const std::string& request_id);
   // decode-2: for decode receive first token from prefill
   bool decode_recv_first_generation(
       const std::string& req_id,
@@ -135,8 +142,8 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
       std::vector<KVTransferMapping> source_mappings,
       int32_t src_dp_size,
       int32_t src_dp_rank,
-      torch::Tensor mtp_bootstrap_embedding = torch::Tensor(),
-      int32_t num_cached_tokens = 0);
+      int32_t num_cached_tokens = 0,
+      std::optional<DraftInput> draft_input = std::nullopt);
 
   // Only consumes a matching waiting reservation, never a running request.
   bool release_reservation(const std::string& req_id,
@@ -181,6 +188,7 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
       TargetEngine* engine,
       const Options& options,
       SkipRuntimeStart,
+      std::shared_ptr<XServiceClient> xservice_client = nullptr,
       std::shared_ptr<DistributedWorkerManager> distributed_worker_manager =
           nullptr,
       std::shared_ptr<ModelResidencyCoordinator> model_residency_coordinator =
@@ -191,11 +199,22 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
                               options,
                               std::move(model_residency_coordinator),
                               std::move(distributed_worker_manager)),
+        xservice_client_(std::move(xservice_client)),
         kv_transfer_coordinator_(std::move(kv_transfer_coordinator)),
         server_name_("DisaggPDServer") {
     if (!options_.instance_role().has_value()) {
       LOG(FATAL) << "Instance type is not set in disagg pd mode.";
     }
+    draft_input_spec_provider_ =
+        dynamic_cast<const DraftInputSpecProvider*>(engine);
+    // The handoff shape is fixed by scheduler options for the scheduler's
+    // lifetime; resolve it once instead of per decoded first-generation.
+    handoff_kind_ = pd_speculative_handoff_kind(
+        options_.speculative_algorithm(), options_.num_speculative_tokens());
+    probabilistic_handoff_ =
+        parse_draft_sampling_mode(options_.draft_sampling_mode()) ==
+        DraftSamplingMode::PROBABILISTIC;
+    handoff_vocab_size_ = engine_->model_args().vocab_size();
   }
 
   void release_failed_request(const std::shared_ptr<Request>& request) override;
@@ -241,6 +260,7 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
   // info
   void register_instance_info(const std::string& server_name);
 
+  std::shared_ptr<XServiceClient> xservice_client_;
   std::shared_ptr<KVCacheTransferCoordinator> kv_transfer_coordinator_;
 
   // remote instance name(ID) -> instance info
@@ -312,6 +332,17 @@ class DisaggPDScheduler : public ContinuousScheduler<> {
   std::unordered_set<std::string> linked_instance_;
 
   std::string server_name_;
+
+  // Resolved once from engine_ at construction; the engine's dynamic type is
+  // fixed for the scheduler's lifetime.
+  const DraftInputSpecProvider* draft_input_spec_provider_ = nullptr;
+
+  // Handoff invariants fixed by scheduler options / engine model args; the
+  // spec itself stays a per-call query because tests retarget it after
+  // construction.
+  SpeculativeHandoffKind handoff_kind_ = SpeculativeHandoffKind::NONE;
+  bool probabilistic_handoff_ = false;
+  int64_t handoff_vocab_size_ = 0;
 };
 
 }  // namespace xllm

@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <memory>
 
+#include "core/distributed_runtime/distributed_worker_manager.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
@@ -33,6 +34,10 @@ class Engine {
   virtual bool init() { return true; };
 
   virtual bool init(MasterStatus master_status) { return true; };
+
+  // Called after all scheduled outputs have been consumed and no batch remains.
+  // Flush request-state releases without dispatching a model forward.
+  virtual void flush_released_requests() {}
 
   // return the tokenizer
   virtual const Tokenizer* tokenizer() const { return tokenizer_.get(); }
@@ -52,6 +57,14 @@ class Engine {
   // return the tokenizer args
   virtual const TokenizerArgs& tokenizer_args() const {
     return tokenizer_args_;
+  }
+
+  // The worker-connection manager for engines that drive remote workers;
+  // speculative bases forward to their target engine. Local-only modes
+  // (OneRec, multi-round rec, unit-test fakes) return nullptr.
+  virtual std::shared_ptr<DistributedWorkerManager>
+  get_distributed_worker_manager() const {
+    return nullptr;
   }
 
   // Start/stop online timeline profiling on all workers. CUDA only for now.

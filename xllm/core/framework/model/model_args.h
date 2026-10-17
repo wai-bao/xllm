@@ -24,6 +24,7 @@ limitations under the License.
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "common/macros.h"
@@ -738,12 +739,19 @@ inline bool has_linear_attention_layers(const ModelArgs& args) {
   return args.full_attention_interval() > 1;
 }
 
-// Closed set by design: a new target variant must be enumerated here rather
-// than matched by a "qwen3_5_" prefix, so draft bodies ("qwen3_5_mtp") are not
-// silently promoted onto the target spec-verify path.
+// Closed model-family predicates used by attention and recurrent-state policy.
+// Target/draft pairing and draft argument conversion belong to ModelRegistry.
+inline bool is_qwen3_5_draft_model_type(std::string_view model_type) {
+  return model_type == "qwen3_5_mtp" || model_type == "qwen3_5_moe_mtp";
+}
+
+inline bool is_qwen3_5_text_model_type(std::string_view model_type) {
+  return model_type == "qwen3_5_text" || model_type == "qwen3_5_moe_text";
+}
+
 inline bool is_qwen3_5_target_model_type(std::string_view model_type) {
   return model_type == "qwen3_5" || model_type == "qwen3_5_moe" ||
-         model_type == "qwen3_5_text" || model_type == "qwen3_5_moe_text";
+         is_qwen3_5_text_model_type(model_type);
 }
 
 inline std::ostream& operator<<(std::ostream& os, const ModelArgs& args) {

@@ -15,16 +15,18 @@ limitations under the License.
 
 #include "core/distributed_runtime/xservice_client.h"
 
+#include <absl/strings/str_cat.h>
 #include <absl/strings/str_split.h>
 #include <absl/time/clock.h>
 #include <absl/time/time.h>
 #include <glog/logging.h>
-#include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <unordered_map>
 #include <utility>
 
+#include "core/common/etcd_utils.h"
 #include "core/framework/config/distributed_config.h"
 #include "core/framework/config/service_config.h"
 #include "util/env_var.h"
@@ -39,6 +41,12 @@ static std::string ETCD_XSERVICES_KEY_PREFIX =
     "XLLM:SERVICE:";  // all xllm_service registration prefix
 constexpr const char* kEtcdUsernameEnvVar = "ETCD_USERNAME";
 constexpr const char* kEtcdPasswordEnvVar = "ETCD_PASSWORD";
+constexpr std::chrono::seconds kDiscoveryRequestTimeout{5};
+
+std::chrono::milliseconds heartbeat_interval() {
+  return std::chrono::milliseconds(static_cast<int64_t>(
+      ::xllm::DistributedConfig::get_instance().heart_beat_interval() * 1000));
+}
 static std::unordered_map<xllm_service::proto::InstanceType, std::string>
     ETCD_KEYS_PREFIX_MAP = {
         {xllm_service::proto::InstanceType::DEFAULT, "XLLM:DEFAULT:"},
@@ -147,12 +155,49 @@ void fill_generation_request(const RequestOutput& output,
 
 }  // namespace
 
+std::shared_ptr<XServiceClient> XServiceClient::acquire(
+    const std::string& etcd_addr,
+    const std::string& instance_name,
+    const std::string& etcd_namespace) {
+  static std::mutex registry_mutex;
+  static std::unordered_map<std::string, std::weak_ptr<XServiceClient>>
+      sessions;
+  const std::string normalized_namespace =
+      normalize_etcd_namespace(etcd_namespace);
+  const std::string key =
+      absl::StrCat(etcd_addr, normalized_namespace, instance_name);
+  std::shared_ptr<XServiceClient> client;
+  {
+    std::lock_guard<std::mutex> lock(registry_mutex);
+    std::erase_if(sessions,
+                  [](const auto& entry) { return entry.second.expired(); });
+    auto& entry = sessions[key];
+    client = entry.lock();
+    if (client == nullptr || client->exited_.load()) {
+      client = std::shared_ptr<XServiceClient>(new XServiceClient);
+      entry = client;
+    }
+  }
+  if (!client->init(etcd_addr, instance_name, etcd_namespace)) {
+    return nullptr;
+  }
+  return client;
+}
+
 bool XServiceClient::init(const std::string& etcd_addr,
                           const std::string& instance_name,
                           const std::string& etcd_namespace) {
-  if (initialize_done_) {
-    LOG(INFO) << "XServiceClient is already initialized, skipping.";
-    return true;
+  std::lock_guard<std::mutex> init_lock(init_mutex_);
+  if (exited_.load()) {
+    return false;
+  }
+  // Normalize once: the idempotence compare and the assignment below must see
+  // the same value, and init is also reachable without acquire's normalization.
+  const std::string normalized_namespace =
+      normalize_etcd_namespace(etcd_namespace);
+  if (initialize_done_.load()) {
+    return etcd_address_ == etcd_addr && instance_name_ == instance_name &&
+           etcd_namespace_ == normalized_namespace;
   }
 
   if (etcd_addr.empty()) {
@@ -161,6 +206,8 @@ bool XServiceClient::init(const std::string& etcd_addr,
   }
 
   instance_name_ = instance_name;
+  etcd_address_ = etcd_addr;
+  etcd_namespace_ = normalized_namespace;
   if (incarnation_id_.empty()) {
     ShortUUID uuid;
     incarnation_id_ = uuid.random();
@@ -181,17 +228,23 @@ bool XServiceClient::init(const std::string& etcd_addr,
     return false;
   }
   if (has_etcd_auth_user) {
-    etcd_client_ = std::make_unique<EtcdClient>(
-        etcd_addr, etcd_username, etcd_password, etcd_namespace);
+    etcd_client_ = std::make_unique<EtcdClient>(etcd_addr,
+                                                etcd_username,
+                                                etcd_password,
+                                                etcd_namespace,
+                                                kDiscoveryRequestTimeout);
   } else {
-    etcd_client_ = std::make_unique<EtcdClient>(etcd_addr, etcd_namespace);
+    etcd_client_ = std::make_unique<EtcdClient>(
+        etcd_addr, etcd_namespace, kDiscoveryRequestTimeout);
   }
 
   // connect master xllm_service
   while (!etcd_client_->get_master_service(ETCD_MASTER_SERVICE_KEY,
                                            &master_xservice_addr_)) {
     LOG(ERROR) << "Master service not set, wait 2s!";
-    sleep(2);
+    if (wait_for_stop(std::chrono::seconds(2))) {
+      return false;
+    }
   }
 
   if (!check_instance_name(master_xservice_addr_)) {
@@ -238,52 +291,200 @@ bool XServiceClient::init(const std::string& etcd_addr,
   };
   etcd_client_->add_watch(ETCD_XSERVICES_KEY_PREFIX, xservices_func);
 
-  initialize_done_ = true;
+  initialize_done_.store(!exited_.load());
+  return initialize_done();
+}
+
+XServiceRegistration::XServiceRegistration(
+    std::shared_ptr<XServiceClient> client,
+    uint64_t registration_id)
+    : client_(std::move(client)), registration_id_(registration_id) {}
+
+XServiceRegistration::~XServiceRegistration() {
+  client_->unbind(registration_id_);
+}
+
+std::unique_ptr<XServiceRegistration> XServiceClient::bind(
+    InstanceInfo info,
+    MetricsProvider metrics_provider) {
+  CHECK(metrics_provider != nullptr);
+  if (!initialize_done()) {
+    return nullptr;
+  }
+  std::unique_ptr<XServiceRegistration> registration;
+  std::unique_lock<std::mutex> lock(observer_mutex_);
+  if (exited_.load() || info.name != instance_name_ ||
+      (!observers_.empty() && info.type != observers_.front()->info.type)) {
+    return nullptr;
+  }
+  auto observer = std::make_shared<Observer>();
+  observer->id = next_observer_id_++;
+  observer->metrics_provider = std::move(metrics_provider);
+  observer->info = std::move(info);
+  registration.reset(
+      new XServiceRegistration(shared_from_this(), observer->id));
+  observers_.emplace_back(observer);
+  const bool needs_registration = observers_.size() == 1;
+  InstanceInfo registration_info = observer->info;
+  lock.unlock();
+  // The etcd RPC runs off observer_mutex_ so heartbeats keep flowing while
+  // registration retries; register_instance re-checks the generation under
+  // registration_mutex_.
+  if (needs_registration && !register_instance(registration_info)) {
+    lock.lock();
+    auto it = std::find(observers_.begin(), observers_.end(), observer);
+    if (it != observers_.end()) {
+      observers_.erase(it);
+    }
+    return nullptr;
+  }
+  return registration;
+}
+
+void XServiceClient::unbind(uint64_t registration_id) {
+  std::unique_lock<std::mutex> lock(observer_mutex_);
+  const bool was_primary =
+      !observers_.empty() && observers_.front()->id == registration_id;
+  auto it = std::find_if(observers_.begin(),
+                         observers_.end(),
+                         [registration_id](const auto& observer) {
+                           return observer->id == registration_id;
+                         });
+  if (it == observers_.end()) {
+    return;
+  }
+  std::shared_ptr<Observer> removed = *it;
+  observers_.erase(it);
+  std::string unregistered_key;
+  if (observers_.empty()) {
+    std::lock_guard<std::mutex> registration_lock(registration_mutex_);
+    register_done_.store(false);
+    ++registration_generation_;
+    unregistered_key = registration_key_;
+    registration_key_.clear();
+    registration_value_.clear();
+  } else if (was_primary) {
+    CHECK(set_registration_info(observers_.front()->info));
+  }
+  lock.unlock();
+  // The etcd RPC runs off observer_mutex_; the generation bump already makes
+  // any concurrent re-registration authoritative.
+  if (!unregistered_key.empty()) {
+    etcd_client_->unregister_instance(unregistered_key);
+  }
+  lock.lock();
+  observer_cv_.wait(lock, [&] { return removed->in_flight == 0; });
+}
+
+XServiceClient::~XServiceClient() { stop(); }
+
+void XServiceClient::stop() {
+  std::call_once(stop_once_, [this] {
+    std::vector<brpc::CallId> pending;
+    {
+      std::lock_guard<std::mutex> lock(stop_mutex_);
+      exited_.store(true);
+      pending.reserve(control_rpcs_.size());
+      for (const auto& entry : control_rpcs_) {
+        pending.emplace_back(entry.second);
+      }
+    }
+    stop_cv_.notify_all();
+    for (brpc::CallId id : pending) {
+      brpc::StartCancel(id);
+    }
+    // Initialization observes exited_ and uses bounded etcd operations.
+    // Wait for publication of its threads before joining them.
+    std::lock_guard<std::mutex> init_lock(init_mutex_);
+    if (etcd_client_ != nullptr) {
+      etcd_client_->stop_watch();
+    }
+    if (heartbeat_thread_ && heartbeat_thread_->joinable()) {
+      heartbeat_thread_->join();
+    }
+    if (reconcile_thread_ && reconcile_thread_->joinable()) {
+      reconcile_thread_->join();
+    }
+    if (etcd_client_ != nullptr) {
+      etcd_client_->stop();
+    }
+  });
+}
+
+bool XServiceClient::track_control_rpc(brpc::CallId id) {
+  std::lock_guard<std::mutex> lock(stop_mutex_);
+  if (exited_.load()) {
+    return false;
+  }
+  control_rpcs_.emplace(id.value, id);
   return true;
 }
 
-XServiceClient::HeartbeatCallbackRegistration
-XServiceClient::set_heartbeat_callback(HeartbeatCallback callback) {
-  return heartbeat_callback_registry_.set_callback(std::move(callback));
+void XServiceClient::forget_control_rpc(brpc::CallId id) {
+  std::lock_guard<std::mutex> lock(stop_mutex_);
+  control_rpcs_.erase(id.value);
 }
 
-void XServiceClient::clear_heartbeat_callback(
-    HeartbeatCallbackRegistration registration) {
-  heartbeat_callback_registry_.clear_callback(registration);
+XServiceClient::ControlRpcScope::ControlRpcScope(XServiceClient& client,
+                                                 brpc::Controller& cntl)
+    : client_(client) {
+  cntl.set_timeout_ms(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          kDiscoveryRequestTimeout)
+                          .count());
+  call_id_ = cntl.call_id();
+  tracked_ = client_.track_control_rpc(call_id_);
 }
 
-XServiceClient::~XServiceClient() {
-  exited_.store(true);
-  if (heartbeat_thread_ && heartbeat_thread_->joinable()) {
-    heartbeat_thread_->join();
+XServiceClient::ControlRpcScope::~ControlRpcScope() {
+  if (tracked_) {
+    client_.forget_control_rpc(call_id_);
   }
-  if (reconcile_thread_ && reconcile_thread_->joinable()) {
-    reconcile_thread_->join();
-  }
+}
+
+bool XServiceClient::wait_for_stop(std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> lock(stop_mutex_);
+  return stop_cv_.wait_for(lock, timeout, [this] { return exited_.load(); });
 }
 
 std::string XServiceClient::get_instance_name() { return instance_name_; }
 
 bool XServiceClient::register_instance_with_retry(const std::string& key,
-                                                  const std::string& value) {
-  int retry_cnt = 0;
-  while (!etcd_client_->register_instance(
-      key, value, ::xllm::DistributedConfig::get_instance().etcd_ttl())) {
+                                                  const std::string& value,
+                                                  uint64_t generation) {
+  int32_t retry_cnt = 0;
+  while (!exited_.load()) {
+    {
+      std::lock_guard<std::mutex> lock(registration_mutex_);
+      if (generation != registration_generation_ || registration_key_.empty()) {
+        return false;
+      }
+    }
+    // Run the etcd RPC unlocked so a stuck call cannot stall unbind or
+    // reconcile_registration waiting on registration_mutex_; a superseded
+    // registration is caught by the generation check on the next pass.
+    if (etcd_client_->register_instance(
+            key, value, DistributedConfig::get_instance().etcd_ttl())) {
+      std::lock_guard<std::mutex> lock(registration_mutex_);
+      return generation == registration_generation_;
+    }
     if (retry_cnt >= 30) {
       LOG(ERROR) << "Register instance failed! key: " << key;
       return false;
     }
 
     LOG(WARNING) << "Register instance failed, wait 2s! key: " << key;
-    sleep(2);
+    if (wait_for_stop(std::chrono::seconds(2))) {
+      return false;
+    }
     retry_cnt++;
   }
-  return true;
+  return false;
 }
 
 bool XServiceClient::reconcile_registration() {
   std::string registration_key;
   std::string registration_value;
+  uint64_t generation = 0;
   {
     std::lock_guard<std::mutex> lock(registration_mutex_);
     if (!register_done_.load() || registration_key_.empty() ||
@@ -292,34 +493,43 @@ bool XServiceClient::reconcile_registration() {
     }
     registration_key = registration_key_;
     registration_value = registration_value_;
+    generation = registration_generation_;
   }
 
   std::string current_value;
   if (etcd_client_->get(registration_key, &current_value) &&
-      !current_value.empty()) {
+      current_value == registration_value) {
     return true;
   }
 
   LOG(WARNING) << "Detected missing instance registration in etcd, "
                   "re-registering instance: "
                << registration_key;
-  return register_instance_with_retry(registration_key, registration_value);
+  if (register_instance_with_retry(
+          registration_key, registration_value, generation)) {
+    return true;
+  }
+  std::lock_guard<std::mutex> lock(registration_mutex_);
+  // A removed or replaced registration is an expected cancellation.
+  return generation != registration_generation_;
 }
 
 void XServiceClient::reconcile_registration_loop() {
-  while (!exited_.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int64_t>(
-        ::xllm::DistributedConfig::get_instance().heart_beat_interval() *
-        1000)));
+  const auto interval = heartbeat_interval();
+  while (!wait_for_stop(interval)) {
     if (!register_done_.load()) continue;
 
-    if (!reconcile_registration()) {
+    if (!reconcile_registration() && !exited_.load()) {
       LOG(ERROR) << "Failed to reconcile instance registration in etcd.";
     }
   }
 }
 
-void XServiceClient::register_instance(const InstanceInfo& instance_info) {
+bool XServiceClient::set_registration_info(const InstanceInfo& instance_info) {
+  if (instance_info.name != instance_name_) {
+    LOG(ERROR) << "Discovery registration does not match its serving instance";
+    return false;
+  }
   InstanceInfo registered_info = instance_info;
   registered_info.incarnation_id = incarnation_id_;
   if (registered_info.register_ts_ms == 0) {
@@ -341,31 +551,54 @@ void XServiceClient::register_instance(const InstanceInfo& instance_info) {
     key_prefix = ETCD_KEYS_PREFIX_MAP[xllm_service::proto::InstanceType::MIX];
   } else {
     LOG(ERROR) << "Unsupported instance type: " << registered_info.type;
-    return;
+    return false;
   }
 
   const std::string key = key_prefix + registered_info.name;
   const std::string value = registered_info.serialize_to_json().dump();
   {
     std::lock_guard<std::mutex> lock(registration_mutex_);
-    instance_name_ = registered_info.name;
     registration_key_ = key;
     registration_value_ = value;
+    ++registration_generation_;
   }
 
-  if (!register_instance_with_retry(key, value)) {
-    LOG(FATAL) << "Register instance to etcd failed!";
-    return;
-  }
+  return true;
+}
 
+bool XServiceClient::register_instance(const InstanceInfo& info) {
+  if (!set_registration_info(info)) {
+    return false;
+  }
+  std::string key;
+  std::string value;
+  uint64_t generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(registration_mutex_);
+    key = registration_key_;
+    value = registration_value_;
+    generation = registration_generation_;
+  }
+  if (!register_instance_with_retry(key, value, generation)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(registration_mutex_);
+  if (generation != registration_generation_ || exited_.load()) {
+    return false;
+  }
   register_done_.store(true);
   LOG(INFO) << "Success register instance to etcd.";
+  return true;
 }
 
 InstanceInfo XServiceClient::get_instance_info(
     const std::string& instance_name) {
   InstanceInfo result;
   brpc::Controller cntl;
+  ControlRpcScope rpc(*this, cntl);
+  if (!rpc.tracked()) {
+    return result;
+  }
   xllm_service::proto::InstanceID req;
   xllm_service::proto::InstanceMetaInfo resp;
   req.set_name(instance_name);
@@ -416,19 +649,72 @@ InstanceInfo XServiceClient::get_instance_info(
 }
 
 void XServiceClient::heartbeat() {
-  while (!exited_.load()) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int64_t>(
-        ::xllm::DistributedConfig::get_instance().heart_beat_interval() *
-        1000)));
+  const auto interval = heartbeat_interval();
+  while (!wait_for_stop(interval)) {
     if (!register_done_.load()) continue;
 
     brpc::Controller cntl;
+    ControlRpcScope rpc(*this, cntl);
+    if (!rpc.tracked()) {
+      return;
+    }
     xllm_service::proto::HeartbeatRequest req;
     req.set_name(instance_name_);
     req.set_incarnation_id(incarnation_id_);
 
-    heartbeat_callback_registry_.invoke(req);
+    std::shared_ptr<Observer> observer;
+    {
+      std::lock_guard<std::mutex> lock(observer_mutex_);
+      if (observers_.empty()) {
+        continue;
+      }
+      observer = observers_.front();
+      ++observer->in_flight;
+    }
+    XServiceMetricsSnapshot metrics = observer->metrics_provider();
+    bool still_primary = false;
+    {
+      std::lock_guard<std::mutex> lock(observer_mutex_);
+      --observer->in_flight;
+      still_primary = !observers_.empty() && observers_.front() == observer;
+      observer_cv_.notify_all();
+    }
+    if (!still_primary) {
+      continue;
+    }
+    req.mutable_load_metrics()->set_gpu_cache_usage_perc(
+        metrics.gpu_cache_usage_perc);
+    req.mutable_load_metrics()->set_waiting_requests_num(
+        metrics.waiting_requests_num);
+    if (!metrics.ttft.empty()) {
+      auto max_ttft =
+          std::max_element(metrics.ttft.begin(), metrics.ttft.end());
+      req.mutable_latency_metrics()->set_recent_max_ttft(*max_ttft);
+    }
 
+    if (!metrics.tbt.empty()) {
+      auto max_tbt = std::max_element(metrics.tbt.begin(), metrics.tbt.end());
+      req.mutable_latency_metrics()->set_recent_max_tbt(*max_tbt);
+    }
+
+    // Collect virtual-memory info (worker free pages, model weight segments)
+    if (metrics.has_virtual_memory_info) {
+      auto* virtual_memory_info = req.mutable_virtual_memory_info();
+      for (size_t free_pages : metrics.worker_free_phy_pages) {
+        virtual_memory_info->add_worker_free_phy_pages(free_pages);
+      }
+
+      // Report weight segments (for non-contiguous allocation support)
+      for (const auto& [model_id, segments] : metrics.model_weight_segments) {
+        auto& seg_list =
+            (*virtual_memory_info->mutable_model_weight_segments())[model_id];
+        for (const auto& seg : segments) {
+          auto* proto_seg = seg_list.add_segments();
+          proto_seg->set_offset(seg.offset);
+          proto_seg->set_size(seg.size);
+        }
+      }
+    }
     xllm_service::proto::Status resp;
     std::string master_addr;
     if (!with_master_stub(
@@ -440,8 +726,10 @@ void XServiceClient::heartbeat() {
     }
 
     if (cntl.Failed()) {
-      LOG(ERROR) << "Failed to send heartbeat to master xservice "
-                 << master_addr << ", error msg is: " << cntl.ErrorText();
+      if (!exited_.load()) {
+        LOG(ERROR) << "Failed to send heartbeat to master xservice "
+                   << master_addr << ", error msg is: " << cntl.ErrorText();
+      }
     } else if (!resp.ok()) {
       LOG(ERROR) << "Failed to send heartbeat to master xservice "
                  << master_addr;
@@ -451,6 +739,10 @@ void XServiceClient::heartbeat() {
 
 std::vector<std::string> XServiceClient::get_static_decode_list() {
   brpc::Controller cntl;
+  ControlRpcScope rpc(*this, cntl);
+  if (!rpc.tracked()) {
+    return {};
+  }
   xllm_service::proto::InstanceID req;
   xllm_service::proto::InstanceIDs resp;
   req.set_name(instance_name_);

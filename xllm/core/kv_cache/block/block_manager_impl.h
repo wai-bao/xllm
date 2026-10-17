@@ -95,6 +95,12 @@ class BlockManagerImpl : public BlockManager {
   // total blocks num
   size_t num_total_blocks() const override { return free_blocks_.size() - 1; }
 
+  bool is_block_used(int32_t block_id) const override {
+    CHECK_GT(block_id, 0);
+    CHECK_LT(static_cast<size_t>(block_id), usage_accounted_ids_.size());
+    return usage_accounted_ids_[static_cast<size_t>(block_id)] != 0;
+  }
+
  protected:
   // Flip a block's entry in `usage_ids` from 0 to 1. Returns true if the flip
   // happened; false if the entry was already 1 (i.e. block was already marked

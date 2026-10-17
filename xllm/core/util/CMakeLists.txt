@@ -27,6 +27,7 @@ cc_library(
     spin_lock.h
     spin_rw_lock.h
     int32_map.h
+    integer_math.h
     linalg.h
     suffix_decoding_cache.h
     suffix_tree.h

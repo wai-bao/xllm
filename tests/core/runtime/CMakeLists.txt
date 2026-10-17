@@ -333,3 +333,72 @@ if(USE_DCU)
       hip::host
   )
 endif()
+
+
+cc_test(
+  NAME
+    mtp_draft_input_carry_test
+  SRCS
+    mtp_draft_input_carry_test.cpp
+  DEPS
+    :runtime
+    :model_loader
+    :batch
+    :kv_cache
+    :platform
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME worker_request_state_test
+  NO_NPU_RUNTIME
+  SRCS worker_request_state_test.cpp
+  DEPS :runtime GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    xservice_client_test
+  NO_NPU_RUNTIME
+  INCLUDES
+    "${CMAKE_BINARY_DIR}/third_party/etcd_cpp_apiv3/proto/gen"
+    "${CMAKE_BINARY_DIR}/third_party/etcd_cpp_apiv3/proto/gen/proto"
+  SRCS
+    xservice_client_test.cpp
+  DEPS
+    :runtime
+    :config
+    GTest::gtest_main
+)
+target_link_libraries(xservice_client_test PRIVATE
+  Python::Python
+  $<$<BOOL:${USE_NPU}>:ascendcl>
+  $<$<BOOL:${USE_NPU}>:hccl>
+  $<$<BOOL:${USE_NPU}>:c_sec>
+  $<$<BOOL:${USE_NPU}>:nnopbase>)
+
+cc_test(
+  NAME
+    speculative_input_builder_test
+  SRCS
+    speculative_input_builder_test.cpp
+  DEPS
+    :runtime
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    spec_verify_test
+  SRCS
+    spec_verify_test.cpp
+  DEPS
+    :runtime
+    GTest::gtest_main
+)
+target_link_libraries(spec_verify_test PRIVATE
+  Python::Python
+  $<$<BOOL:${USE_NPU}>:ascendcl>
+  $<$<BOOL:${USE_NPU}>:hccl>
+  $<$<BOOL:${USE_NPU}>:c_sec>
+  $<$<BOOL:${USE_NPU}>:nnopbase>)

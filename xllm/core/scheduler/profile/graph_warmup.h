@@ -22,9 +22,6 @@ limitations under the License.
 
 namespace xllm {
 
-class Sequence;
-struct ModelArgs;
-
 enum class GraphWarmupPlan : int8_t {
   UNIFIED = 0,
   PREFILL_ONLY = 1,
@@ -40,16 +37,8 @@ std::string graph_warmup_progress(int32_t completed,
 
 // Returns a process-unique request id for synthetic profiling/warmup requests.
 // Distinct ids keep these requests separable from each other (and from real
-// requests) in the embedding cache, so stale decode state from a recycled
-// embedding block cannot be mistaken for a warmup request's own state.
+// requests) in worker-owned request state, so a recycled embedding block
+// cannot make stale decode state appear to belong to a warmup request.
 std::string next_warmup_request_id();
-
-// Prepares synthetic decode state with the model's bootstrap geometry. Block
-// drafts consume concatenated captured layers; MTP consumes its hidden state.
-// The zero values are synthetic, but the shape must obey the worker contract.
-// Does nothing when speculative decoding is disabled.
-void prepare_warmup_decode_sequence(Sequence* sequence,
-                                    const ModelArgs& model_args,
-                                    int32_t num_speculative_tokens);
 
 }  // namespace xllm

@@ -101,6 +101,9 @@ class RecMaster : public Master {
 
   // flag to indicate if the handler is running
   std::atomic<bool> running_{false};
+
+  // Ownership rule: see Master::bind_service_registration.
+  std::unique_ptr<XServiceRegistration> discovery_registration_;
 };
 
 }  // namespace xllm

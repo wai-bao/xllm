@@ -77,6 +77,10 @@ class CausalLM : public torch::nn::Module {
                               std::vector<KVCache>& kv_caches,
                               const ModelInputParams& parameters) = 0;
 
+  // True only when aux_hidden_states carries a model-specific speculative
+  // feedback tensor rather than a configured intermediate-layer capture.
+  virtual bool provides_capture_hidden_hook() const { return false; }
+
   virtual bool requires_graph_forward_metadata() { return false; }
 
   virtual bool is_hybrid_linear_attention() { return false; }
@@ -195,6 +199,10 @@ class CausalLM : public torch::nn::Module {
 
   virtual bool share_weights_from(CausalLM& /*source*/) { return false; }
 
+  // A self-contained MTP draft checkpoint supplies its own token embedding
+  // and LM head. Other draft models borrow those weights from the target.
+  virtual bool owns_mtp_draft_weights() const { return false; }
+
   // DFlash-specific interface. Attention-free scatter-only pass that projects
   // target hidden into the draft's per-layer KV cache. Not part of forward()
   // because it has no attention and its shape doesn't match forward's decode
@@ -261,6 +269,13 @@ class CausalLMImpl : public CausalLM {
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& parameters) override {
     return model_->forward(tokens, positions, kv_caches, parameters);
+  }
+
+  bool provides_capture_hidden_hook() const override {
+    if constexpr (detail::has_provides_capture_hidden_hook<Model>::value) {
+      return model_->provides_capture_hidden_hook();
+    }
+    return CausalLM::provides_capture_hidden_hook();
   }
 
   bool requires_graph_forward_metadata() override {
@@ -547,6 +562,13 @@ class CausalLMImpl : public CausalLM {
     } else {
       CausalLM::set_word_embedding(embedding);
     }
+  }
+
+  bool owns_mtp_draft_weights() const override {
+    if constexpr (detail::has_owns_mtp_draft_weights<Model>::value) {
+      return model_->owns_mtp_draft_weights();
+    }
+    return CausalLM::owns_mtp_draft_weights();
   }
 
   torch::Device device() const override { return options_.device(); }

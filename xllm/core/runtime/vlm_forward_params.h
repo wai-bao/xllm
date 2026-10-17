@@ -252,12 +252,6 @@ class VlmForwardInput final {
   ForwardRuntimeState runtime;
 };
 
-inline LlmForwardInput make_llm_draft_input(const LlmForwardInput& target) {
-  LlmForwardInput draft = target.clone();
-  draft.input_params.clear_linear_attention_state();
-  return draft;
-}
-
 inline LlmForwardInput make_llm_draft_input(const VlmForwardInput& target) {
   CHECK(!target.runtime.input_host_buffer_has_layout ||
         target.runtime.device_tensors_ready)
@@ -291,10 +285,6 @@ inline LlmForwardInput make_llm_draft_input(const VlmForwardInput& target) {
   params.embedding.extra_token_ids = source.embedding.extra_token_ids;
   params.embedding.mtp_shifted_token_ids =
       source.embedding.mtp_shifted_token_ids;
-  params.embedding.mtp_bootstrap_row_idxes =
-      source.embedding.mtp_bootstrap_row_idxes;
-  params.embedding.mtp_bootstrap_embeddings =
-      source.embedding.mtp_bootstrap_embeddings;
   params.parallel = source.parallel;
   params.block_copy = source.block_copy;
   params.expert = source.expert;

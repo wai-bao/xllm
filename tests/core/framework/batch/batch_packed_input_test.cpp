@@ -1188,9 +1188,7 @@ TEST(BatchPackedInputTest, RecSnapshotTransferMovesExecutionTensors) {
   ModelInputParams params(owner);
   const torch::Tensor values = torch::tensor({1, 2}, torch::kInt32);
   params.embedding.mtp_shifted_token_ids = values;
-  params.embedding.mtp_bootstrap_embeddings = values;
   params.embedding.extra_token_ids = {3};
-  params.embedding.mtp_bootstrap_row_idxes = {4};
   params.graph.use_expanded_decode_for_spec_verify_attention = true;
   params.graph.expanded_kv_seq_lens = values;
   params.graph.expanded_block_tables = values;
@@ -1215,7 +1213,6 @@ TEST(BatchPackedInputTest, RecSnapshotTransferMovesExecutionTensors) {
 
   const std::vector<torch::Tensor> transferred_tensors = {
       converted.embedding.mtp_shifted_token_ids,
-      converted.embedding.mtp_bootstrap_embeddings,
       converted.graph.expanded_kv_seq_lens,
       converted.graph.expanded_block_tables,
       converted.graph.expanded_paged_kv_indptr,
@@ -1242,8 +1239,6 @@ TEST(BatchPackedInputTest, RecSnapshotTransferMovesExecutionTensors) {
   EXPECT_TRUE(converted.graph.spec_verify_source_addresses_stable);
   EXPECT_TRUE(converted.graph.spec_verify_static_graph_tasks_prepared);
   EXPECT_EQ(converted.embedding.extra_token_ids, (std::vector<int32_t>{3}));
-  EXPECT_EQ(converted.embedding.mtp_bootstrap_row_idxes,
-            (std::vector<int32_t>{4}));
   EXPECT_EQ(converted.num_accepted_tokens_host, (std::vector<int64_t>{6}));
   ASSERT_EQ(converted.multi_block_tables.size(), 1u);
   EXPECT_TRUE(converted.multi_block_tables[0].device().is_cpu());

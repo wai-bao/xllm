@@ -23,10 +23,13 @@ limitations under the License.
 
 #include "common/options.h"
 #include "common/rate_limiter.h"
-
+#include "core/distributed_runtime/xservice_client.h"
+#include "core/framework/request/request_output.h"
 namespace xllm {
 
+class Engine;
 class ModelArgs;
+class Scheduler;
 
 class Master {
  public:
@@ -45,14 +48,30 @@ class Master {
 
   RateLimiter* get_rate_limiter() { return &rate_limiter_; }
 
+  // The response transport can outlive this master's serving registration.
+  OutputCallback make_rpc_response_callback() const;
+
  protected:
   // node_rank == 0. Only the base class and derived masters branch on this;
   // no external caller needs it.
   bool is_leader() const { return options_.node_rank() == 0; }
 
+  // Acquire the shared discovery client when service routing is enabled, and
+  // register this instance once its scheduler exists. The acquire/bind
+  // lifecycle lives in one place here, but the registration handle is returned
+  // rather than stored: it borrows the derived class's scheduler and engine, so
+  // the derived class must own it and declare it after them. Member
+  // destruction order then releases the registration first, which the language
+  // guarantees -- a base-class member could not.
+  void acquire_service_client();
+  [[nodiscard]] std::unique_ptr<XServiceRegistration> bind_service_registration(
+      Scheduler* scheduler,
+      Engine* engine);
+
   Options options_;
   std::vector<torch::Device> devices_;
   RateLimiter rate_limiter_;
+  std::shared_ptr<XServiceClient> xservice_client_;
 
  private:
   static void handle_shutdown_signal(int signum);

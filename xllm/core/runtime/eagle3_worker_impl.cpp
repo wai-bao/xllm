@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "eagle3_worker_impl.h"
+#include "core/runtime/eagle3_worker_impl.h"
 
 #include <glog/logging.h>
 
@@ -25,24 +25,11 @@ namespace xllm {
 
 namespace {
 
-runtime::Options eagle3_main_options(const runtime::Options& options) {
-  auto opts = options;
-  opts.enable_schedule_overlap(false)
-      .is_draft_engine(false)
-      .enable_graph_aux_hidden_states(true);
-  return opts;
-}
-
 runtime::Options eagle3_draft_options(const runtime::Options& options) {
-  auto opts = options;
-  opts.enable_schedule_overlap(false)
-      .is_draft_engine(true)
-      .num_decoding_tokens(1)
-      .num_speculative_tokens(0)
-      .enable_graph(false)
+  auto opts = speculative_draft_options(options);
+  opts.enable_graph(false)
       .enable_graph_mode_decode_no_padding(false)
       .enable_prefill_piecewise_graph(false)
-      .enable_graph_aux_hidden_states(true)
       .backend("llm");
   return opts;
 }
@@ -58,7 +45,7 @@ Eagle3WorkerImpl<TargetInput>::Eagle3WorkerImpl(
     : MTPWorkerImpl<TargetInput>(parallel_args,
                                  device,
                                  options,
-                                 eagle3_main_options(options),
+                                 speculative_target_options(options),
                                  eagle3_draft_options(options),
                                  worker_type,
                                  /*enable_adaptive_speculative_decode=*/false) {
@@ -82,12 +69,10 @@ bool Eagle3WorkerImpl<TargetInput>::init_model(
   bool result = MTPWorkerImpl<TargetInput>::init_model(
       model_weights_path, random_seed, master_status);
 
-  // Load hot_token_id_ directly from state_dict (EAGLE-3 specific)
-  // This should be done after draft model is loaded
+  // Build the immutable sampling map after the draft model is loaded.
   if (draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
-    use_draft_token_mapping_ = !uses_embedded_eagle3_draft();
-    if (!use_draft_token_mapping_) {
-      hot_token_id_ = torch::Tensor();
+    if (uses_embedded_eagle3_draft()) {
+      vocab_map_ = VocabMap();
       return result;
     }
 
@@ -99,10 +84,12 @@ bool Eagle3WorkerImpl<TargetInput>::init_model(
       torch::Tensor d2t_tensor = state_dict->get_tensor("d2t");
       if (d2t_tensor.defined()) {
         auto arange_tensor = torch::arange(d2t_tensor.size(0));
-        hot_token_id_ = (d2t_tensor + arange_tensor).to(device_, torch::kLong);
+        vocab_map_ =
+            VocabMap((d2t_tensor + arange_tensor).to(device_, torch::kLong),
+                     context_.get_model_args().vocab_size());
         LOG(INFO) << "Eagle3WorkerImpl: Loaded d2t tensor from state_dict, "
                      "hot_token_id size: "
-                  << hot_token_id_.size(0);
+                  << vocab_map_.draft_to_target().size(0);
         break;
       }
     }
@@ -112,23 +99,42 @@ bool Eagle3WorkerImpl<TargetInput>::init_model(
 }
 
 template <typename TargetInput>
-int64_t Eagle3WorkerImpl<TargetInput>::get_embedding_placeholder_size() const {
-  return AuxHiddenCapture::aux_hidden_dim(context_.get_model_args());
+void Eagle3WorkerImpl<TargetInput>::release_algorithm_state(
+    const std::vector<int32_t>& embedding_ids) {
+  MTPWorkerImpl<TargetInput>::release_algorithm_state(embedding_ids);
+  if (!embedding_ids.empty()) {
+    draft_history_batch_.reclaim_unused_projection();
+  }
 }
 
 template <typename TargetInput>
-void Eagle3WorkerImpl<TargetInput>::process_draft_sample_output(
-    SampleOutput& sample_output) {
-  // Keep probability compression behavior fully aligned with MTP.
-  MTPWorkerImpl<TargetInput>::process_draft_sample_output(sample_output);
+std::vector<uint8_t>
+Eagle3WorkerImpl<TargetInput>::prepare_draft_vocabulary_sampling(
+    SamplingParameters& sampling_params,
+    const DraftTokenHistories& histories) {
+  if (!draft_token_mapping_active()) {
+    return {};
+  }
+  return vocab_map_.remap(sampling_params, draft_history_batch_, histories);
+}
 
-  // EAGLE-3 specific: map draft token IDs to target token IDs.
-  if (!use_draft_token_mapping_ || !hot_token_id_.defined() ||
-      !sample_output.next_tokens.defined() ||
+template <typename TargetInput>
+void Eagle3WorkerImpl<TargetInput>::remap_draft_sample_output(
+    SampleOutput& sample_output) {
+  if (!draft_token_mapping_active() || !sample_output.next_tokens.defined() ||
       sample_output.next_tokens.numel() == 0) {
     return;
   }
 
+  // The vocabulary expansion below allocates the full target-vocab q; drop
+  // proposals that cannot use q first. Only the non-probabilistic case is
+  // decidable here without the sampling params; the all-greedy drop stays
+  // with finalize_mixed_proposal_q, the single authoritative drop point.
+  if (draft_sampling_mode_ != DraftSamplingMode::PROBABILISTIC) {
+    sample_output.probs = torch::Tensor();
+  }
+
+  const torch::Tensor& hot_token_ids = vocab_map_.draft_to_target();
   // Scatter q so the (p-q)+ residual keeps full target mass where the draft
   // cannot propose (q=0), letting rejection sampling align q with p.
   if (sample_output.probs.defined()) {
@@ -136,13 +142,13 @@ void Eagle3WorkerImpl<TargetInput>::process_draft_sample_output(
     torch::Tensor full_vocab_probs =
         torch::zeros({sample_output.probs.size(0), target_vocab_size},
                      sample_output.probs.options());
-    full_vocab_probs.index_put_({torch::indexing::Slice(), hot_token_id_},
+    full_vocab_probs.index_put_({torch::indexing::Slice(), hot_token_ids},
                                 sample_output.probs);
     sample_output.probs = full_vocab_probs;
   }
 
   sample_output.next_tokens =
-      hot_token_id_.index_select(0, sample_output.next_tokens);
+      hot_token_ids.index_select(0, sample_output.next_tokens);
 }
 
 template <typename TargetInput>
@@ -156,7 +162,8 @@ void Eagle3WorkerImpl<TargetInput>::check_draft_input_embedding(
     return;
   }
 
-  const int64_t expected_hidden_size = get_embedding_placeholder_size();
+  const int64_t expected_hidden_size =
+      AuxHiddenCapture::aux_hidden_dim(context_.get_model_args());
   const int64_t draft_hidden_size =
       draft_impl_ == nullptr ? 0 : draft_impl_->hidden_size();
   CHECK_EQ(embedding.dim(), 2)

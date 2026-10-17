@@ -39,6 +39,11 @@ bool WorkerClient::init_model(const std::string& model_weights_path,
   return worker_->init_model(model_weights_path, random_seed, master_status);
 }
 
+folly::SemiFuture<bool> WorkerClient::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  return worker_->release_idle_request_state_async(std::move(embedding_ids));
+}
+
 bool WorkerClient::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
   return worker_->allocate_kv_cache(kv_cache_shape);
 }

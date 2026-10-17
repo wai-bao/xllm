@@ -37,7 +37,7 @@ limitations under the License.
 #if defined(USE_CUDA) || defined(USE_ILU) || defined(USE_MUSA)
 #include "layers/cuda/flashinfer_workspace.h"
 #endif
-#include "core/framework/speculative/draft_extend_input.h"
+#include "core/runtime/speculative_output.h"
 #include "models/model_registry.h"
 #include "runtime/executor.h"
 #include "util/env_var.h"
@@ -388,13 +388,14 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     const bool is_target_prefill =
         !input.input_params.meta.batch_forward_type.is_decode() &&
         !is_spec_draft_;
-    output_spec_hidden_states(output.sample_output,
-                              model_output.hidden_states,
-                              model_output.aux_hidden_states,
-                              lm_head_selected_token_idxes,
-                              selected_hidden,
-                              is_target_prefill,
-                              /*cp_enabled=*/options_.cp_size() > 1);
+    output_captured_hidden_states(output.sample_output,
+                                  model_output.hidden_states,
+                                  model_output.aux_hidden_states,
+                                  lm_head_selected_token_idxes,
+                                  selected_hidden,
+                                  capture_hidden_mode_,
+                                  is_target_prefill,
+                                  /*cp_enabled=*/options_.cp_size() > 1);
   }
 
   MULTI_MODEL_STEP_UNLOCK();

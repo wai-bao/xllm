@@ -26,7 +26,7 @@ limitations under the License.
 namespace xllm {
 
 class LlmForwardInput;
-struct MtpContextView;
+struct SpecContextView;
 
 struct ModelInputCapacity {
   uint32_t max_tokens = 0;
@@ -53,10 +53,11 @@ struct ModelInputBatch {
   bool is_graph_warmup = false;
 };
 
-enum class MtpInvocationKind : uint8_t {
+enum class SpecInvocationKind : uint8_t {
   PREFILL,
   DRAFT,
   VALIDATE,
+  EXTEND,
   BLOCK_DRAFT
 };
 
@@ -67,7 +68,7 @@ struct MtpInputSpec {
   // Global page width, including all DCP shards of a logical KV block.
   uint32_t logical_block_size = 0;
   uint32_t num_speculative_tokens = 0;
-  MtpInvocationKind kind = MtpInvocationKind::PREFILL;
+  SpecInvocationKind kind = SpecInvocationKind::PREFILL;
   uint32_t draft_step = 0;
   bool enable_mla = true;
   int32_t mask_token_id = 0;
@@ -197,8 +198,8 @@ class SlotBuffer final {
                                            const ModelInputBatch& batch,
                                            const Stream& stream,
                                            uint32_t physical_rows = 0);
-  static void patch_mtp_decode(SlotBuffer& input,
-                               const MtpContextView& binding);
+  static void patch_spec_decode(SlotBuffer& input,
+                                const SpecContextView& binding);
 
   static Status plan_mtp_prefill(SlotBuffer& input,
                                  const ModelInputHostView& base,
@@ -218,14 +219,15 @@ class SlotBuffer final {
   static void patch_mtp_prefill(SlotBuffer& input,
                                 const torch::Tensor& target_hidden,
                                 const torch::Tensor& sampled_tokens,
-                                MtpContextView& binding);
+                                SpecContextView& binding);
   static void initialize_mtp_context(SlotBuffer& input,
                                      const torch::Tensor& target_hidden,
                                      const torch::Tensor& sampled_tokens,
-                                     MtpContextView& binding);
+                                     SpecContextView& binding);
 
   struct InputScratch {
     MtpInputSpec spec_;
+    torch::ScalarType hidden_dtype_ = torch::kFloat32;
     uint32_t rows_per_sequence_ = 0;
     int32_t first_offset_ = 0;
     uint32_t sequences_ = 0;
@@ -244,18 +246,14 @@ class SlotBuffer final {
     torch::Tensor block_indices_storage_;
     torch::Tensor block_ids_storage_;
     torch::Tensor cache_offsets_storage_;
-    torch::Tensor repair_scratch_storage_;
     torch::Tensor positions_view_;
     torch::Tensor kv_lengths_view_;
     torch::Tensor tokens_view_;
     torch::Tensor cache_positions_;
-    torch::Tensor cache_first_column_;
-    torch::Tensor model_first_column_;
     torch::Tensor block_indices_;
     torch::Tensor block_ids_;
     torch::Tensor cache_offsets_;
     torch::Tensor cache_offsets_flat_;
-    torch::Tensor future_positions_;
     std::vector<int32_t> token_to_sequence_;
     std::vector<uint8_t> published_mask_;
     std::vector<uint32_t> planned_rows_;

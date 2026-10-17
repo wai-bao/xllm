@@ -28,12 +28,8 @@ namespace {
 class MtpDecodeInputTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_context(
-                    /*capacity=*/4,
-                    /*hidden_size=*/3,
-                    torch::kBFloat16,
-                    device_,
-                    context_)
+    ASSERT_TRUE(TaskPipelineTestPeer::create_spec_context(
+                    /*capacity=*/4, device_, context_)
                     .ok());
     ASSERT_TRUE(
         TaskPipelineTestPeer::context_create(*context_, /*capacity=*/2, state_)
@@ -47,13 +43,10 @@ class MtpDecodeInputTest : public ::testing::Test {
             .ok());
     ASSERT_EQ(prepare.synchronize(), 0);
     state_->tokens_.copy_(torch::tensor({42, 52}, torch::kInt64));
-    state_->state_.previous_tokens.copy_(
-        torch::tensor({41, 51}, torch::kInt64));
+
     state_->state_.positions.copy_(torch::tensor({7, 15}, torch::kInt32));
     state_->state_.kv_seq_lens.copy_(torch::tensor({8, 16}, torch::kInt32));
-    state_->state_.repair_required.copy_(
-        torch::tensor({true, false}, torch::kBool));
-    state_->state_.hidden.zero_();
+
     TaskPipelineTestPeer::context_publish(*state_);
     ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
   }
@@ -94,15 +87,15 @@ class MtpDecodeInputTest : public ::testing::Test {
     {
       auto guard = task.set_stream_guard();
       ASSERT_TRUE(task.wait_event(ready));
-      TaskPipelineTestPeer::patch_mtp_decode(binding, *state_);
+      TaskPipelineTestPeer::patch_spec_decode(binding, *state_);
     }
     ASSERT_EQ(task.synchronize(), 0);
   }
 
   torch::Device device_{torch::kPrivateUse1, 0};
-  std::unique_ptr<MtpContextStorage> context_;
-  std::unique_ptr<MtpContextView> state_;
-  MtpInputSpec spec_{{8, 2, 4}, 0, 8, 3, MtpInvocationKind::DRAFT, 0};
+  std::unique_ptr<SpecContextStorage> context_;
+  std::unique_ptr<SpecContextView> state_;
+  MtpInputSpec spec_{{8, 2, 4}, 0, 8, 3, SpecInvocationKind::DRAFT, 0};
   ModelInputBatch batch_{BatchForwardType::DECODE, 2, 71, false};
   std::array<int32_t, 2> tokens_{{-1, -1}};
   std::array<int32_t, 2> positions_{{10, 18}};
@@ -120,16 +113,16 @@ TEST_F(MtpDecodeInputTest, UnifiedSlotAccountsForExpandedScratch) {
                   .ok());
   std::unique_ptr<SlotBuffer> ordinary;
   ASSERT_TRUE(
-      SlotBuffer::create({4, 4, 4}, /*enable_mla=*/true, device_, ordinary)
+      SlotBuffer::create({2, 2, 4}, /*enable_mla=*/true, device_, ordinary)
           .ok());
-  // Two int32 offsets; four rows of int64 positions/indices and int32
-  // block ids/offsets; two int64 repair positions.
+  // One int32 offset; two rows of int64 positions/indices and int32
+  // block ids/offsets.
   EXPECT_EQ(binding->pinned_bytes(), ordinary->pinned_bytes());
-  EXPECT_EQ(binding->device_bytes() - ordinary->device_bytes(), 120U);
+  EXPECT_EQ(binding->device_bytes() - ordinary->device_bytes(), 52U);
 }
 
 TEST_F(MtpDecodeInputTest, BlockDraftKeepsNonCausalBlocksAndDeviceLengths) {
-  spec_.kind = MtpInvocationKind::BLOCK_DRAFT;
+  spec_.kind = SpecInvocationKind::BLOCK_DRAFT;
   spec_.enable_mla = false;
   spec_.mask_token_id = 99;
   std::unique_ptr<SlotBuffer> binding;
@@ -161,7 +154,7 @@ TEST_F(MtpDecodeInputTest, BlockDraftKeepsNonCausalBlocksAndDeviceLengths) {
 }
 
 TEST_F(MtpDecodeInputTest, DSparkSamplesAnchorWithoutAnExtraQueryRow) {
-  spec_.kind = MtpInvocationKind::BLOCK_DRAFT;
+  spec_.kind = SpecInvocationKind::BLOCK_DRAFT;
   spec_.enable_mla = false;
   spec_.mask_token_id = 99;
   spec_.sample_from_anchor = true;
@@ -184,41 +177,34 @@ TEST_F(MtpDecodeInputTest, DSparkSamplesAnchorWithoutAnExtraQueryRow) {
   EXPECT_TRUE(torch::equal(
       binding->model_params().attention.device.new_cache_slots.cpu(),
       torch::tensor({23, 24, 25, 63, 64, 65}, torch::kInt32)));
-  spec_.kind = MtpInvocationKind::VALIDATE;
+  spec_.kind = SpecInvocationKind::VALIDATE;
   EXPECT_FALSE(TaskPipelineTestPeer::create_mtp_input(
                    spec_, torch::kBFloat16, device_, binding)
                    .ok());
 }
 
-TEST_F(MtpDecodeInputTest, FirstDraftRepairsOnlyFullAcceptance) {
+TEST_F(MtpDecodeInputTest, FirstRecursiveDraftUsesRootPosition) {
   std::unique_ptr<SlotBuffer> binding;
   ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
                   spec_, torch::kBFloat16, device_, binding)
                   .ok());
   run(*binding);
-  const auto& model = *binding;
   EXPECT_EQ(TaskPipelineTestPeer::input_scratch(*binding).rows_per_sequence_,
-            2U);
-  EXPECT_TRUE(torch::equal(model.tokens().cpu(),
-                           torch::tensor({41, 42, 51, 52}, torch::kInt32)));
-  EXPECT_TRUE(torch::equal(model.positions().cpu(),
-                           torch::tensor({6, 7, 14, 15}, torch::kInt32)));
+            1U);
+  EXPECT_TRUE(torch::equal(binding->positions().cpu(),
+                           torch::tensor({7, 15}, torch::kInt32)));
   EXPECT_TRUE(
-      torch::equal(model.model_params().attention.device.kv_seq_lens.cpu(),
-                   torch::tensor({7, 8, 15, 16}, torch::kInt32)));
-  EXPECT_TRUE(
-      torch::equal(model.model_params().attention.device.new_cache_slots.cpu(),
-                   torch::tensor({22, 23, 64, 63}, torch::kInt32)));
-  EXPECT_EQ(model.model_params().attention.host.kv_seq_lens,
-            std::vector<int32_t>({10, 11, 18, 19}));
+      torch::equal(binding->model_params().attention.device.kv_seq_lens.cpu(),
+                   torch::tensor({8, 16}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(
-      model.model_params().attention.device.block_tables.cpu(),
-      torch::tensor({{2, 3, 4, 5}, {2, 3, 4, 5}, {6, 7, 8, 9}, {6, 7, 8, 9}},
-                    torch::kInt32)));
+      binding->model_params().attention.device.new_cache_slots.cpu(),
+      torch::tensor({23, 63}, torch::kInt32)));
+  EXPECT_EQ(binding->model_params().attention.host.kv_seq_lens,
+            std::vector<int32_t>({11, 19}));
 }
 
 TEST_F(MtpDecodeInputTest, ValidateUsesActualDeviceBaseAcrossBlocks) {
-  spec_.kind = MtpInvocationKind::VALIDATE;
+  spec_.kind = SpecInvocationKind::VALIDATE;
   std::unique_ptr<SlotBuffer> binding;
   ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
                   spec_, torch::kBFloat16, device_, binding)
@@ -249,7 +235,7 @@ TEST_F(MtpDecodeInputTest, ValidateUsesActualDeviceBaseAcrossBlocks) {
 }
 
 TEST_F(MtpDecodeInputTest, ValidatePatchesOnlyLogicalPrefixOfDpGraphBucket) {
-  spec_.kind = MtpInvocationKind::VALIDATE;
+  spec_.kind = SpecInvocationKind::VALIDATE;
   spec_.model.max_sequences = 4;
   std::unique_ptr<SlotBuffer> binding;
   ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
@@ -266,7 +252,7 @@ TEST_F(MtpDecodeInputTest, ValidatePatchesOnlyLogicalPrefixOfDpGraphBucket) {
   {
     auto guard = task.set_stream_guard();
     ASSERT_TRUE(task.wait_event(ready));
-    TaskPipelineTestPeer::patch_mtp_decode(*binding, *state_);
+    TaskPipelineTestPeer::patch_spec_decode(*binding, *state_);
   }
   ASSERT_EQ(task.synchronize(), 0);
   const auto& model = *binding;
@@ -312,7 +298,7 @@ TEST_F(MtpDecodeInputTest, LaterDraftLeavesSampledTokenToItsProducer) {
       torch::equal(model.tokens().cpu(), torch::zeros({2}, torch::kInt32)));
 }
 
-TEST_F(MtpDecodeInputTest, DcpFirstDraftRepairsAcrossLogicalPages) {
+TEST_F(MtpDecodeInputTest, DcpFirstRecursiveDraftUsesLogicalPages) {
   // Physical blocks contain eight tokens on each of two DCP ranks. The
   // scheduler page table and this input builder use sixteen-token pages.
   spec_.logical_block_size = 16;
@@ -324,7 +310,7 @@ TEST_F(MtpDecodeInputTest, DcpFirstDraftRepairsAcrossLogicalPages) {
   state_->state_.kv_seq_lens.copy_(torch::tensor({17, 16}, torch::kInt32));
   ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
 
-  for (const uint32_t padded_batch_size : {0U, 8U}) {
+  for (const uint32_t padded_batch_size : {0U, 4U}) {
     SCOPED_TRACE(padded_batch_size);
     std::unique_ptr<SlotBuffer> binding;
     ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
@@ -333,21 +319,19 @@ TEST_F(MtpDecodeInputTest, DcpFirstDraftRepairsAcrossLogicalPages) {
     run(*binding, padded_batch_size);
     const auto& params = binding->model_params();
     EXPECT_TRUE(torch::equal(
-        binding->positions().cpu().narrow(/*dim=*/0, /*start=*/0, 4),
-        torch::tensor({15, 16, 14, 15}, torch::kInt32)));
-    // Full acceptance repairs the preceding page. The other row writes its
-    // unused repair result to the future page without overwriting valid KV.
+        binding->positions().cpu().narrow(/*dim=*/0, /*start=*/0, 2),
+        torch::tensor({16, 15}, torch::kInt32)));
     EXPECT_TRUE(
         torch::equal(params.attention.device.new_cache_slots.cpu().narrow(
-                         /*dim=*/0, /*start=*/0, 4),
-                     torch::tensor({63, 16, 0, 47}, torch::kInt32)));
+                         /*dim=*/0, /*start=*/0, 2),
+                     torch::tensor({16, 47}, torch::kInt32)));
     EXPECT_TRUE(torch::equal(params.attention.device.kv_seq_lens.cpu().narrow(
-                                 /*dim=*/0, /*start=*/0, 4),
-                             torch::tensor({16, 17, 15, 16}, torch::kInt32)));
+                                 /*dim=*/0, /*start=*/0, 2),
+                             torch::tensor({17, 16}, torch::kInt32)));
     EXPECT_TRUE(torch::equal(
         params.attention.device.new_cache_slots.cpu().slice(
-            /*dim=*/0, /*start=*/4),
-        torch::full({padded_batch_size == 0 ? 0 : 4}, -1, torch::kInt32)));
+            /*dim=*/0, /*start=*/2),
+        torch::full({padded_batch_size == 0 ? 0 : 2}, -1, torch::kInt32)));
   }
 }
 
@@ -363,7 +347,7 @@ TEST_F(MtpDecodeInputTest, DcpValidateAndLaterDraftUseLogicalPageOffsets) {
 
   for (const uint32_t padded_batch_size : {0U, 16U}) {
     SCOPED_TRACE(padded_batch_size);
-    spec_.kind = MtpInvocationKind::VALIDATE;
+    spec_.kind = SpecInvocationKind::VALIDATE;
     std::unique_ptr<SlotBuffer> binding;
     ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
                     spec_, torch::kBFloat16, device_, binding)
@@ -379,7 +363,7 @@ TEST_F(MtpDecodeInputTest, DcpValidateAndLaterDraftUseLogicalPageOffsets) {
         torch::full({padded_batch_size == 0 ? 0 : 8}, -1, torch::kInt32)));
   }
 
-  spec_.kind = MtpInvocationKind::DRAFT;
+  spec_.kind = SpecInvocationKind::DRAFT;
   spec_.draft_step = 2;
   for (const uint32_t padded_batch_size : {0U, 4U}) {
     SCOPED_TRACE(padded_batch_size);
@@ -421,7 +405,7 @@ TEST_F(MtpDecodeInputTest, DraftGraphPaddingSurvivesStatePatching) {
     {
       auto guard = task.set_stream_guard();
       ASSERT_TRUE(task.wait_event(ready));
-      TaskPipelineTestPeer::patch_mtp_decode(*binding, *state_);
+      TaskPipelineTestPeer::patch_spec_decode(*binding, *state_);
     }
     ASSERT_EQ(task.synchronize(), 0);
     const auto& model = *binding;
@@ -434,9 +418,9 @@ TEST_F(MtpDecodeInputTest, DraftGraphPaddingSurvivesStatePatching) {
         model.model_params().attention.device.new_cache_slots.cpu().slice(
             /*dim=*/0, logical_rows),
         torch::full({padded_batch_size - logical_rows}, -1, torch::kInt32)));
-    const auto expected_positions =
-        step == 0 ? torch::tensor({6, 7, 14, 15}, torch::kInt32)
-                  : torch::tensor({9, 17}, torch::kInt32);
+    const auto expected_positions = step == 0
+                                        ? torch::tensor({7, 15}, torch::kInt32)
+                                        : torch::tensor({9, 17}, torch::kInt32);
     EXPECT_TRUE(torch::equal(
         model.positions().cpu().narrow(/*dim=*/0, /*start=*/0, logical_rows),
         expected_positions));
@@ -459,8 +443,7 @@ TEST_F(MtpDecodeInputTest, InvalidPreparationPreservesPreviousInput) {
   const auto host_before = binding->model_params().attention.host.kv_seq_lens;
   const void* address = binding->positions().data_ptr();
   Stream prepare(device_);
-  positions_[1] =
-      31;  // The inactive repair row still needs a reserved scratch position.
+  positions_[1] = 32;  // Outside the reserved page table.
   EXPECT_FALSE(TaskPipelineTestPeer::prepare_mtp_decode(
                    *binding, input(), batch_, prepare)
                    .ok());

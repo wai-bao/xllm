@@ -68,9 +68,10 @@ class ExecutionConfig final {
 
   PROPERTY(bool, enable_graph) = false;
 
-  // Opt supported NPU MTP requests into the unified Python graph path.
-  // Disabling this keeps the legacy ACL graph/decode route available for
-  // comparison and fallback without disabling ordinary graph execution.
+  // Route supported NPU speculative requests through the unified Python
+  // graph path (GLM DSA MoE overlap flags and the DFlash/DSpark unified
+  // capacity graph). Does not select the MTP worker; the draft-input-carry MTP
+  // path is unconditional and this flag only gates its graph-mode opt-in.
   PROPERTY(bool, enable_unified_mtp_graph) = false;
 
   PROPERTY(bool, disable_graph_warmup) = false;

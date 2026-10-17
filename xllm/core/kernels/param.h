@@ -1572,6 +1572,7 @@ struct FusedSigmoidGatingDeltaRuleUpdateParams {
   torch::Tensor initial_state_indices;
   torch::Tensor cu_seqlens;
   std::optional<torch::Tensor> num_accepted_tokens = std::nullopt;
+  int64_t checkpoint_stride = 1;
   std::optional<float> scale = std::nullopt;
   bool use_qk_l2norm_in_kernel = false;
   bool is_kda = false;

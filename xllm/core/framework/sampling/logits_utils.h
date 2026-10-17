@@ -49,4 +49,10 @@ void apply_top_k_top_p(torch::Tensor& logits,
                        const torch::Tensor& top_k,
                        const torch::Tensor& top_p);
 
+// Probability of each row's selected token without materializing a full
+// [batch, vocab] softmax. Accumulates in FP32 and preserves the selected token
+// layout, either [batch] or [batch, 1].
+torch::Tensor selected_softmax_prob(const torch::Tensor& logits,
+                                    const torch::Tensor& selected);
+
 }  // namespace xllm

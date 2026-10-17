@@ -12,6 +12,7 @@ include(CMakeParseArguments)
 # COPTS: List of private compile options
 # LINKOPTS: List of link options
 # ARGS: Command line arguments to test case
+# NO_NPU_RUNTIME: Do not initialize a device for a host-only test.
 #
 # Usage:
 # cc_library(

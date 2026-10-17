@@ -226,5 +226,6 @@ TORCH_MODULE(Glm52ForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(glm_moe_dsa, Glm52ForCausalLM);
+REGISTER_TARGET_SPEC_VERIFY_MODE(glm_moe_dsa, PYTHON_EXPANDED_VERIFY);
 
 }  // namespace xllm

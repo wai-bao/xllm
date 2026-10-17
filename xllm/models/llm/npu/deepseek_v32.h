@@ -517,6 +517,7 @@ TORCH_MODULE(DeepseekV32ForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(deepseek_v32, DeepseekV32ForCausalLM);
+REGISTER_TARGET_SPEC_VERIFY_MODE(deepseek_v32, PYTHON_EXPANDED_VERIFY);
 
 // register the model args
 // example config:

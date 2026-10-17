@@ -20,8 +20,6 @@ graph can replay them without re-planning.
 
 from __future__ import annotations
 
-from typing import List
-
 import torch
 
 reshape_paged_cache = torch.ops.xllm_ops.reshape_paged_cache

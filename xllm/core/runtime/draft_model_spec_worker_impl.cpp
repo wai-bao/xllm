@@ -29,9 +29,11 @@ limitations under the License.
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/parallel_state/process_group.h"
+#include "core/framework/sampling/draft_sampling.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/adaptive_speculative_controller.h"
-#include "core/framework/speculative/embedding_cache.h"
+#include "core/framework/speculative/draft_input_model_spec.h"
+#include "core/framework/speculative/mtp_utils.h"
 #include "core/kv_cache/layout/kv_cache_capacity.h"
 #include "core/kv_cache/layout/kv_cache_estimation.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
@@ -46,6 +48,12 @@ namespace xllm {
 
 namespace {
 
+int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
+  const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
+  const int64_t cp_size = std::max<int64_t>(parallel_args.cp_size(), 1);
+  return std::max<int64_t>(parallel_args.world_size() / dp_size / cp_size, 1);
+}
+
 template <typename MakeShape, typename Allocate>
 bool allocate_pool_if_loaded(WorkerImpl& worker,
                              MakeShape&& make_shape,
@@ -56,12 +64,6 @@ bool allocate_pool_if_loaded(WorkerImpl& worker,
   }
   CHECK_EQ(status, WorkerImpl::Status::READY);
   return true;
-}
-
-int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
-  const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
-  const int64_t cp_size = std::max<int64_t>(parallel_args.cp_size(), 1);
-  return std::max<int64_t>(parallel_args.world_size() / dp_size / cp_size, 1);
 }
 
 std::string stable_path_digest(const std::string& path_string) {
@@ -336,17 +338,6 @@ void DraftModelSpecWorkerImpl<
 }
 
 template <typename TargetInput>
-void DraftModelSpecWorkerImpl<TargetInput>::init_embedding_cache(
-    int64_t num_blocks) {
-  embedding_cache_ = std::make_unique<EmbeddingCache>(num_blocks);
-  const int64_t placeholder_size = get_embedding_placeholder_size();
-  if (placeholder_size > 0) {
-    embedding_cache_->set_placeholder(
-        torch::zeros({placeholder_size}, torch::dtype(dtype_).device(device_)));
-  }
-}
-
-template <typename TargetInput>
 bool DraftModelSpecWorkerImpl<TargetInput>::allocate_pools(
     const KVCacheShape& kv_cache_shape,
     const AllocateFn& allocate) {
@@ -359,8 +350,10 @@ bool DraftModelSpecWorkerImpl<TargetInput>::allocate_pools(
       [&] { return draft_kv_cache_shape(kv_cache_shape); },
       allocate);
 
-  init_embedding_cache(kv_cache_shape.key_cache_shape()[0]);
   const bool allocated = target_allocated && draft_allocated;
+  if (allocated) {
+    on_kv_pools_allocated(kv_cache_shape.key_cache_shape()[0]);
+  }
   if (allocated) {
     finalize_hierarchy_kv_cache_transfers();
   }
@@ -405,14 +398,9 @@ bool DraftModelSpecWorkerImpl<TargetInput>::allocate_kv_cache_with_transfer(
 template <typename TargetInput>
 void DraftModelSpecWorkerImpl<TargetInput>::force_greedy_draft_sampling(
     SamplingParameters& sampling_params) {
-  if (sampling_params.do_sample.defined()) {
-    sampling_params.do_sample = torch::zeros_like(sampling_params.do_sample);
-  }
-  sampling_params.all_random_sample = false;
-  sampling_params.all_greedy_sample = true;
-  sampling_params.logprobs = false;
-  sampling_params.max_top_logprobs = 0;
-  sampling_params.return_probs = false;
+  configure_draft_sampling(sampling_params,
+                           DraftSamplingMode::GREEDY,
+                           /*require_probs_for_greedy=*/false);
 }
 
 template <typename TargetInput>
@@ -420,41 +408,6 @@ TargetInput
 DraftModelSpecWorkerImpl<TargetInput>::update_input_by_last_step_output(
     TargetInput& inputs) {
   return inputs.clone();
-}
-
-template <typename TargetInput>
-void DraftModelSpecWorkerImpl<TargetInput>::prepare_draft_input(
-    const TargetInput& input) {
-  const auto& embedding = input.input_params.embedding;
-  if (!embedding.mtp_bootstrap_embeddings.defined()) {
-    return;
-  }
-  CHECK(input.token_ids_host.defined() &&
-        input.token_ids_host.scalar_type() == torch::kInt)
-      << "draft token_ids_host must be int32";
-  const Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
-
-  torch::Tensor bootstrap_embeddings = safe_to(
-      embedding.mtp_bootstrap_embeddings, torch::dtype(dtype_).device(device_));
-  const int32_t num_rows =
-      static_cast<int32_t>(embedding.mtp_bootstrap_row_idxes.size());
-  CHECK_EQ(bootstrap_embeddings.size(0), static_cast<int64_t>(num_rows))
-      << "bootstrap row count mismatch";
-  CHECK_EQ(embedding.embedding_ids.size(), embedding.request_ids.size())
-      << "bootstrap embedding/request id vectors must be parallel";
-  const int32_t num_ids = static_cast<int32_t>(embedding.embedding_ids.size());
-  for (int32_t i = 0; i < num_rows; ++i) {
-    const int32_t row_idx = embedding.mtp_bootstrap_row_idxes[i];
-    CHECK_GE(row_idx, 0) << "bootstrap row index should be valid";
-    CHECK_LT(row_idx, num_ids) << "bootstrap row index exceeds embedding ids";
-    CHECK_LT(static_cast<size_t>(row_idx), token_ids.size())
-        << "bootstrap row index exceeds token ids";
-    embedding_cache_->write_mtp_bootstrap_context(
-        embedding.embedding_ids[row_idx],
-        embedding.request_ids[row_idx],
-        token_ids[row_idx],
-        bootstrap_embeddings.select(/*dim=*/0, i));
-  }
 }
 
 template <typename TargetInput>
@@ -509,6 +462,33 @@ void DraftModelSpecWorkerImpl<TargetInput>::
       << "DP rank out of range for dp_global_token_nums";
   sync_dp_global_token_nums_after_prune(
       input_params, token_nums[static_cast<size_t>(dp_rank)]);
+}
+
+template <typename TargetInput>
+DraftInputModelSpec DraftModelSpecWorkerImpl<TargetInput>::draft_input_spec()
+    const {
+  return {draft_input_hidden_width(draft_impl_->context_.get_model_args()),
+          draft_impl_->dtype()};
+}
+
+template <typename TargetInput>
+void DraftModelSpecWorkerImpl<TargetInput>::on_kv_pools_allocated(
+    int64_t num_blocks) {
+  target_state_store_ = std::make_unique<TargetDecodeStateStore>(num_blocks);
+}
+
+template <typename TargetInput>
+void DraftModelSpecWorkerImpl<TargetInput>::release_request_state(
+    const std::vector<int32_t>& released) {
+  if (released.empty()) {
+    return;
+  }
+  // Algorithm hooks run first: a pending-context flush may re-populate the
+  // target store, so the shared clear must come after it.
+  release_algorithm_state(released);
+  if (target_state_store_ != nullptr) {
+    target_state_store_->clear(released);
+  }
 }
 
 template class DraftModelSpecWorkerImpl<LlmForwardInput>;

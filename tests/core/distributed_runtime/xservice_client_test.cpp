@@ -21,6 +21,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -28,6 +29,14 @@ limitations under the License.
 #include <vector>
 
 namespace xllm {
+
+class XServiceGenerationTestPeer {
+ public:
+  static std::shared_ptr<XServiceClient> make_client() {
+    return std::shared_ptr<XServiceClient>(new XServiceClient());
+  }
+};
+
 namespace {
 
 enum class ResponseMode { NORMAL, TRANSPORT_FAILURE, MISMATCHED_STATUS_COUNT };
@@ -128,7 +137,8 @@ TEST(XServiceClientDeathTest, MismatchedResponseCountIsFatal) {
         GenerationTestServer server(ResponseMode::MISMATCHED_STATUS_COUNT);
         CHECK_EQ(server.start(), 0);
         const RequestOutput output = make_output("mismatch", server.address());
-        XServiceClient::get_instance()->generation(output);
+        const auto client = XServiceGenerationTestPeer::make_client();
+        client->generation(output);
       },
       "The size of status set is not equal to the size of outputs");
 }
@@ -166,7 +176,7 @@ TEST(XServiceClientTest, SingleGenerationPreservesPayload) {
   second.stop_reason = std::string("done");
   output.outputs.emplace_back(std::move(second));
 
-  EXPECT_TRUE(XServiceClient::get_instance()->generation(output));
+  EXPECT_TRUE(XServiceGenerationTestPeer::make_client()->generation(output));
   EXPECT_EQ(server.service().calls(), 1);
   const auto request = server.service().request();
   ASSERT_EQ(request.gens_size(), 1);
@@ -226,7 +236,7 @@ TEST(XServiceClientTest, BatchRoutesResultsToOriginalInputOrder) {
   outputs.emplace_back(make_output("other-service", second.address()));
   outputs.emplace_back(make_output("accepted", first.address()));
 
-  EXPECT_EQ(XServiceClient::get_instance()->generations(outputs),
+  EXPECT_EQ(XServiceGenerationTestPeer::make_client()->generations(outputs),
             (std::vector<bool>{false, true, true}));
   const auto first_request = first.service().request();
   ASSERT_EQ(first_request.gens_size(), 2);
@@ -246,7 +256,7 @@ TEST(XServiceClientTest, SingleGenerationReturnsRejectedStatus) {
   GenerationTestServer server(ResponseMode::NORMAL, {{"rejected", false}});
   ASSERT_EQ(server.start(), 0);
   const RequestOutput output = make_output("rejected", server.address());
-  EXPECT_FALSE(XServiceClient::get_instance()->generation(output));
+  EXPECT_FALSE(XServiceGenerationTestPeer::make_client()->generation(output));
 }
 
 TEST(XServiceClientTest, TransportFailureOnlyFailsAffectedService) {
@@ -260,15 +270,17 @@ TEST(XServiceClientTest, TransportFailureOnlyFailsAffectedService) {
   outputs.emplace_back(make_output("healthy", healthy.address()));
   outputs.emplace_back(make_output("failed-last", failing.address()));
 
-  EXPECT_EQ(XServiceClient::get_instance()->generations(outputs),
+  EXPECT_EQ(XServiceGenerationTestPeer::make_client()->generations(outputs),
             (std::vector<bool>{false, true, false}));
-  EXPECT_FALSE(XServiceClient::get_instance()->generation(outputs.front()));
+  EXPECT_FALSE(
+      XServiceGenerationTestPeer::make_client()->generation(outputs.front()));
 }
 
 TEST(XServiceClientTest, EmptyBatchAndMissingTargetDoNotRequireInitialization) {
-  EXPECT_TRUE(XServiceClient::get_instance()->generations({}).empty());
+  EXPECT_TRUE(
+      XServiceGenerationTestPeer::make_client()->generations({}).empty());
   const RequestOutput output = make_output("missing-target", "");
-  EXPECT_FALSE(XServiceClient::get_instance()->generation(output));
+  EXPECT_FALSE(XServiceGenerationTestPeer::make_client()->generation(output));
 }
 
 }  // namespace

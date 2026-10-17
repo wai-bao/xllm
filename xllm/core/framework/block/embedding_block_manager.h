@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <functional>
 #include <string>
 
 #include "core/kv_cache/block/block_manager_impl.h"
@@ -33,7 +34,8 @@ class EmbeddingBlockManager final : public BlockManagerImpl {
  public:
   EmbeddingBlockManager(uint32_t num_blocks,
                         std::string resource_name,
-                        std::string exhaustion_message = "");
+                        std::string exhaustion_message = "",
+                        std::function<void(int32_t)> on_release = {});
   ~EmbeddingBlockManager() override = default;
 
   // One block per sequence: empty when already held, else a single block (or
@@ -51,6 +53,7 @@ class EmbeddingBlockManager final : public BlockManagerImpl {
   // otherwise hide it (name hiding).
   using BlockManagerImpl::allocate;
   Block allocate() override;
+  void free(int32_t block_id) override;
 
   // EMBEDDING never serves prefix cache; these must not be reached.
   std::vector<Block> allocate_shared(
@@ -68,6 +71,7 @@ class EmbeddingBlockManager final : public BlockManagerImpl {
  private:
   std::string resource_name_;
   std::string exhaustion_message_;
+  std::function<void(int32_t)> on_release_;
 };
 
 }  // namespace xllm

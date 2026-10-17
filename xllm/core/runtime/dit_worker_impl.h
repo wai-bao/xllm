@@ -65,12 +65,13 @@ class DiTWorkerImpl : public WorkerImpl {
   int64_t get_active_activation_memory();
 
  private:
+  // Component layers retain ATB context pointers, so this owner must outlive
+  // the executor and model (members are destroyed in reverse order).
+  mutable DiTModelContext dit_context_;
+
   std::unique_ptr<DiTModel> dit_model_;
 
   std::unique_ptr<DiTExecutor> dit_model_executor_;
-
-  // model context, includes model args, parallel args and date type etc.
-  mutable DiTModelContext dit_context_;
 
   ThreadPool threadpool_{/*num_threads=*/1,
                          /*cpu_binding=*/false,

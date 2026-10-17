@@ -18,8 +18,8 @@ limitations under the License.
 #include <concepts>
 #include <cstdint>
 #include <memory>
-#include <utility>
 
+#include "core/distributed_runtime/xservice_client.h"
 #include "scheduler/continuous_scheduler.h"
 #include "scheduler/disagg_pd_scheduler.h"
 #include "scheduler/dit_scheduler.h"
@@ -47,6 +47,7 @@ template <typename TargetEngine>
 std::unique_ptr<Scheduler> create_continuous_scheduler(
     TargetEngine* engine,
     SchedulerOptions options,
+    std::shared_ptr<XServiceClient> xservice_client = nullptr,
     std::shared_ptr<DistributedWorkerManager> distributed_worker_manager =
         nullptr,
     std::shared_ptr<ModelResidencyCoordinator> model_residency_coordinator =
@@ -55,9 +56,11 @@ std::unique_ptr<Scheduler> create_continuous_scheduler(
         nullptr) {
   switch (select_scheduler_kind(options)) {
     case SchedulerKind::DISAGG_PD:
+      // The scheduler ctor fetches the engine's worker manager itself.
       return std::make_unique<DisaggPDScheduler>(
           engine,
           options,
+          std::move(xservice_client),
           std::move(distributed_worker_manager),
           std::move(model_residency_coordinator),
           std::move(kv_transfer_coordinator));

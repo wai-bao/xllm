@@ -169,6 +169,12 @@ class BlockManager {
   // get number of total blocks
   virtual size_t num_total_blocks() const = 0;
 
+  // Whether a block id is currently allocated. Consumers of release
+  // notifications use this to discard stale ids that were reused after their
+  // release (BlockManagerImpl-based leaves implement it; composites route to
+  // the owning leaf).
+  virtual bool is_block_used(int32_t /*block_id*/) const { return false; }
+
   // True only for CompositeBlockManager. Leaves and flat managers return false.
   virtual bool is_composite() const { return false; }
 

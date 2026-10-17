@@ -26,8 +26,6 @@ struct TaskPipelineTestPeer {
       TaskExecutionPipeline::context_prepare;
   static constexpr auto context_prepare_prefill =
       TaskExecutionPipeline::context_prepare_prefill;
-  static constexpr auto context_prepare_decode =
-      TaskExecutionPipeline::context_prepare_decode;
   static constexpr auto context_gather = TaskExecutionPipeline::context_gather;
   static constexpr auto context_publish =
       TaskExecutionPipeline::context_publish;
@@ -45,12 +43,12 @@ struct TaskPipelineTestPeer {
   static constexpr auto prepare_mtp_decode = SlotBuffer::prepare_mtp_decode;
   static constexpr auto prepare_planned_mtp_decode =
       SlotBuffer::prepare_planned_mtp_decode;
-  static constexpr auto patch_mtp_decode = SlotBuffer::patch_mtp_decode;
+  static constexpr auto patch_spec_decode = SlotBuffer::patch_spec_decode;
   static constexpr auto prepare_mtp_prefill = SlotBuffer::prepare_mtp_prefill;
   static constexpr auto patch_mtp_prefill = SlotBuffer::patch_mtp_prefill;
-  static constexpr auto create_mtp_context =
-      TaskExecutionPipeline::create_mtp_context;
-  static constexpr auto mtp_context_bytes =
-      TaskExecutionPipeline::mtp_context_bytes;
+  static constexpr auto create_spec_context =
+      TaskExecutionPipeline::create_spec_context;
+  static constexpr auto spec_context_bytes =
+      TaskExecutionPipeline::spec_context_bytes;
 };
 }  // namespace xllm

@@ -22,7 +22,7 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
-#include "core/framework/speculative/embedding_cache.h"
+#include "core/framework/speculative/target_decode_state_store.h"
 #include "core/kv_cache/transfer/kv_cache_transfer.h"
 #include "framework/model/model_args.h"
 #include "framework/sampling/draft_proposal.h"
@@ -188,7 +188,8 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
 
   void update_decode_step_input(
       LlmForwardInput& input,
-      const std::vector<EmbeddingCache::DecodeState>& last_states) const;
+      const std::vector<TargetDecodeStateStore::DecodeState>& last_states)
+      const;
 
   void write_context_kv(const LlmForwardInput& input,
                         const torch::Tensor& context_hidden,

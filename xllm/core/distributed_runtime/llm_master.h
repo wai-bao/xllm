@@ -80,9 +80,7 @@ class LLMMaster : public Master {
                             std::vector<RequestParams> sp,
                             BatchOutputCallback callback);
 
-  // handle rpc response, send stream generations to xllm service
-  bool handle_rpc_response(const RequestOutput& output);
-
+  // Send stream generations to xllm service.
   std::vector<bool> handle_rpc_responses(
       const std::vector<RequestOutput>& outputs);
 
@@ -129,10 +127,6 @@ class LLMMaster : public Master {
   std::shared_ptr<KVCacheTransferCoordinator> kv_transfer_coordinator_;
 
   MasterStatus master_status_;
-  XServiceClient* xservice_client_ = nullptr;
-
-  // Shared workers outlive the scheduler and every engine using them.
-  std::shared_ptr<DistributedWorkerManager> distributed_worker_manager_;
 
   // Created by the master after worker setup and shared with serving consumers.
   std::shared_ptr<ModelResidencyCoordinator> model_residency_coordinator_;
@@ -172,6 +166,13 @@ class LLMMaster : public Master {
   std::atomic_bool running_{false};
 
   std::string task_type_;
+
+  // Ownership rule: see Master::bind_service_registration.
+  std::unique_ptr<XServiceRegistration> discovery_registration_;
+
+  // Engines expose their shared worker manager; the master caches it for the
+  // XTensor controller and worker-connection control plane.
+  std::shared_ptr<DistributedWorkerManager> distributed_worker_manager_;
 };
 
 }  // namespace xllm

@@ -336,10 +336,6 @@ class LlmEmbeddingInput final {
   // Precomputed shifted token ids for MTP prefill, aligned with tokens.
   torch::Tensor mtp_shifted_token_ids;
 
-  // Pending PD handoff bootstrap rows for the first MTP decode step.
-  std::vector<int32_t> mtp_bootstrap_row_idxes;
-  torch::Tensor mtp_bootstrap_embeddings;
-
   LlmEmbeddingInput to(const torch::Device& device) const {
     LlmEmbeddingInput out;
     out.input_embedding = safe_to(input_embedding, device);
@@ -349,9 +345,6 @@ class LlmEmbeddingInput final {
     out.request_ids = request_ids;
     out.extra_token_ids = extra_token_ids;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
-    out.mtp_bootstrap_row_idxes = mtp_bootstrap_row_idxes;
-    out.mtp_bootstrap_embeddings =
-        safe_to(mtp_bootstrap_embeddings, device, true);
     return out;
   }
 };
@@ -404,10 +397,6 @@ class ParallelInput final {
   // Attention/FFN paths may need the padded counts, while lm_head output
   // compaction must skip true empty DP ranks.
   std::vector<int32_t> raw_dp_global_token_nums;
-  // Per-DP-shard generation derived from the local batch identity. Every shard
-  // receives the full vector so speculative prelaunch reuse decisions remain
-  // collective-order consistent when any shard changes its batch.
-  std::vector<uint64_t> dp_global_batch_generations;
   // max kv seq len of all dp shards. Graph key generation uses this so empty
   // DP decode ranks pick the same graph as ranks with real decode tokens.
   std::vector<int32_t> dp_global_kv_max_seq_lens;
@@ -441,7 +430,6 @@ class ParallelInput final {
     out.dp_global_token_nums = dp_global_token_nums;
     out.dp_global_sequence_nums = dp_global_sequence_nums;
     out.raw_dp_global_token_nums = raw_dp_global_token_nums;
-    out.dp_global_batch_generations = dp_global_batch_generations;
     out.dp_global_kv_max_seq_lens = dp_global_kv_max_seq_lens;
     out.dp_global_json_object_active = dp_global_json_object_active;
     out.dp_is_decode = dp_is_decode;
@@ -585,10 +573,6 @@ class VlmEmbeddingInput final {
   // Precomputed shifted token ids for MTP prefill, aligned with tokens.
   torch::Tensor mtp_shifted_token_ids;
 
-  // Pending PD handoff bootstrap rows for the first MTP decode step.
-  std::vector<int32_t> mtp_bootstrap_row_idxes;
-  torch::Tensor mtp_bootstrap_embeddings;
-
   VlmEmbeddingInput to(const torch::Device& device) const {
     VlmEmbeddingInput out;
     out.input_embedding = safe_to(input_embedding, device);
@@ -598,9 +582,6 @@ class VlmEmbeddingInput final {
     out.request_ids = request_ids;
     out.extra_token_ids = extra_token_ids;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
-    out.mtp_bootstrap_row_idxes = mtp_bootstrap_row_idxes;
-    out.mtp_bootstrap_embeddings =
-        safe_to(mtp_bootstrap_embeddings, device, true);
     return out;
   }
 };

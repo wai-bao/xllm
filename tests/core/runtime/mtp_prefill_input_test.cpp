@@ -26,12 +26,8 @@ namespace {
 class MtpPrefillInputTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_context(
-                    /*capacity=*/4,
-                    /*hidden_size=*/3,
-                    torch::kBFloat16,
-                    device_,
-                    context_)
+    ASSERT_TRUE(TaskPipelineTestPeer::create_spec_context(
+                    /*capacity=*/4, device_, context_)
                     .ok());
     ASSERT_TRUE(
         TaskPipelineTestPeer::context_create(*context_, /*capacity=*/2, state_)
@@ -100,8 +96,8 @@ class MtpPrefillInputTest : public ::testing::Test {
   }
 
   torch::Device device_{torch::kPrivateUse1, 0};
-  std::unique_ptr<MtpContextStorage> context_;
-  std::unique_ptr<MtpContextView> state_;
+  std::unique_ptr<SpecContextStorage> context_;
+  std::unique_ptr<SpecContextView> state_;
   std::unique_ptr<SlotBuffer> input_;
   std::array<int32_t, 2> keys_{{1, 2}};
   std::array<std::string, 2> requests_{{"request", "request"}};
@@ -124,10 +120,10 @@ TEST_F(MtpPrefillInputTest, UnifiedSlotAccountsForPromptScratch) {
   ASSERT_TRUE(
       SlotBuffer::create({8, 2, 2}, /*enable_mla=*/true, device_, ordinary)
           .ok());
-  // Only completed-row hidden is owned; prompt hidden is borrowed from the
-  // target output until the draft forward completes.
+  // MTP borrows target hidden until the draft forward completes and keeps
+  // only token/position scratch; seeds own the recurrent draft hidden.
   EXPECT_EQ(input_->pinned_bytes() - ordinary->pinned_bytes(), 32U);
-  EXPECT_EQ(input_->device_bytes() - ordinary->device_bytes(), 52U);
+  EXPECT_EQ(input_->device_bytes() - ordinary->device_bytes(), 40U);
   const auto* original = input_.get();
   EXPECT_FALSE(
       TaskPipelineTestPeer::create_mtp_input(
@@ -185,19 +181,8 @@ TEST_F(MtpPrefillInputTest, ShiftAndBootstrapRespectChunkBoundaries) {
                            torch::tensor({7}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(state_->state_.kv_seq_lens.cpu(),
                            torch::tensor({8}, torch::kInt32)));
-  EXPECT_TRUE(torch::equal(state_->state_.previous_tokens.cpu(),
-                           state_->tokens_.cpu()));
-  EXPECT_TRUE(
-      torch::equal(state_->state_.hidden.select(/*dim=*/1, /*index=*/1).cpu(),
-                   hidden_.narrow(/*dim=*/0, /*start=*/3, /*length=*/1).cpu()));
-  EXPECT_EQ(state_->state_.hidden.select(/*dim=*/1, /*index=*/0)
-                .cpu()
-                .count_nonzero()
-                .item<int64_t>(),
-            0);
-  EXPECT_FALSE(state_->state_.repair_required.cpu().item<bool>());
   Stream prepare(device_);
-  std::unique_ptr<MtpContextView> next;
+  std::unique_ptr<SpecContextView> next;
   ASSERT_TRUE(
       TaskPipelineTestPeer::context_create(*context_, /*capacity=*/2, next)
           .ok());
@@ -224,12 +209,8 @@ TEST_F(MtpPrefillInputTest, SamplingOrderControlsPublicationOrder) {
                            torch::tensor({7, 6}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(state_->state_.kv_seq_lens.cpu(),
                            torch::tensor({8, 7}, torch::kInt32)));
-  EXPECT_TRUE(torch::equal(
-      TaskPipelineTestPeer::input_scratch(*input_).bootstrap_hidden_.cpu(),
-      hidden_
-          .index_select(/*dim=*/0,
-                        torch::tensor({3, 2}, torch::kInt64).to(device_))
-          .cpu()));
+  EXPECT_FALSE(
+      TaskPipelineTestPeer::input_scratch(*input_).bootstrap_hidden_.defined());
 }
 
 TEST_F(MtpPrefillInputTest, IncompleteChunksRequireNoSampleOrPublishedState) {
@@ -312,8 +293,6 @@ TEST_F(MtpPrefillInputTest, DecodeRowsCanRefreshStateDuringPeerPrefill) {
                            torch::tensor({6, 7}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(state_->state_.kv_seq_lens.cpu(),
                            torch::tensor({7, 8}, torch::kInt32)));
-  EXPECT_TRUE(
-      torch::equal(state_->state_.hidden.select(1, 1).cpu(), hidden.cpu()));
 }
 
 TEST_F(MtpPrefillInputTest, BorrowedHiddenSurvivesProducerReleaseAndSlotReuse) {

@@ -123,6 +123,25 @@ struct has_reload_model_weights_from_device<
 template <typename T, typename = void>
 struct has_requires_graph_forward_metadata : std::false_type {};
 
+template <typename T, typename = void>
+struct has_provides_capture_hidden_hook : std::false_type {};
+
+template <typename T>
+struct has_provides_capture_hidden_hook<
+    T,
+    std::void_t<
+        decltype(std::declval<const T>()->provides_capture_hidden_hook())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_owns_mtp_draft_weights : std::false_type {};
+
+template <typename T>
+struct has_owns_mtp_draft_weights<
+    T,
+    std::void_t<decltype(std::declval<const T>()->owns_mtp_draft_weights())>>
+    : std::true_type {};
+
 template <typename T>
 struct has_requires_graph_forward_metadata<
     T,

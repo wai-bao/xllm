@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/model/causal_vlm.h"
 #include "core/framework/model/dit_model.h"
 #include "core/framework/model/rec_causal_lm.h"
+#include "core/framework/model/target_spec_verify_mode.h"
 #include "core/framework/model_context/dit_model_context.h"
 #include "core/framework/model_context/model_context.h"
 #include "core/framework/tokenizer/tokenizer_args.h"
@@ -80,8 +81,11 @@ struct ModelMeta {
   QuantArgsLoader quant_args_loader;
   TokenizerArgsLoader tokenizer_args_loader;
   CpShardingMode cp_sharding_mode = CpShardingMode::NONE;
-  bool owns_mtp_shared_weights = false;
   bool supports_dcp = false;
+  TargetSpecVerifyMode target_spec_verify_mode = TargetSpecVerifyMode::GENERIC;
+  std::string mtp_draft_model_type;
+  std::string mtp_target_model_type;
+  std::function<void(ModelArgs&)> mtp_draft_args_adapter;
 };
 
 // Model registry is a singleton class that registers all models with the
@@ -130,8 +134,17 @@ class ModelRegistry {
   static void register_dcp_capability(const std::string& name);
   static bool supports_dcp(const std::string& name);
 
-  static void register_mtp_shared_weight_owner(const std::string& name);
-  static bool owns_mtp_shared_weights(const std::string& name);
+  static void register_mtp_model_pair(
+      const std::string& target,
+      const std::string& draft,
+      std::function<void(ModelArgs&)> args_adapter);
+  static std::string get_mtp_target_model_type(const std::string& draft);
+  // Convert loaded target arguments using the paired model's own policy.
+  static bool convert_to_mtp_draft(ModelArgs& args);
+  static void register_target_spec_verify_mode(const std::string& name,
+                                               TargetSpecVerifyMode mode);
+  static TargetSpecVerifyMode get_target_spec_verify_mode(
+      const std::string& name);
 
   static CausalLMFactory get_causallm_factory(const std::string& name);
 
@@ -213,6 +226,19 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
 
 #define REGISTER_CAUSAL_MODEL(ModelType, ModelClass) \
   REGISTER_CAUSAL_MODEL_WITH_VARNAME(ModelType, ModelType, ModelClass)
+
+#define REGISTER_TARGET_SPEC_VERIFY_MODE(ModelType, Mode) \
+  const bool ModelType##_spec_verify_registered = []() {  \
+    ModelRegistry::register_target_spec_verify_mode(      \
+        #ModelType, TargetSpecVerifyMode::Mode);          \
+    return true;                                          \
+  }()
+
+#define REGISTER_MTP_MODEL_PAIR(TargetType, DraftType, Adapter)               \
+  const bool DraftType##_mtp_pair_registered = []() {                         \
+    ModelRegistry::register_mtp_model_pair(#TargetType, #DraftType, Adapter); \
+    return true;                                                              \
+  }()
 
 #define REGISTER_REC_MODEL_WITH_VARNAME(VarName, ModelType, ModelClass) \
   const bool VarName##_rec_registered = []() {                          \

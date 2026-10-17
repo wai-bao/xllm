@@ -62,11 +62,13 @@ ModelContext::ModelContext(const ParallelArgs& input_parallel_args,
 #if defined(USE_NPU)
   int32_t device_id = tensor_options.device().index();
   aclError ret = aclrtSetDevice(device_id);
-  atb::CreateContext(&context_);
+  CHECK_EQ(ret, ACL_ERROR_NONE);
+  context_owner_ = create_owned_atb_context("ATB context");
+  atb::Context* const context = context_owner_.get();
   void* stream = c10_npu::getCurrentNPUStream(device_id).stream();
-  context_->SetExecuteStream(stream);
+  context->SetExecuteStream(stream);
   if (should_enable_async_tiling_copy_stream()) {
-    context_->SetAsyncTilingCopyStatus(true);
+    context->SetAsyncTilingCopyStatus(true);
   }
   atb_workspace_ = std::make_shared<AtbWorkspace>(tensor_options.device());
 #endif
@@ -78,21 +80,21 @@ ModelContext::ModelContext(const ParallelArgs& input_parallel_args,
                            const ModelArgs& model_args,
                            const QuantArgs& quant_args,
                            const torch::TensorOptions& tensor_options,
-                           atb::Context* context)
+                           std::shared_ptr<atb::Context> context)
     : parallel_args_(input_parallel_args),
       model_args_(model_args),
       quant_args_(quant_args),
       tensor_options_(tensor_options),
       stream_registry_(
           std::make_shared<ModelStreamRegistry>(tensor_options.device())),
-      context_(context) {}
+      context_owner_(std::move(context)) {}
 #endif
 
 ModelContext ModelContext::with_parallel_args(
     const ParallelArgs& parallel_args) const {
 #if defined(USE_NPU)
   ModelContext derived(
-      parallel_args, model_args_, quant_args_, tensor_options_, context_);
+      parallel_args, model_args_, quant_args_, tensor_options_, context_owner_);
   derived.atb_workspace_ = atb_workspace_;
 #else
   ModelContext derived(
@@ -108,7 +110,7 @@ ModelContext ModelContext::with_parallel_args(
 ModelContext ModelContext::with_quant_args(const QuantArgs& quant_args) const {
 #if defined(USE_NPU)
   ModelContext derived(
-      parallel_args_, model_args_, quant_args, tensor_options_, context_);
+      parallel_args_, model_args_, quant_args, tensor_options_, context_owner_);
   derived.atb_workspace_ = atb_workspace_;
 #else
   ModelContext derived(

@@ -87,6 +87,13 @@ class SpeculativeConfig final {
            is_block_diffusion_algorithm(algorithm);
   }
 
+  // True for the algorithms that carry a per-request MTP draft input across
+  // speculative rounds (MTP and Eagle3). Centralizes the classification so the
+  // PD-handoff transfer path and the request factory stay in agreement.
+  static bool produces_draft_input(std::string_view algorithm) {
+    return is_mtp_algorithm(algorithm) || is_eagle3_algorithm(algorithm);
+  }
+
   // DFlash2 carries the dense proposal only when probabilistic rejection
   // requires it; greedy-only DFlash and Suffix stay out.
   static bool is_probabilistic_draft_sampling_supported(

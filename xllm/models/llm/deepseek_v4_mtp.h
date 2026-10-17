@@ -1136,6 +1136,11 @@ class DeepseekV4MtpForCausalLMImpl final
   explicit DeepseekV4MtpForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<DeepseekV4MtpModel>(context) {}
 
+  // The draft checkpoint owns its embedding and LM head weights.
+  bool owns_mtp_draft_weights() const { return true; }
+
+  bool provides_capture_hidden_hook() const { return true; }
+
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "model.") override {
     for (const auto& state_dict : loader->get_state_dicts()) {
@@ -1182,11 +1187,5 @@ REGISTER_MODEL_ARGS(deepseek_v4_mtp, [&] {
   validate_deepseek_v4_args(*args, args_policy);
   normalize_deepseek_v4_args(args);
 });
-
-// The draft checkpoint owns its embedding and LM head weights.
-const bool deepseek_v4_mtp_shared_weight_owner_registered = []() {
-  ModelRegistry::register_mtp_shared_weight_owner("deepseek_v4_mtp");
-  return true;
-}();
 
 }  // namespace xllm

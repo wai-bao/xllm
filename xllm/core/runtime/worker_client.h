@@ -56,6 +56,9 @@ class WorkerClient {
 
   virtual folly::SemiFuture<bool> stop_profile_async();
 
+  virtual folly::SemiFuture<bool> release_idle_request_state_async(
+      std::vector<int32_t> embedding_ids);
+
   virtual std::tuple<int64_t, int64_t> estimate_kv_cache_capacity();
 
   // allocate kv cache. blocking call

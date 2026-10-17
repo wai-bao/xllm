@@ -27,8 +27,12 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.h>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.h>
     py_executor_impl.h
-    mtp_py_executor_pair.h
-    unified_mtp_executor.h
+    mtp_verify_input_layout.h
+    $<$<BOOL:${USE_NPU}>:mtp_npu_validate_input_state.h>
+    adaptive_pruning_helpers.h
+    speculative_output.h
+    spec_verify.h
+    speculative_input_builder.h
     py_attention_metadata.h
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.h>
     worker.h
@@ -44,14 +48,14 @@ cc_library(
     draft_model_spec_worker_impl.h
     speculative_worker_impl.h
     mtp_worker_impl.h
-    mtp_runtime_helpers.h
-    unified_mtp_worker_impl.h
     suffix_worker_impl.h
     eagle3_worker_impl.h
     dflash_worker_impl.h
     dflash2_worker_impl.h
     dspark_worker_impl.h
     forward_shared_memory_manager.h
+    mtp_target_context_handoff.h
+    $<$<BOOL:${USE_NPU}>:mtp_json_draft_token_handoff.h>
     worker_rendezvous.h
   SRCS
     decode_graph_bucket.cpp
@@ -70,8 +74,12 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.cpp>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.cpp>
     py_executor_impl.cpp
-    mtp_py_executor_pair.cpp
-    unified_mtp_executor.cpp
+    mtp_verify_input_layout.cpp
+    $<$<BOOL:${USE_NPU}>:mtp_npu_validate_input_state.cpp>
+    adaptive_pruning_helpers.cpp
+    speculative_output.cpp
+    spec_verify.cpp
+    speculative_input_builder.cpp
     py_attention_metadata.cpp
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.cpp>
     worker.cpp
@@ -88,9 +96,8 @@ cc_library(
     dit_forward_params.cpp
     draft_model_spec_worker_impl.cpp
     speculative_worker_impl.cpp
+    mtp_target_context_handoff.cpp
     mtp_worker_impl.cpp
-    mtp_runtime_helpers.cpp
-    unified_mtp_worker_impl.cpp
     suffix_worker_impl.cpp
     eagle3_worker_impl.cpp
     dflash_worker_impl.cpp
@@ -105,6 +112,7 @@ cc_library(
     :model_context
     :request
     :speculative
+    :speculative_transport_adapter
     :encoder_cache
     :state_dict
     :dit_cache

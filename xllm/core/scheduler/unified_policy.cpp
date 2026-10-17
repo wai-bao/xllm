@@ -113,7 +113,7 @@ void UnifiedPolicy::schedule_from_unified_queue(
     }
 
     if (request->finished() || request->cancelled()) {
-      clear_mtp_bootstrap(request.get(), state);
+      clear_speculative_pd_handoff_state(request.get(), state.options);
       state.kv_cache_manager->deallocate(request.get());
       finished.emplace_back(request);
       unified.pop_front();
@@ -293,7 +293,7 @@ void UnifiedPolicy::schedule_from_unified_queue(
                    << " is too long, please set a larger "
                       "max_tokens value via --max_tokens_per_batch.";
         unified.pop_front();
-        clear_mtp_bootstrap(request.get(), state);
+        clear_speculative_pd_handoff_state(request.get(), state.options);
         state.kv_cache_manager->deallocate(request.get());
         state.output_dispatcher->process_failed_request(
             request,
@@ -312,7 +312,8 @@ void UnifiedPolicy::schedule_from_unified_queue(
                 ->kv_state()
                 .kv_cache_tokens_num() != 0) {
           ++budget.num_preempted_requests;
-          clear_mtp_bootstrap(request_to_preempt.get(), state);
+          clear_speculative_pd_handoff_state(request_to_preempt.get(),
+                                             state.options);
           state.kv_cache_manager->deallocate(request_to_preempt.get());
           auto prev = preempt_iterator;
           preempt_iterator--;
@@ -343,7 +344,7 @@ void UnifiedPolicy::schedule_from_unified_queue(
             << "Request prompt is too long, no enough memory to schedule "
             << "a single sequence.";
         unified.pop_front();
-        clear_mtp_bootstrap(request.get(), state);
+        clear_speculative_pd_handoff_state(request.get(), state.options);
         state.kv_cache_manager->deallocate(request.get());
         state.output_dispatcher->process_failed_request(
             request,

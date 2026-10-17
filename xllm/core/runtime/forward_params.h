@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/framework/multimodal/embedding_output.h"
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_data.h"
+#include "core/framework/speculative/draft_input.h"
 #include "core/framework/speculative/verify_layout.h"
 #include "framework/config/execution_config.h"
 #include "framework/model/llm_model_params.h"
@@ -52,6 +53,17 @@ class PackedForwardInput;
 
 class LlmForwardInput;
 constexpr int32_t kUnknownPackedSampleCount = -1;
+
+// Control data consumed by worker orchestration, never by model forward.
+// Identity (embedding_ids / request_ids / extra_token_ids) lives in
+// input_params.embedding on every forward-input domain; this struct only
+// carries the speculative draft-input/bootstrap/release channels.
+struct WorkerRequestState {
+  std::vector<int32_t> released_embedding_ids;
+  std::vector<int32_t> target_decode_bootstrap_row_idxes;
+  std::vector<int32_t> draft_input_row_idxes;
+  std::optional<DraftInput> draft_input;
+};
 
 namespace detail {
 
@@ -226,7 +238,6 @@ template <typename Params>
 inline void clear_contiguous_input_buffer_tensor_targets(Params& params) {
   params.embedding.input_embedding = torch::Tensor();
   params.embedding.linear_state_indices = torch::Tensor();
-  params.embedding.mtp_bootstrap_embeddings = torch::Tensor();
   params.block_copy.src_block_indices = torch::Tensor();
   params.block_copy.dst_block_indices = torch::Tensor();
   params.block_copy.cum_sum = torch::Tensor();
@@ -274,8 +285,6 @@ inline bool add_model_tensors_to_plan(const Params& source,
                   &target.embedding.input_embedding) &&
          plan.add(source.embedding.linear_state_indices,
                   &target.embedding.linear_state_indices) &&
-         plan.add(source.embedding.mtp_bootstrap_embeddings,
-                  &target.embedding.mtp_bootstrap_embeddings) &&
          plan.add(source.block_copy.src_block_indices,
                   &target.block_copy.src_block_indices) &&
          plan.add(source.block_copy.dst_block_indices,
@@ -285,31 +294,22 @@ inline bool add_model_tensors_to_plan(const Params& source,
          plan.add(source.graph.tiling_data, &target.graph.tiling_data);
 }
 
-inline torch::Tensor gather_tensor_by_indices(
-    const torch::Tensor& tensor,
-    const std::vector<int64_t>& indices) {
-  if (!tensor.defined()) {
-    return tensor;
+inline bool add_request_state_to_plan(const WorkerRequestState& source,
+                                      WorkerRequestState& target,
+                                      ForwardInputBufferPlan& plan) {
+  target.draft_input.reset();
+  if (source.draft_input.has_value()) {
+    target.draft_input.emplace();
+    const DraftInput& input = *source.draft_input;
+    DraftInput& output = *target.draft_input;
+    output.point_mass_q = input.point_mass_q;
+    for (torch::Tensor DraftInput::* member : kDraftInputTensors) {
+      if (!plan.add(input.*member, &(output.*member))) {
+        return false;
+      }
+    }
   }
-  torch::Tensor cpu_tensor = to_cpu_contiguous(tensor);
-  torch::Tensor gather_indices = make_cpu_tensor(indices);
-  if (cpu_tensor.dim() <= 1) {
-    return cpu_tensor.index_select(0, gather_indices);
-  }
-  CHECK_EQ(cpu_tensor.dim(), 2) << "Expected 1-D or 2-D tensor for CP shard";
-  return cpu_tensor.index_select(1, gather_indices);
-}
-
-inline torch::Tensor gather_tensor_by_indices_on_dim(
-    const torch::Tensor& tensor,
-    const std::vector<int64_t>& indices,
-    int64_t dim) {
-  if (!tensor.defined()) {
-    return tensor;
-  }
-  torch::Tensor cpu_tensor = to_cpu_contiguous(tensor);
-  torch::Tensor gather_indices = make_cpu_tensor(indices);
-  return cpu_tensor.index_select(dim, gather_indices);
+  return true;
 }
 
 }  // namespace detail
@@ -457,6 +457,9 @@ class LlmForwardInput final {
         runtime.input_host_buffer_has_layout;
     inputs.runtime.device_tensors_ready = true;
     inputs.runtime.kv_slot_layout = runtime.kv_slot_layout;
+    inputs.request_state.draft_input = draft_input_to(request_state.draft_input,
+                                                      device,
+                                                      /*non_blocking=*/true);
     return inputs;
   }
 
@@ -487,7 +490,9 @@ class LlmForwardInput final {
     if (!detail::add_attention_to_plan(
             source_params.attention, inputs.input_params.attention, plan) ||
         !detail::add_model_tensors_to_plan(
-            source_params, inputs.input_params, plan)) {
+            source_params, inputs.input_params, plan) ||
+        !detail::add_request_state_to_plan(
+            request_state, inputs.request_state, plan)) {
       return false;
     }
 
@@ -528,6 +533,7 @@ class LlmForwardInput final {
     inputs.sample_prior_output_rows = sample_prior_output_rows;
     inputs.json_object_states = json_object_states;
     inputs.json_object_state_snapshots = json_object_state_snapshots;
+    inputs.request_state = request_state;
   }
 
   void set_host_views(LlmForwardInput& inputs) const {
@@ -574,6 +580,7 @@ class LlmForwardInput final {
   torch::Tensor token_ids_host;
   torch::Tensor positions_host;
   mutable LlmModelParams input_params;
+  WorkerRequestState request_state;
   SamplingParameters sampling_params;
   std::vector<std::string> sample_sequence_ids;
   std::vector<int32_t> sample_prior_output_rows;
@@ -638,8 +645,8 @@ class ForwardOutput final {
   // Selected hidden states matching `logits` layout: [num_selected,
   // hidden_dim]. Populated when a speculative worker requests the pre-lm_head
   // hidden (e.g. DSpark's ConfidenceHead), or on the context-parallel
-  // speculative-decode path, where output_spec_hidden_states reuses it instead
-  // of re-selecting the local shard.
+  // speculative-decode path, where output_captured_hidden_states reuses it
+  // instead of re-selecting the local shard.
   torch::Tensor selected_hidden;
   // Backend-neutral state for the next MTP draft step.
   MtpTopkStatePtr mtp_topk_state;
@@ -685,6 +692,7 @@ struct RawSampleOutput {
   std::vector<torch::Tensor> mm_embeddings;
   EmbeddingOutputMetadata mm_embeddings_metadata;
   SpeculativeTokenStats speculative_token_stats;
+  std::optional<DraftInput> draft_input;
 };
 
 class RawForwardOutput final {
@@ -708,5 +716,20 @@ struct BatchedForwardInputs {
   std::vector<LlmForwardInput> micro_inputs;
   SamplingParameters concated_sampling_params;
 };
+
+// Replaces host-side views into transport buffers with independent, contiguous,
+// detached copies so later execution cannot race the buffer being refilled.
+// Caller-specific tensors (e.g. multi-block tables) are cloned separately by
+// the caller.
+template <typename Input>
+inline void stabilize_host_views(Input& input) {
+  input.token_ids_host =
+      clone_cpu_contiguous_detached_tensor(input.token_ids_host);
+  input.positions_host =
+      clone_cpu_contiguous_detached_tensor(input.positions_host);
+  input.input_params.attention.host.block_tables =
+      clone_cpu_contiguous_detached_tensor(
+          input.input_params.attention.host.block_tables);
+}
 
 }  // namespace xllm

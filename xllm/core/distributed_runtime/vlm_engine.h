@@ -23,6 +23,7 @@ limitations under the License.
 #include "common/macros.h"
 #include "core/distributed_runtime/distributed_worker_manager.h"
 #include "core/framework/batch/vlm_forward_input_factory.h"
+#include "core/framework/speculative/speculative_profile_registry.h"
 #include "engine.h"
 #include "framework/batch/batch_group.h"
 #include "framework/block/block_manager_pool.h"
@@ -46,13 +47,14 @@ class VLMEngine : public Engine {
   const runtime::Options& options() const { return options_; }
 
   std::shared_ptr<DistributedWorkerManager> get_distributed_worker_manager()
-      const {
+      const override {
     return distributed_worker_manager_;
   }
 
   bool init(MasterStatus master_status) override;
 
   void update_last_step_result(BatchGroup& batch);
+  void flush_released_requests() override;
 
  private:
   template <typename TargetEngine>

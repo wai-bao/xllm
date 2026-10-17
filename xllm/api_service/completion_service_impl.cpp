@@ -215,10 +215,7 @@ void CompletionServiceImpl::process_async_rpc_impl(
     const proto::CompletionRequest* request) {
   const auto& service_request_id = request->service_request_id();
   const auto& target_xservice_addr = request->source_xservice_addr();
-  OutputCallback callback = [](RequestOutput output) {
-    const auto results = XServiceClient::get_instance()->generations({output});
-    return results.size() == 1 && results.front();
-  };
+  OutputCallback callback;
   const auto& rpc_request = *request;
   const auto& model = rpc_request.model();
   auto master = get_model_master(model);
@@ -229,15 +226,7 @@ void CompletionServiceImpl::process_async_rpc_impl(
                         target_xservice_addr);
     return;
   }
-  const std::weak_ptr<LLMMaster> weak_master = master;
-  callback = [weak_master](const RequestOutput& req_output) -> bool {
-    const auto master = weak_master.lock();
-    if (master == nullptr) {
-      return false;
-    }
-    req_output.log_request_status();
-    return master->handle_rpc_response(req_output);
-  };
+  callback = master->make_rpc_response_callback();
 
   // Check if the request is being rate-limited.
   const Status admission = master->get_rate_limiter()->acquire();

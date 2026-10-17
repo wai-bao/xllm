@@ -130,6 +130,12 @@ class RecordingWorkerClient final : public WorkerClient {
 
 class DistributedWorkerManagerTest : public ::testing::Test {
  protected:
+  // TEST_F bodies live in generated subclasses, which do not inherit the
+  // fixture's friendship; expose the private member through this static.
+  static bool has_link_threadpool(const DistributedWorkerManager& manager) {
+    return manager.link_threadpool_ != nullptr;
+  }
+
   std::unique_ptr<DistributedWorkerManager> make_manager(
       std::vector<std::shared_ptr<RecordingWorkerClient>> clients) {
     std::vector<std::shared_ptr<WorkerClient>> worker_clients;
@@ -139,10 +145,6 @@ class DistributedWorkerManagerTest : public ::testing::Test {
     }
     return std::unique_ptr<DistributedWorkerManager>(
         new DistributedWorkerManager(std::move(worker_clients)));
-  }
-
-  static bool has_link_threadpool(const DistributedWorkerManager& manager) {
-    return manager.link_threadpool_ != nullptr;
   }
 
   static std::vector<uint64_t> cluster_ids() { return {11, 22}; }

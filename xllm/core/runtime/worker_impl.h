@@ -25,6 +25,7 @@ limitations under the License.
 
 #include "common/types.h"
 #include "core/framework/allocator/virtual_memory/mapped_virtual_memory_region.h"
+#include "core/framework/config/eplb_config.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/transfer/hierarchy_kv_cache_transfer.h"
 #include "core/kv_cache/transfer/kv_cache_store.h"
@@ -39,6 +40,7 @@ limitations under the License.
 #include "framework/parallel_state/parallel_state.h"
 #include "framework/sampling/beam_searcher.h"
 #include "framework/sampling/sampler.h"
+#include "framework/speculative/capture_hidden_mode.h"
 #include "framework/state_dict/state_dict.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "options.h"
@@ -78,7 +80,6 @@ class WorkerImpl {
   virtual ::xllm::Status create_task_pipeline(
       std::unique_ptr<TaskExecutionPipeline>& output);
   virtual bool task_models_loaded() const { return status_ == Status::LOADED; }
-  virtual bool uses_worker_task_pipeline() const { return false; }
   ::xllm::Status task_capacity(const runtime::Options& options,
                                LlmTaskCapacity& output) const;
   TaskModel task_model();
@@ -188,6 +189,13 @@ class WorkerImpl {
   virtual std::optional<ForwardOutput> step(const LlmForwardInput& inputs);
   virtual std::optional<ForwardOutput> step(const VlmForwardInput& inputs);
 
+  // The caller has consumed all scheduled outputs. Runs on the model's host
+  // execution queue, then retires device work and unused last-output storage.
+  folly::SemiFuture<bool> release_idle_request_state_async(
+      std::vector<int32_t> embedding_ids);
+  virtual void release_request_state(
+      const std::vector<int32_t>& /*embedding_ids*/) {}
+
   // Optional no-sync execution hook used by speculative LLM/VLM workers.
   // Other worker types do not support this execution mode.
   virtual std::optional<ForwardOutput> execute_no_sync_on_stream(
@@ -206,10 +214,6 @@ class WorkerImpl {
       LlmForwardInput& input,
       const ForwardOutput& prior_output,
       const std::vector<std::string>& prior_sample_sequence_ids);
-  virtual void prepare_task_pipeline_input(const LlmForwardInput& input,
-                                           LlmForwardInput& prepared);
-  virtual std::optional<ForwardOutput> execute_task_pipeline(
-      const LlmForwardInput& prepared);
   void sanitize_json_object_error_inputs(LlmForwardInput& inputs);
   virtual VlmForwardInput update_input_by_last_step_output(
       VlmForwardInput& inputs);
@@ -348,6 +352,11 @@ class WorkerImpl {
     return model_->share_weights_from(*source.model_);
   }
 
+  bool owns_mtp_draft_weights() const {
+    CHECK(model_ != nullptr);
+    return model_->owns_mtp_draft_weights();
+  }
+
   bool enable_schedule_overlap() const {
     return options_.enable_schedule_overlap_;
   }
@@ -355,6 +364,14 @@ class WorkerImpl {
   virtual ForwardOutput get_last_step_result();
 
   bool is_driver() const { return driver_ || dp_driver_; }
+
+  // Whether this rank publishes step outputs to the scheduler: any
+  // schedule-overlap rank, the DP driver, or an EPLB participant. Non-driving
+  // plain ranks under a non-overlap setup return nullopt instead.
+  bool publishes_step_output() const {
+    return enable_schedule_overlap() || is_driver() ||
+           ::xllm::EPLBConfig::get_instance().enable_eplb();
+  }
 
   int64_t get_active_activation_memory();
 
@@ -382,6 +399,9 @@ class WorkerImpl {
       const std::optional<ForwardOutput>& output,
       const std::vector<std::string>& request_ids,
       const std::vector<std::string>& sample_sequence_ids);
+  // Clears last_step_output_ and its request-id cache; call under mtx_ unless
+  // the idle non-driver path (no overlap consumer can race).
+  void clear_last_step_output();
   bool can_use_last_step_output_for_schedule_overlap(
       const LlmForwardInput& input) const;
   bool can_use_last_step_output_for_schedule_overlap(
@@ -531,6 +551,9 @@ class WorkerImpl {
  protected:
   // runtime options
   runtime::Options options_;
+  // Resolved once by init_model, where the model's answer is available; no
+  // algorithm-string branch belongs in the per-token hidden handoff.
+  CaptureHiddenMode capture_hidden_mode_ = CaptureHiddenMode::FINAL_OUTPUT;
 
   // whether the worker is a driver, who takes care of the sampling
   bool driver_ = false;
