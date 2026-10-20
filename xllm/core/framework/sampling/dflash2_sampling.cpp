@@ -46,12 +46,11 @@ DFlash2SampleOutput sample_dflash2_path(
   // Target-side truncation, penalties, and grammar constraints belong to
   // verification and must not be applied to the selector's top-k
   // distribution.
-  torch::Tensor edge_log_probs = candidates.edge_logits.to(torch::kFloat32);
+  torch::Tensor edge_logits = candidates.edge_logits.to(torch::kFloat32);
   if (sampling_params.temperatures.defined()) {
     apply_selector_temperatures(
-        edge_log_probs, sampling_params.temperatures, batch_size);
+        edge_logits, sampling_params.temperatures, batch_size);
   }
-  edge_log_probs = torch::log_softmax(edge_log_probs, /*dim=*/-1);
 
   torch::Tensor token_ids =
       torch::empty({batch_size, num_steps}, candidates.candidate_ids.options());
@@ -78,13 +77,18 @@ DFlash2SampleOutput sample_dflash2_path(
   }
 
   for (int64_t step = 0; step < num_steps; ++step) {
-    torch::Tensor edge = edge_log_probs.select(/*dim=*/1, /*index=*/step);
+    torch::Tensor edge = edge_logits.select(/*dim=*/1, /*index=*/step);
     torch::Tensor gather_indices = previous_indices.view({batch_size, 1, 1})
                                        .expand({batch_size, 1, top_k});
-    torch::Tensor row_log_probs =
+    // Softmax is monotone, so the selector argmaxes the raw row logits
+    // directly; the log_softmax below only normalizes the selected row (the
+    // random-row scatter needs the per-candidate values, the confidence the
+    // sampled one).
+    torch::Tensor row_logits =
         edge.gather(/*dim=*/1, gather_indices).squeeze(/*dim=*/1);
     torch::Tensor sampled_indices = gumbel_argmax(
-        row_log_probs, gumbel_noise.select(/*dim=*/1, /*index=*/step));
+        row_logits, gumbel_noise.select(/*dim=*/1, /*index=*/step));
+    torch::Tensor row_log_probs = torch::log_softmax(row_logits, /*dim=*/-1);
 
     torch::Tensor step_candidates =
         candidates.candidate_ids.select(/*dim=*/1, /*index=*/step);

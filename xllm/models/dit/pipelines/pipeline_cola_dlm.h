@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/framework/model/dit_model.h"
 #include "core/framework/model_context/model_context.h"
 #include "core/framework/model_loader/dit_model_loader.h"
+#include "core/framework/sampling/gumbel_sampling.h"
 #include "core/framework/tokenizer/fast_tokenizer.h"
 #include "core/framework/tokenizer/tokenizer_args.h"
 #include "core/util/json_reader.h"
@@ -550,9 +551,10 @@ class ColaDLMPipelineImpl final : public torch::nn::Module {
                                       -std::numeric_limits<float>::infinity());
         }
 
-        // Softmax over the filtered logit distribution, then sample.
-        auto probs = torch::softmax(logits, /*dim=*/-1);
-        block_ids = torch::multinomial(probs, /*num_samples=*/1).squeeze(-1);
+        // Gumbel-max over the masked logits: -inf stays -inf under additive
+        // noise, so filtered tokens can never win; no softmax needed (it is
+        // monotone, a constant row offset cancels in the argmax).
+        block_ids = gumbel_argmax(logits, gumbel_noise_like(logits));
       }
 
       // Collect tokens.

@@ -1202,11 +1202,7 @@ Status TaskExecutionPipeline::prepare_speculative(
           prefix(slot.context_slots_storage, slot.rows * width);
     }
     const auto& base = slot.target_prefill->sampling_params();
-    slot.rejection = std::make_unique<RejectionSampler>(base.do_sample,
-                                                        base.all_random_sample,
-                                                        base.all_greedy_sample,
-                                                        base.logprobs,
-                                                        base.max_top_logprobs);
+    slot.rejection = std::make_unique<RejectionSampler>(base);
     for (uint32_t step = 0; step < slot.drafts.size(); ++step) {
       auto& invocation = *slot.drafts[step];
       status =
@@ -1518,10 +1514,6 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
   slot.target_logits = model_.logits(
       slot.target_output.hidden_states,
       slot.validate_input->sampling_params().selected_token_idxes);
-  // The executor returns raw logits; the rejection sampler must score the
-  // request's transformed distribution.
-  Sampler::process_logits(slot.target_logits,
-                          slot.validate_input->sampling_params());
   const auto& base = slot.target_prefill->sampling_params();
   std::optional<torch::Tensor> draft_logits;
   if (block_draft()) {
@@ -1534,6 +1526,8 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
     }
     draft_logits = stack_draft_logits(draft_logits_steps);
   }
+  // The rejection sampler applies the sampling transforms to the raw logits
+  // itself.
   SampleOutput accepted = slot.rejection->forward(
       DraftProposal(slot.proposal, draft_logits),
       slot.target_logits.view(
@@ -1609,13 +1603,16 @@ void TaskExecutionPipeline::launch_block_draft(SpeculativeSlot& slot) {
                                slot.greedy_do_sample,
                                /*num_rows=*/slot.rows);
   if (speculative_capacity_->kind == SpeculativeTaskKind::DFLASH2) {
-    slot.block_gumbel =
-        sample_gumbel_noise(slot.rows,
-                            steps,
-                            speculative_capacity_->selector_top_k,
-                            selector_sampling,
-                            device_.unwrap());
-    if (capacity_.sampling_group != nullptr &&
+    // All-greedy batches skip the draw and the cross-rank consensus inside
+    // sample_gumbel_noise: the zeros are deterministic on every rank.
+    slot.block_gumbel = sample_gumbel_noise(
+        steps,
+        speculative_capacity_->selector_top_k,
+        /*greedy_rows=*/greedy_draft_rows(selector_sampling),
+        /*all_greedy=*/selector_sampling.all_greedy_sample,
+        device_.unwrap());
+    if (!selector_sampling.all_greedy_sample &&
+        capacity_.sampling_group != nullptr &&
         capacity_.sampling_group->world_size() > 1) {
       capacity_.sampling_group->broadcast(slot.block_gumbel, /*root_rank=*/0);
     }

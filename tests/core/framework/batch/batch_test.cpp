@@ -1784,12 +1784,10 @@ TEST(BatchTest, ReorderedMtpAcceptedRowsCommitToOwningSequences) {
     target_logits.index_put_(
         {row, 5, bonus_token_ids.index({row, 0}).item<int64_t>()}, 20.0F);
   }
-  const torch::Tensor do_sample = torch::tensor({false, false}, torch::kBool);
-  RejectionSampler rejection_sampler(do_sample,
-                                     /*all_random_sample=*/false,
-                                     /*all_greedy_sample=*/true,
-                                     /*logprobs=*/false,
-                                     /*max_top_logprobs=*/0);
+  SamplingParameters sampling_params;
+  sampling_params.do_sample = torch::tensor({false, false}, torch::kBool);
+  sampling_params.all_greedy_sample = true;
+  RejectionSampler rejection_sampler(sampling_params);
   DraftProposal draft_proposal = DraftProposal(draft_token_ids);
   const SampleOutput accepted_output =
       rejection_sampler.forward(draft_proposal, target_logits);

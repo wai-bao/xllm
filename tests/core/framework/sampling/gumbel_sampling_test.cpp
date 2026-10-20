@@ -18,19 +18,26 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
-#include "core/framework/sampling/sampling_params.h"
-
 namespace xllm {
 
 TEST(GumbelSamplingTest, ReturnsZeroNoiseForGreedyBatch) {
-  SamplingParameters sampling_params;
-  sampling_params.all_greedy_sample = true;
-  sampling_params.all_random_sample = false;
-
-  torch::Tensor noise = sample_gumbel_noise(/*batch_size=*/2,
-                                            /*num_steps=*/3,
+  torch::Tensor noise = sample_gumbel_noise(/*num_steps=*/3,
                                             /*num_classes=*/4,
-                                            sampling_params,
+                                            /*greedy_rows=*/
+                                            torch::ones({2}, torch::kBool),
+                                            /*all_greedy=*/false,
+                                            torch::Device(torch::kCPU));
+
+  EXPECT_EQ(noise.sizes(), torch::IntArrayRef({2, 3, 4}));
+  EXPECT_TRUE(noise.eq(0).all().item<bool>());
+}
+
+TEST(GumbelSamplingTest, SkipsDrawForAllGreedyBatch) {
+  torch::Tensor noise = sample_gumbel_noise(/*num_steps=*/3,
+                                            /*num_classes=*/4,
+                                            /*greedy_rows=*/
+                                            torch::ones({2}, torch::kBool),
+                                            /*all_greedy=*/true,
                                             torch::Device(torch::kCPU));
 
   EXPECT_EQ(noise.sizes(), torch::IntArrayRef({2, 3, 4}));
@@ -38,17 +45,15 @@ TEST(GumbelSamplingTest, ReturnsZeroNoiseForGreedyBatch) {
 }
 
 TEST(GumbelSamplingTest, MasksGreedyRowsInMixedBatch) {
-  SamplingParameters sampling_params;
-  sampling_params.do_sample = torch::tensor({false, true}, torch::kBool);
-  sampling_params.all_greedy_sample = false;
-  sampling_params.all_random_sample = false;
   torch::manual_seed(2026);
 
-  torch::Tensor noise = sample_gumbel_noise(/*batch_size=*/2,
-                                            /*num_steps=*/3,
-                                            /*num_classes=*/4,
-                                            sampling_params,
-                                            torch::Device(torch::kCPU));
+  torch::Tensor noise =
+      sample_gumbel_noise(/*num_steps=*/3,
+                          /*num_classes=*/4,
+                          /*greedy_rows=*/
+                          torch::tensor({true, false}, torch::kBool),
+                          /*all_greedy=*/false,
+                          torch::Device(torch::kCPU));
 
   EXPECT_TRUE(noise.select(/*dim=*/0, /*index=*/0).eq(0).all().item<bool>());
   EXPECT_TRUE(torch::isfinite(noise).all().item<bool>());

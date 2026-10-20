@@ -340,7 +340,6 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
     TargetInput& validate_input) {
   validate_input = input.to(device_, dtype_);
   validate_input.skip_sampling_for_logits_only = true;
-  validate_input.skip_process_logits = true;
   validate_input.runtime.device_tensors_ready = false;
   auto& input_params = validate_input.input_params;
   torch::TensorOptions token_options = validate_input.token_ids.options();
@@ -479,7 +478,6 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
     const std::vector<int32_t>& per_seq_val_tokens) {
   validate_input = input.to(device_, dtype_);
   validate_input.skip_sampling_for_logits_only = true;
-  validate_input.skip_process_logits = true;
   validate_input.runtime.device_tensors_ready = false;
   auto& input_params = validate_input.input_params;
   torch::TensorOptions token_options = validate_input.token_ids.options();

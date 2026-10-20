@@ -17,22 +17,36 @@ limitations under the License.
 #include <torch/types.h>
 
 #include <cstdint>
+#include <optional>
 
-#include "framework/sampling/sampling_params.h"
+#include "core/framework/sampling/sampling_params.h"
 
 namespace xllm {
 
+// Gumbel(0, 1) noise with the shape and device of `like` (fp32). Uses the
+// global RNG unless a generator is given (the seeded sampler path passes its
+// private one).
+torch::Tensor gumbel_noise_like(
+    const torch::Tensor& like,
+    std::optional<torch::Generator> generator = std::nullopt);
+
+// Greedy row mask [batch] for draft sampling: all-greedy batches treat every
+// row as greedy (do_sample may carry request-side values in GREEDY mode),
+// mixed batches invert do_sample.
+torch::Tensor greedy_draft_rows(const SamplingParameters& sampling_params);
+
 // Draws Gumbel(0, 1) noise shaped [batch_size, num_steps, num_classes] on
-// `device`. Greedy batches get zero noise so the gumbel_argmax below collapses
-// onto the plain argmax; mixed batches zero the greedy rows so their argmax
-// stays deterministic, mirroring the sampler's where(do_sample, ...) select.
-// The caller owns cross-rank consensus: per-rank RNG divergence would fork the
-// sampled path, so under TP > 1 the caller must broadcast the result from a
-// single root before feeding it to gumbel_argmax.
-torch::Tensor sample_gumbel_noise(int64_t batch_size,
-                                  int64_t num_steps,
+// `device`. `greedy_rows` [batch_size] bool zeroes those rows' noise so
+// gumbel_argmax collapses onto the plain argmax for them; `all_greedy` skips
+// the draw entirely (all-greedy rows only ever argmax the zero-noise logits:
+// deterministic zeros on every rank, so the draw and the cross-rank consensus
+// on it are both skippable). The caller owns cross-rank consensus: per-rank
+// RNG divergence would fork the sampled path, so under TP > 1 the caller must
+// broadcast the result from a single root before feeding it to gumbel_argmax.
+torch::Tensor sample_gumbel_noise(int64_t num_steps,
                                   int64_t num_classes,
-                                  const SamplingParameters& sampling_params,
+                                  const torch::Tensor& greedy_rows,
+                                  bool all_greedy,
                                   const torch::Device& device);
 
 // Applies temperatures in-place to `logits` [batch, ..., num_classes] with the
@@ -42,12 +56,13 @@ void apply_selector_temperatures(torch::Tensor& logits,
                                  const torch::Tensor& temperatures,
                                  int64_t batch_size);
 
-// Single-row Gumbel-max sampling over log-probabilities: argmax(log_probs + g)
-// draws from exactly categorical(exp(log_probs)), so logits MUST already be
-// normalized (e.g. log_softmax output). Returns sampled class indices
+// Single-row Gumbel-max sampling: argmax(logits + g) draws from exactly
+// categorical(softmax(logits)). Unnormalized logits are fine — softmax is
+// monotone, so any constant per-row offset cancels in the argmax; -inf
+// entries stay -inf and never win. Returns sampled class indices
 // [batch_size] on the logits device. Stays on the current stream and never
 // blocks the host, which is what makes it ACL-graph safe.
-torch::Tensor gumbel_argmax(const torch::Tensor& log_probs,
+torch::Tensor gumbel_argmax(const torch::Tensor& logits,
                             const torch::Tensor& gumbel_noise);
 
 }  // namespace xllm

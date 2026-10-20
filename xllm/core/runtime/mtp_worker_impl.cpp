@@ -2900,7 +2900,6 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
   clear_ready_events(validate_input);
   validate_input.runtime.device_tensors_ready = false;
   validate_input.skip_sampling_for_logits_only = true;
-  validate_input.skip_process_logits = true;
   auto& input_params = validate_input.input_params;
   input_params.embedding.input_embedding = torch::Tensor();
   torch::TensorOptions token_options = validate_input.token_ids.options();
@@ -3352,7 +3351,6 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
   clear_ready_events(validate_input);
   validate_input.runtime.device_tensors_ready = false;
   validate_input.skip_sampling_for_logits_only = true;
-  validate_input.skip_process_logits = true;
   auto& input_params = validate_input.input_params;
   input_params.embedding.input_embedding = torch::Tensor();
   torch::TensorOptions token_options = validate_input.token_ids.options();
@@ -3953,9 +3951,7 @@ SampleOutput MTPWorkerImpl<TargetInput>::validate(
         draft_proposal.token_ids().masked_fill(invalid_mask, /*sentinel=*/-1);
   }
   SampleOutput sample_output = spec_verify::run_rejection_sampling(
-      {.do_sample = sampling_params.do_sample,
-       .all_random_sample = sampling_params.all_random_sample,
-       .all_greedy_sample = sampling_params.all_greedy_sample},
+      sampling_params,
       DraftProposal(validation_token_ids.defined() ? validation_token_ids
                                                    : draft_proposal.token_ids(),
                     draft_proposal.logits()),

@@ -32,13 +32,19 @@ namespace xllm {
 namespace {
 RejectionSampler make_greedy_rejection_sampler(int64_t batch_size,
                                                torch::Device device) {
-  return RejectionSampler(
-      torch::zeros({batch_size},
-                   torch::TensorOptions().dtype(torch::kBool).device(device)),
-      /*all_random_sample=*/false,
-      /*all_greedy_sample=*/true,
-      /*logprobs=*/false,
-      /*max_top_logprobs=*/0);
+  SamplingParameters params;
+  params.do_sample = torch::zeros(
+      {batch_size}, torch::TensorOptions().dtype(torch::kBool).device(device));
+  params.all_greedy_sample = true;
+  return RejectionSampler(params);
+}
+
+// Derives the all_random / all_greedy batch flags the production callers
+// compute from a do_sample row mask.
+void set_batch_flags(SamplingParameters& params,
+                     const torch::Tensor& do_sample) {
+  params.all_random_sample = do_sample.all().item<bool>();
+  params.all_greedy_sample = !do_sample.any().item<bool>();
 }
 
 // Helper function to get test device: MLU if available, otherwise CPU
@@ -245,11 +251,10 @@ TEST(RejectionSamplerTest, RandomForwardUsesGreedyDraftWithoutDraftProbs) {
   const auto options = get_test_options(torch::kFloat32);
   const auto device = get_test_device();
   const auto do_sample = torch::tensor({true}, device);
-  RejectionSampler sampler(do_sample,
-                           /*all_random_sample=*/true,
-                           /*all_greedy_sample=*/false,
-                           /*logprobs=*/false,
-                           /*max_top_logprobs=*/0);
+  SamplingParameters params;
+  params.do_sample = do_sample;
+  params.all_random_sample = true;
+  RejectionSampler sampler(params);
 
   DraftProposal draft_proposal = DraftProposal(torch::tensor({{1, 2}}, device));
   const auto target_logits = torch::tensor({{{-1000.0f, 1000.0f, -1000.0f},
@@ -288,11 +293,12 @@ TEST(RejectionSamplerTest, LogProbs) {
   const auto device = get_test_device();
   const auto do_sample = torch::tensor({false, true, false, true}, device);
   const int64_t max_top_logprobs = 2;
-  RejectionSampler sampler(do_sample,
-                           do_sample.all().item<bool>(),
-                           !do_sample.any().item<bool>(),
-                           /*logprobs=*/true,
-                           max_top_logprobs);
+  SamplingParameters params;
+  params.do_sample = do_sample;
+  set_batch_flags(params, do_sample);
+  params.logprobs = true;
+  params.max_top_logprobs = max_top_logprobs;
+  RejectionSampler sampler(params);
 
   int64_t batch_size = 4;
   int64_t n_speculative_tokens = 4;
@@ -342,11 +348,10 @@ TEST(RejectionSamplerTest, ConstructorDoesNotMutateDoSampleShape) {
   ASSERT_EQ(do_sample.dim(), 1);
   ASSERT_EQ(do_sample.sizes(), torch::IntArrayRef({2}));
 
-  RejectionSampler sampler(do_sample,
-                           do_sample.all().item<bool>(),
-                           !do_sample.any().item<bool>(),
-                           /*logprobs=*/false,
-                           /*max_top_logprobs=*/0);
+  SamplingParameters params;
+  params.do_sample = do_sample;
+  set_batch_flags(params, do_sample);
+  RejectionSampler sampler(params);
 
   EXPECT_EQ(do_sample.dim(), 1);
   EXPECT_EQ(do_sample.sizes(), torch::IntArrayRef({2}));
@@ -358,11 +363,10 @@ TEST(RejectionSamplerTest,
   const auto device = get_test_device();
   auto do_sample = torch::tensor({false, true}, torch::device(device));
 
-  RejectionSampler rejection_sampler(do_sample,
-                                     do_sample.all().item<bool>(),
-                                     !do_sample.any().item<bool>(),
-                                     /*logprobs=*/false,
-                                     /*max_top_logprobs=*/0);
+  SamplingParameters rejection_params;
+  rejection_params.do_sample = do_sample;
+  set_batch_flags(rejection_params, do_sample);
+  RejectionSampler rejection_sampler(rejection_params);
   (void)rejection_sampler;
 
   SamplingParameters params;
@@ -399,8 +403,7 @@ TEST(RejectionSamplerTest, Random) {
       target_prob.reshape({1, 1, -1}).repeat({num_samples, 1, 1});
 
   auto draft_logits = torch::randn({num_samples, 1, vocab_size}, options);
-  auto draft_token_ids =
-      Sampler::random_sample(torch::softmax(draft_logits, /*dim=*/-1));
+  auto draft_token_ids = Sampler::random_sample(draft_logits);
 
   auto bonus_token_ids =
       torch::ones({num_samples, 1}, options.dtype(torch::kInt64));

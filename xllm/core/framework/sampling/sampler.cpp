@@ -28,6 +28,7 @@ limitations under the License.
 
 #include "common/global_flags.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/sampling/gumbel_sampling.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/sampling/logits_utils.h"
 #include "core/framework/sampling/sampling_params.h"
@@ -182,18 +183,9 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
     CHECK_EQ(sample_logits.size(0), params.do_sample.size(0));
   }
 
-  // The greedy legs argmax the logits directly; softmax feeds only the
-  // random legs (argmax(softmax(x)) == argmax(x)).
+  // Both legs consume the raw sample_logits directly.
   const bool seed_sampling =
       params.seeds.defined() && !params.all_greedy_sample;
-  const bool need_probs =
-      seed_sampling || params.all_random_sample ||
-      (!params.all_greedy_sample && params.do_sample.defined());
-  torch::Tensor probs;
-  if (need_probs) {
-    probs =
-        torch::softmax(sample_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
-  }
   torch::Tensor samples;
   if (seed_sampling) {
     torch::Tensor seeds = params.seeds;
@@ -206,33 +198,33 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
     offsets = offsets.to(torch::kCPU);
     const torch::Tensor sample_rows = params.do_sample.to(torch::kCPU);
     std::vector<torch::Tensor> rows;
-    rows.reserve(probs.size(0));
-    for (int64_t row = 0; row < probs.size(0); ++row) {
-      const torch::Tensor probabilities = probs.select(0, row);
+    rows.reserve(sample_logits.size(0));
+    for (int64_t row = 0; row < sample_logits.size(0); ++row) {
+      const torch::Tensor row_logits = sample_logits.select(0, row);
       if (!sample_rows[row].item<bool>()) {
-        rows.emplace_back(probabilities.argmax(-1).view({1}));
+        rows.emplace_back(row_logits.argmax(-1).view({1}));
         continue;
       }
       const int64_t seed = seeds[row].item<int64_t>();
       if (seed == -1) {
-        rows.emplace_back(random_sample(probabilities.unsqueeze(0)).view({1}));
+        rows.emplace_back(random_sample(row_logits.unsqueeze(0)).view({1}));
         continue;
       }
       // A private generator keeps this request independent from the global RNG.
-      auto generator = make_sampling_generator(probs.device());
+      auto generator = make_sampling_generator(sample_logits.device());
       generator.set_current_seed(
           sampling_seed(seed, offsets[row].item<int64_t>()));
-      rows.emplace_back(probabilities.multinomial(/*num_samples=*/1,
-                                                  /*replacement=*/false,
-                                                  generator));
+      // fp32 noise promotes the sum, so no explicit dtype cast is needed.
+      rows.emplace_back(
+          random_sample(row_logits.unsqueeze(0), generator).view({1}));
     }
     samples = torch::cat(rows, /*dim=*/0);
   } else if (params.all_random_sample) {
-    samples = random_sample(probs);
+    samples = random_sample(sample_logits);
   } else if (params.all_greedy_sample) {
     samples = greedy_sample(sample_logits);
   } else {
-    auto random = random_sample(probs);
+    auto random = random_sample(sample_logits);
     auto greedy = greedy_sample(sample_logits);
     samples = torch::where(params.do_sample, random, greedy);
   }
@@ -283,30 +275,28 @@ SampleOutput Sampler::forward(torch::Tensor& logits,
   return output;
 }
 
-torch::Tensor Sampler::greedy_sample(const torch::Tensor& probs) {
-  return probs.argmax(/*dim=*/-1);
+torch::Tensor Sampler::greedy_sample(const torch::Tensor& logits) {
+  return logits.argmax(/*dim=*/-1);
 }
 
-torch::Tensor Sampler::random_sample(const torch::Tensor& probs) {
+torch::Tensor Sampler::random_sample(
+    const torch::Tensor& logits,
+    std::optional<torch::Generator> generator) {
 #if defined(USE_MLU) || defined(USE_CUDA) || defined(USE_DCU)
-  if (!probs.device().is_cpu()) {
+  // The device kernel consumes probabilities, so it cannot take the
+  // raw-logits contract; the seeded path always goes through the gumbel
+  // draw with its private generator.
+  if (!generator.has_value() && !logits.device().is_cpu()) {
     xllm::kernel::RandomSampleParams params;
-    params.logits = probs;
+    params.logits = logits;
     return xllm::kernel::random_sample(params);
   }
 #endif
-  if (probs.dim() == 3) {
-    auto batch_size = probs.size(0);
-    auto seq_len = probs.size(1);
-    auto vocab_size = probs.size(2);
-    auto flat_probs = probs.reshape({-1, vocab_size});
-    auto sampled =
-        flat_probs.multinomial(/*num_samples=*/1, /*replacement=*/false);
-    return sampled.reshape({batch_size, seq_len});
-  } else {
-    return probs.multinomial(/*num_samples=*/1, /*replacement=*/false)
-        .flatten();
-  }
+  // Additive Gumbel over raw logits; the softmax is unnecessary because
+  // softmax is monotone in the logits. gumbel_argmax allocates the sum, so
+  // the caller's logits are never mutated (the rejection sampler still
+  // reads them as the draft distribution).
+  return gumbel_argmax(logits, gumbel_noise_like(logits, generator));
 }
 
 }  // namespace xllm

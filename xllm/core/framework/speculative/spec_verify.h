@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <torch/types.h>
 
+#include "core/framework/sampling/sampling_params.h"
+
 namespace xllm {
 
 class DraftProposal;
@@ -55,13 +57,10 @@ torch::Tensor materialize_graph_speculative_verify_tokens(
     const torch::Tensor& tokens,
     const GraphInputView& graph_input);
 
-struct SamplerPolicy {
-  torch::Tensor do_sample;
-  bool all_random_sample = false;
-  bool all_greedy_sample = false;
-};
-
-SampleOutput run_rejection_sampling(const SamplerPolicy& policy,
+// Scores the RAW target logits (sampling transforms are applied inside the
+// RejectionSampler exactly once); `target_output` supplies the logprobs /
+// top-k request flags.
+SampleOutput run_rejection_sampling(const SamplingParameters& sampling_params,
                                     const DraftProposal& draft_proposal,
                                     const torch::Tensor& target_logits,
                                     const ForwardOutput& target_output);

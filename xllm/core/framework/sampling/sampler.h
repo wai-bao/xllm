@@ -18,6 +18,8 @@ limitations under the License.
 #include <c10/core/TensorOptions.h>
 #include <torch/types.h>
 
+#include <optional>
+
 #include "sampling_params.h"
 
 namespace xllm {
@@ -48,11 +50,16 @@ class Sampler final {
                                       const torch::Tensor& filter_mask = {});
 
   // helper functions
-  // probs: [..., vocab_size]
-  static torch::Tensor greedy_sample(const torch::Tensor& probs);
+  // logits: [..., vocab_size], possibly with -inf masks
+  static torch::Tensor greedy_sample(const torch::Tensor& logits);
 
-  // probs: [..., vocab_size]
-  static torch::Tensor random_sample(const torch::Tensor& probs);
+  // Gumbel-max over raw logits: argmax(logit + Gumbel) draws exactly from
+  // softmax(logits). -inf entries stay -inf under additive noise, so masked
+  // tokens can never win. A generator pins the draw to a private RNG (the
+  // seeded sampler path passes its own); the default uses the global RNG.
+  static torch::Tensor random_sample(
+      const torch::Tensor& logits,
+      std::optional<torch::Generator> generator = std::nullopt);
 };
 
 }  // namespace xllm

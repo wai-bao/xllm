@@ -1040,12 +1040,7 @@ SampleOutput DFlashWorkerImpl::validate(
   torch::Tensor target_logits = target_output.logits.view(
       {batch_size, num_val_tokens, target_output.logits.size(/*dim=*/-1)});
   return spec_verify::run_rejection_sampling(
-      {.do_sample = sampling_params.do_sample,
-       .all_random_sample = sampling_params.all_random_sample,
-       .all_greedy_sample = sampling_params.all_greedy_sample},
-      draft_proposal,
-      target_logits,
-      target_output);
+      sampling_params, draft_proposal, target_logits, target_output);
 }
 
 void DFlashWorkerImpl::maybe_broadcast_spec_tokens(torch::Tensor& tokens) {

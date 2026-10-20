@@ -100,15 +100,14 @@ torch::Tensor materialize_graph_speculative_verify_tokens(
       verify_tokens, graph_input.spec_verify_draft_token_sources);
 }
 
-SampleOutput run_rejection_sampling(const SamplerPolicy& policy,
+SampleOutput run_rejection_sampling(const SamplingParameters& sampling_params,
                                     const DraftProposal& draft_proposal,
                                     const torch::Tensor& target_logits,
                                     const ForwardOutput& target_output) {
-  const RejectionSampler sampler(policy.do_sample,
-                                 policy.all_random_sample,
-                                 policy.all_greedy_sample,
-                                 target_output.logprobs,
-                                 target_output.max_top_logprobs);
+  SamplingParameters verify_params = sampling_params;
+  verify_params.logprobs = target_output.logprobs;
+  verify_params.max_top_logprobs = target_output.max_top_logprobs;
+  const RejectionSampler sampler(std::move(verify_params));
 
   SampleOutput sample_output = sampler.forward(draft_proposal, target_logits);
 

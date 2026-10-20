@@ -383,12 +383,10 @@ SampleOutput SuffixWorkerImpl::validate(
       target_output.logits.view({batch_size, num_val_tokens, vocab_size});
 
   auto greedy_do_sample = torch::zeros({batch_size}, torch::kBool);
-  return spec_verify::run_rejection_sampling({.do_sample = greedy_do_sample,
-                                              .all_random_sample = false,
-                                              .all_greedy_sample = true},
-                                             draft_proposal,
-                                             target_logits,
-                                             target_output);
+  SamplingParameters greedy_params;
+  greedy_params.do_sample = greedy_do_sample;
+  return spec_verify::run_rejection_sampling(
+      greedy_params, draft_proposal, target_logits, target_output);
 }
 
 }  // namespace xllm

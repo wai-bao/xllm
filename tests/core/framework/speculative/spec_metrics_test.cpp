@@ -36,11 +36,10 @@ SpecMetrics calculate_from_widths(
 }
 
 RejectionSampler make_greedy_rejection_sampler(int64_t batch_size) {
-  return RejectionSampler(torch::zeros({batch_size}, torch::kBool),
-                          /*all_random_sample=*/false,
-                          /*all_greedy_sample=*/true,
-                          /*logprobs=*/false,
-                          /*max_top_logprobs=*/0);
+  SamplingParameters params;
+  params.do_sample = torch::zeros({batch_size}, torch::kBool);
+  params.all_greedy_sample = true;
+  return RejectionSampler(params);
 }
 
 TEST(SpeculativeTokenStatsTest, CountsTokensPerSequence) {

@@ -24,11 +24,10 @@ namespace xllm {
 
 class RejectionSampler final {
  public:
-  RejectionSampler(const torch::Tensor& do_sample,
-                   bool all_random_sample,
-                   bool all_greedy_sample,
-                   bool logprobs,
-                   int64_t max_top_logprobs);
+  // Takes the full request sampling parameters; forward() applies the
+  // sampling transforms (penalties, temperature, top-k/top-p, filter mask)
+  // to the raw target logits exactly once, in place.
+  explicit RejectionSampler(SamplingParameters sampling_params);
 
   // operator() allows us to use the module as a function.
   template <typename... Args>
@@ -36,10 +35,12 @@ class RejectionSampler final {
     return this->forward(::std::forward<Args>(args)...);
   }
 
-  // The single sampling owner for speculative verification. The
+  // The single sampling owner for speculative verification. Consumes RAW
+  // target logits [batch, n_spec + 1, vocab] and applies the sampling
+  // transforms itself; callers must not pre-shape the logits. The
   // general-purpose Sampler never runs for verify steps.
   SampleOutput forward(const DraftProposal& draft_proposal,
-                       const torch::Tensor& target_logits) const;
+                       torch::Tensor target_logits) const;
 
   // `uniform_rand` is consumed in place (log'ed); `target_lse` is the
   // caller-computed row logsumexp of `target_logits`.
@@ -63,16 +64,13 @@ class RejectionSampler final {
   SampleOutput fill_logprob_outputs(SampleOutput output,
                                     const torch::Tensor& target_logits) const;
 
-  // whether to return logprobs
-  bool logprobs_ = false;
+  // [B, 1] row mask for torch::where over [B, ...] tensors. do_sample is [B];
+  // a bare [B] broadcasts as [1, B] and silently blows the where result up
+  // to [B, B], so every row-wise where must go through this accessor.
+  torch::Tensor row_sample_mask() const;
 
-  // max number of top logprobs in the batch
-  int64_t max_top_logprobs_ = 0;
-
-  // [batch_size]
-  torch::Tensor do_sample_;
-  bool all_random_sample_ = true;
-  bool all_greedy_sample_ = true;
+  // The request's sampling constraints, applied once inside forward().
+  SamplingParameters sampling_params_;
 };
 
 }  // namespace xllm

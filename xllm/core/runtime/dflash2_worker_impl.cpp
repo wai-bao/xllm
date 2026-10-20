@@ -63,15 +63,19 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
   SamplingParameters draft_sampling_params =
       input.sampling_params.to(draft_impl_->device(), torch::kFloat32);
   prepare_draft_sampling(draft_sampling_mode_, draft_sampling_params);
-  torch::Tensor gumbel_noise = sample_gumbel_noise(batch_size,
-                                                   num_speculative_tokens,
-                                                   selector_top_k,
-                                                   draft_sampling_params,
-                                                   draft_impl_->device());
-  // Cross-rank RNG divergence must not fork the sampled path: unify the noise
-  // once from rank 0.  The edge logits are TP-replicated, so identical noise
-  // yields identical argmax on every rank for all steps.
-  if (sampling_process_group_ != nullptr &&
+  // All-greedy batches skip the draw and the cross-rank consensus inside
+  // sample_gumbel_noise: the zeros are deterministic on every rank.
+  torch::Tensor gumbel_noise = sample_gumbel_noise(
+      num_speculative_tokens,
+      selector_top_k,
+      greedy_draft_rows(draft_sampling_params),
+      /*all_greedy=*/draft_sampling_params.all_greedy_sample,
+      draft_impl_->device());
+  // Cross-rank RNG divergence must not fork the sampled path: unify the
+  // noise once from rank 0.  The edge logits are TP-replicated, so identical
+  // noise yields identical argmax on every rank for all steps.
+  if (!draft_sampling_params.all_greedy_sample &&
+      sampling_process_group_ != nullptr &&
       sampling_process_group_->world_size() > 1) {
     gumbel_noise = gumbel_noise.contiguous();
     sampling_process_group_->broadcast(gumbel_noise, /*root_rank=*/0);
