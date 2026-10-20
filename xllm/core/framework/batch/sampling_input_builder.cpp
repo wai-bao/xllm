@@ -30,7 +30,6 @@ void SamplingInputBuilder::reserve(size_t rows) {
   params_.reserve(rows);
   sequences_.reserve(rows);
   selected_token_indices_.reserve(rows);
-  sample_indices_.reserve(rows);
   token_ids_.reserve(rows);
   token_counts_.reserve(rows);
   token_lengths_.reserve(rows);
@@ -40,14 +39,10 @@ void SamplingInputBuilder::append(const RequestSamplingParam* params,
                                   int32_t token_index,
                                   const TokenCounts* counts,
                                   const TokenCounts* excluded_counts,
-                                  bool sample,
                                   const Sequence* sequence) {
   CHECK(params != nullptr);
   CHECK_GE(token_index, 0);
   CHECK_LT(size(), std::numeric_limits<int32_t>::max());
-  if (sample) {
-    sample_indices_.emplace_back(static_cast<int32_t>(size()));
-  }
   params_.emplace_back(params);
   sequences_.emplace_back(sequence);
   selected_token_indices_.emplace_back(token_index);
@@ -77,14 +72,10 @@ void SamplingInputBuilder::merge(SamplingInputBuilder other,
                                  int32_t token_offset) {
   CHECK_GE(token_offset, 0);
   CHECK_LE(size() + other.size(), std::numeric_limits<int32_t>::max());
-  const int32_t row_offset = static_cast<int32_t>(size());
   reserve(size() + other.size());
   for (int32_t index : other.selected_token_indices_) {
     CHECK_LE(index, std::numeric_limits<int32_t>::max() - token_offset);
     selected_token_indices_.emplace_back(index + token_offset);
-  }
-  for (int32_t index : other.sample_indices_) {
-    sample_indices_.emplace_back(index + row_offset);
   }
   params_.insert(params_.end(), other.params_.begin(), other.params_.end());
   sequences_.insert(
@@ -109,20 +100,20 @@ SamplingParameters SamplingInputBuilder::build() {
   util::pad_2d_vector(token_counts_, /*pad_value=*/0);
   result.init(params_,
               selected_token_indices_,
-              sample_indices_,
               token_ids_,
               token_counts_,
               token_lengths_);
+  // Batch-scope derivations local to build(): these drive logits_bias/seeds
+  // materialization and must not outlive this function.
   bool need_constraints = false;
   bool need_seed = false;
   int64_t vocab_size = 0;
-  for (const auto* params : params_) {
-    need_constraints = need_constraints || !params->logit_bias.empty() ||
-                       params->allowed_token_ids.has_value() ||
-                       params->min_tokens > 0 ||
-                       !params->bad_words_token_ids.empty();
-    need_seed = need_seed || params->seed.has_value();
-    vocab_size = std::max(vocab_size, params->vocab_size);
+  for (const auto* p : params_) {
+    need_constraints = need_constraints || !p->logit_bias.empty() ||
+                       p->allowed_token_ids.has_value() || p->min_tokens > 0 ||
+                       !p->bad_words_token_ids.empty();
+    need_seed = need_seed || p->seed.has_value();
+    vocab_size = std::max(vocab_size, p->vocab_size);
   }
   if (need_constraints) {
     CHECK_GT(vocab_size, 0);

@@ -1060,7 +1060,6 @@ void ForwardInputBuilder::handle_sampling_parameters(Sequence* sequence,
       static_cast<int32_t>(state.flatten_tokens_vec.size() - 1),
       need_unique_tokens_ ? &sequence->token_to_count_map() : nullptr,
       /*excluded_counts=*/nullptr,
-      /*sample=*/true,
       sequence);
   if (enable_json_object_output_) {
     const JsonObjectGrammarState* json_state = sequence->json_object_state();
@@ -1397,36 +1396,6 @@ Input ForwardInputBuilder::state_to_forward_input() {
       return forward_input;
     }
     forward_input.json_object_states = std::move(state_.json_object_states);
-    std::vector<std::string> sample_sequence_ids =
-        std::move(state_.sample_sequence_ids);
-    std::vector<int32_t> sample_prior_output_rows =
-        std::move(state_.sample_prior_output_rows);
-    CHECK_EQ(sample_sequence_ids.size(),
-             forward_input.json_object_states.size());
-    CHECK_EQ(sample_prior_output_rows.size(),
-             forward_input.json_object_states.size());
-    if (state_.sampling.sample_indices().size() !=
-        forward_input.json_object_states.size()) {
-      std::vector<JsonObjectGrammarState> sampled_states;
-      sampled_states.reserve(state_.sampling.sample_indices().size());
-      std::vector<std::string> sampled_sequence_ids;
-      sampled_sequence_ids.reserve(state_.sampling.sample_indices().size());
-      std::vector<int32_t> sampled_prior_output_rows;
-      sampled_prior_output_rows.reserve(
-          state_.sampling.sample_indices().size());
-      for (const int32_t sample_idx : state_.sampling.sample_indices()) {
-        CHECK_GE(sample_idx, 0);
-        CHECK_LT(static_cast<size_t>(sample_idx),
-                 forward_input.json_object_states.size());
-        sampled_states.push_back(forward_input.json_object_states[sample_idx]);
-        sampled_sequence_ids.emplace_back(sample_sequence_ids[sample_idx]);
-        sampled_prior_output_rows.emplace_back(
-            sample_prior_output_rows[sample_idx]);
-      }
-      forward_input.json_object_states = std::move(sampled_states);
-      sample_sequence_ids = std::move(sampled_sequence_ids);
-      sample_prior_output_rows = std::move(sampled_prior_output_rows);
-    }
     const bool has_json_object_state =
         std::any_of(forward_input.json_object_states.begin(),
                     forward_input.json_object_states.end(),
@@ -1434,6 +1403,15 @@ Input ForwardInputBuilder::state_to_forward_input() {
                       return state.initialized();
                     });
     if (has_json_object_state) {
+      std::vector<std::string> sample_sequence_ids =
+          std::move(state_.sample_sequence_ids);
+      std::vector<int32_t> sample_prior_output_rows =
+          std::move(state_.sample_prior_output_rows);
+      // All three vectors are appended together per sequence.
+      CHECK_EQ(sample_sequence_ids.size(),
+               forward_input.json_object_states.size());
+      CHECK_EQ(sample_prior_output_rows.size(),
+               forward_input.json_object_states.size());
       forward_input.sampling_params.filter_bitmask =
           build_json_object_filter_bitmask(forward_input.json_object_states);
       // JSON rows use the compact packed mask. Keep the generic dense API

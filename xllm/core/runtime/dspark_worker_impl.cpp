@@ -155,7 +155,7 @@ DSparkWorkerImpl::DraftBlock DSparkWorkerImpl::sample_block(
       },
       [this, &sampling_params](torch::Tensor& tokens) {
         synchronize_sampled_token_ids(tokens,
-                                      sampling_params.all_greedy_sample);
+                                      sampling_params.all_greedy_sample());
       });
   const auto& token_ids = draft_block.proposal.token_ids();
 
