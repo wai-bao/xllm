@@ -16,9 +16,9 @@ limitations under the License.
 #include "core/runtime/speculative_worker_impl.h"
 
 #include "common/global_flags.h"
+#include "core/framework/batch/decode_row_builder.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_utils.h"
-#include "core/framework/speculative/spec_input_builder.h"
 #include "core/framework/speculative/verify_layout.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "runtime/llm_worker_impl.h"
@@ -296,14 +296,12 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
   input_builder::DecodeRowContext row_ctx =
       input_builder::make_decode_row_context(input);
 
-  Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   input_builder::ValidateRowPlan plan;
   plan.num_val_tokens = num_val_tokens;
   plan.block_size = block_size;
   plan.chunked_layout = use_chunked_spec_verify;
   input_builder::ValidateRowResult row_result =
-      input_builder::build_validate_rows(
-          row_ctx, tensor_slice(input.token_ids_host), kv_seq_lens, plan);
+      input_builder::build_validate_rows(row_ctx, plan);
   auto& buf = row_result.buf;
 
   input_builder::set_token_position_tensors(validate_input,
@@ -311,33 +309,8 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
                                             buf.out_positions,
                                             token_options,
                                             position_options);
-  // update the input_params
-  if (!use_chunked_spec_verify) {
-    input_params.meta.num_sequences = total_num_val_tokens;
-    input_params.meta.q_max_seq_len = 1;
-    input_params.meta.batch_forward_type = BatchForwardType::DECODE;
-  } else {
-    input_params.meta.q_max_seq_len = num_val_tokens;
-    input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
-  }
-  if (use_chunked_spec_verify) {
-    input_builder::update_input_params(input_params,
-                                       buf,
-                                       num_val_tokens,
-                                       std::move(row_result.atb_q_seq_lens),
-                                       std::move(row_result.atb_q_cu_seq_lens),
-                                       row_result.atb_kv_max_seq_len,
-                                       std::move(row_result.atb_kv_seq_lens));
-  } else {
-    input_builder::update_input_params(input_params,
-                                       buf,
-                                       1,
-                                       std::move(buf.out_q_seq_lens),
-                                       std::move(buf.out_q_cu_seq_lens),
-                                       buf.meta.kv_max_seq_len,
-                                       std::move(buf.out_kv_seq_lens),
-                                       /*update_block_tables=*/true);
-  }
+  input_builder::commit_validate_rows(
+      input_params, row_result, plan, total_num_val_tokens);
   input_params.attention.rebuild_device_buffer(device_);
 
   expand_sampling_params_for_verify(validate_input.sampling_params,

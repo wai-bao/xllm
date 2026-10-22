@@ -21,7 +21,7 @@ limitations under the License.
 #include <optional>
 #include <vector>
 
-#include "core/framework/batch/forward_input_builder.h"
+#include "core/framework/batch/decode_row_builder.h"
 #include "core/framework/model/mtp_topk_state.h"
 #include "core/framework/sampling/draft_proposal.h"
 #include "util/slice.h"

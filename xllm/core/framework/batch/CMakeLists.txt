@@ -23,6 +23,7 @@ cc_library(
     rec_batch_builder.h
     batch_factory.h
     rec_batch_factory.h
+    decode_row_builder.h
     forward_input_builder.h
     forward_input_factory.h
     vlm_forward_input_factory.h
@@ -50,6 +51,7 @@ cc_library(
     rec_batch_builder.cpp
     batch_factory.cpp
     rec_batch_factory.cpp
+    decode_row_builder.cpp
     forward_input_builder.cpp
     forward_input_factory.cpp
     vlm_forward_input_factory.cpp
@@ -65,6 +67,7 @@ cc_library(
     :eplb
     :request
     :runtime
+    :model
     :common
     :util
     :mposition

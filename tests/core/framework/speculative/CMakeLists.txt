@@ -53,7 +53,9 @@ cc_test(
   SRCS
     spec_input_builder_test.cpp
     "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/spec_input_builder.cpp"
+    "${PROJECT_SOURCE_DIR}/xllm/core/framework/batch/decode_row_builder.cpp"
   DEPS
+    :batch
     :multimodal
     :parallel_state
     :request

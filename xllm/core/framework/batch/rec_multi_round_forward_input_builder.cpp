@@ -27,6 +27,7 @@ limitations under the License.
 
 #include "core/common/global_flags.h"
 #include "core/common/metrics.h"
+#include "core/framework/batch/decode_row_builder.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/model/model_args.h"
@@ -34,7 +35,6 @@ limitations under the License.
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/sequences_group.h"
 #include "core/framework/sampling/sampling_params.h"
-#include "core/framework/speculative/spec_input_builder.h"
 #include "core/util/blocking_counter.h"
 #include "core/util/rec_model_utils.h"
 #include "core/util/slice.h"
@@ -43,14 +43,7 @@ limitations under the License.
 #include "core/util/utils.h"
 
 namespace xllm {
-namespace {
-
-std::vector<int32_t> build_q_cu_seq_lens_vec(
-    const std::vector<int32_t>& q_seq_lens) {
-  return input_builder::build_q_cu_seq_lens(q_seq_lens);
-}
-
-}  // namespace
+namespace {}  // namespace
 
 RecMultiRoundForwardInputBuilder::RecMultiRoundForwardInputBuilder(
     const BatchInputData& data,
@@ -304,7 +297,7 @@ RecForwardInput RecMultiRoundForwardInputBuilder::state_to_forward_input() {
   input_params.attention.device.q_seq_lens =
       torch::tensor(state.q_seq_lens, torch::kInt);
   std::vector<int32_t> q_cu_seq_lens =
-      build_q_cu_seq_lens_vec(state.q_seq_lens);
+      input_builder::build_q_cu_seq_lens(state.q_seq_lens);
   input_params.attention.device.q_cu_seq_lens =
       torch::tensor(q_cu_seq_lens, torch::kInt);
   input_params.attention.host.kv_seq_lens = std::move(state.seq_lens);

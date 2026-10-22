@@ -27,8 +27,8 @@ limitations under the License.
 #include <limits>
 
 #include "compiler/triton/include/jit_kernel.h"
+#include "framework/batch/decode_row_builder.h"
 #include "framework/config/kv_cache_config.h"
-#include "framework/speculative/spec_input_builder.h"
 #include "layers/common/attention_metadata_builder.h"
 #include "platform/device.h"
 #include "platform/platform.h"
@@ -1078,28 +1078,28 @@ TEST(Glm5NextKPoolIndexerTest,
       torch::tensor({{2, 1}, {3, 0}}, torch::kInt32);
   params.embedding.linear_state_indices = torch::tensor({1, 2}, torch::kInt32);
   params.linear_state_validity_mask = {1, 1};
-  const auto context = specBuilder::make_decode_row_context(input);
-  specBuilder::DecodeBuildBuffers buffers;
+  const auto context = input_builder::make_decode_row_context(input);
+  input_builder::DecodeBuildBuffers buffers;
   const std::vector<int32_t> query_lens{6, 3};
   for (int32_t seq = 0; seq < 2; ++seq) {
     for (int32_t offset = 0; offset < query_lens[seq]; ++offset) {
-      specBuilder::RowSpec row;
+      input_builder::RowSpec row;
       row.seq_id = seq;
       row.position_offset = offset;
       row.append_q_len_one = true;
       row.append_block_table = true;
-      specBuilder::append_decode_row(context, row, 16, buffers);
+      input_builder::append_decode_row(context, row, 16, buffers);
     }
   }
   params.meta.num_sequences = 9;
-  specBuilder::update_input_params(params,
-                                   buffers,
-                                   1,
-                                   std::move(buffers.out_q_seq_lens),
-                                   std::move(buffers.out_q_cu_seq_lens),
-                                   buffers.meta.kv_max_seq_len,
-                                   std::move(buffers.out_kv_seq_lens),
-                                   true);
+  input_builder::update_input_params(params,
+                                     buffers,
+                                     1,
+                                     std::move(buffers.out_q_seq_lens),
+                                     std::move(buffers.out_q_cu_seq_lens),
+                                     buffers.meta.kv_max_seq_len,
+                                     std::move(buffers.out_kv_seq_lens),
+                                     true);
   params.attention.host.kpool_query_lens = query_lens;
   params.enable_graph = false;
   params.attention.rebuild_device_buffer(device);

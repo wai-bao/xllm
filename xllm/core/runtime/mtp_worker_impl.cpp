@@ -1346,8 +1346,7 @@ void MTPWorkerImpl<TargetInput>::prepare_prefill_inputs(
     new_token_ids.emplace_back(extra_token_ids[i]);
   }
   prefill_input.runtime.device_tensors_ready = false;
-  prefill_input.token_ids_host =
-      input_builder::make_cpu_int_tensor(new_token_ids);
+  prefill_input.token_ids_host = make_pinned_cpu_tensor(new_token_ids);
   prefill_input.token_ids = safe_to(prefill_input.token_ids_host,
                                     prefill_input.positions.options(),
                                     /*non_blocking=*/true);
@@ -2587,8 +2586,8 @@ void MTPWorkerImpl<TargetInput>::update_decode_step_input(
     input_builder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
   }
 
-  input.token_ids_host = input_builder::make_cpu_int_tensor(token_ids_vec);
-  input.positions_host = input_builder::make_cpu_int_tensor(positions_vec);
+  input.token_ids_host = make_pinned_cpu_tensor(token_ids_vec);
+  input.positions_host = make_pinned_cpu_tensor(positions_vec);
   input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
   input.runtime.device_tensors_ready = false;
 }
@@ -2640,18 +2639,16 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
 #endif
   input_builder::DecodeRowContext row_ctx =
       input_builder::make_decode_row_context(input);
-  Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
-  Slice<int32_t> positions = tensor_slice(input.positions_host);
-  Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   const bool use_atb_spec_kernel =
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
       use_chunked_prefill_spec_verify_path();
   // Per-seq position/kv consistency check; row emission itself is the shared
   // width-parameterized builder.
   if (!positions_decoupled) {
+    const Slice<int32_t> positions = row_ctx.positions;
     for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
       const int32_t kv_len =
-          input_builder::calc_kv_len(kv_seq_lens, seq_id, /*offset=*/0);
+          input_builder::calc_kv_len(row_ctx.kv_seq_lens, seq_id, /*offset=*/0);
       CHECK_EQ(positions[seq_id] + 1, kv_len)
           << "validate position/kv_len mismatch, seq_id=" << seq_id
           << ", start_position=" << positions[seq_id] << ", kv_len=" << kv_len;
@@ -2663,7 +2660,7 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
   plan.chunked_layout = use_atb_spec_kernel;
   plan.step_major = uses_step_major_validate_layout();
   input_builder::ValidateRowResult row_result =
-      input_builder::build_validate_rows(row_ctx, token_ids, kv_seq_lens, plan);
+      input_builder::build_validate_rows(row_ctx, plan);
   auto& buf = row_result.buf;
 
   if (impl_->has_request_state_cache()) {
@@ -2679,30 +2676,8 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
                                               token_options,
                                               position_options);
   }
-  if (!use_atb_spec_kernel) {
-    input_params.meta.num_sequences = total_num_val_tokens;
-    input_params.meta.batch_forward_type = BatchForwardType::DECODE;
-  } else {
-    input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
-  }
-  if (use_atb_spec_kernel) {
-    input_builder::update_input_params(input_params,
-                                       buf,
-                                       num_val_tokens,
-                                       std::move(row_result.atb_q_seq_lens),
-                                       std::move(row_result.atb_q_cu_seq_lens),
-                                       row_result.atb_kv_max_seq_len,
-                                       std::move(row_result.atb_kv_seq_lens));
-  } else {
-    input_builder::update_input_params(input_params,
-                                       buf,
-                                       1,
-                                       std::move(buf.out_q_seq_lens),
-                                       std::move(buf.out_q_cu_seq_lens),
-                                       buf.meta.kv_max_seq_len,
-                                       std::move(buf.out_kv_seq_lens),
-                                       /*update_block_tables=*/true);
-  }
+  input_builder::commit_validate_rows(
+      input_params, row_result, plan, total_num_val_tokens);
 
   if (!input.json_object_states.empty()) {
     // Validation installs exact per-position JSON masks after the draft
@@ -3268,9 +3243,8 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_inputs(
       << "draft kv slots/positions mismatch";
 
   torch::TensorOptions position_options = input.positions.options();
-  set_positions_tensor(draft_input,
-                       input_builder::make_cpu_int_tensor(buf.out_positions),
-                       position_options);
+  set_positions_tensor(
+      draft_input, make_pinned_cpu_tensor(buf.out_positions), position_options);
   input_builder::update_input_params(
       input_params,
       buf,

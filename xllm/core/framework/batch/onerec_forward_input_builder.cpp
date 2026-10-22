@@ -26,10 +26,10 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include "core/framework/batch/decode_row_builder.h"
 #include "core/framework/model/rec_model_params.h"
 #include "core/framework/request/onerec_sequence.h"
 #include "core/framework/sampling/sampling_params.h"
-#include "core/framework/speculative/spec_input_builder.h"
 #include "core/util/tensor_helper.h"
 #include "core/util/threadpool.h"
 #include "core/util/utils.h"
@@ -43,11 +43,6 @@ namespace {
 // rows give per-task work in the tens of microseconds on aarch64.
 constexpr size_t kSequenceParallelGrain = 32;
 constexpr size_t kGroupParallelGrain = 16;
-
-std::vector<int32_t> build_q_cu_seq_lens_vec(
-    const std::vector<int32_t>& q_seq_lens) {
-  return input_builder::build_q_cu_seq_lens(q_seq_lens);
-}
 
 }  // namespace
 
@@ -555,7 +550,7 @@ RecForwardInput OneRecForwardInputBuilder::build_rec_forward_input(
                 q_cu_seq_lens.data(),
                 q_cu_seq_lens.size() * sizeof(int));
     std::vector<int32_t> device_q_cu_seq_lens =
-        build_q_cu_seq_lens_vec(q_cu_seq_lens);
+        input_builder::build_q_cu_seq_lens(q_cu_seq_lens);
     input_params.attention.device.q_cu_seq_lens =
         torch::tensor(device_q_cu_seq_lens,
                       torch::TensorOptions()
@@ -650,7 +645,7 @@ RecForwardInput OneRecForwardInputBuilder::build_rec_forward_input(
                 q_cu_seq_lens.size() * sizeof(int));
 
     std::vector<int32_t> device_q_cu_seq_lens =
-        build_q_cu_seq_lens_vec(q_cu_seq_lens);
+        input_builder::build_q_cu_seq_lens(q_cu_seq_lens);
     input_params.attention.device.q_cu_seq_lens =
         torch::tensor(device_q_cu_seq_lens,
                       torch::TensorOptions()

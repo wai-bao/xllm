@@ -30,6 +30,8 @@ namespace xllm {
 namespace specBuilder {
 namespace {
 
+using namespace input_builder;
+
 Slice<int32_t> to_slice(std::vector<int32_t>& vec) {
   return {vec.data(), static_cast<size_t>(vec.size())};
 }
