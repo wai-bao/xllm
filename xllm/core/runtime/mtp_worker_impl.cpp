@@ -2676,8 +2676,7 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
                                               token_options,
                                               position_options);
   }
-  input_builder::commit_validate_rows(
-      input_params, row_result, plan, total_num_val_tokens);
+  input_builder::commit_validate_rows(input_params, row_result, plan);
 
   if (!input.json_object_states.empty()) {
     // Validation installs exact per-position JSON masks after the draft

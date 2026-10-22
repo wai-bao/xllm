@@ -309,8 +309,7 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
                                             buf.out_positions,
                                             token_options,
                                             position_options);
-  input_builder::commit_validate_rows(
-      input_params, row_result, plan, total_num_val_tokens);
+  input_builder::commit_validate_rows(input_params, row_result, plan);
   input_params.attention.rebuild_device_buffer(device_);
 
   expand_sampling_params_for_verify(validate_input.sampling_params,

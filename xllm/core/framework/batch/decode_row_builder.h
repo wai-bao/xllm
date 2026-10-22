@@ -223,6 +223,7 @@ struct ValidateRowResult {
   std::vector<int32_t> chunked_q_cu_seq_lens;
   std::vector<int32_t> chunked_kv_seq_lens;
   int32_t chunked_kv_max_seq_len = 0;
+  int32_t total_num_val_tokens = 0;
 };
 
 struct ValidateRowPlan {
@@ -242,22 +243,19 @@ ValidateRowResult build_validate_rows(const DecodeRowContext& ctx,
 // of every build_validate_rows caller.
 void commit_validate_rows(LlmModelParams& input_params,
                           ValidateRowResult& row_result,
-                          const ValidateRowPlan& plan,
-                          int32_t total_num_val_tokens);
+                          const ValidateRowPlan& plan);
 void commit_validate_rows(VlmModelParams& input_params,
                           ValidateRowResult& row_result,
-                          const ValidateRowPlan& plan,
-                          int32_t total_num_val_tokens);
+                          const ValidateRowPlan& plan);
+void commit_validate_rows(ModelParamsView& input_params,
+                          ValidateRowResult& row_result,
+                          const ValidateRowPlan& plan);
 
 // Stages token_ids/positions into both the host and device tensors of
 // LlmForwardInput/VlmForwardInput with async H2D copies, toggling
 // device_tensors_ready around the write.
-void set_token_position_tensors(LlmForwardInput& input,
-                                const std::vector<int32_t>& token_ids,
-                                const std::vector<int32_t>& positions,
-                                const torch::TensorOptions& token_options,
-                                const torch::TensorOptions& position_options);
-void set_token_position_tensors(VlmForwardInput& input,
+template <typename Input>
+void set_token_position_tensors(Input& input,
                                 const std::vector<int32_t>& token_ids,
                                 const std::vector<int32_t>& positions,
                                 const torch::TensorOptions& token_options,

@@ -18,7 +18,6 @@ limitations under the License.
 
 #include <glog/logging.h>
 
-#include <algorithm>
 #include <limits>
 
 #include "core/framework/model/model_params_view.h"
@@ -465,7 +464,8 @@ void update_input_params(VlmModelParams& input_params,
                       update_block_tables);
 }
 
-void set_token_position_tensors(LlmForwardInput& input,
+template <typename Input>
+void set_token_position_tensors(Input& input,
                                 const std::vector<int32_t>& token_ids,
                                 const std::vector<int32_t>& positions,
                                 const torch::TensorOptions& token_options,
@@ -480,20 +480,16 @@ void set_token_position_tensors(LlmForwardInput& input,
   input.runtime.device_tensors_ready = true;
 }
 
-void set_token_position_tensors(VlmForwardInput& input,
-                                const std::vector<int32_t>& token_ids,
-                                const std::vector<int32_t>& positions,
-                                const torch::TensorOptions& token_options,
-                                const torch::TensorOptions& position_options) {
-  input.runtime.device_tensors_ready = false;
-  input.token_ids_host = make_pinned_cpu_tensor(token_ids);
-  input.positions_host = make_pinned_cpu_tensor(positions);
-  input.token_ids =
-      safe_to(input.token_ids_host, token_options, /*non_blocking=*/true);
-  input.positions =
-      safe_to(input.positions_host, position_options, /*non_blocking=*/true);
-  input.runtime.device_tensors_ready = true;
-}
+template void set_token_position_tensors(LlmForwardInput&,
+                                         const std::vector<int32_t>&,
+                                         const std::vector<int32_t>&,
+                                         const torch::TensorOptions&,
+                                         const torch::TensorOptions&);
+template void set_token_position_tensors(VlmForwardInput&,
+                                         const std::vector<int32_t>&,
+                                         const std::vector<int32_t>&,
+                                         const torch::TensorOptions&,
+                                         const torch::TensorOptions&);
 
 ValidateRowResult build_validate_rows(const DecodeRowContext& ctx,
                                       const ValidateRowPlan& plan) {
@@ -501,6 +497,7 @@ ValidateRowResult build_validate_rows(const DecodeRowContext& ctx,
   const int32_t num_val_tokens = plan.num_val_tokens;
   const int32_t total = num_sequences * num_val_tokens;
   ValidateRowResult result;
+  result.total_num_val_tokens = total;
   auto& buf = result.buf;
   buf.out_token_ids.reserve(total);
   buf.out_positions.reserve(total);
@@ -562,12 +559,10 @@ ValidateRowResult build_validate_rows(const DecodeRowContext& ctx,
 
 void commit_validate_rows(ModelParamsView& input_params,
                           ValidateRowResult& row_result,
-                          const ValidateRowPlan& plan,
-                          int32_t total_num_val_tokens) {
+                          const ValidateRowPlan& plan) {
   auto& buf = row_result.buf;
   if (!plan.chunked_layout) {
-    input_params.meta.num_sequences = total_num_val_tokens;
-    input_params.meta.q_max_seq_len = 1;
+    input_params.meta.num_sequences = row_result.total_num_val_tokens;
     input_params.meta.batch_forward_type = BatchForwardType::DECODE;
     update_input_params(input_params,
                         buf,
@@ -578,7 +573,6 @@ void commit_validate_rows(ModelParamsView& input_params,
                         std::move(buf.out_kv_seq_lens),
                         /*update_block_tables=*/true);
   } else {
-    input_params.meta.q_max_seq_len = plan.num_val_tokens;
     input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
     update_input_params(input_params,
                         buf,
@@ -592,20 +586,16 @@ void commit_validate_rows(ModelParamsView& input_params,
 
 void commit_validate_rows(LlmModelParams& input_params,
                           ValidateRowResult& row_result,
-                          const ValidateRowPlan& plan,
-                          int32_t total_num_val_tokens) {
+                          const ValidateRowPlan& plan) {
   ModelParamsView input_params_view(input_params);
-  commit_validate_rows(
-      input_params_view, row_result, plan, total_num_val_tokens);
+  commit_validate_rows(input_params_view, row_result, plan);
 }
 
 void commit_validate_rows(VlmModelParams& input_params,
                           ValidateRowResult& row_result,
-                          const ValidateRowPlan& plan,
-                          int32_t total_num_val_tokens) {
+                          const ValidateRowPlan& plan) {
   ModelParamsView input_params_view(input_params);
-  commit_validate_rows(
-      input_params_view, row_result, plan, total_num_val_tokens);
+  commit_validate_rows(input_params_view, row_result, plan);
 }
 
 int32_t calc_slot_id(int32_t position,

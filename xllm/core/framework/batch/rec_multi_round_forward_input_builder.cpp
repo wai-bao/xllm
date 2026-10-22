@@ -43,7 +43,6 @@ limitations under the License.
 #include "core/util/utils.h"
 
 namespace xllm {
-namespace {}  // namespace
 
 RecMultiRoundForwardInputBuilder::RecMultiRoundForwardInputBuilder(
     const BatchInputData& data,
