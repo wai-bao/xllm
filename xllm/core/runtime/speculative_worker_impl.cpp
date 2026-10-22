@@ -216,22 +216,22 @@ SpeculativeWorkerImpl<TargetInput>::update_input_by_last_step_output(
     last_step_decode_num = last_step_output_.sample_output.next_tokens.size(1);
   }
 
-  specBuilder::DecodeBuildBuffers buf;
+  input_builder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(num_sequences);
   buf.out_positions.reserve(num_sequences);
   buf.out_kv_seq_lens.reserve(num_sequences);
   buf.out_new_cache_slots.reserve(num_sequences);
-  specBuilder::DecodeRowContext row_ctx =
-      specBuilder::make_decode_row_context(inputs);
+  input_builder::DecodeRowContext row_ctx =
+      input_builder::make_decode_row_context(inputs);
 
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    specBuilder::append_decode_row_from_last_step(row_ctx,
-                                                  seq_id,
-                                                  token_ids[seq_id],
-                                                  last_tokens_ids_slice,
-                                                  last_step_decode_num,
-                                                  block_size,
-                                                  buf);
+    input_builder::append_decode_row_from_last_step(row_ctx,
+                                                    seq_id,
+                                                    token_ids[seq_id],
+                                                    last_tokens_ids_slice,
+                                                    last_step_decode_num,
+                                                    block_size,
+                                                    buf);
   }
 
   CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_token_ids.size())
@@ -239,11 +239,11 @@ SpeculativeWorkerImpl<TargetInput>::update_input_by_last_step_output(
   CHECK_EQ(buf.out_positions.size(), buf.out_token_ids.size())
       << "step-update positions/tokens mismatch";
 
-  specBuilder::set_token_position_tensors(new_inputs,
-                                          buf.out_token_ids,
-                                          buf.out_positions,
-                                          inputs.token_ids.options(),
-                                          inputs.positions.options());
+  input_builder::set_token_position_tensors(new_inputs,
+                                            buf.out_token_ids,
+                                            buf.out_positions,
+                                            inputs.token_ids.options(),
+                                            inputs.positions.options());
   // update the input_params
   input_params.meta.kv_max_seq_len = buf.meta.kv_max_seq_len;
   input_params.attention.host.kv_seq_lens = std::move(buf.out_kv_seq_lens);
@@ -293,64 +293,24 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
   const bool use_chunked_spec_verify =
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
       input.input_params.is_spec_verify;
-  specBuilder::DecodeRowContext row_ctx =
-      specBuilder::make_decode_row_context(input);
+  input_builder::DecodeRowContext row_ctx =
+      input_builder::make_decode_row_context(input);
 
-  Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
-  specBuilder::DecodeBuildBuffers buf;
-  buf.out_token_ids.reserve(total_num_val_tokens);
-  buf.out_positions.reserve(total_num_val_tokens);
-  buf.out_new_cache_slots.reserve(total_num_val_tokens);
-  if (!use_chunked_spec_verify) {
-    buf.out_kv_seq_lens.reserve(total_num_val_tokens);
-    buf.out_q_seq_lens.reserve(total_num_val_tokens);
-    buf.out_q_cu_seq_lens.reserve(total_num_val_tokens);
-    buf.reserve_row_buffers(static_cast<size_t>(total_num_val_tokens),
-                            row_ctx.block_table_stride);
-  }
+  input_builder::ValidateRowPlan plan;
+  plan.num_val_tokens = num_val_tokens;
+  plan.block_size = block_size;
+  plan.chunked_layout = use_chunked_spec_verify;
+  input_builder::ValidateRowResult row_result =
+      input_builder::build_validate_rows(
+          row_ctx, tensor_slice(input.token_ids_host), kv_seq_lens, plan);
+  auto& buf = row_result.buf;
 
-  std::vector<int32_t> atb_kv_seq_lens_vec = {};
-  std::vector<int32_t> atb_q_seq_lens_vec = {};
-  std::vector<int32_t> atb_q_cu_seq_lens_vec = {};
-  int32_t atb_kv_max_seq_len = 0;
-  for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    int32_t kv_len =
-        specBuilder::calc_kv_len(kv_seq_lens, seq_id, /*offset=*/0);
-    for (int32_t val_idx = 0; val_idx < num_val_tokens; ++val_idx) {
-      specBuilder::RowSpec row;
-      row.seq_id = seq_id;
-      if (val_idx == 0) {
-        row.token_id = token_ids[seq_id];
-      } else {
-        row.token_id = -val_idx;
-      }
-      row.position_offset = val_idx;
-      row.append_kv_len = !use_chunked_spec_verify;
-      row.append_q_len_one = !use_chunked_spec_verify;
-      row.append_block_table = !use_chunked_spec_verify;
-      specBuilder::append_decode_row(row_ctx, row, block_size, buf);
-    }
-
-    if (use_chunked_spec_verify) {
-      const int32_t kv_len_after_validation = kv_len + num_speculative_tokens;
-      specBuilder::update_kv_seq_lens_and_max(
-          atb_kv_seq_lens_vec, kv_len_after_validation, atb_kv_max_seq_len);
-      specBuilder::append_q_seq_len(
-          atb_q_seq_lens_vec, atb_q_cu_seq_lens_vec, num_val_tokens);
-    }
-  }
-
-  CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_token_ids.size())
-      << "validate kv slots/tokens mismatch";
-  CHECK_EQ(buf.out_positions.size(), buf.out_token_ids.size())
-      << "validate positions/tokens mismatch";
-
-  specBuilder::set_token_position_tensors(validate_input,
-                                          buf.out_token_ids,
-                                          buf.out_positions,
-                                          token_options,
-                                          position_options);
+  input_builder::set_token_position_tensors(validate_input,
+                                            buf.out_token_ids,
+                                            buf.out_positions,
+                                            token_options,
+                                            position_options);
   // update the input_params
   if (!use_chunked_spec_verify) {
     input_params.meta.num_sequences = total_num_val_tokens;
@@ -361,22 +321,22 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
     input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
   }
   if (use_chunked_spec_verify) {
-    specBuilder::update_input_params(input_params,
-                                     buf,
-                                     num_val_tokens,
-                                     std::move(atb_q_seq_lens_vec),
-                                     std::move(atb_q_cu_seq_lens_vec),
-                                     atb_kv_max_seq_len,
-                                     std::move(atb_kv_seq_lens_vec));
+    input_builder::update_input_params(input_params,
+                                       buf,
+                                       num_val_tokens,
+                                       std::move(row_result.atb_q_seq_lens),
+                                       std::move(row_result.atb_q_cu_seq_lens),
+                                       row_result.atb_kv_max_seq_len,
+                                       std::move(row_result.atb_kv_seq_lens));
   } else {
-    specBuilder::update_input_params(input_params,
-                                     buf,
-                                     1,
-                                     std::move(buf.out_q_seq_lens),
-                                     std::move(buf.out_q_cu_seq_lens),
-                                     buf.meta.kv_max_seq_len,
-                                     std::move(buf.out_kv_seq_lens),
-                                     /*update_block_tables=*/true);
+    input_builder::update_input_params(input_params,
+                                       buf,
+                                       1,
+                                       std::move(buf.out_q_seq_lens),
+                                       std::move(buf.out_q_cu_seq_lens),
+                                       buf.meta.kv_max_seq_len,
+                                       std::move(buf.out_kv_seq_lens),
+                                       /*update_block_tables=*/true);
   }
   input_params.attention.rebuild_device_buffer(device_);
 

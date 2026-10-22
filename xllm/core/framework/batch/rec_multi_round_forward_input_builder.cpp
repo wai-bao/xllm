@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/sequences_group.h"
 #include "core/framework/sampling/sampling_params.h"
+#include "core/framework/speculative/spec_input_builder.h"
 #include "core/util/blocking_counter.h"
 #include "core/util/rec_model_utils.h"
 #include "core/util/slice.h"
@@ -46,23 +47,7 @@ namespace {
 
 std::vector<int32_t> build_q_cu_seq_lens_vec(
     const std::vector<int32_t>& q_seq_lens) {
-  std::vector<int32_t> q_cu_seq_lens;
-  if (q_seq_lens.empty()) {
-    return q_cu_seq_lens;
-  }
-#if defined(USE_NPU)
-  q_cu_seq_lens.reserve(q_seq_lens.size());
-  int32_t cum_seq_len = 0;
-  for (int32_t q_len : q_seq_lens) {
-    cum_seq_len += q_len;
-    q_cu_seq_lens.emplace_back(cum_seq_len);
-  }
-#else
-  CHECK(q_seq_lens.front() == 0)
-      << "q_seq_lens must be cumulative with leading zero";
-  q_cu_seq_lens.assign(q_seq_lens.begin() + 1, q_seq_lens.end());
-#endif
-  return q_cu_seq_lens;
+  return input_builder::build_q_cu_seq_lens(q_seq_lens);
 }
 
 }  // namespace

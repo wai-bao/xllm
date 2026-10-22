@@ -190,7 +190,7 @@ void build_query_rows(const LlmForwardInput& input,
                       int32_t block_size,
                       bool sample_from_anchor,
                       bool use_block_parallel_rows,
-                      specBuilder::DecodeBuildBuffers& buf,
+                      input_builder::DecodeBuildBuffers& buf,
                       std::vector<int32_t>& selected_idxes) {
   const int32_t num_sequences = input.input_params.meta.num_sequences;
   // DFlash: (1 + N) block — slot 0 is the un-selected anchor (real token), the
@@ -199,8 +199,8 @@ void build_query_rows(const LlmForwardInput& input,
   // (predicts the first draft token), positions 1..N-1 are masks.
   const int32_t query_width = dflash_detail::decode_draft_width(
       num_speculative_tokens, sample_from_anchor);
-  specBuilder::DecodeRowContext row_ctx =
-      specBuilder::make_decode_row_context(input);
+  input_builder::DecodeRowContext row_ctx =
+      input_builder::make_decode_row_context(input);
   if (use_block_parallel_rows) {
     CHECK(sample_from_anchor)
         << "block-parallel rows require DSpark anchor sampling";
@@ -222,7 +222,7 @@ void build_query_rows(const LlmForwardInput& input,
 
   selected_idxes.reserve(num_sequences * query_width);
 
-  specBuilder::RowSpec row_template;
+  input_builder::RowSpec row_template;
   row_template.append_kv_len = use_block_parallel_rows;
   row_template.kv_len_offset =
       use_block_parallel_rows ? std::make_optional<int32_t>(query_width - 1)
@@ -232,11 +232,11 @@ void build_query_rows(const LlmForwardInput& input,
 
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
     for (int32_t query_idx = 0; query_idx < query_width; ++query_idx) {
-      specBuilder::RowSpec row = row_template;
+      input_builder::RowSpec row = row_template;
       row.seq_id = seq_id;
       row.token_id = query_idx == 0 ? token_ids[seq_id] : mask_token_id;
       row.position_offset = query_idx;
-      specBuilder::append_decode_row(row_ctx, row, block_size, buf);
+      input_builder::append_decode_row(row_ctx, row, block_size, buf);
       // DFlash skips slot 0 (anchor, not sampled); DSpark samples every slot.
       if (sample_from_anchor || query_idx > 0) {
         selected_idxes.emplace_back(seq_id * query_width + query_idx);
@@ -246,7 +246,7 @@ void build_query_rows(const LlmForwardInput& input,
     if (use_block_parallel_rows) {
       continue;
     }
-    specBuilder::append_q_seq_len(
+    input_builder::append_q_seq_len(
         buf.out_q_seq_lens, buf.out_q_cu_seq_lens, query_width);
     // kv_len must cover exactly this block's max absolute position (anchor +
     // query_width - 1), not a fixed anchor + num_speculative_tokens: DFlash's
@@ -254,12 +254,12 @@ void build_query_rows(const LlmForwardInput& input,
     // the max position by different amounts, and using num_speculative_tokens
     // unconditionally overshoots by one slot for DSpark, exposing an
     // uninitialized cache slot to this block's non-causal attention.
-    const int32_t kv_len =
-        specBuilder::calc_kv_len(input.input_params.attention.host.kv_seq_lens,
-                                 seq_id,
-                                 /*offset=*/0) +
-        (query_width - 1);
-    specBuilder::update_kv_seq_lens_and_max(
+    const int32_t kv_len = input_builder::calc_kv_len(
+                               input.input_params.attention.host.kv_seq_lens,
+                               seq_id,
+                               /*offset=*/0) +
+                           (query_width - 1);
+    input_builder::update_kv_seq_lens_and_max(
         buf.out_kv_seq_lens, kv_len, buf.meta.kv_max_seq_len);
   }
 }
@@ -268,14 +268,14 @@ std::vector<int64_t> build_accepted_context_rows(
     const LlmForwardInput& input,
     const torch::Tensor& accepted_tokens_cpu,
     int32_t block_size,
-    specBuilder::DecodeBuildBuffers& buf) {
+    input_builder::DecodeBuildBuffers& buf) {
   const int32_t batch_size = static_cast<int32_t>(accepted_tokens_cpu.size(0));
   const int32_t token_width = static_cast<int32_t>(accepted_tokens_cpu.size(1));
   CHECK_EQ(input.input_params.meta.num_sequences, batch_size)
       << "DFlash accepted token batch mismatch.";
 
-  specBuilder::DecodeRowContext row_ctx =
-      specBuilder::make_decode_row_context(input);
+  input_builder::DecodeRowContext row_ctx =
+      input_builder::make_decode_row_context(input);
   std::vector<int64_t> accepted_idxes;
   accepted_idxes.reserve(static_cast<size_t>(accepted_tokens_cpu.numel()));
   buf.out_positions.reserve(buf.out_positions.size() +
@@ -293,12 +293,12 @@ std::vector<int64_t> build_accepted_context_rows(
         break;
       }
 
-      specBuilder::RowSpec row;
+      input_builder::RowSpec row;
       row.seq_id = seq_id;
       row.position_offset = token_idx;
       row.append_token = false;
       row.append_kv_len = false;
-      specBuilder::append_decode_row(row_ctx, row, block_size, buf);
+      input_builder::append_decode_row(row_ctx, row, block_size, buf);
       accepted_idxes.emplace_back(row_offset + token_idx);
     }
   }
@@ -663,8 +663,8 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_prefill(
         processed_target_input.input_params.attention.device.new_cache_slots;
     if (!processed_target_input.input_params.multi_block_tables.empty()) {
       const std::vector<int32_t> grouped_swa_slots =
-          specBuilder::build_grouped_prefill_swa_slots(processed_target_input,
-                                                       options_.block_size());
+          input_builder::build_grouped_prefill_swa_slots(processed_target_input,
+                                                         options_.block_size());
       c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
       context_cache_slots =
           async_h2d_tensor(grouped_swa_slots, device_.unwrap());
@@ -906,7 +906,7 @@ void DFlashWorkerImpl::update_decode_step_input(
     const int32_t position_offset =
         use_cache_correction ? state.position_offset : 0;
     const int32_t current_position = input_positions[seq_id] + position_offset;
-    const int32_t current_kv_len = specBuilder::calc_kv_len(
+    const int32_t current_kv_len = input_builder::calc_kv_len(
         input.input_params.attention.host.kv_seq_lens, seq_id, position_offset);
     const int32_t expected_kv_len = current_position + 1;
 
@@ -918,11 +918,11 @@ void DFlashWorkerImpl::update_decode_step_input(
     token_ids_vec.emplace_back(rewrite_fake_token ? state.token_id
                                                   : input_token_id);
     positions_vec.emplace_back(current_position);
-    specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
+    input_builder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
   }
 
-  input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
+  input.token_ids_host = input_builder::make_cpu_int_tensor(token_ids_vec);
+  input.positions_host = input_builder::make_cpu_int_tensor(positions_vec);
   input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
   input.runtime.device_tensors_ready = false;
 }
@@ -983,7 +983,7 @@ void DFlashWorkerImpl::prepare_query_inputs(const LlmForwardInput& input,
   input_params.embedding.input_embedding = torch::Tensor();
   dflash_detail::invalidate_draft_model_geometry(input_params);
 
-  specBuilder::DecodeBuildBuffers buf;
+  input_builder::DecodeBuildBuffers buf;
   std::vector<int32_t> selected_idxes;
   const bool use_block_parallel_rows = draft_use_block_parallel_rows();
   build_query_rows(input,
@@ -1006,24 +1006,24 @@ void DFlashWorkerImpl::prepare_query_inputs(const LlmForwardInput& input,
       << "DFlash per-seq row count must be uniform (query_width=" << query_width
       << ", num_sequences=" << num_sequences_query << ")";
 
-  specBuilder::set_token_position_tensors(query_input,
-                                          buf.out_token_ids,
-                                          buf.out_positions,
-                                          input.token_ids.options(),
-                                          input.positions.options());
+  input_builder::set_token_position_tensors(query_input,
+                                            buf.out_token_ids,
+                                            buf.out_positions,
+                                            input.token_ids.options(),
+                                            input.positions.options());
   input_params.meta.batch_forward_type = draft_batch_forward_type();
   if (use_block_parallel_rows) {
     expand_block_parallel_sequence_rows(input_params, query_width);
   }
-  specBuilder::update_input_params(input_params,
-                                   buf,
-                                   use_block_parallel_rows ? 1 : query_width,
-                                   std::move(buf.out_q_seq_lens),
-                                   std::move(buf.out_q_cu_seq_lens),
-                                   buf.meta.kv_max_seq_len,
-                                   std::move(buf.out_kv_seq_lens),
-                                   /*update_block_tables=*/
-                                   use_block_parallel_rows);
+  input_builder::update_input_params(input_params,
+                                     buf,
+                                     use_block_parallel_rows ? 1 : query_width,
+                                     std::move(buf.out_q_seq_lens),
+                                     std::move(buf.out_q_cu_seq_lens),
+                                     buf.meta.kv_max_seq_len,
+                                     std::move(buf.out_kv_seq_lens),
+                                     /*update_block_tables=*/
+                                     use_block_parallel_rows);
   scale_speculative_parallel_token_counts(input_params, query_width);
   if (sample_from_anchor() && !use_block_parallel_rows &&
       ModelConfig::is_python_model_impl(context_.get_model_impl())) {
@@ -1136,7 +1136,7 @@ void DFlashWorkerImpl::write_target_context_to_cache(
   CHECK_EQ(accepted_embeddings.size(1), token_width)
       << "DFlash accepted token/embedding width mismatch.";
 
-  specBuilder::DecodeBuildBuffers buf;
+  input_builder::DecodeBuildBuffers buf;
   std::vector<int64_t> accepted_idxes = build_accepted_context_rows(
       input, accepted_tokens, options_.block_size(), buf);
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();

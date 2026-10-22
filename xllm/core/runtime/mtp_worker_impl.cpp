@@ -1347,7 +1347,7 @@ void MTPWorkerImpl<TargetInput>::prepare_prefill_inputs(
   }
   prefill_input.runtime.device_tensors_ready = false;
   prefill_input.token_ids_host =
-      specBuilder::make_cpu_int_tensor(new_token_ids);
+      input_builder::make_cpu_int_tensor(new_token_ids);
   prefill_input.token_ids = safe_to(prefill_input.token_ids_host,
                                     prefill_input.positions.options(),
                                     /*non_blocking=*/true);
@@ -2520,7 +2520,7 @@ void MTPWorkerImpl<TargetInput>::update_decode_step_input(
     const int32_t position_offset =
         use_cache_correction ? state.position_offset : 0;
     int32_t current_position = input_positions[seq_id] + position_offset;
-    int32_t current_kv_len = specBuilder::calc_kv_len(
+    int32_t current_kv_len = input_builder::calc_kv_len(
         input.input_params.attention.host.kv_seq_lens, seq_id, position_offset);
     int32_t expected_kv_len =
         positions_decoupled ? current_kv_len : current_position + 1;
@@ -2584,11 +2584,11 @@ void MTPWorkerImpl<TargetInput>::update_decode_step_input(
                                    ? state.token_id
                                    : input_token_id);
     positions_vec.emplace_back(current_position);
-    specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
+    input_builder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
   }
 
-  input.token_ids_host = specBuilder::make_cpu_int_tensor(token_ids_vec);
-  input.positions_host = specBuilder::make_cpu_int_tensor(positions_vec);
+  input.token_ids_host = input_builder::make_cpu_int_tensor(token_ids_vec);
+  input.positions_host = input_builder::make_cpu_int_tensor(positions_vec);
   input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
   input.runtime.device_tensors_ready = false;
 }
@@ -2638,77 +2638,33 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
 #else
   const bool use_explicit_spec_verify_replay_update = false;
 #endif
-  specBuilder::DecodeRowContext row_ctx =
-      specBuilder::make_decode_row_context(input);
+  input_builder::DecodeRowContext row_ctx =
+      input_builder::make_decode_row_context(input);
   Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
   Slice<int32_t> positions = tensor_slice(input.positions_host);
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   const bool use_atb_spec_kernel =
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
       use_chunked_prefill_spec_verify_path();
-  specBuilder::DecodeBuildBuffers buf;
-  buf.out_token_ids.reserve(total_num_val_tokens);
-  buf.out_positions.reserve(total_num_val_tokens);
-  buf.out_new_cache_slots.reserve(total_num_val_tokens);
-  if (!use_atb_spec_kernel) {
-    buf.out_kv_seq_lens.reserve(total_num_val_tokens);
-    buf.out_q_seq_lens.reserve(total_num_val_tokens);
-    buf.out_q_cu_seq_lens.reserve(total_num_val_tokens);
-    buf.reserve_row_buffers(static_cast<size_t>(total_num_val_tokens),
-                            row_ctx.block_table_stride);
-  }
-
-  std::vector<int32_t> atb_kv_seq_lens_vec;
-  std::vector<int32_t> atb_q_seq_lens_vec;
-  std::vector<int32_t> atb_q_cu_seq_lens_vec;
-  int32_t atb_kv_max_seq_len = 0;
-  const bool step_major_validate_layout = uses_step_major_validate_layout();
-  for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    const int32_t start_position = positions[seq_id];
-    const int32_t kv_len =
-        specBuilder::calc_kv_len(kv_seq_lens, seq_id, /*offset=*/0);
-    if (!positions_decoupled) {
-      CHECK_EQ(start_position + 1, kv_len)
-          << "validate position/kv_len mismatch, seq_id=" << seq_id
-          << ", start_position=" << start_position << ", kv_len=" << kv_len;
-    }
-
-    if (use_atb_spec_kernel) {
-      const int32_t kv_len_after_validation =
-          kv_len + options_.num_speculative_tokens();
-      specBuilder::update_kv_seq_lens_and_max(
-          atb_kv_seq_lens_vec, kv_len_after_validation, atb_kv_max_seq_len);
-      specBuilder::append_q_seq_len(
-          atb_q_seq_lens_vec, atb_q_cu_seq_lens_vec, num_val_tokens);
-    }
-  }
-  if (step_major_validate_layout) {
-    for (int32_t val_idx = 0; val_idx < num_val_tokens; ++val_idx) {
-      for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-        specBuilder::RowSpec row;
-        row.seq_id = seq_id;
-        row.token_id = val_idx == 0 ? token_ids[seq_id] : -val_idx;
-        row.position_offset = val_idx;
-        row.append_kv_len = true;
-        row.append_q_len_one = true;
-        row.append_block_table = true;
-        specBuilder::append_decode_row(row_ctx, row, logical_block_size, buf);
-      }
-    }
-  } else {
+  // Per-seq position/kv consistency check; row emission itself is the shared
+  // width-parameterized builder.
+  if (!positions_decoupled) {
     for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-      for (int32_t val_idx = 0; val_idx < num_val_tokens; ++val_idx) {
-        specBuilder::RowSpec row;
-        row.seq_id = seq_id;
-        row.token_id = val_idx == 0 ? token_ids[seq_id] : -val_idx;
-        row.position_offset = val_idx;
-        row.append_kv_len = !use_atb_spec_kernel;
-        row.append_q_len_one = !use_atb_spec_kernel;
-        row.append_block_table = !use_atb_spec_kernel;
-        specBuilder::append_decode_row(row_ctx, row, logical_block_size, buf);
-      }
+      const int32_t kv_len =
+          input_builder::calc_kv_len(kv_seq_lens, seq_id, /*offset=*/0);
+      CHECK_EQ(positions[seq_id] + 1, kv_len)
+          << "validate position/kv_len mismatch, seq_id=" << seq_id
+          << ", start_position=" << positions[seq_id] << ", kv_len=" << kv_len;
     }
   }
+  input_builder::ValidateRowPlan plan;
+  plan.num_val_tokens = num_val_tokens;
+  plan.block_size = logical_block_size;
+  plan.chunked_layout = use_atb_spec_kernel;
+  plan.step_major = uses_step_major_validate_layout();
+  input_builder::ValidateRowResult row_result =
+      input_builder::build_validate_rows(row_ctx, token_ids, kv_seq_lens, plan);
+  auto& buf = row_result.buf;
 
   if (impl_->has_request_state_cache()) {
     input_params.attention.host.kpool_query_lens =
@@ -2716,17 +2672,12 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
     input_params.is_spec_verify = true;
   }
 
-  CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_token_ids.size())
-      << "validate kv slots/tokens mismatch";
-  CHECK_EQ(buf.out_positions.size(), buf.out_token_ids.size())
-      << "validate positions/tokens mismatch";
-
   if (!use_explicit_spec_verify_replay_update) {
-    specBuilder::set_token_position_tensors(validate_input,
-                                            buf.out_token_ids,
-                                            buf.out_positions,
-                                            token_options,
-                                            position_options);
+    input_builder::set_token_position_tensors(validate_input,
+                                              buf.out_token_ids,
+                                              buf.out_positions,
+                                              token_options,
+                                              position_options);
   }
   if (!use_atb_spec_kernel) {
     input_params.meta.num_sequences = total_num_val_tokens;
@@ -2735,22 +2686,22 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
     input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
   }
   if (use_atb_spec_kernel) {
-    specBuilder::update_input_params(input_params,
-                                     buf,
-                                     num_val_tokens,
-                                     std::move(atb_q_seq_lens_vec),
-                                     std::move(atb_q_cu_seq_lens_vec),
-                                     atb_kv_max_seq_len,
-                                     std::move(atb_kv_seq_lens_vec));
+    input_builder::update_input_params(input_params,
+                                       buf,
+                                       num_val_tokens,
+                                       std::move(row_result.atb_q_seq_lens),
+                                       std::move(row_result.atb_q_cu_seq_lens),
+                                       row_result.atb_kv_max_seq_len,
+                                       std::move(row_result.atb_kv_seq_lens));
   } else {
-    specBuilder::update_input_params(input_params,
-                                     buf,
-                                     1,
-                                     std::move(buf.out_q_seq_lens),
-                                     std::move(buf.out_q_cu_seq_lens),
-                                     buf.meta.kv_max_seq_len,
-                                     std::move(buf.out_kv_seq_lens),
-                                     /*update_block_tables=*/true);
+    input_builder::update_input_params(input_params,
+                                       buf,
+                                       1,
+                                       std::move(buf.out_q_seq_lens),
+                                       std::move(buf.out_q_cu_seq_lens),
+                                       buf.meta.kv_max_seq_len,
+                                       std::move(buf.out_kv_seq_lens),
+                                       /*update_block_tables=*/true);
   }
 
   if (!input.json_object_states.empty()) {
@@ -3056,13 +3007,13 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_extend_inputs(
                    }));
 
   const int32_t logical_block_size = this->logical_block_size();
-  specBuilder::DecodeRowContext row_ctx =
-      specBuilder::make_decode_row_context(base_input);
+  input_builder::DecodeRowContext row_ctx =
+      input_builder::make_decode_row_context(base_input);
   torch::TensorOptions token_options = extend_input.token_ids.options();
   torch::TensorOptions position_options = extend_input.positions.options();
   Slice<int32_t> token_ids = tensor_slice(base_input.token_ids_host);
 
-  specBuilder::DecodeBuildBuffers buf;
+  input_builder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(num_sequences * 2);
   buf.out_positions.reserve(num_sequences * 2);
   buf.out_new_cache_slots.reserve(num_sequences * 2);
@@ -3094,14 +3045,14 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_extend_inputs(
     auto add_row = [&](int32_t token_id,
                        int32_t position_offset,
                        const torch::Tensor& embedding) {
-      specBuilder::RowSpec row;
+      input_builder::RowSpec row;
       row.seq_id = seq_id;
       row.token_id = token_id >= 0 ? token_id : 0;
       row.position_offset = position_offset;
       row.append_kv_len = !use_chunked_prefill;
       row.append_q_len_one = !use_chunked_prefill;
       row.append_block_table = !use_chunked_prefill;
-      specBuilder::append_decode_row(row_ctx, row, logical_block_size, buf);
+      input_builder::append_decode_row(row_ctx, row, logical_block_size, buf);
       if (embedding.defined()) {
         expanded_embeddings.emplace_back(to_worker_device(embedding));
       } else {
@@ -3129,12 +3080,12 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_extend_inputs(
         buf.out_new_cache_slots.back() = 0;
       }
       add_row(state.token_id, /*position_offset=*/0, state.embedding);
-      specBuilder::append_seq_len_by_layout(buf.out_q_seq_lens, 2);
-      const int32_t kv_len = specBuilder::calc_kv_len(
+      input_builder::append_seq_len_by_layout(buf.out_q_seq_lens, 2);
+      const int32_t kv_len = input_builder::calc_kv_len(
           base_input.input_params.attention.host.kv_seq_lens,
           seq_id,
           /*offset=*/0);
-      specBuilder::update_kv_seq_lens_and_max(
+      input_builder::update_kv_seq_lens_and_max(
           buf.out_kv_seq_lens, kv_len, buf.meta.kv_max_seq_len);
       selected_row_idx.emplace_back(2 * seq_id + 1);
       continue;
@@ -3184,11 +3135,11 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_extend_inputs(
   CHECK_EQ(expanded_embeddings.size(), buf.out_positions.size())
       << "draft extend embeddings/positions mismatch";
 
-  specBuilder::set_token_position_tensors(extend_input,
-                                          buf.out_token_ids,
-                                          buf.out_positions,
-                                          token_options,
-                                          position_options);
+  input_builder::set_token_position_tensors(extend_input,
+                                            buf.out_token_ids,
+                                            buf.out_positions,
+                                            token_options,
+                                            position_options);
   if (use_chunked_prefill) {
     input_params.meta.num_sequences = num_sequences;
     input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
@@ -3199,29 +3150,29 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_extend_inputs(
       cumulative_q_len += q_len;
       q_cu_seq_lens_vec.emplace_back(cumulative_q_len);
     }
-    specBuilder::update_input_params(input_params,
-                                     buf,
-                                     /*q_max_seq_len=*/2,
-                                     std::move(buf.out_q_seq_lens),
-                                     std::move(q_cu_seq_lens_vec),
-                                     buf.meta.kv_max_seq_len,
-                                     std::move(buf.out_kv_seq_lens),
-                                     /*update_block_tables=*/false);
+    input_builder::update_input_params(input_params,
+                                       buf,
+                                       /*q_max_seq_len=*/2,
+                                       std::move(buf.out_q_seq_lens),
+                                       std::move(q_cu_seq_lens_vec),
+                                       buf.meta.kv_max_seq_len,
+                                       std::move(buf.out_kv_seq_lens),
+                                       /*update_block_tables=*/false);
   } else {
     input_params.meta.num_sequences =
         static_cast<int32_t>(buf.out_positions.size());
     input_params.meta.batch_forward_type = BatchForwardType::DECODE;
-    specBuilder::update_input_params(input_params,
-                                     buf,
-                                     1,
-                                     std::move(buf.out_q_seq_lens),
-                                     std::move(buf.out_q_cu_seq_lens),
-                                     buf.meta.kv_max_seq_len,
-                                     std::move(buf.out_kv_seq_lens),
-                                     /*update_block_tables=*/true);
+    input_builder::update_input_params(input_params,
+                                       buf,
+                                       1,
+                                       std::move(buf.out_q_seq_lens),
+                                       std::move(buf.out_q_cu_seq_lens),
+                                       buf.meta.kv_max_seq_len,
+                                       std::move(buf.out_kv_seq_lens),
+                                       /*update_block_tables=*/true);
   }
   if (supports_explicit_spec_verify_replay_update()) {
-    specBuilder::rebuild_q_cu_seq_lens(input_params);
+    input_builder::rebuild_q_cu_seq_lens(input_params);
   }
   input_params.attention.rebuild_device_buffer(device_);
 
@@ -3298,19 +3249,19 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_inputs(
     }
   }
   const int32_t logical_block_size = this->logical_block_size();
-  specBuilder::DecodeRowContext row_ctx =
-      specBuilder::make_decode_row_context(input);
-  specBuilder::DecodeBuildBuffers buf;
+  input_builder::DecodeRowContext row_ctx =
+      input_builder::make_decode_row_context(input);
+  input_builder::DecodeBuildBuffers buf;
   buf.out_positions.reserve(num_sequences);
   buf.out_kv_seq_lens.reserve(num_sequences);
   buf.out_new_cache_slots.reserve(num_sequences);
 
   for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    specBuilder::RowSpec row;
+    input_builder::RowSpec row;
     row.seq_id = seq_id;
     row.position_offset = position_offset;
     row.append_token = false;
-    specBuilder::append_decode_row(row_ctx, row, logical_block_size, buf);
+    input_builder::append_decode_row(row_ctx, row, logical_block_size, buf);
   }
 
   CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_positions.size())
@@ -3318,9 +3269,9 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_inputs(
 
   torch::TensorOptions position_options = input.positions.options();
   set_positions_tensor(draft_input,
-                       specBuilder::make_cpu_int_tensor(buf.out_positions),
+                       input_builder::make_cpu_int_tensor(buf.out_positions),
                        position_options);
-  specBuilder::update_input_params(
+  input_builder::update_input_params(
       input_params,
       buf,
       input_params.meta.q_max_seq_len,
@@ -3329,7 +3280,7 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_inputs(
       buf.meta.kv_max_seq_len,
       std::move(buf.out_kv_seq_lens));
   if (supports_explicit_spec_verify_replay_update()) {
-    specBuilder::rebuild_q_cu_seq_lens(input_params);
+    input_builder::rebuild_q_cu_seq_lens(input_params);
   }
   input_params.attention.rebuild_device_buffer(device_);
 #if defined(USE_NPU)
