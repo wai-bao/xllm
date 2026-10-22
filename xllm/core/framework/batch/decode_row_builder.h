@@ -165,6 +165,7 @@ void append_seq_len_by_layout(std::vector<int32_t>& vec, int32_t len);
 
 // Rebuilds leading-zero query offsets from the backend-neutral length accessor.
 void rebuild_q_cu_seq_lens(LlmModelParams& params);
+void rebuild_q_cu_seq_lens(VlmModelParams& params);
 void rebuild_q_cu_seq_lens(ModelParamsView& params);
 
 // Appends one q length and the matching cumulative q length.
@@ -194,15 +195,8 @@ void update_input_params(ModelParamsView& input_params,
                          int32_t kv_max_seq_len,
                          std::vector<int32_t> kv_seq_lens_vec,
                          bool update_block_tables = false);
-void update_input_params(LlmModelParams& input_params,
-                         DecodeBuildBuffers& buf,
-                         int32_t q_max_seq_len,
-                         std::vector<int32_t> q_seq_lens_vec,
-                         std::vector<int32_t> q_cu_seq_lens_vec,
-                         int32_t kv_max_seq_len,
-                         std::vector<int32_t> kv_seq_lens_vec,
-                         bool update_block_tables = false);
-void update_input_params(VlmModelParams& input_params,
+template <typename Params>
+void update_input_params(Params& input_params,
                          DecodeBuildBuffers& buf,
                          int32_t q_max_seq_len,
                          std::vector<int32_t> q_seq_lens_vec,
@@ -211,9 +205,9 @@ void update_input_params(VlmModelParams& input_params,
                          std::vector<int32_t> kv_seq_lens_vec,
                          bool update_block_tables = false);
 
-// Builds the validate (spec-verify) row expansion of a decode input: each
-// sequence emits num_val_tokens rows (the committed token plus N speculative
-// slots at positions +0..+N). chunked_layout selects the chunked-prefill
+// Builds the validate row expansion of a decode input: each sequence emits
+// num_val_tokens rows (the committed token plus N continuation slots at
+// positions +0..+N). chunked_layout selects the chunked-prefill
 // flavor (one q_len = num_val_tokens row per sequence) versus the flat
 // decode-row flavor. Returns the assembled buffers plus the chunked-side
 // length vectors when chunked_layout is set.
@@ -223,14 +217,13 @@ struct ValidateRowResult {
   std::vector<int32_t> chunked_q_cu_seq_lens;
   std::vector<int32_t> chunked_kv_seq_lens;
   int32_t chunked_kv_max_seq_len = 0;
-  int32_t total_num_val_tokens = 0;
 };
 
 struct ValidateRowPlan {
   int32_t num_val_tokens = 1;
   int32_t block_size = 0;
   bool chunked_layout = false;
-  // step-major emits rows in val_idx-major order (embedded Eagle3 layout).
+  // step-major emits rows in val_idx-major order instead of sequence-major.
   bool step_major = false;
 };
 
@@ -241,10 +234,8 @@ ValidateRowResult build_validate_rows(const DecodeRowContext& ctx,
 // length vectors, sets num_sequences/q_max_seq_len/batch_forward_type from the
 // plan, and writes the buffers back via update_input_params. Shared epilogue
 // of every build_validate_rows caller.
-void commit_validate_rows(LlmModelParams& input_params,
-                          ValidateRowResult& row_result,
-                          const ValidateRowPlan& plan);
-void commit_validate_rows(VlmModelParams& input_params,
+template <typename Params>
+void commit_validate_rows(Params& input_params,
                           ValidateRowResult& row_result,
                           const ValidateRowPlan& plan);
 void commit_validate_rows(ModelParamsView& input_params,

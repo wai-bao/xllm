@@ -38,6 +38,7 @@ cc_library(
   DEPS
     Threads::Threads
     torch
+    :batch
     :model
     $<$<BOOL:${USE_NPU}>:torch_npu>
     :common

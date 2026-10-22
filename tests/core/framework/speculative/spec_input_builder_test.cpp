@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <vector>
 
+#include "core/framework/batch/decode_row_builder.h"
 #include "core/framework/model/mtp_topk_state.h"
 #include "core/util/tensor_helper.h"
 #include "framework/model/model_params_view.h"

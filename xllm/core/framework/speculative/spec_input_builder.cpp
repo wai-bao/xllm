@@ -17,15 +17,8 @@ limitations under the License.
 
 #include <glog/logging.h>
 
-#include <algorithm>
-#include <limits>
-#include <utility>
-
-#include "framework/model/model_params_view.h"
+#include "core/framework/batch/decode_row_builder.h"
 #include "framework/sampling/sampling_params.h"
-#include "layers/common/expanded_decode_metadata_builder.h"
-#include "runtime/vlm_forward_params.h"
-#include "util/tensor_helper.h"
 
 namespace xllm::specBuilder {
 

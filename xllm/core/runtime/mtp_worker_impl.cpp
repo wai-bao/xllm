@@ -47,6 +47,7 @@ limitations under the License.
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
 #endif
+#include "core/framework/batch/decode_row_builder.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/draft_extend_input.h"
 #include "core/framework/speculative/mtp_async_input_builder.h"
@@ -2720,13 +2721,7 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
     input_params.embedding.input_embedding = torch::Tensor();
     input_params.is_spec_verify = true;
     if (!input_params.attention.host.q_seq_lens.empty()) {
-      std::vector<int32_t> q_cu_seq_lens_vec;
-      q_cu_seq_lens_vec.reserve(input_params.meta.num_sequences + 1);
-      q_cu_seq_lens_vec.emplace_back(0);
-      for (int32_t q_len : input_params.attention.host.q_seq_lens) {
-        q_cu_seq_lens_vec.emplace_back(q_cu_seq_lens_vec.back() + q_len);
-      }
-      input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens_vec);
+      input_builder::rebuild_q_cu_seq_lens(input_params);
     }
     accepted_prefix_lengths.assign(num_sequences, 1);
     if (embedding_cache_ != nullptr &&

@@ -80,8 +80,8 @@ Slice<int32_t> get_block_table_slice(const DecodeRowContext& ctx,
       << ", row_offset=" << row_offset
       << ", row_stride=" << ctx.block_table_stride
       << ", block_tables_size=" << ctx.block_tables.size();
-  return {ctx.block_tables.data() + row_offset,
-          static_cast<size_t>(ctx.block_table_stride)};
+  return ctx.block_tables.slice(
+      row_offset, row_offset + static_cast<size_t>(ctx.block_table_stride));
 }
 
 void fill_multi_block_table_slices(DecodeRowContext& ctx) {
@@ -117,14 +117,10 @@ void append_paged_kv_row(const Slice<int32_t>& block_table,
       << "row KV length exceeds block-table capacity, kv_seq_len=" << kv_seq_len
       << ", page_count=" << page_count
       << ", block_table_size=" << block_table.size();
-  if (buf.out_paged_kv_indptr.empty()) {
-    buf.out_paged_kv_indptr.emplace_back(0);
-  }
   buf.out_paged_kv_indices.insert(buf.out_paged_kv_indices.end(),
                                   block_table.begin(),
                                   block_table.begin() + page_count);
-  buf.out_paged_kv_indptr.emplace_back(buf.out_paged_kv_indptr.back() +
-                                       page_count);
+  push_cumsum(buf.out_paged_kv_indptr, page_count);
   buf.out_paged_kv_last_page_len.emplace_back(
       layer::kv_last_page_len(kv_seq_len, block_size));
 }
@@ -253,7 +249,12 @@ void append_decode_row(const DecodeRowContext& ctx,
   if (row.append_kv_len) {
     const int32_t kv_len_offset =
         row.kv_len_offset.value_or(row.position_offset);
-    row_kv_seq_len = calc_kv_len(ctx.kv_seq_lens, row.seq_id, kv_len_offset);
+    // When the KV offset matches the row position, the length was already
+    // computed for cache_position; reuse it instead of a second read.
+    row_kv_seq_len =
+        (kv_len_offset == row.position_offset)
+            ? cache_position + 1
+            : calc_kv_len(ctx.kv_seq_lens, row.seq_id, kv_len_offset);
     update_kv_seq_lens_and_max(
         buf.out_kv_seq_lens, *row_kv_seq_len, buf.meta.kv_max_seq_len);
   }
@@ -426,7 +427,8 @@ void update_input_params(ModelParamsView& input_params,
   }
 }
 
-void update_input_params(LlmModelParams& input_params,
+template <typename Params>
+void update_input_params(Params& input_params,
                          DecodeBuildBuffers& buf,
                          int32_t q_max_seq_len,
                          std::vector<int32_t> q_seq_lens_vec,
@@ -445,24 +447,22 @@ void update_input_params(LlmModelParams& input_params,
                       update_block_tables);
 }
 
-void update_input_params(VlmModelParams& input_params,
-                         DecodeBuildBuffers& buf,
-                         int32_t q_max_seq_len,
-                         std::vector<int32_t> q_seq_lens_vec,
-                         std::vector<int32_t> q_cu_seq_lens_vec,
-                         int32_t kv_max_seq_len,
-                         std::vector<int32_t> kv_seq_lens_vec,
-                         bool update_block_tables) {
-  ModelParamsView input_params_view(input_params);
-  update_input_params(input_params_view,
-                      buf,
-                      q_max_seq_len,
-                      std::move(q_seq_lens_vec),
-                      std::move(q_cu_seq_lens_vec),
-                      kv_max_seq_len,
-                      std::move(kv_seq_lens_vec),
-                      update_block_tables);
-}
+template void update_input_params(LlmModelParams&,
+                                  DecodeBuildBuffers&,
+                                  int32_t,
+                                  std::vector<int32_t>,
+                                  std::vector<int32_t>,
+                                  int32_t,
+                                  std::vector<int32_t>,
+                                  bool);
+template void update_input_params(VlmModelParams&,
+                                  DecodeBuildBuffers&,
+                                  int32_t,
+                                  std::vector<int32_t>,
+                                  std::vector<int32_t>,
+                                  int32_t,
+                                  std::vector<int32_t>,
+                                  bool);
 
 template <typename Input>
 void set_token_position_tensors(Input& input,
@@ -497,7 +497,6 @@ ValidateRowResult build_validate_rows(const DecodeRowContext& ctx,
   const int32_t num_val_tokens = plan.num_val_tokens;
   const int32_t total = num_sequences * num_val_tokens;
   ValidateRowResult result;
-  result.total_num_val_tokens = total;
   auto& buf = result.buf;
   buf.out_token_ids.reserve(total);
   buf.out_positions.reserve(total);
@@ -521,7 +520,7 @@ ValidateRowResult build_validate_rows(const DecodeRowContext& ctx,
   };
 
   if (plan.step_major) {
-    // val-major order (embedded Eagle3 layout): all sequences' row k first.
+    // val-major order: all sequences' row k first.
     for (int32_t val_idx = 0; val_idx < num_val_tokens; ++val_idx) {
       for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
         emit_row(seq_id, val_idx);
@@ -562,7 +561,8 @@ void commit_validate_rows(ModelParamsView& input_params,
                           const ValidateRowPlan& plan) {
   auto& buf = row_result.buf;
   if (!plan.chunked_layout) {
-    input_params.meta.num_sequences = row_result.total_num_val_tokens;
+    input_params.meta.num_sequences =
+        static_cast<int32_t>(row_result.buf.out_token_ids.size());
     input_params.meta.batch_forward_type = BatchForwardType::DECODE;
     update_input_params(input_params,
                         buf,
@@ -584,19 +584,20 @@ void commit_validate_rows(ModelParamsView& input_params,
   }
 }
 
-void commit_validate_rows(LlmModelParams& input_params,
+template <typename Params>
+void commit_validate_rows(Params& input_params,
                           ValidateRowResult& row_result,
                           const ValidateRowPlan& plan) {
   ModelParamsView input_params_view(input_params);
   commit_validate_rows(input_params_view, row_result, plan);
 }
 
-void commit_validate_rows(VlmModelParams& input_params,
-                          ValidateRowResult& row_result,
-                          const ValidateRowPlan& plan) {
-  ModelParamsView input_params_view(input_params);
-  commit_validate_rows(input_params_view, row_result, plan);
-}
+template void commit_validate_rows(LlmModelParams&,
+                                   ValidateRowResult&,
+                                   const ValidateRowPlan&);
+template void commit_validate_rows(VlmModelParams&,
+                                   ValidateRowResult&,
+                                   const ValidateRowPlan&);
 
 int32_t calc_slot_id(int32_t position,
                      const Slice<int32_t>& block_table_slice,
@@ -654,6 +655,11 @@ void append_seq_len_by_layout(std::vector<int32_t>& vec, int32_t len) {
 }
 
 void rebuild_q_cu_seq_lens(LlmModelParams& params) {
+  ModelParamsView params_view(params);
+  rebuild_q_cu_seq_lens(params_view);
+}
+
+void rebuild_q_cu_seq_lens(VlmModelParams& params) {
   ModelParamsView params_view(params);
   rebuild_q_cu_seq_lens(params_view);
 }

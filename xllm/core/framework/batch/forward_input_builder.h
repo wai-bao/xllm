@@ -211,6 +211,4 @@ class ForwardInputBuilder final {
   uint64_t batch_id_;
 };
 
-// Generic decode row building primitives live in decode_row_builder.h.
-
 }  // namespace xllm

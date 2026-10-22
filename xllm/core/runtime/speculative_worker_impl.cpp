@@ -244,11 +244,14 @@ SpeculativeWorkerImpl<TargetInput>::update_input_by_last_step_output(
                                             buf.out_positions,
                                             inputs.token_ids.options(),
                                             inputs.positions.options());
-  // update the input_params
-  input_params.meta.kv_max_seq_len = buf.meta.kv_max_seq_len;
-  input_params.attention.host.kv_seq_lens = std::move(buf.out_kv_seq_lens);
-  input_params.attention.host.new_cache_slots =
-      std::move(buf.out_new_cache_slots);
+  input_builder::update_input_params(
+      input_params,
+      buf,
+      input_params.meta.q_max_seq_len,
+      std::move(input_params.attention.host.q_seq_lens),
+      std::move(input_params.attention.host.q_cu_seq_lens),
+      buf.meta.kv_max_seq_len,
+      std::move(buf.out_kv_seq_lens));
   input_params.attention.rebuild_device_buffer(device_);
   new_inputs.runtime.device_tensors_ready = true;
 

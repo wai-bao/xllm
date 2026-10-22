@@ -42,6 +42,7 @@ limitations under the License.
 #include "core/layers/common/expanded_decode_metadata_builder.h"
 #include "core/layers/npu_torch/deepseek_sparse_attention.h"
 #endif
+#include "core/framework/batch/decode_row_builder.h"
 #include "core/framework/model_loader/hf_model_config.h"
 #include "core/framework/speculative/draft_extend_input.h"
 #include "core/framework/speculative/spec_input_builder.h"
@@ -954,13 +955,7 @@ void DFlashWorkerImpl::prepare_validate_inputs(
         torch::tensor(accepted_prefix_lengths,
                       validate_input.token_ids.options().dtype(torch::kInt32));
     if (!input_params.attention.host.q_seq_lens.empty()) {
-      std::vector<int32_t> q_cu_seq_lens;
-      q_cu_seq_lens.reserve(input_params.attention.host.q_seq_lens.size() + 1);
-      q_cu_seq_lens.emplace_back(0);
-      for (int32_t q_len : input_params.attention.host.q_seq_lens) {
-        q_cu_seq_lens.emplace_back(q_cu_seq_lens.back() + q_len);
-      }
-      input_params.attention.host.q_cu_seq_lens = std::move(q_cu_seq_lens);
+      input_builder::rebuild_q_cu_seq_lens(input_params);
     }
     // The generic builder materializes the device buffer before the hybrid
     // cumulative lengths above are canonicalized.  Rebind it so GDN sees

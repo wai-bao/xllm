@@ -58,7 +58,6 @@ cc_test(
   SRCS
     glm5_next_kpool_indexer_test.cpp
   DEPS
-    :speculative
     :batch
     :config
     :mlu_layers
