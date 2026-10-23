@@ -49,9 +49,10 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
                               LlmForwardInput& validate_input) override;
 
  private:
-  // Fills DraftBlock::proposal; retained_inputs is
+  // Fills DraftBlock::proposal and confidence_probs; retained_inputs is
   // left to the caller.
   DraftBlock sample_block(const torch::Tensor& base_logits,
+                          const torch::Tensor& last_hidden,
                           const torch::Tensor& anchor_token_ids,
                           const SamplingParameters& sampling_params) const;
 

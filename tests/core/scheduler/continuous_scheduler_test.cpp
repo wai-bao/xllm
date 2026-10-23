@@ -209,6 +209,7 @@ class FakeEngine : public Engine {
   }
   const ModelArgs& model_args() const { return model_args_; }
   const TokenizerArgs& tokenizer_args() const { NOT_IMPLEMENTED(); }
+
   bool init() override { return true; }
 
   void set_prefetch_ready(bool ready) {

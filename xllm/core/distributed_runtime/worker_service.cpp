@@ -37,6 +37,7 @@ limitations under the License.
 #include "core/distributed_runtime/worker_model_codec.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/speculative/adaptive/spec_startup_calibration.h"
+#include "core/framework/speculative/draft_input.h"
 #include "core/framework/speculative/metrics.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/transfer/kv_transport_codec.h"
@@ -92,36 +93,6 @@ int32_t get_decode_sequence_count(const Input& input) {
   return unpacked ? static_cast<int32_t>(
                         unpacked_input.sampling_params.num_sample_seqs())
                   : 0;
-}
-
-template <typename Input>
-void stabilize_host_views(Input& input) {
-  input.token_ids_host = materialize_cpu_tensor(input.token_ids_host);
-  input.positions_host = materialize_cpu_tensor(input.positions_host);
-  input.input_params.attention.host.block_tables =
-      materialize_cpu_tensor(input.input_params.attention.host.block_tables);
-}
-
-bool has_cpu_llm_output(const ForwardOutput& output) {
-  const auto on_cpu = [](const torch::Tensor& tensor) {
-    return !tensor.defined() || tensor.device().is_cpu();
-  };
-  const auto& sample = output.sample_output;
-  const auto& beam = output.beam_search_output;
-  const bool cpu_tensors =
-      on_cpu(output.next_tokens_host.defined() ? output.next_tokens_host
-                                               : sample.next_tokens) &&
-      on_cpu(output.expert_load_data) && on_cpu(sample.embeddings) &&
-      on_cpu(sample.logprobs) && on_cpu(sample.top_tokens) &&
-      on_cpu(sample.top_logprobs) && on_cpu(beam.src_seq_idxes) &&
-      on_cpu(beam.out_tokens) && on_cpu(beam.out_logprobs);
-  return cpu_tensors &&
-         std::all_of(sample.mm_embeddings.begin(),
-                     sample.mm_embeddings.end(),
-                     [&](const auto& sequence) {
-                       return std::all_of(
-                           sequence.begin(), sequence.end(), on_cpu);
-                     });
 }
 
 class WorkerPrefetchSession final
@@ -452,6 +423,8 @@ void WorkerService::collect_llm_output(const ForwardOutput& output,
                                                   : sample.next_tokens,
                 torch::kCPU,
                 /*non_blocking=*/true);
+    cpu_output.draft_input =
+        draft_input_to(output.draft_input, torch::kCPU, /*non_blocking=*/true);
     if (cpu_output.sample_output.next_tokens.defined()) {
       cpu_output.sample_output.logprobs =
           safe_to(sample.logprobs, torch::kCPU, /*non_blocking=*/true);
@@ -504,8 +477,6 @@ void WorkerService::step_llm_model(
     std::vector<SpeculativeTokenStats>& speculative_token_stats) {
   speculative_token_stats.clear();
   const bool task_pipeline = options_.enable_task_pipeline();
-  const bool worker_prepare =
-      task_pipeline && worker_->task_pipeline_uses_worker_prepare();
   const bool worker_rebuilds_host_views =
       input.runtime.input_host_buffer_has_layout &&
       input.runtime.input_host_buffer.defined() &&
@@ -513,8 +484,7 @@ void WorkerService::step_llm_model(
       input.runtime.input_host_buffer.is_contiguous() &&
       input.runtime.input_host_buffer.numel() > 0 &&
       !input.runtime.device_tensors_ready;
-  if (options_.enable_schedule_overlap() && !worker_rebuilds_host_views &&
-      (!task_pipeline || worker_prepare)) {
+  if (options_.enable_schedule_overlap() && !worker_rebuilds_host_views) {
     // Packed preparation rebuilds views from its retained owner. Device-ready
     // inputs reuse their existing views, which can still borrow shared memory.
     stabilize_host_views(input);
@@ -525,8 +495,7 @@ void WorkerService::step_llm_model(
     if (!output.has_value()) {
       return;
     }
-    const bool cpu_ready_result =
-        task_pipeline && (!worker_prepare || has_cpu_llm_output(*output));
+    const bool cpu_ready_result = task_pipeline;
     collect_llm_output(*output, cpu_output, cpu_ready_result);
     speculative_token_stats =
         record_speculative_metrics(*output,
@@ -634,11 +603,7 @@ void WorkerService::GetLastLLMStepResult(
     ForwardOutput cpu_output;
     std::vector<SpeculativeTokenStats> speculative_token_stats;
     if (output.has_value()) {
-      const bool task_pipeline = options_.enable_task_pipeline();
-      const bool worker_prepare =
-          task_pipeline && worker_->task_pipeline_uses_worker_prepare();
-      const bool cpu_ready_result =
-          task_pipeline && (!worker_prepare || has_cpu_llm_output(*output));
+      const bool cpu_ready_result = options_.enable_task_pipeline();
       collect_llm_output(*output, cpu_output, cpu_ready_result);
       speculative_token_stats =
           record_speculative_metrics(*output,
@@ -1358,6 +1323,20 @@ void WorkerService::Wakeup(::google::protobuf::RpcController* controller,
   });
 
   return;
+}
+
+void WorkerService::ReleaseIdleRequestState(
+    ::google::protobuf::RpcController* /*controller*/,
+    const proto::RequestStateRelease* request,
+    proto::Status* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, request, response, done] {
+    brpc::ClosureGuard done_guard(done);
+    std::vector<int32_t> ids(request->embedding_ids().begin(),
+                             request->embedding_ids().end());
+    auto future = worker_->release_idle_request_state_async(std::move(ids));
+    response->set_ok(std::move(future).get());
+  });
 }
 
 void WorkerService::StartProfile(::google::protobuf::RpcController* controller,

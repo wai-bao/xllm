@@ -224,6 +224,13 @@ struct SamplingParameters {
   // filters) is defined; a fully greedy batch with no per-row state has none.
   bool has_sampling_fields() const;
 
+  // Whether any per-row sampling field that the unified block graph cannot
+  // capture is defined: penalties, transforms, and the token filter masks,
+  // i.e. kSamplingFields minus the greedy-safe history members (seeds and
+  // min_token_*). Derived from the same descriptor table as
+  // has_sampling_fields so a new field is never missed here.
+  bool has_unified_graph_incompatible_fields() const;
+
   // Fails fast unless the batch is mixed (see do_sample).
   const torch::Tensor& require_do_sample() const {
     CHECK(do_sample.defined())
@@ -243,35 +250,38 @@ struct SamplingParameters {
 //   by clear_sampling_transforms.
 // - post_penalty_transform: a transform in Sampler::process_logits applied
 //   after the penalties (top-k, top-p, min-p, or the token filter masks).
+// - unified_graph_excluded: carried history that a greedy unified block graph
+//   replays without per-row tensors (seeds, min_token_*); excluded by
+//   has_unified_graph_incompatible_fields.
 //
-// Per-sequence members (selected_token_idxes, do_sample) are handled by
-// their call sites; slot_buffer.cpp's kFields is a separate staging-side
-// list.
+// selected_token_idxes is handled by its call sites; slot_buffer.cpp's kFields
+// is a separate staging-side list.
 struct SamplingFieldDesc {
   torch::Tensor SamplingParameters::* member;
   bool clear_on_greedy_draft;
   bool post_penalty_transform;
+  bool unified_graph_excluded;
 };
 
 inline constexpr std::array<SamplingFieldDesc, 18> kSamplingFields = {
-    {{&SamplingParameters::frequency_penalties, false, false},
-     {&SamplingParameters::presence_penalties, false, false},
-     {&SamplingParameters::repetition_penalties, false, false},
-     {&SamplingParameters::temperatures, true, false},
-     {&SamplingParameters::top_p, true, true},
-     {&SamplingParameters::min_p, true, true},
-     {&SamplingParameters::seed_offsets, true, false},
-     {&SamplingParameters::seeds, true, false},
-     {&SamplingParameters::logits_bias, false, false},
-     {&SamplingParameters::min_token_positions, true, false},
-     {&SamplingParameters::min_tokens_remaining, true, false},
-     {&SamplingParameters::min_token_ids, true, false},
-     {&SamplingParameters::top_k, true, true},
-     {&SamplingParameters::unique_token_ids, false, false},
-     {&SamplingParameters::unique_token_counts, false, false},
-     {&SamplingParameters::unique_token_ids_lens, false, false},
-     {&SamplingParameters::filter_mask, false, true},
-     {&SamplingParameters::filter_bitmask, false, true}}};
+    {{&SamplingParameters::frequency_penalties, false, false, false},
+     {&SamplingParameters::presence_penalties, false, false, false},
+     {&SamplingParameters::repetition_penalties, false, false, false},
+     {&SamplingParameters::temperatures, true, false, false},
+     {&SamplingParameters::top_p, true, true, false},
+     {&SamplingParameters::min_p, true, true, false},
+     {&SamplingParameters::seed_offsets, true, false, true},
+     {&SamplingParameters::seeds, true, false, true},
+     {&SamplingParameters::logits_bias, false, false, false},
+     {&SamplingParameters::min_token_positions, true, false, true},
+     {&SamplingParameters::min_tokens_remaining, true, false, true},
+     {&SamplingParameters::min_token_ids, true, false, true},
+     {&SamplingParameters::top_k, true, true, false},
+     {&SamplingParameters::unique_token_ids, false, false, false},
+     {&SamplingParameters::unique_token_counts, false, false, false},
+     {&SamplingParameters::unique_token_ids_lens, false, false, false},
+     {&SamplingParameters::filter_mask, false, true, false},
+     {&SamplingParameters::filter_bitmask, false, true, false}}};
 
 // Out-of-line because it derives from kSamplingFields (below the struct).
 inline bool SamplingParameters::has_post_penalty_transforms() const {
@@ -289,6 +299,16 @@ inline bool SamplingParameters::has_sampling_fields() const {
                      kSamplingFields.end(),
                      [this](const SamplingFieldDesc& field) {
                        return (this->*field.member).defined();
+                     });
+}
+
+// Out-of-line because it derives from kSamplingFields (below the struct).
+inline bool SamplingParameters::has_unified_graph_incompatible_fields() const {
+  return std::any_of(kSamplingFields.begin(),
+                     kSamplingFields.end(),
+                     [this](const SamplingFieldDesc& field) {
+                       return !field.unified_graph_excluded &&
+                              (this->*field.member).defined();
                      });
 }
 
@@ -328,11 +348,29 @@ inline void expand_sampling_params_for_verify(
   repeat_interleave_if_defined(sampling_params.do_sample, repeats);
 }
 
-// Mode-aware draft sampling policy: clears logprob outputs and, in GREEDY
-// mode, flips the batch to greedy; PROBABILISTIC exposes draft logits
-// exactly when the verifier needs q.
-void prepare_draft_sampling(DraftSamplingMode mode,
-                            SamplingParameters& sampling_params);
+// Per-sequence variant: uploads the row counts as an int64 device tensor and
+// delegates to the tensor overload above.
+inline void expand_sampling_params_for_verify(
+    SamplingParameters& sampling_params,
+    const std::vector<int32_t>& per_seq_val_tokens,
+    int64_t total_num_val_tokens,
+    const torch::Device& device) {
+  torch::Tensor repeats_tensor =
+      async_h2d_tensor(std::vector<int64_t>(per_seq_val_tokens.begin(),
+                                            per_seq_val_tokens.end()),
+                       device);
+  expand_sampling_params_for_verify(
+      sampling_params, repeats_tensor, total_num_val_tokens, device);
+}
+
+// True when any repetition-family penalty tensor is set, i.e. the sampler must
+// build and consult per-token history. Centralizes the predicate shared by the
+// draft/seed sampling paths.
+inline bool has_penalty_params(const SamplingParameters& params) {
+  return params.frequency_penalties.defined() ||
+         params.presence_penalties.defined() ||
+         params.repetition_penalties.defined();
+}
 
 // Draft proposals and acceptances executed by the verifier, before output
 // truncation. Accepted drafts exclude the target replacement/bonus token.
@@ -380,5 +418,21 @@ class SampleOutput final {
 
   std::vector<std::vector<torch::Tensor>> mm_embeddings;
 };
+
+// Per-row (one sequence each) tensor members of SamplingParameters that the
+// speculative paths repeat or re-index to match expanded token counts.
+// Mirrors kSamplingFields plus do_sample (which repeats onto the validate row
+// domain but is otherwise a per-sequence member handled by its call sites).
+inline constexpr std::array<torch::Tensor SamplingParameters::*, 10>
+    kSamplingRowTensors = {&SamplingParameters::frequency_penalties,
+                           &SamplingParameters::presence_penalties,
+                           &SamplingParameters::repetition_penalties,
+                           &SamplingParameters::temperatures,
+                           &SamplingParameters::top_p,
+                           &SamplingParameters::top_k,
+                           &SamplingParameters::unique_token_ids,
+                           &SamplingParameters::unique_token_counts,
+                           &SamplingParameters::unique_token_ids_lens,
+                           &SamplingParameters::do_sample};
 
 }  // namespace xllm

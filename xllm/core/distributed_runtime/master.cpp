@@ -28,6 +28,7 @@ limitations under the License.
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #include "common/types.h"
 #include "core/common/xllm_build_info.h"
@@ -38,8 +39,11 @@ limitations under the License.
 #if defined(USE_NPU)
 #include "framework/parallel_state/npu_rank_table_env.h"
 #endif
+#include "core/framework/block/block_manager_pool.h"
 #include "core/platform/device_name_utils.h"
+#include "engine.h"
 #include "platform/platform.h"
+#include "scheduler/scheduler.h"
 
 namespace brpc {
 DECLARE_bool(graceful_quit_on_sigterm);
@@ -207,6 +211,72 @@ std::atomic<bool> Master::idle_running_{false};
 
 void Master::handle_shutdown_signal(int /*signum*/) {
   idle_running_.store(false, std::memory_order_relaxed);
+}
+
+void Master::acquire_service_client() {
+  if (options_.enable_service_routing()) {
+    xservice_client_ =
+        XServiceClient::acquire(options_.etcd_addr().value_or(""),
+                                options_.instance_name().value_or(""),
+                                options_.etcd_namespace().value_or(""));
+    CHECK(xservice_client_ != nullptr) << "XServiceClient init failed";
+  }
+}
+
+std::unique_ptr<XServiceRegistration> Master::bind_service_registration(
+    Scheduler* scheduler,
+    Engine* engine) {
+  if (xservice_client_ == nullptr) {
+    return nullptr;
+  }
+  const BlockManagerPool* block_manager_pool = engine->block_manager_pool();
+  InstanceInfo instance_info = scheduler->get_instance_info();
+  std::unique_ptr<XServiceRegistration> registration = xservice_client_->bind(
+      std::move(instance_info), [scheduler, block_manager_pool] {
+        XServiceMetricsSnapshot snapshot;
+        if (block_manager_pool != nullptr) {
+          snapshot.gpu_cache_usage_perc =
+              block_manager_pool->get_gpu_cache_usage_perc();
+        }
+        snapshot.waiting_requests_num = scheduler->get_waiting_requests_num();
+        scheduler->get_latency_metrics(snapshot.ttft, snapshot.tbt);
+        return snapshot;
+      });
+  CHECK(registration != nullptr);
+  return registration;
+}
+
+OutputCallback Master::make_rpc_response_callback() const {
+  return [client = xservice_client_](const RequestOutput& output) {
+    if (client == nullptr) {
+      return false;
+    }
+    output.log_request_status();
+    const std::vector<bool> results = client->generations({output});
+    return results.size() == 1 && results.front();
+  };
+}
+
+OutputCallback Master::make_error_response_callback() {
+  return [](const RequestOutput& output) {
+    output.log_request_status();
+    return false;
+  };
+}
+
+OutputCallback Master::stamp_stream_on_error(OutputCallback callback,
+                                             bool stream) {
+  return [callback = std::move(callback), stream](const RequestOutput& output) {
+    // Successful terminal outputs also carry a status (request.cpp sets
+    // Status(OK)), so skip on value equality too: only mismatched outputs
+    // pay the copy below, and the per-token path never does.
+    if (!output.status.has_value() || output.stream == stream) {
+      return callback(output);
+    }
+    RequestOutput stamped = output;
+    stamped.stream = stream;
+    return callback(stamped);
+  };
 }
 
 Master::~Master() {

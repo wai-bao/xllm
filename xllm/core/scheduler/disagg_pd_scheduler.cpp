@@ -26,6 +26,7 @@ limitations under the License.
 #include <limits>
 #include <queue>
 #include <random>
+#include <utility>
 #include <vector>
 
 #include "common/global_flags.h"
@@ -36,8 +37,12 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/sampling/draft_sampling_mode.h"
+#include "core/framework/speculative/draft_input_spec_provider.h"
+#include "core/framework/speculative/pd_speculative_handoff.h"
 #include "core/kv_cache/transfer/pd_topology_guard.h"
 #include "core/scheduler/disagg_pd_scheduler.h"
+#include "core/transport/draft_input_proto.h"
 #include "core/util/scope_guard.h"
 #include "disagg_pd.pb.h"
 #include "distributed_runtime/engine.h"
@@ -176,14 +181,11 @@ bool has_rank_preserving_kv_groups(const proto::DisaggResponse& response) {
 }
 
 DisaggPDScheduler::~DisaggPDScheduler() {
-  if (xservice_client_ != nullptr) {
-    xservice_client_->clear_heartbeat_callback(
-        heartbeat_callback_registration_);
-  }
-
+  // Stop RPC admission while the scheduler and engine are still alive.
   // start_rpc_server blocks in Server::Join(). Stop its listener before
   // joining the owner thread, while the scheduler and engine are still alive.
-  auto rpc_server = ServerRegistry::get_instance().try_get_server(server_name_);
+  auto& registry = ServerRegistry::get_instance();
+  auto* rpc_server = registry.try_get_server(server_name_);
   if (rpc_server != nullptr) {
     rpc_server->stop();
   }
@@ -192,13 +194,20 @@ DisaggPDScheduler::~DisaggPDScheduler() {
     rpc_server_thread_->join();
   }
 
+  // Wake an idle dispatch thread through its existing shutdown sentinel.
   if (dispatch_thread_ && dispatch_thread_->joinable()) {
     CHECK(prefill_request_queue_.enqueue(nullptr));
     dispatch_thread_->join();
   }
 
+  // The single FIFO worker may still have first-generation callbacks using
+  // maps/mutexes declared after the pool. Drain it before member destruction.
+  TaskGroup pending_prefill(/*count=*/1);
+  prefill_threadpool_.schedule(pending_prefill.wrap([] {}));
+  pending_prefill.wait();
+
   if (rpc_server != nullptr) {
-    ServerRegistry::get_instance().unregister_server(server_name_);
+    registry.unregister_server(server_name_);
   }
 }
 
@@ -210,18 +219,10 @@ void DisaggPDScheduler::initialize_rpc_server(const std::string& server_name) {
     rpc_server = ServerRegistry::get_instance().get_server(server_name);
   }
   // connect to master service
-  xservice_client_ = XServiceClient::get_instance();
-  if (!xservice_client_->initialize_done()) {
+  if (xservice_client_ == nullptr || !xservice_client_->initialize_done()) {
     LOG(FATAL) << "XServiceClient not init.";
     return;
   }
-  const XServiceClient::HeartbeatCallbackRegistration previous_registration =
-      heartbeat_callback_registration_;
-  heartbeat_callback_registration_ = xservice_client_->set_heartbeat_callback(
-      [this](xllm_service::proto::HeartbeatRequest& request) {
-        populate_heartbeat_request(request, true);
-      });
-  xservice_client_->clear_heartbeat_callback(previous_registration);
 }
 
 void DisaggPDScheduler::register_instance_info(const std::string& server_name) {
@@ -386,6 +387,7 @@ void DisaggPDScheduler::start_rpc_server(
       this,
       engine_,
       KVCacheConfig::get_instance().block_size(),
+      xservice_client_,
       std::move(response_options));
   auto rpc_server =
       ServerRegistry::get_instance().register_server(server_name_);
@@ -943,28 +945,15 @@ void DisaggPDScheduler::prefill_send_first_generation() {
         gen->set_dp_size(instance_info_.dp_size);
         gen->set_dp_rank(sequence->dp_rank());
       }
-      if (options_.num_speculative_tokens() > 0) {
-        torch::Tensor embedding =
-            request->sequences()[0]->get_mtp_bootstrap_embedding();
-        if (!embedding.defined()) {
-          LOG(ERROR) << "Missing MTP bootstrap embedding, request_id: "
-                     << request->request_id();
-          fail_request(
-              request,
-              {StatusCode::UNKNOWN, "Missing MTP bootstrap embedding"});
-          continue;
-        }
-        torch::Tensor embedding_cpu = safe_to(embedding, torch::kCPU);
-        if (!util::torch_to_proto(embedding_cpu,
-                                  gen->mutable_mtp_bootstrap_embedding())) {
-          LOG(ERROR) << "Failed to serialize MTP bootstrap embedding, "
-                     << "request_id: " << request->request_id();
-          fail_request(request,
-                       {StatusCode::UNKNOWN,
-                        "Failed to serialize MTP bootstrap embedding"});
-          continue;
-        }
-        request->sequences()[0]->clear_mtp_bootstrap_embedding();
+      Sequence* sequence = request->sequences()[0].get();
+      const std::optional<DraftInput> seed = sequence->take_draft_input();
+      const char* handoff_error = proto_adapter::encode_pd_speculative_handoff(
+          handoff_kind_, seed, gen);
+      if (handoff_error != nullptr) {
+        LOG(ERROR) << handoff_error
+                   << ", request_id: " << request->request_id();
+        fail_request(request, {StatusCode::UNKNOWN, handoff_error});
+        continue;
       }
       const double prepare_seconds = first_generation_timer.elapsed_seconds();
 
@@ -1133,6 +1122,22 @@ bool DisaggPDScheduler::decode_schedule(
   return true;
 }
 
+void DisaggPDScheduler::reject_received_request(const std::string& request_id) {
+  std::shared_ptr<Request> request;
+  {
+    std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+    request = take_waiting_request(request_id);
+  }
+  if (request != nullptr) {
+    // The handshake request was prefilled remotely; its blocks must not be
+    // published into the local decode-side prefix cache, matching
+    // release_reservation and the duplicate-reservation rejects.
+    for (const auto& sequence : request->sequences()) {
+      engine_->block_manager_pool()->deallocate_without_cache(sequence.get());
+    }
+  }
+}
+
 bool DisaggPDScheduler::decode_recv_first_generation(
     const std::string& req_id,
     const std::string& reservation_id,
@@ -1149,8 +1154,8 @@ bool DisaggPDScheduler::decode_recv_first_generation(
     std::vector<KVTransferMapping> source_mappings,
     int32_t src_dp_size,
     int32_t src_dp_rank,
-    torch::Tensor mtp_bootstrap_embedding,
-    int32_t num_cached_tokens) {
+    int32_t num_cached_tokens,
+    std::optional<DraftInput> draft_input) {
   Timer receive_timer;
   // push to request_queue_, and will be executed by engine.
   std::shared_ptr<Request> request = nullptr;
@@ -1196,25 +1201,25 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   }
   request->record_num_prefix_cache_tokens(
       static_cast<size_t>(num_cached_tokens));
-  const bool need_mtp_bootstrap = options_.num_speculative_tokens() > 0;
-  if (need_mtp_bootstrap) {
-    const int32_t slot_id = sequence->get_embedding_block_id();
-    if (slot_id < 0) {
-      LOG(ERROR) << "Invalid MTP bootstrap slot, request_id: " << req_id;
+  if (handoff_kind_ != SpeculativeHandoffKind::NONE) {
+    const std::optional<DraftInputModelSpec> handoff_spec =
+        draft_input_spec_provider_ == nullptr
+            ? std::nullopt
+            : draft_input_spec_provider_->draft_input_spec();
+    const char* handoff_reason =
+        apply_pd_handoff(handoff_kind_,
+                         *sequence,
+                         token_id,
+                         draft_input,
+                         probabilistic_handoff_,
+                         handoff_vocab_size_,
+                         handoff_spec ? &*handoff_spec : nullptr);
+    if (handoff_reason != nullptr) {
+      LOG(ERROR) << handoff_reason << ", request_id: " << req_id;
+      // The entry ScopeGuard already deallocates without cache on this
+      // early return; an explicit deallocate here would clean up twice.
       return false;
     }
-    if (token_id < 0 ||
-        token_id > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
-      LOG(ERROR) << "Invalid MTP bootstrap token, request_id: " << req_id
-                 << ", token_id: " << token_id;
-      return false;
-    }
-    if (!mtp_bootstrap_embedding.defined()) {
-      LOG(ERROR) << "Missing MTP bootstrap embedding, request_id: " << req_id;
-      return false;
-    }
-
-    sequence->update_mtp_bootstrap_embedding(mtp_bootstrap_embedding);
   }
 
   Token first_token(token_id);
@@ -1242,8 +1247,8 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   // TODO: we only support one sequence for currently.
   // Heterogeneous TP now restores the Prefill KV/linear state before Decode,
   // so its first token follows the same overlap protocol as every other PD
-  // transfer path.  Appending the real token here bypasses last_step_token and
-  // makes the first Decode step consume misaligned sequence state.
+  // transfer path.  Appending the real token here bypasses last_step_token
+  // and makes the first Decode step consume misaligned sequence state.
   if (enable_schedule_overlap()) {
     Token fake_token(-1);
     sequence->append_token(fake_token);
@@ -1253,8 +1258,9 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   }
   const double prepare_seconds = receive_timer.elapsed_seconds();
 
-  // Pull KV cache only in native PULL mode. Heterogeneous PUSH writes directly
-  // into the final destination tensors before FirstGeneration is sent.
+  // Pull KV cache only in native PULL mode. Heterogeneous PUSH writes
+  // directly into the final destination tensors before FirstGeneration is
+  // sent.
   if (kv_cache_transfer_mode == "PULL") {
     Timer pull_timer;
     for (KVTransferMapping& mapping : source_mappings) {

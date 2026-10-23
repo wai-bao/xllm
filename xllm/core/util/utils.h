@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/util/binary_payload.h"
+#include "core/util/integer_math.h"
 #include "rec.pb.h"
 #include "slice.h"
 #include "tensor.pb.h"
@@ -80,12 +81,6 @@ const T& max(const std::vector<T>& vec) {
   return *std::max_element(vec.begin(), vec.end());
 }
 
-template <typename T>
-inline std::enable_if_t<std::is_integral_v<T>, T> ceil_div(T value, T divisor) {
-  CHECK_GT(divisor, 0) << "divisor must be positive.";
-  return value / divisor + static_cast<T>(value % divisor != 0);
-}
-
 static inline int64_t align_up(int64_t value, int64_t alignment) {
   if (alignment == 0) {
     return value;
@@ -122,6 +117,12 @@ torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor,
 torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor,
                              const BinaryPayload& binary_payload);
 
+// Rejective variant for untrusted (RPC-received) tensors: returns std::nullopt
+// on malformed metadata instead of logging an error and returning an
+// undefined tensor. Semantics otherwise identical to proto_to_torch.
+std::optional<torch::Tensor> try_proto_to_torch(
+    const proto::Tensor& proto_tensor);
+
 bool torch_to_proto(const torch::Tensor& torch_tensor,
                     proto::Tensor* proto_tensor);
 
@@ -130,6 +131,9 @@ bool torch_to_proto(const torch::Tensor& torch_tensor,
                     std::string& binary_payload);
 
 int32_t ceil_pow2(int32_t n);
+
+std::optional<torch::ScalarType> try_datatype_proto_to_torch(
+    const std::string& proto_datatype);
 
 torch::ScalarType datatype_proto_to_torch(const std::string& proto_datatype);
 

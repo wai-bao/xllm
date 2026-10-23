@@ -416,6 +416,18 @@ folly::SemiFuture<bool> RemoteWorker::wakeup_async(
   return future;
 }
 
+folly::SemiFuture<bool> RemoteWorker::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        ids = std::move(embedding_ids),
+                        promise = std::move(promise)]() mutable {
+    promise.setValue(channel_->release_idle_request_state(ids));
+  });
+  return future;
+}
+
 folly::SemiFuture<bool> RemoteWorker::start_profile_async() {
   folly::Promise<bool> promise;
   auto future = promise.getSemiFuture();

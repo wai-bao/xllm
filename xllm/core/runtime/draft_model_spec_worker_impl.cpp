@@ -28,8 +28,10 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_params_view.h"
+#include "core/framework/parallel_state/process_group.h"
+#include "core/framework/sampling/draft_sampling.h"
 #include "core/framework/sampling/sampling_params.h"
-#include "core/framework/speculative/embedding_cache.h"
+#include "core/framework/speculative/draft_input_model_spec.h"
 #include "core/kv_cache/layout/kv_cache_capacity.h"
 #include "core/kv_cache/layout/kv_cache_estimation.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
@@ -45,6 +47,12 @@ namespace xllm {
 
 namespace {
 
+int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
+  const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
+  const int64_t cp_size = std::max<int64_t>(parallel_args.cp_size(), 1);
+  return std::max<int64_t>(parallel_args.world_size() / dp_size / cp_size, 1);
+}
+
 template <typename MakeShape, typename Allocate>
 bool allocate_pool_if_loaded(WorkerImpl& worker,
                              MakeShape&& make_shape,
@@ -55,12 +63,6 @@ bool allocate_pool_if_loaded(WorkerImpl& worker,
   }
   CHECK_EQ(status, WorkerImpl::Status::READY);
   return true;
-}
-
-int64_t get_dp_local_tp_size(const ParallelArgs& parallel_args) {
-  const int64_t dp_size = std::max<int64_t>(parallel_args.dp_size(), 1);
-  const int64_t cp_size = std::max<int64_t>(parallel_args.cp_size(), 1);
-  return std::max<int64_t>(parallel_args.world_size() / dp_size / cp_size, 1);
 }
 
 std::string stable_path_digest(const std::string& path_string) {
@@ -345,17 +347,6 @@ void DraftModelSpecWorkerImpl<
 }
 
 template <typename TargetInput>
-void DraftModelSpecWorkerImpl<TargetInput>::init_embedding_cache(
-    int64_t num_blocks) {
-  embedding_cache_ = std::make_unique<EmbeddingCache>(num_blocks);
-  const int64_t placeholder_size = get_embedding_placeholder_size();
-  if (placeholder_size > 0) {
-    embedding_cache_->set_placeholder(
-        torch::zeros({placeholder_size}, torch::dtype(dtype_).device(device_)));
-  }
-}
-
-template <typename TargetInput>
 bool DraftModelSpecWorkerImpl<TargetInput>::allocate_pools(
     const KVCacheShape& kv_cache_shape,
     const AllocateFn& allocate) {
@@ -368,9 +359,9 @@ bool DraftModelSpecWorkerImpl<TargetInput>::allocate_pools(
       [&] { return draft_kv_cache_shape(kv_cache_shape); },
       allocate);
 
-  init_embedding_cache(kv_cache_shape.key_cache_shape()[0]);
   const bool allocated = target_allocated && draft_allocated;
   if (allocated) {
+    on_kv_pools_allocated(kv_cache_shape.key_cache_shape()[0]);
     finalize_hierarchy_kv_cache_transfers();
   }
   return allocated;
@@ -418,38 +409,166 @@ DraftModelSpecWorkerImpl<TargetInput>::update_input_by_last_step_output(
   return inputs.clone();
 }
 
+namespace {
+
+// Chunked-prefill verify normalization: clamps the decode position to the
+// block-table capacity (leaving room for one validate row) and resolves the
+// scheduler's KV-length lag or lead against that position.
+void normalize_chunked_prefill_row(int32_t logical_block_size,
+                                   int32_t validate_width,
+                                   const torch::Tensor& block_tables,
+                                   int32_t seq_id,
+                                   int32_t& current_position,
+                                   int32_t& current_kv_len,
+                                   int32_t& expected_kv_len) {
+  if (block_tables.defined() && block_tables.dim() == 2 &&
+      seq_id < block_tables.size(0)) {
+    const int32_t allocated_kv_len =
+        static_cast<int32_t>(block_tables.size(1)) * logical_block_size;
+    const int32_t max_valid_position = allocated_kv_len - validate_width;
+    if (current_position > max_valid_position) {
+      CHECK_GT(allocated_kv_len, 0)
+          << "decode context has empty block table, seq_id=" << seq_id;
+      CHECK_GE(max_valid_position, 0)
+          << "decode context block table is too small for validation, "
+          << "seq_id=" << seq_id << ", allocated_kv_len=" << allocated_kv_len
+          << ", validate_width=" << validate_width;
+      CHECK_LE(current_position - max_valid_position, validate_width)
+          << "decode context position exceeds allocated blocks, seq_id="
+          << seq_id << ", current_position=" << current_position
+          << ", current_kv_len=" << current_kv_len
+          << ", allocated_kv_len=" << allocated_kv_len;
+      current_position = max_valid_position;
+      expected_kv_len = current_position + 1;
+      current_kv_len = std::min(current_kv_len, expected_kv_len);
+    }
+  }
+  if (current_kv_len < expected_kv_len) {
+    // Qwen3.5/MiMo MTP can receive a scheduler KV length that has not yet
+    // caught up with the speculative placeholder resolved into
+    // current_position. Normalize only the lag explainable by the current
+    // speculative step.
+    CHECK_LE(expected_kv_len - current_kv_len, validate_width)
+        << "decode context kv_len lag is too large, seq_id=" << seq_id
+        << ", current_position=" << current_position
+        << ", current_kv_len=" << current_kv_len;
+    current_kv_len = expected_kv_len;
+  } else if (current_kv_len > expected_kv_len) {
+    // The first decode step can carry the prompt KV length while the decode
+    // position is still initialized to zero. Align the position to the KV
+    // context before building the MTP draft input.
+    current_position = current_kv_len - 1;
+    expected_kv_len = current_kv_len;
+  }
+}
+
+}  // namespace
+
 template <typename TargetInput>
-void DraftModelSpecWorkerImpl<TargetInput>::prepare_draft_input(
-    const TargetInput& input) {
-  const auto& embedding = input.input_params.embedding;
-  if (!embedding.mtp_bootstrap_embeddings.defined()) {
+void DraftModelSpecWorkerImpl<TargetInput>::
+    rewrite_decode_rows_from_target_state(
+        TargetInput& input,
+        const std::vector<TargetDecodeStateStore::DecodeState>& last_states,
+        const DecodeRowPolicy& policy) const {
+  const int32_t num_sequences = input.input_params.meta.num_sequences;
+  CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
+      << "decode context state count mismatch";
+  const bool enable_cache_correction = this->enable_schedule_overlap();
+
+  std::vector<int32_t> token_ids_vec;
+  std::vector<int32_t> positions_vec;
+  std::vector<int32_t> kv_seq_lens_vec;
+  token_ids_vec.reserve(num_sequences);
+  positions_vec.reserve(num_sequences);
+  kv_seq_lens_vec.reserve(num_sequences + 1);
+
+  const torch::Tensor& token_ids_cpu = input.token_ids_host;
+  const torch::Tensor& positions_cpu = input.positions_host;
+  const Slice<int32_t> input_token_ids = tensor_slice(token_ids_cpu);
+  const Slice<int32_t> input_positions = tensor_slice(positions_cpu);
+
+  for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+    CHECK_LT(static_cast<size_t>(seq_id), input_token_ids.size())
+        << "decode context token seq_id out of range, seq_id=" << seq_id;
+    CHECK_LT(static_cast<size_t>(seq_id), input_positions.size())
+        << "decode context position seq_id out of range, seq_id=" << seq_id;
+    const TargetDecodeStateStore::DecodeState& state = last_states[seq_id];
+    const int32_t input_token_id = input_token_ids[seq_id];
+    const bool input_is_fake_token = input_token_id < 0;
+    // Rewrite fake input tokens to the last committed real token so KV cache
+    // scatter has a valid id; only apply the recorded position offset when the
+    // cached state is still valid.
+    const bool rewrite_fake_token =
+        enable_cache_correction && input_is_fake_token;
+    const bool use_cache_correction = rewrite_fake_token && state.valid;
+    const bool use_fake_context = rewrite_fake_token && !state.valid &&
+                                  policy.fake_context_falls_back_to_state_token;
+    const int32_t position_offset =
+        use_cache_correction ? state.position_offset : 0;
+    int32_t current_position = input_positions[seq_id] + position_offset;
+    int32_t current_kv_len = specBuilder::calc_kv_len(
+        input.input_params.attention.host.kv_seq_lens, seq_id, position_offset);
+    int32_t expected_kv_len = policy.positions_decoupled_from_kv_len
+                                  ? current_kv_len
+                                  : current_position + 1;
+    if (policy.chunked_prefill_verify) {
+      normalize_chunked_prefill_row(
+          policy.logical_block_size,
+          policy.validate_width,
+          input.input_params.attention.host.block_tables,
+          seq_id,
+          current_position,
+          current_kv_len,
+          expected_kv_len);
+    }
+
+    CHECK_EQ(expected_kv_len, current_kv_len)
+        << "decode context position/kv_len mismatch, seq_id=" << seq_id
+        << ", current_position=" << current_position
+        << ", current_kv_len=" << current_kv_len;
+
+    token_ids_vec.emplace_back((use_cache_correction || use_fake_context)
+                                   ? state.token_id
+                                   : input_token_id);
+    positions_vec.emplace_back(current_position);
+    specBuilder::append_seq_len_by_layout(kv_seq_lens_vec, current_kv_len);
+  }
+
+  input.token_ids_host = make_pinned_cpu_tensor(token_ids_vec);
+  input.positions_host = make_pinned_cpu_tensor(positions_vec);
+  input.input_params.attention.host.kv_seq_lens = std::move(kv_seq_lens_vec);
+  input.runtime.device_tensors_ready = false;
+}
+
+template <typename TargetInput>
+DraftInputModelSpec DraftModelSpecWorkerImpl<TargetInput>::draft_input_spec()
+    const {
+  if (!draft_input_spec_valid_) {
+    draft_input_spec_ = {
+        draft_input_hidden_width(draft_impl_->context_.get_model_args()),
+        draft_impl_->dtype()};
+    draft_input_spec_valid_ = true;
+  }
+  return draft_input_spec_;
+}
+
+template <typename TargetInput>
+void DraftModelSpecWorkerImpl<TargetInput>::on_kv_pools_allocated(
+    int64_t num_blocks) {
+  target_state_store_ = std::make_unique<TargetDecodeStateStore>(num_blocks);
+}
+
+template <typename TargetInput>
+void DraftModelSpecWorkerImpl<TargetInput>::release_request_state(
+    const std::vector<int32_t>& released) {
+  if (released.empty()) {
     return;
   }
-  CHECK(input.token_ids_host.defined() &&
-        input.token_ids_host.scalar_type() == torch::kInt)
-      << "draft token_ids_host must be int32";
-  const Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
-
-  torch::Tensor bootstrap_embeddings = safe_to(
-      embedding.mtp_bootstrap_embeddings, torch::dtype(dtype_).device(device_));
-  const int32_t num_rows =
-      static_cast<int32_t>(embedding.mtp_bootstrap_row_idxes.size());
-  CHECK_EQ(bootstrap_embeddings.size(0), static_cast<int64_t>(num_rows))
-      << "bootstrap row count mismatch";
-  CHECK_EQ(embedding.embedding_ids.size(), embedding.request_ids.size())
-      << "bootstrap embedding/request id vectors must be parallel";
-  const int32_t num_ids = static_cast<int32_t>(embedding.embedding_ids.size());
-  for (int32_t i = 0; i < num_rows; ++i) {
-    const int32_t row_idx = embedding.mtp_bootstrap_row_idxes[i];
-    CHECK_GE(row_idx, 0) << "bootstrap row index should be valid";
-    CHECK_LT(row_idx, num_ids) << "bootstrap row index exceeds embedding ids";
-    CHECK_LT(static_cast<size_t>(row_idx), token_ids.size())
-        << "bootstrap row index exceeds token ids";
-    embedding_cache_->write_mtp_bootstrap_context(
-        embedding.embedding_ids[row_idx],
-        embedding.request_ids[row_idx],
-        token_ids[row_idx],
-        bootstrap_embeddings.select(/*dim=*/0, i));
+  // Algorithm hooks run first: a pending-context flush may re-populate the
+  // target store, so the shared clear must come after it.
+  release_algorithm_state(released);
+  if (target_state_store_ != nullptr) {
+    target_state_store_->clear(released);
   }
 }
 

@@ -18,6 +18,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <future>
 #include <string>
 
@@ -53,66 +54,84 @@ TEST(CollectiveServiceTest, RendezvousNeedsNoDeviceOrCommunicator) {
   ASSERT_EQ(addresses.size(), 2);
   EXPECT_EQ(addresses.at(0), "127.0.0.1:9000");
   EXPECT_EQ(addresses.at(1), "127.0.0.1:9001");
-}
+  TEST(CollectiveServiceTest, RegistersWorkersWithoutUnusedCommunicationRoots) {
+    for (int32_t world_size : {1, 2}) {
+      CollectiveService service(world_size);
+      for (int32_t rank = 0; rank < world_size; ++rank) {
+        proto::AddressInfo request;
+        request.set_global_rank(rank);
+        request.set_address("worker-" + std::to_string(rank));
+        proto::CommUniqueIdList response;
+        service.Sync(nullptr, &request, &response, nullptr);
+        EXPECT_EQ(response.comm_unique_ids_size(), 0);
+      }
+      const auto addresses = service.wait();
+      ASSERT_EQ(addresses.size(), world_size);
+      for (int32_t rank = 0; rank < world_size; ++rank) {
+        EXPECT_EQ(addresses.at(rank), "worker-" + std::to_string(rank));
+      }
+    }
+  }
 
-TEST(CollectiveServiceTest, MissingWorkersTimeOutWithoutPartialAddresses) {
-  CollectiveService service(/*total_num=*/2);
-  register_worker(service, /*rank=*/0, "127.0.0.1:9000");
+  TEST(CollectiveServiceTest, MissingWorkersTimeOutWithoutPartialAddresses) {
+    CollectiveService service(/*total_num=*/2);
+    register_worker(service, /*rank=*/0, "127.0.0.1:9000");
 
-  const auto addresses = service.wait_until(std::chrono::steady_clock::now());
+    const auto addresses = service.wait_until(std::chrono::steady_clock::now());
 
-  EXPECT_FALSE(addresses.has_value());
-}
+    EXPECT_FALSE(addresses.has_value());
+  }
 
-TEST(CollectiveServiceTest, TimedWaitAcceptsWorkersRegisteredBeforeWaiting) {
-  CollectiveService service(/*total_num=*/2);
-  register_worker(service, /*rank=*/0, "127.0.0.1:9000");
-  register_worker(service, /*rank=*/1, "127.0.0.1:9001");
+  TEST(CollectiveServiceTest, TimedWaitAcceptsWorkersRegisteredBeforeWaiting) {
+    CollectiveService service(/*total_num=*/2);
+    register_worker(service, /*rank=*/0, "127.0.0.1:9000");
+    register_worker(service, /*rank=*/1, "127.0.0.1:9001");
 
-  const auto addresses = service.wait_until(std::chrono::steady_clock::now() +
-                                            std::chrono::seconds(1));
+    const auto addresses = service.wait_until(std::chrono::steady_clock::now() +
+                                              std::chrono::seconds(1));
 
-  ASSERT_TRUE(addresses.has_value());
-  ASSERT_EQ(addresses->size(), 2);
-  EXPECT_EQ(addresses->at(0), "127.0.0.1:9000");
-  EXPECT_EQ(addresses->at(1), "127.0.0.1:9001");
-}
+    ASSERT_TRUE(addresses.has_value());
+    ASSERT_EQ(addresses->size(), 2);
+    EXPECT_EQ(addresses->at(0), "127.0.0.1:9000");
+    EXPECT_EQ(addresses->at(1), "127.0.0.1:9001");
+  }
 
-TEST(CollectiveServiceTest, FinalRegistrationWakesTimedWaitBeforeDeadline) {
-  CollectiveService service(/*total_num=*/2);
-  register_worker(service, /*rank=*/0, "127.0.0.1:9000");
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  auto result = std::async(std::launch::async, [&service, deadline]() {
-    return service.wait_until(deadline);
-  });
-  EXPECT_EQ(result.wait_for(std::chrono::milliseconds(20)),
-            std::future_status::timeout);
+  TEST(CollectiveServiceTest, FinalRegistrationWakesTimedWaitBeforeDeadline) {
+    CollectiveService service(/*total_num=*/2);
+    register_worker(service, /*rank=*/0, "127.0.0.1:9000");
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto result = std::async(std::launch::async, [&service, deadline]() {
+      return service.wait_until(deadline);
+    });
+    EXPECT_EQ(result.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
 
-  register_worker(service, /*rank=*/1, "127.0.0.1:9001");
-  EXPECT_EQ(result.wait_for(std::chrono::seconds(1)),
-            std::future_status::ready);
-  const auto addresses = result.get();
-  ASSERT_TRUE(addresses.has_value());
-  ASSERT_EQ(addresses->size(), 2);
-  EXPECT_EQ(addresses->at(1), "127.0.0.1:9001");
-}
+    register_worker(service, /*rank=*/1, "127.0.0.1:9001");
+    EXPECT_EQ(result.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    const auto addresses = result.get();
+    ASSERT_TRUE(addresses.has_value());
+    ASSERT_EQ(addresses->size(), 2);
+    EXPECT_EQ(addresses->at(1), "127.0.0.1:9001");
+  }
 
-TEST(CollectiveServiceTest, TimedOutRendezvousCanObserveLateWorkersOnRetry) {
-  CollectiveService service(/*total_num=*/2);
-  register_worker(service, /*rank=*/0, "127.0.0.1:9000");
-  const auto expired_addresses = service.wait_until(
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
-  ASSERT_FALSE(expired_addresses.has_value());
+  TEST(CollectiveServiceTest, TimedOutRendezvousCanObserveLateWorkersOnRetry) {
+    CollectiveService service(/*total_num=*/2);
+    register_worker(service, /*rank=*/0, "127.0.0.1:9000");
+    const auto expired_addresses = service.wait_until(
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(20));
+    ASSERT_FALSE(expired_addresses.has_value());
 
-  register_worker(service, /*rank=*/1, "127.0.0.1:9001");
+    register_worker(service, /*rank=*/1, "127.0.0.1:9001");
 
-  // A new rendezvous may observe registrations made after the previous timeout.
-  const auto addresses = service.wait_until(std::chrono::steady_clock::now() +
-                                            std::chrono::seconds(1));
-  ASSERT_TRUE(addresses.has_value());
-  EXPECT_EQ(addresses->size(), 2);
-}
+    // A new rendezvous may observe registrations made after the previous
+    // timeout.
+    const auto addresses = service.wait_until(std::chrono::steady_clock::now() +
+                                              std::chrono::seconds(1));
+    ASSERT_TRUE(addresses.has_value());
+    EXPECT_EQ(addresses->size(), 2);
+  }
 
 }  // namespace
 }  // namespace xllm

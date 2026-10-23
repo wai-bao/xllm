@@ -38,6 +38,7 @@ cc_library(
     :distributed_virtual_memory_coordinator
     :request
     :runtime
+    :speculative_transport_adapter
     :profile
     :pd_topology_guard
     glog::glog

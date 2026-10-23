@@ -249,7 +249,6 @@ TEST_F(SlotBufferTest, DpMetadataStaysPrivateAcrossSlotPreparationAndReuse) {
   input.raw_dp_global_token_nums = {3, 0};
   input.dp_is_decode = {0, 0};
   input.dp_global_kv_max_seq_lens = {2, 0};
-  input.dp_global_batch_generations = {1, 0};
   input.dp_global_sequence_nums = {2, 0};
   auto forward = make_forward_input(active, BatchForwardType::PREFILL, 2);
   forward.input_params.parallel = input;
@@ -262,7 +261,6 @@ TEST_F(SlotBufferTest, DpMetadataStaysPrivateAcrossSlotPreparationAndReuse) {
   const int32_t* phases = first_params.parallel.dp_is_decode.data();
   EXPECT_TRUE(first_params.parallel.raw_dp_global_token_nums.empty());
   EXPECT_TRUE(first_params.parallel.dp_global_kv_max_seq_lens.empty());
-  EXPECT_TRUE(first_params.parallel.dp_global_batch_generations.empty());
   EXPECT_TRUE(first_params.parallel.dp_global_sequence_nums.empty());
 
   input.dp_global_token_nums = {0, 4};

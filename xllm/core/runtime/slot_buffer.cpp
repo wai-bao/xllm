@@ -1358,16 +1358,16 @@ Status SlotBuffer::prepare_decode_padded(const ModelInputHostView& input,
   return Status();
 }
 
-Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
-                                    torch::ScalarType hidden_dtype,
-                                    const torch::Device& device,
-                                    std::unique_ptr<SlotBuffer>& output) {
-  const bool prefill = spec.kind == MtpInvocationKind::PREFILL;
+Status SlotBuffer::create_spec_input(const SpecInputSpec& spec,
+                                     torch::ScalarType hidden_dtype,
+                                     const torch::Device& device,
+                                     std::unique_ptr<SlotBuffer>& output) {
+  const bool prefill = spec.kind == SpecInvocationKind::PREFILL;
   if (spec.model.max_tokens == 0 || spec.model.max_sequences == 0 ||
       spec.model.max_blocks_per_sequence == 0 ||
       (spec.context_only && !prefill) ||
       (spec.sample_from_anchor &&
-       spec.kind != MtpInvocationKind::BLOCK_DRAFT) ||
+       spec.kind != SpecInvocationKind::BLOCK_DRAFT) ||
       (prefill &&
        (spec.hidden_size == 0 ||
         spec.hidden_size > std::numeric_limits<int32_t>::max() ||
@@ -1380,30 +1380,31 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
        (spec.logical_block_size == 0 || spec.num_speculative_tokens == 0 ||
         spec.num_speculative_tokens >= std::numeric_limits<int32_t>::max() ||
         spec.logical_block_size > std::numeric_limits<int32_t>::max() ||
-        (spec.kind != MtpInvocationKind::DRAFT &&
-         spec.kind != MtpInvocationKind::VALIDATE &&
-         spec.kind != MtpInvocationKind::BLOCK_DRAFT) ||
+        (spec.kind != SpecInvocationKind::DRAFT &&
+         spec.kind != SpecInvocationKind::VALIDATE &&
+         spec.kind != SpecInvocationKind::EXTEND &&
+         spec.kind != SpecInvocationKind::BLOCK_DRAFT) ||
         spec.mask_token_id < 0 ||
         spec.draft_step >= spec.num_speculative_tokens ||
-        (spec.kind == MtpInvocationKind::VALIDATE && spec.draft_step != 0)))) {
+        (spec.kind == SpecInvocationKind::VALIDATE && spec.draft_step != 0)))) {
     return invalid("Invalid fixed MTP model input specification.");
   }
   auto scratch = std::make_unique<SlotBuffer::InputScratch>();
   auto& view = *scratch;
   view.spec_ = spec;
+  view.hidden_dtype_ = hidden_dtype;
   ModelInputCapacity capacity = spec.model;
   if (!prefill) {
+    // Recursive drafts consume one carried row per step: the first reads the
+    // seed's root position directly (offset 0), later steps advance by their
+    // draft_step. The bootstrap era's two-row first draft is gone.
     view.rows_per_sequence_ =
-        spec.kind != MtpInvocationKind::DRAFT
+        spec.kind != SpecInvocationKind::DRAFT
             ? spec.num_speculative_tokens + (spec.sample_from_anchor ? 0U : 1U)
-            : (spec.draft_step == 0 ? 2U : 1U);
-    // Draft positions follow target hidden states, one token behind target.
-    view.first_offset_ =
-        spec.kind != MtpInvocationKind::DRAFT
-            ? 0
-            : (spec.draft_step == 0
-                   ? -2
-                   : static_cast<int32_t>(spec.draft_step) - 1);
+            : 1U;
+    view.first_offset_ = spec.kind != SpecInvocationKind::DRAFT
+                             ? 0
+                             : static_cast<int32_t>(spec.draft_step);
     const uint64_t rows = static_cast<uint64_t>(spec.model.max_sequences) *
                           view.rows_per_sequence_;
     if (rows > std::numeric_limits<int32_t>::max()) {
@@ -1436,7 +1437,6 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
     view.token_to_sequence_.reserve(capacity.max_tokens);
     view.published_mask_.resize(capacity.max_sequences);
     view.planned_rows_.reserve(capacity.max_sequences);
-    view.published_rows_.reserve(capacity.max_sequences);
     view.sampled_token_rows_.reserve(capacity.max_sequences);
     const auto host = options.device(torch::kCPU).pinned_memory(true);
     view.host_indices_ =
@@ -1447,9 +1447,11 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
         torch::empty({2, capacity.max_sequences}, host.dtype(torch::kInt32));
     view.device_lengths_ =
         torch::empty({2, capacity.max_sequences}, options.dtype(torch::kInt32));
-    view.bootstrap_hidden_storage_ =
-        torch::empty({capacity.max_sequences, spec.hidden_size},
-                     options.dtype(hidden_dtype));
+    if (spec.context_only) {
+      view.bootstrap_hidden_storage_ =
+          torch::empty({capacity.max_sequences, spec.hidden_size},
+                       options.dtype(hidden_dtype));
+    }
     view.token_storage_ =
         torch::empty({capacity.max_sequences}, options.dtype(torch::kInt32));
   } else {
@@ -1477,8 +1479,6 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
         torch::empty({capacity.max_tokens}, options.dtype(torch::kInt32));
     view.cache_offsets_storage_ =
         torch::empty({capacity.max_tokens}, options.dtype(torch::kInt32));
-    view.repair_scratch_storage_ =
-        torch::empty({spec.model.max_sequences}, options.dtype(torch::kInt64));
   }
   for (const auto* tensor : {&view.host_indices_, &view.host_lengths_}) {
     view.pinned_bytes_ += tensor->defined() ? tensor->nbytes() : 0;
@@ -1491,8 +1491,7 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
                              &view.cache_positions_storage_,
                              &view.block_indices_storage_,
                              &view.block_ids_storage_,
-                             &view.cache_offsets_storage_,
-                             &view.repair_scratch_storage_}) {
+                             &view.cache_offsets_storage_}) {
     view.device_bytes_ += tensor->defined() ? tensor->nbytes() : 0;
   }
   input->input_scratch_ = std::move(scratch);
@@ -1503,7 +1502,7 @@ Status SlotBuffer::create_mtp_input(const MtpInputSpec& spec,
 Status SlotBuffer::set_mtp_validate_width(SlotBuffer& input,
                                           uint32_t draft_steps) {
   if (!input.input_scratch_ ||
-      input.input_scratch_->spec_.kind != MtpInvocationKind::VALIDATE ||
+      input.input_scratch_->spec_.kind != SpecInvocationKind::VALIDATE ||
       draft_steps == 0 ||
       draft_steps > input.input_scratch_->spec_.num_speculative_tokens) {
     return invalid("MTP validate depth exceeds its fixed storage capacity.");
@@ -1519,11 +1518,11 @@ Status SlotBuffer::set_mtp_validate_width(SlotBuffer& input,
   return Status();
 }
 
-Status SlotBuffer::plan_mtp_decode(SlotBuffer& input,
-                                   const ModelInputHostView& base,
-                                   const ModelInputBatch& batch) {
+Status SlotBuffer::plan_spec_decode(SlotBuffer& input,
+                                    const ModelInputHostView& base,
+                                    const ModelInputBatch& batch) {
   if (!input.input_scratch_ ||
-      input.input_scratch_->spec_.kind == MtpInvocationKind::PREFILL) {
+      input.input_scratch_->spec_.kind == SpecInvocationKind::PREFILL) {
     return invalid("MTP decode requires an expanded model input.");
   }
   auto& view = *input.input_scratch_;
@@ -1545,8 +1544,8 @@ Status SlotBuffer::plan_mtp_decode(SlotBuffer& input,
   const int64_t capacity_positions =
       static_cast<int64_t>(base.block_table_width) *
       view.spec_.logical_block_size;
-  const bool first_draft =
-      view.spec_.kind == MtpInvocationKind::DRAFT && view.spec_.draft_step == 0;
+  const bool first_draft = view.spec_.kind == SpecInvocationKind::DRAFT &&
+                           view.spec_.draft_step == 0;
   for (uint64_t row = 0; row < count; ++row) {
     const int64_t first_position = std::max<int64_t>(
         first_draft ? 0 : -1,
@@ -1558,15 +1557,11 @@ Status SlotBuffer::plan_mtp_decode(SlotBuffer& input,
         static_cast<int64_t>(base.kv_seq_lens[row]) + view.first_offset_);
     const int64_t last_kv_length =
         static_cast<int64_t>(base.kv_seq_lens[row]) + max_offset;
-    const int64_t repair_position = base.positions[row];
-    if (first_position < 0 || first_kv_length <= 0 || last_position < 0 ||
-        last_position >= capacity_positions || last_kv_length <= 0 ||
+    if (first_position < 0 || first_kv_length <= 0 ||
+        last_position >= capacity_positions ||
         last_kv_length > capacity_positions ||
         last_position > std::numeric_limits<int32_t>::max() ||
-        last_kv_length > std::numeric_limits<int32_t>::max() ||
-        (first_draft &&
-         (repair_position >= capacity_positions ||
-          repair_position > std::numeric_limits<int32_t>::max()))) {
+        last_kv_length > std::numeric_limits<int32_t>::max()) {
       return invalid(
           "MTP invocation exceeds its reserved position or KV capacity.");
     }
@@ -1597,13 +1592,13 @@ Status SlotBuffer::plan_mtp_decode(SlotBuffer& input,
     for (uint32_t item = 0; item < view.rows_per_sequence_; ++item) {
       const int32_t offset = view.first_offset_ + static_cast<int32_t>(item);
       view.tokens_.emplace_back(view.spec_.kind ==
-                                        MtpInvocationKind::BLOCK_DRAFT
+                                        SpecInvocationKind::BLOCK_DRAFT
                                     ? view.spec_.mask_token_id
                                     : 0);
       view.positions_.emplace_back(
           std::max<int32_t>(base.positions[row] + offset, 0));
       view.slots_.emplace_back(0);
-      if (view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT) {
+      if (view.spec_.kind == SpecInvocationKind::BLOCK_DRAFT) {
         continue;
       }
       view.q_lengths_.emplace_back(1);
@@ -1613,7 +1608,7 @@ Status SlotBuffer::plan_mtp_decode(SlotBuffer& input,
       view.block_tables_.insert(
           view.block_tables_.end(), blocks.begin(), blocks.end());
     }
-    if (view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT) {
+    if (view.spec_.kind == SpecInvocationKind::BLOCK_DRAFT) {
       view.q_lengths_.emplace_back(view.rows_per_sequence_);
       view.kv_lengths_.emplace_back(base.kv_seq_lens[row] +
                                     view.rows_per_sequence_ - 1);
@@ -1633,15 +1628,15 @@ Status SlotBuffer::plan_mtp_decode(SlotBuffer& input,
   return Status();
 }
 
-Status SlotBuffer::prepare_mtp_decode(SlotBuffer& input,
-                                      const ModelInputHostView& base,
-                                      const ModelInputBatch& batch,
-                                      const Stream& stream) {
-  Status status = plan_mtp_decode(input, base, batch);
+Status SlotBuffer::prepare_spec_decode(SlotBuffer& input,
+                                       const ModelInputHostView& base,
+                                       const ModelInputBatch& batch,
+                                       const Stream& stream) {
+  Status status = plan_spec_decode(input, base, batch);
   if (!status.ok()) {
     return status;
   }
-  return prepare_planned_mtp_decode(input, base, batch, stream);
+  return prepare_planned_spec_decode(input, base, batch, stream);
 }
 
 Status SlotBuffer::prepare_block_draft_padded(SlotBuffer& input,
@@ -1696,14 +1691,14 @@ Status SlotBuffer::prepare_block_draft_padded(SlotBuffer& input,
   return status;
 }
 
-Status SlotBuffer::prepare_planned_mtp_decode(SlotBuffer& input,
-                                              const ModelInputHostView& base,
-                                              const ModelInputBatch& batch,
-                                              const Stream& stream,
-                                              uint32_t physical_rows) {
+Status SlotBuffer::prepare_planned_spec_decode(SlotBuffer& input,
+                                               const ModelInputHostView& base,
+                                               const ModelInputBatch& batch,
+                                               const Stream& stream,
+                                               uint32_t physical_rows) {
   auto& view = *input.input_scratch_;
   ModelInputBatch expanded = batch;
-  if (view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT) {
+  if (view.spec_.kind == SpecInvocationKind::BLOCK_DRAFT) {
     expanded.forward_type = BatchForwardType::CHUNKED_PREFILL;
   }
   expanded.num_actual_sequences =
@@ -1711,7 +1706,7 @@ Status SlotBuffer::prepare_planned_mtp_decode(SlotBuffer& input,
   Status status;
   if (physical_rows == 0) {
     status = input.prepare(view.planned_, expanded, stream);
-  } else if (view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT) {
+  } else if (view.spec_.kind == SpecInvocationKind::BLOCK_DRAFT) {
     status = prepare_block_draft_padded(input, expanded, physical_rows, stream);
   } else {
     status = input.prepare_decode_padded(
@@ -1732,9 +1727,9 @@ Status SlotBuffer::prepare_planned_mtp_decode(SlotBuffer& input,
           .narrow(
               /*dim=*/0,
               /*start=*/0,
-              view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT ? count : rows)
+              view.spec_.kind == SpecInvocationKind::BLOCK_DRAFT ? count : rows)
           .view({count,
-                 view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT
+                 view.spec_.kind == SpecInvocationKind::BLOCK_DRAFT
                      ? 1
                      : view.rows_per_sequence_});
   view.tokens_view_ = input.tokens()
@@ -1743,10 +1738,6 @@ Status SlotBuffer::prepare_planned_mtp_decode(SlotBuffer& input,
   view.cache_positions_ =
       view.cache_positions_storage_.narrow(/*dim=*/0, /*start=*/0, rows)
           .view({count, view.rows_per_sequence_});
-  view.cache_first_column_ =
-      view.cache_positions_.select(/*dim=*/1, /*index=*/0);
-  view.model_first_column_ =
-      view.positions_view_.select(/*dim=*/1, /*index=*/0);
   view.block_indices_ =
       view.block_indices_storage_.narrow(/*dim=*/0, /*start=*/0, rows)
           .view({rows, 1});
@@ -1756,8 +1747,6 @@ Status SlotBuffer::prepare_planned_mtp_decode(SlotBuffer& input,
       view.cache_offsets_storage_.narrow(/*dim=*/0, /*start=*/0, rows)
           .view({count, view.rows_per_sequence_});
   view.cache_offsets_flat_ = view.cache_offsets_.view({rows});
-  view.future_positions_ =
-      view.repair_scratch_storage_.narrow(/*dim=*/0, /*start=*/0, count);
   return Status();
 }
 
@@ -1769,7 +1758,7 @@ Status SlotBuffer::prepare_dspark_validate(SlotBuffer& input,
                                            uint64_t batch_id,
                                            const Stream& stream) {
   if (!input.input_scratch_ ||
-      input.input_scratch_->spec_.kind != MtpInvocationKind::VALIDATE) {
+      input.input_scratch_->spec_.kind != SpecInvocationKind::VALIDATE) {
     return invalid("DSpark verification requires a VALIDATE model input.");
   }
   auto& view = *input.input_scratch_;
@@ -1820,20 +1809,17 @@ Status SlotBuffer::prepare_dspark_validate(SlotBuffer& input,
                        &view.kv_lengths_view_,
                        &view.tokens_view_,
                        &view.cache_positions_,
-                       &view.cache_first_column_,
-                       &view.model_first_column_,
                        &view.block_indices_,
                        &view.block_ids_,
                        &view.cache_offsets_,
-                       &view.cache_offsets_flat_,
-                       &view.future_positions_}) {
+                       &view.cache_offsets_flat_}) {
     *tensor = torch::Tensor();
   }
   return Status();
 }
 
-void SlotBuffer::patch_mtp_decode(SlotBuffer& input,
-                                  const MtpContextView& binding) {
+void SlotBuffer::patch_spec_decode(SlotBuffer& input,
+                                   const SpecContextView& binding) {
   auto& view = *input.input_scratch_;
   CHECK_GT(view.sequences_, 0U);
   CHECK(binding.prepared_);
@@ -1842,8 +1828,8 @@ void SlotBuffer::patch_mtp_decode(SlotBuffer& input,
   const auto& state = binding.state_;
   torch::add_out(view.positions_view_,
                  state.positions.unsqueeze(/*dim=*/1),
-                 view.active_offsets_);
-  if (view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT) {
+                 view.offsets_);
+  if (view.spec_.kind == SpecInvocationKind::BLOCK_DRAFT) {
     view.kv_lengths_view_.copy_(state.kv_seq_lens.unsqueeze(/*dim=*/1));
     view.kv_lengths_view_.add_(view.rows_per_sequence_ - 1);
   } else {
@@ -1851,26 +1837,15 @@ void SlotBuffer::patch_mtp_decode(SlotBuffer& input,
                    state.kv_seq_lens.unsqueeze(/*dim=*/1),
                    view.active_offsets_);
   }
-  const bool first_draft =
-      view.spec_.kind == MtpInvocationKind::DRAFT && view.spec_.draft_step == 0;
+  const bool first_draft = view.spec_.kind == SpecInvocationKind::DRAFT &&
+                           view.spec_.draft_step == 0;
   if (first_draft) {
     // A one-token prompt has no predecessor; keep its unused repair row valid.
     view.positions_view_.clamp_min_(0);
     view.kv_lengths_view_.clamp_min_(1);
   }
   view.cache_positions_.copy_(view.positions_view_);
-  if (first_draft) {
-    // MTP consumes token t with target hidden t-1, matching shifted prefill.
-    // Its current cache row is t-1; redirect unused repair writes to t.
-    view.future_positions_.copy_(state.positions);
-    torch::where_out(view.cache_first_column_,
-                     state.repair_required,
-                     view.model_first_column_,
-                     view.future_positions_);
-    view.tokens_view_.select(/*dim=*/1, /*index=*/0)
-        .copy_(state.previous_tokens);
-    view.tokens_view_.select(/*dim=*/1, /*index=*/1).copy_(binding.tokens_);
-  } else if (view.spec_.kind != MtpInvocationKind::DRAFT) {
+  if (view.first_offset_ == 0) {
     view.tokens_view_.select(/*dim=*/1, /*index=*/0).copy_(binding.tokens_);
   }
   // Each expanded row owns its duplicated block table. Indices and outputs
@@ -1879,7 +1854,7 @@ void SlotBuffer::patch_mtp_decode(SlotBuffer& input,
       view.block_indices_.view({view.sequences_, view.rows_per_sequence_});
   torch::floor_divide_out(
       indices_matrix, view.cache_positions_, view.spec_.logical_block_size);
-  if (view.spec_.kind == MtpInvocationKind::BLOCK_DRAFT) {
+  if (view.spec_.kind == SpecInvocationKind::BLOCK_DRAFT) {
     auto ids_matrix =
         view.block_ids_.view({view.sequences_, view.rows_per_sequence_});
     torch::gather_out(ids_matrix,
@@ -1905,13 +1880,13 @@ void SlotBuffer::patch_mtp_decode(SlotBuffer& input,
   slots.mul_(view.spec_.logical_block_size).add_(view.cache_offsets_flat_);
 }
 
-Status SlotBuffer::plan_mtp_prefill(SlotBuffer& input,
-                                    const ModelInputHostView& base,
-                                    const ModelInputBatch& batch,
-                                    std::span<const int32_t> extra_token_ids,
-                                    const SamplingParameters& sampling) {
+Status SlotBuffer::plan_spec_prefill(SlotBuffer& input,
+                                     const ModelInputHostView& base,
+                                     const ModelInputBatch& batch,
+                                     std::span<const int32_t> extra_token_ids,
+                                     const SamplingParameters& sampling) {
   if (!input.input_scratch_ ||
-      input.input_scratch_->spec_.kind != MtpInvocationKind::PREFILL) {
+      input.input_scratch_->spec_.kind != SpecInvocationKind::PREFILL) {
     return invalid("MTP prefill requires a prompt model input.");
   }
   auto& view = *input.input_scratch_;
@@ -1994,24 +1969,25 @@ Status SlotBuffer::plan_mtp_prefill(SlotBuffer& input,
   return Status();
 }
 
-Status SlotBuffer::prepare_mtp_prefill(SlotBuffer& input,
-                                       const ModelInputHostView& base,
-                                       const ModelInputBatch& batch,
-                                       std::span<const int32_t> extra_token_ids,
-                                       const SamplingParameters& sampling,
-                                       const Stream& stream) {
+Status SlotBuffer::prepare_spec_prefill(
+    SlotBuffer& input,
+    const ModelInputHostView& base,
+    const ModelInputBatch& batch,
+    std::span<const int32_t> extra_token_ids,
+    const SamplingParameters& sampling,
+    const Stream& stream) {
   Status status =
-      plan_mtp_prefill(input, base, batch, extra_token_ids, sampling);
+      plan_spec_prefill(input, base, batch, extra_token_ids, sampling);
   if (!status.ok()) {
     return status;
   }
-  return prepare_planned_mtp_prefill(input, base, batch, stream);
+  return prepare_planned_spec_prefill(input, base, batch, stream);
 }
 
-Status SlotBuffer::prepare_planned_mtp_prefill(SlotBuffer& input,
-                                               const ModelInputHostView& base,
-                                               const ModelInputBatch& batch,
-                                               const Stream& stream) {
+Status SlotBuffer::prepare_planned_spec_prefill(SlotBuffer& input,
+                                                const ModelInputHostView& base,
+                                                const ModelInputBatch& batch,
+                                                const Stream& stream) {
   auto& view = *input.input_scratch_;
   if (stream.get_stream()->device_index() !=
       view.device_indices_.device().index()) {
@@ -2026,8 +2002,7 @@ Status SlotBuffer::prepare_planned_mtp_prefill(SlotBuffer& input,
       return status;
     }
   }
-  view.published_rows_ = view.planned_rows_;
-  const int64_t samples = view.published_rows_.size();
+  const int64_t samples = view.planned_rows_.size();
   int64_t* indices = view.host_indices_.data_ptr<int64_t>();
   int32_t* positions =
       view.host_lengths_.select(/*dim=*/0, /*index=*/0).data_ptr<int32_t>();
@@ -2036,7 +2011,7 @@ Status SlotBuffer::prepare_planned_mtp_prefill(SlotBuffer& input,
   for (int64_t index = 0; index < samples; ++index) {
     indices[index] = view.sampled_token_rows_[index];
     positions[index] = base.positions[indices[index]] + 1;
-    lengths[index] = base.kv_seq_lens[view.published_rows_[index]] + 1;
+    lengths[index] = base.kv_seq_lens[view.planned_rows_[index]] + 1;
   }
   view.indices_ = view.device_indices_.narrow(/*dim=*/0, /*start=*/0, samples);
   view.bootstrap_positions_ =
@@ -2045,8 +2020,10 @@ Status SlotBuffer::prepare_planned_mtp_prefill(SlotBuffer& input,
   view.bootstrap_kv_lengths_ =
       view.device_lengths_.select(/*dim=*/0, /*index=*/1)
           .narrow(/*dim=*/0, /*start=*/0, samples);
-  view.bootstrap_hidden_ =
-      view.bootstrap_hidden_storage_.narrow(/*dim=*/0, /*start=*/0, samples);
+  if (view.bootstrap_hidden_storage_.defined()) {
+    view.bootstrap_hidden_ =
+        view.bootstrap_hidden_storage_.narrow(0, 0, samples);
+  }
   view.sampled_token_values_ =
       view.token_storage_.narrow(/*dim=*/0, /*start=*/0, samples);
   input.model_params().embedding.input_embedding = torch::Tensor();
@@ -2064,33 +2041,32 @@ Status SlotBuffer::prepare_planned_mtp_prefill(SlotBuffer& input,
   return Status();
 }
 
-void SlotBuffer::patch_mtp_prefill(SlotBuffer& input,
-                                   const torch::Tensor& target_hidden,
-                                   const torch::Tensor& sampled_tokens,
-                                   MtpContextView& binding) {
+void SlotBuffer::patch_spec_prefill(SlotBuffer& input,
+                                    const torch::Tensor& target_hidden,
+                                    const torch::Tensor& sampled_tokens,
+                                    SpecContextView& binding) {
   auto& view = *input.input_scratch_;
   CHECK_EQ(target_hidden.size(/*dim=*/0), input.tokens().numel());
   // Prefill is eager. The owning task retains its target output through
   // retirement, so the draft can borrow it without a second prompt-sized copy.
   input.model_params().embedding.input_embedding = target_hidden;
-  initialize_mtp_context(input, target_hidden, sampled_tokens, binding);
-  if (!view.published_rows_.empty()) {
+  initialize_block_context(input, target_hidden, sampled_tokens, binding);
+  if (!view.planned_rows_.empty()) {
     input.tokens().index_copy_(
         /*dim=*/0, view.indices_, view.sampled_token_values_);
   }
 }
 
-void SlotBuffer::initialize_mtp_context(SlotBuffer& input,
-                                        const torch::Tensor& target_hidden,
-                                        const torch::Tensor& sampled_tokens,
-                                        MtpContextView& binding) {
+void SlotBuffer::initialize_block_context(SlotBuffer& input,
+                                          const torch::Tensor& target_hidden,
+                                          const torch::Tensor& sampled_tokens,
+                                          SpecContextView& binding) {
   auto& view = *input.input_scratch_;
   CHECK_EQ(target_hidden.dim(), 2);
   CHECK_EQ(target_hidden.size(/*dim=*/1), view.spec_.hidden_size);
-  CHECK_EQ(target_hidden.device(), view.bootstrap_hidden_storage_.device());
-  CHECK_EQ(target_hidden.scalar_type(),
-           view.bootstrap_hidden_storage_.scalar_type());
-  const int64_t samples = view.published_rows_.size();
+  CHECK_EQ(target_hidden.device(), binding.tokens_.device());
+  CHECK_EQ(target_hidden.scalar_type(), view.hidden_dtype_);
+  const int64_t samples = view.planned_rows_.size();
   CHECK_EQ(binding.tokens_.numel(), samples);
   if (samples == 0) {
     return;
@@ -2102,16 +2078,12 @@ void SlotBuffer::initialize_mtp_context(SlotBuffer& input,
   CHECK_EQ(sampled_tokens.size(/*dim=*/0), samples);
   CHECK_EQ(sampled_tokens.size(/*dim=*/1), 1);
   view.sampled_token_values_.copy_(sampled_tokens.squeeze(/*dim=*/1));
-  torch::index_select_out(
-      view.bootstrap_hidden_, target_hidden, /*dim=*/0, view.indices_);
+  if (view.bootstrap_hidden_.defined()) {
+    torch::index_select_out(
+        view.bootstrap_hidden_, target_hidden, 0, view.indices_);
+  }
   binding.tokens_.copy_(sampled_tokens.squeeze(/*dim=*/1));
   const auto& state = binding.state_;
-  if (state.hidden.defined()) {
-    state.previous_tokens.copy_(binding.tokens_);
-    state.hidden.select(/*dim=*/1, /*index=*/0).zero_();
-    state.hidden.select(/*dim=*/1, /*index=*/1).copy_(view.bootstrap_hidden_);
-    state.repair_required.zero_();
-  }
   state.positions.copy_(view.bootstrap_positions_);
   state.kv_seq_lens.copy_(view.bootstrap_kv_lengths_);
 }

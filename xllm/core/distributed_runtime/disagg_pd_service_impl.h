@@ -47,6 +47,7 @@ class DisaggPDServiceImpl {
   explicit DisaggPDServiceImpl(DisaggPDScheduler* scheduler,
                                Engine* engine,
                                int32_t kv_cache_block_tokens,
+                               std::shared_ptr<XServiceClient> client = nullptr,
                                DisaggPDServiceOptions response_options = {});
   ~DisaggPDServiceImpl() = default;
 
@@ -76,7 +77,7 @@ class DisaggPDServiceImpl {
   DisaggPDScheduler* scheduler_;  // not owned
   Engine* engine_;                // not owned
   const DisaggPDServiceOptions response_options_;
-  XServiceClient* xservice_client_ = nullptr;
+  std::shared_ptr<XServiceClient> xservice_client_;
   std::mutex json_object_grammar_mutex_;
   std::shared_ptr<const JsonObjectGrammar> json_object_grammar_;
   std::shared_ptr<const JsonObjectGrammar> json_reasoning_grammar_;

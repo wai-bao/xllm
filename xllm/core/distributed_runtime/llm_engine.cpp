@@ -35,6 +35,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "common/options.h"
 #include "core/common/global_flags.h"
+#include "core/distributed_runtime/request_state_cleanup.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/parallel_config.h"
@@ -52,7 +53,6 @@ limitations under the License.
 #include "core/platform/platform.h"
 #include "framework/block/kv_cache_manager_factory.h"
 #include "framework/model/model_args.h"
-#include "framework/speculative/mtp_utils.h"
 #include "models/model_registry.h"
 #include "runtime/decode_graph_bucket.h"
 #include "runtime/llm_worker_impl.h"
@@ -203,8 +203,16 @@ bool LLMEngine::init_model(MasterStatus master_status,
 
   args_ = model_loader->model_args();
 #if defined(USE_NPU)
-  configure_glm5_next_mtp_args(
-      args_, options_.speculative_algorithm(), options_.is_draft_engine());
+  if (SpeculativeConfig::resolve_mtp_draft_conversion(
+          options_.is_draft_engine(),
+          options_.speculative_algorithm(),
+          options_.num_speculative_tokens(),
+          /*num_nextn_predict_layers=*/0,
+          /*is_block_diffusion=*/false,
+          /*is_npu=*/true) ==
+      SpeculativeConfig::MtpDraftConversion::DRAFT_ENGINE_PAIR) {
+    ModelRegistry::convert_to_mtp_draft(args_);
+  }
 #endif
   if (!options_.is_draft_engine() &&
       SpeculativeConfig::is_block_diffusion_algorithm(
@@ -597,6 +605,14 @@ ForwardOutput LLMEngine::step(BatchGroup& batch) {
   forward_input_factory_->create_inputs(
       batch, args_, forward_inputs, is_graph_warmup);
   select_draft_steps(forward_inputs);
+  // Released embedding ids ride the next forward input to the worker, which
+  // clears the per-request speculative state on arrival. The pool already
+  // drops ids it reused at the release-queue choke point, so every consumer
+  // only sees genuinely departed slots.
+  for (uint32_t dp_rank = 0; dp_rank < forward_inputs.size(); ++dp_rank) {
+    forward_inputs[dp_rank].request_state.released_embedding_ids =
+        kv_cache_manager_->take_released_embedding_ids(dp_rank);
+  }
   if (eplb_controller_ != nullptr) {
     eplb_controller_->on_step_dispatched(forward_inputs, is_graph_warmup);
   }
@@ -658,6 +674,11 @@ ForwardOutput LLMEngine::step(BatchGroup& batch) {
 
   COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
   return {};
+}
+
+void LLMEngine::flush_released_requests() {
+  flush_released_request_state(
+      *kv_cache_manager_, worker_clients_, dp_local_size_);
 }
 
 void LLMEngine::update_last_step_result(BatchGroup& last_batch) {

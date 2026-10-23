@@ -58,6 +58,19 @@ inline bool is_cpu_int_tensor(const torch::Tensor& tensor, int32_t dimensions) {
          tensor.is_contiguous();
 }
 
+// H2D-source options; the caching host allocator recycles pinned blocks.
+inline torch::TensorOptions pinned_cpu_options(torch::ScalarType dtype) {
+  return torch::TensorOptions()
+      .dtype(dtype)
+      .device(torch::kCPU)
+      .pinned_memory(true);
+}
+
+// Host-only tensors stay pageable; pinning them is pure waste.
+inline torch::TensorOptions pageable_cpu_options(torch::ScalarType dtype) {
+  return torch::TensorOptions().dtype(dtype).device(torch::kCPU);
+}
+
 // CHECKed flat borrow; T defaults to int32, the dominant token/length type.
 template <typename T = int32_t>
 inline Slice<T> tensor_slice(const torch::Tensor& tensor) {
@@ -84,19 +97,6 @@ inline torch::Tensor index_select_2d(const torch::Tensor& input,
 }
 
 namespace detail {
-
-// H2D-source options; the caching host allocator recycles pinned blocks.
-inline torch::TensorOptions pinned_cpu_options(torch::ScalarType dtype) {
-  return torch::TensorOptions()
-      .dtype(dtype)
-      .device(torch::kCPU)
-      .pinned_memory(true);
-}
-
-// Host-only tensors stay pageable; pinning them is pure waste.
-inline torch::TensorOptions pageable_cpu_options(torch::ScalarType dtype) {
-  return torch::TensorOptions().dtype(dtype).device(torch::kCPU);
-}
 
 // empty+memcpy avoids torch::tensor's intermediate copy; vector<bool> is
 // bit-packed with no data(), so it is filled element-by-element.
@@ -129,7 +129,7 @@ inline torch::Tensor create_2d_tensor(const std::vector<std::vector<T>>& vec,
   const size_t n_cols = vec[0].size();
   auto tensor =
       torch::empty({static_cast<int64_t>(n_rows), static_cast<int64_t>(n_cols)},
-                   detail::pinned_cpu_options(dtype));
+                   pinned_cpu_options(dtype));
   // Fill the contiguous pinned buffer row-by-row with a plain memcpy. The
   // element type T must match `dtype`'s storage; every current caller pairs
   // int32_t with kInt and int64_t with kInt64. Copying directly avoids a
@@ -178,7 +178,7 @@ constexpr torch::ScalarType get_scalar_type() {
 template <typename T>
 inline torch::Tensor make_cpu_tensor(const std::vector<T>& values) {
   return detail::make_cpu_tensor_with_options(
-      values, detail::pageable_cpu_options(get_scalar_type<T>()));
+      values, pageable_cpu_options(get_scalar_type<T>()));
 }
 
 // Pinned variant for host tensors that are the source of an async H2D copy;
@@ -187,7 +187,7 @@ inline torch::Tensor make_cpu_tensor(const std::vector<T>& values) {
 template <typename T>
 inline torch::Tensor make_pinned_cpu_tensor(const std::vector<T>& values) {
   return detail::make_cpu_tensor_with_options(
-      values, detail::pinned_cpu_options(get_scalar_type<T>()));
+      values, pinned_cpu_options(get_scalar_type<T>()));
 }
 
 // Identity index vector [0, count) as an int32 device tensor, built directly
@@ -215,6 +215,24 @@ template <typename T>
 inline torch::Tensor async_h2d_tensor(const std::vector<T>& values,
                                       const torch::Device& device) {
   return async_h2d_tensor(values, torch::TensorOptions().device(device));
+}
+
+// Capacity-based grow-and-reuse for buffers rebuilt every decode round: keeps
+// an existing allocation when it still fits capacity_sizes (same device and
+// dtype), otherwise reallocates. The caller narrows the result to the exact
+// per-round shape.
+inline torch::Tensor& ensure_capacity(torch::Tensor& buffer,
+                                      c10::IntArrayRef capacity_sizes,
+                                      const torch::TensorOptions& options) {
+  bool fits = buffer.defined() && buffer.device() == options.device() &&
+              buffer.scalar_type() == options.dtype();
+  for (size_t dim = 0; fits && dim < capacity_sizes.size(); ++dim) {
+    fits = buffer.size(static_cast<int64_t>(dim)) >= capacity_sizes[dim];
+  }
+  if (!fits) {
+    buffer = torch::empty(capacity_sizes, options);
+  }
+  return buffer;
 }
 
 inline std::vector<char> get_the_bytes(std::string filename) {

@@ -28,6 +28,7 @@ limitations under the License.
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/sampling/draft_sampling_mode.h"
 #include "core/framework/sampling/sampler.h"
+#include "core/framework/speculative/draft_input_model_spec.h"
 #include "core/kv_cache/transfer/host_transfer/transfer.h"
 #include "core/platform/device.h"
 #include "core/runtime/executor.h"
@@ -98,6 +99,18 @@ struct SpeculativeTaskCapacity {
   SpeculativeTaskKind kind = SpeculativeTaskKind::MTP;
   uint32_t num_speculative_tokens = 0;
   uint32_t context_hidden_size = 0;
+  // Whether this algorithm carries a per-request MTP draft input across
+  // rounds (SpeculativeConfig::produces_draft_input). The explicit flag is
+  // the single gate for store creation and PD export; draft_input_spec stays
+  // a pure model-geometry contract.
+  bool carries_draft_input = false;
+  // Draft-model contract for MTP draft input validation and warmup
+  // (draft_input_hidden_width of the loaded draft, which differs from the
+  // target's hidden size for models like DeepSeek V4's hc_mult scaling, plus
+  // the draft's dtype). Built once by MTPWorkerImpl from its own
+  // draft_input_spec() so every consumer validates against one spec instead
+  // of re-deriving it.
+  DraftInputModelSpec draft_input_spec{};
   int32_t mask_token_id = -1;
   uint32_t selector_top_k = 0;
   uint32_t index_topk = 0;
@@ -114,10 +127,17 @@ struct SpeculativeTaskCapacity {
   std::shared_ptr<const SpecCostProfileStore> adaptive_costs;
   bool calibration_leader = false;
   bool startup_calibration = false;
+  // PD PREFILL instances export the round's seed through the sample output
+  // for the decode-side handoff; mirrors the eager worker's InstanceRole
+  // gate. DECODE instances import it into the draft-input store instead.
+  bool export_pd_draft_input = false;
 };
 
-struct MtpContextStorage;
-struct MtpContextView;
+class DraftInputStateStore;
+struct DraftInput;
+struct DraftInputSamplingState;
+struct SpecContextStorage;
+struct SpecContextView;
 
 struct TaskSubmission {
   Status status;
@@ -155,14 +175,6 @@ class TaskExecutionPipeline final {
                        TaskModel draft,
                        const SpeculativeTaskCapacity& capacity,
                        std::unique_ptr<TaskExecutionPipeline>& output);
-  // Reuse this same queue for workers whose execution state is owned by the
-  // WorkerImpl. The worker supplies only prepare/execute hooks; admission,
-  // FIFO ordering, launch and result retirement remain in this class.
-  static Status create(ThreadPool& state_executor,
-                       TaskModel target,
-                       WorkerImpl& worker,
-                       const LlmTaskCapacity& capacity,
-                       std::unique_ptr<TaskExecutionPipeline>& output);
 
   ~TaskExecutionPipeline();
   TaskExecutionPipeline(const TaskExecutionPipeline&) = delete;
@@ -185,55 +197,49 @@ class TaskExecutionPipeline final {
   // The Step/GetLast adapter consumes the same FIFO without another ID queue.
   // Empty FIFO returns INVALID_ARGUMENT. Successful results carry their ID.
   folly::Future<TaskResult> take_result_async();
+  folly::SemiFuture<bool> release_idle_request_state_async(
+      std::vector<int32_t> embedding_ids);
   uint64_t pinned_bytes() const;
   uint64_t device_bytes() const;
 
  private:
   friend struct TaskPipelineTestPeer;
   friend class SlotBuffer;
-  static Status context_create(MtpContextStorage& pool,
+  static Status context_create(SpecContextStorage& pool,
                                uint32_t capacity,
-                               std::unique_ptr<MtpContextView>& output);
-  static Status context_prepare(MtpContextView& view,
+                               std::unique_ptr<SpecContextView>& output);
+  static Status context_prepare(SpecContextView& view,
                                 std::span<const int32_t> embedding_ids,
                                 std::span<const std::string> request_ids,
                                 bool read_published_state,
                                 const Stream& stream);
   static Status context_prepare_prefill(
-      MtpContextView& view,
+      SpecContextView& view,
       std::span<const int32_t> embedding_ids,
       std::span<const std::string> request_ids,
       std::span<const int32_t> extra_token_ids,
       std::span<const uint32_t> published_sequence_rows,
       const Stream& stream);
-  static Status context_prepare_decode(MtpContextView& view,
-                                       std::span<const int32_t> embedding_ids,
-                                       std::span<const std::string> request_ids,
-                                       std::span<const int32_t> bootstrap_rows,
-                                       const Stream& stream);
   static Status context_prepare_impl(
-      MtpContextView& view,
+      SpecContextView& view,
       std::span<const int32_t> embedding_ids,
       std::span<const std::string> request_ids,
       std::span<const uint32_t> published_sequence_rows,
       bool read_published_state,
-      const Stream& stream,
-      std::span<const int32_t> bootstrap_rows);
-  static void context_gather(MtpContextView& view);
-  static void context_publish(MtpContextView& view);
-  static void context_advance(MtpContextView& view,
+      const Stream& stream);
+  static void context_gather(SpecContextView& view);
+  static void context_publish(SpecContextView& view);
+  static void context_advance(SpecContextView& view,
                               const torch::Tensor& accepted_tokens,
-                              const torch::Tensor& accepted_lengths,
-                              const torch::Tensor& target_hidden);
-  static void context_release(MtpContextView& view);
-  static uint64_t context_device_bytes(const MtpContextView& view);
+                              const torch::Tensor& accepted_lengths);
+  static void context_release(SpecContextView& view);
+  static uint64_t context_device_bytes(const SpecContextView& view);
 
-  static Status create_mtp_context(uint32_t capacity,
-                                   uint32_t hidden_size,
-                                   torch::ScalarType dtype,
-                                   const torch::Device& device,
-                                   std::unique_ptr<MtpContextStorage>& output);
-  static uint64_t mtp_context_bytes(const MtpContextStorage& cache);
+  static Status create_spec_context(
+      uint32_t capacity,
+      const torch::Device& device,
+      std::unique_ptr<SpecContextStorage>& output);
+  static uint64_t spec_context_bytes(const SpecContextStorage& cache);
   friend class TaskExecutionPipelineInputTest;
   static Status validate_input(const LlmForwardInput& input,
                                const LlmTaskCapacity& capacity,
@@ -271,13 +277,6 @@ class TaskExecutionPipeline final {
     SampleOutput sample_output;
     ModelOutput model_output;
     torch::Tensor logits;
-    // Used only by the WorkerImpl-owned execution mode. These values stay in
-    // the normal task slot until the completed FIFO retires it.
-    LlmForwardInput worker_input;
-    // Packed host views borrow this storage even if worker preparation builds
-    // a different contiguous H2D buffer.
-    torch::Tensor worker_input_host_buffer;
-    std::optional<ForwardOutput> worker_output;
   };
 
   struct SlotTicket {
@@ -292,11 +291,9 @@ class TaskExecutionPipeline final {
                         LlmTaskCapacity capacity,
                         TaskKVPush push_kv,
                         TaskKVLoad load_kv,
-                        TaskKVFence fence_kv,
-                        WorkerImpl* worker_pipeline = nullptr);
+                        TaskKVFence fence_kv);
   Status validate(const Slot& slot, const LlmForwardInput& input) const;
   Status prepare(uint32_t slot_id, const LlmForwardInput& input);
-  Status prepare_worker(uint32_t slot_id, const LlmForwardInput& input);
   void launch(uint32_t slot_id);
   void observe_execution_memory(uint32_t slot_id);
   ForwardOutput consume(uint32_t slot_id);
@@ -321,19 +318,29 @@ class TaskExecutionPipeline final {
   Status validate_input(SpeculativeSlot& slot, const LlmForwardInput& input);
   Status plan_sampling(SpeculativeSlot& slot, const LlmForwardInput& input);
   uint32_t draft_calls(const SpeculativeSlot& slot) const;
-  Status validate_bootstrap(const LlmForwardInput& input) const;
-  void prepare_bootstrap(SpeculativeSlot& slot, const LlmForwardInput& input);
-  void apply_bootstrap(SpeculativeSlot& slot);
-  void warmup_draft_graphs(const LlmForwardInput& input);
-  void prepare_draft_state(SpeculativeSlot& slot, uint32_t step, bool warmup);
   void prepare_prefix_refresh_state(SpeculativeSlot& slot, bool warmup);
   void launch_prefix_refresh(SpeculativeSlot& slot);
+  // Rebuilds slot.host_sampling from the incoming round unless a stable
+  // decode round (same rows, no PD import, no warmup, nothing released,
+  // identical sampling mode) can keep the previous round's copy.
+  void rebuild_host_sampling(SpeculativeSlot& slot,
+                             const LlmForwardInput& input,
+                             bool warmup_decode,
+                             bool pd_first_decode,
+                             const std::vector<int32_t>& released);
+  void record_dspark_draft_warmup(SpeculativeSlot& slot,
+                                  uint32_t draft_rows,
+                                  uint32_t query_width,
+                                  int32_t maximum_kv_length);
+  void warmup_mtp_draft_graphs(const LlmForwardInput& input);
+  void prepare_mtp_draft_state(SpeculativeSlot& slot,
+                               uint32_t step,
+                               bool warmup);
   void prepare_empty_shard(SpeculativeSlot& slot, uint64_t batch_id);
   void launch_empty_shard(SpeculativeSlot& slot);
   void launch_prefill(SpeculativeSlot& slot);
   void launch_decode(SpeculativeSlot& slot);
   bool launch_unified_block(SpeculativeSlot& slot);
-  void launch_block_draft(SpeculativeSlot& slot);
   void generate_adaptive_dspark_proposals(SpeculativeSlot& slot,
                                           const torch::Tensor& anchors);
   void launch_adaptive_dspark(SpeculativeSlot& slot);
@@ -350,9 +357,30 @@ class TaskExecutionPipeline final {
       const SpecCalibrationCommand& command);
   std::optional<std::string> draft_step_calibration_capabilities() const;
   void consume_adaptive_dspark(SpeculativeSlot& slot);
-  void write_block_context(SpeculativeSlot& slot, bool prefill);
-  void synchronize_samples(const TokenResultTensors& result,
-                           bool all_greedy = false);
+  void trace_adaptive_dspark(const SpeculativeSlot& slot,
+                             const torch::Tensor& accepted_lengths) const;
+  void launch_draft_block(SpeculativeSlot& slot);
+  void launch_draft_extend(SpeculativeSlot& slot);
+  // identity_rows: the caller proved on the host that the step's row
+  // selection is the [0..rows) prefix (decode steps via plan_sampling);
+  // prefill publish and extend pass false and probe here.
+  DraftInput sample_draft_tokens(SpeculativeSlot& slot,
+                                 uint32_t step,
+                                 int64_t rows,
+                                 bool identity_rows);
+  void stage_mtp_draft_input_tokens(SpeculativeSlot& slot,
+                                    const torch::Tensor& committed_tokens);
+  // Shared prefill/extend tail: build the draft-input sampling state,
+  // configure the draft sampling rows, sample the last draft step and publish
+  // its draft input. `rows` is the number of sampling rows (sequences).
+  void publish_mtp_draft_input(SpeculativeSlot& slot,
+                               const torch::Tensor& selected_token_idxes,
+                               uint32_t rows);
+  void write_context_kv(SpeculativeSlot& slot, bool prefill);
+  // Unifies sample-consensus across ranks: the full result tensors when the
+  // sampling group participates, otherwise just the tokens.
+  void synchronize_result(const TokenResultTensors& result, bool all_greedy);
+  void synchronize_samples(const TokenResultTensors& result, bool all_greedy);
   void synchronize_tokens(torch::Tensor& tokens, bool all_greedy);
   static Status plan_parallel(const ParallelInput& input,
                               uint32_t dp_size,
@@ -364,6 +392,11 @@ class TaskExecutionPipeline final {
                               bool& decode);
   bool block_draft() const;
   uint32_t context_hidden_size() const;
+  // Model contract of the seed this pipeline's drafter carries; single
+  // source for both PD import validation and output finishing.
+  DraftInputModelSpec draft_input_spec() const {
+    return speculative_capacity_->draft_input_spec;
+  }
   void release_outputs(SpeculativeSlot& slot);
 
   std::unique_ptr<SpeculativeTaskCapacity> speculative_capacity_;
@@ -372,7 +405,8 @@ class TaskExecutionPipeline final {
   WorkerImpl* worker_pipeline_ = nullptr;
   std::unique_ptr<TaskModel> draft_;
   torch::ScalarType hidden_dtype_ = torch::kFloat32;
-  std::unique_ptr<MtpContextStorage> context_;
+  std::unique_ptr<SpecContextStorage> context_;
+  std::unique_ptr<DraftInputStateStore> draft_input_state_store_;
   CausalLM& model_;
   Executor& executor_;
   std::vector<KVCache>& kv_caches_;

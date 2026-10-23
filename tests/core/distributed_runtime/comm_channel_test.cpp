@@ -16,10 +16,19 @@ limitations under the License.
 #include "core/distributed_runtime/comm_channel.h"
 
 #include <brpc/closure_guard.h>
+#include <brpc/details/controller_private_accessor.h>
 #include <brpc/server.h>
 #include <butil/endpoint.h>
 #include <gtest/gtest.h>
+#include <sys/socket.h>
 
+#include <atomic>
+#include <chrono>
+#include <future>
+#include <mutex>
+#include <thread>
+
+#include "core/framework/speculative/draft_input_state_store.h"
 #include "runtime/rec_forward_params.h"
 #include "runtime/vlm_forward_params.h"
 
@@ -218,6 +227,138 @@ TEST_F(CommChannelTest, CompletesPromiseWhenLastVLMResultRpcFails) {
   EXPECT_FALSE(channel_.get_last_vlm_step_result_async(promise));
   ASSERT_TRUE(future.isReady());
   EXPECT_FALSE(std::move(future).get().has_value());
+}
+
+class ReleaseService final : public proto::DistributeWorker {
+ public:
+  explicit ReleaseService(bool disconnect_first)
+      : disconnect_first_(disconnect_first),
+        resume_(resume_promise_.get_future().share()) {}
+  ~ReleaseService() override {
+    resume_original();
+    if (original_.joinable()) {
+      original_.join();
+    }
+  }
+
+  void store(const std::string& request_id) {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    cache_.write_draft_input(
+        {1},
+        {request_id},
+        {torch::tensor({3}, torch::kLong), torch::ones({1, 2}), {}, {}});
+  }
+
+  bool contains(const std::string& request_id) {
+    std::lock_guard<std::mutex> lock(cache_mutex_);
+    return cache_.collect_draft_inputs({1}, {request_id}).has_value();
+  }
+
+  void resume_original() {
+    if (!resumed_.exchange(true)) {
+      resume_promise_.set_value();
+    }
+  }
+
+  std::future<void> original_done() { return done_promise_.get_future(); }
+  int32_t calls() const { return calls_.load(); }
+
+  void ReleaseIdleRequestState(google::protobuf::RpcController* controller,
+                               const proto::RequestStateRelease* request,
+                               proto::Status* response,
+                               google::protobuf::Closure* done) override {
+    std::vector<int32_t> ids(request->embedding_ids().begin(),
+                             request->embedding_ids().end());
+    const int32_t attempt = calls_.fetch_add(1);
+    if (disconnect_first_ && attempt == 0) {
+      auto* socket = brpc::ControllerPrivateAccessor(
+                         static_cast<brpc::Controller*>(controller))
+                         .get_sending_socket();
+      CHECK(socket != nullptr);
+      // Drop the connection while the server operation remains pending.
+      CHECK_EQ(::shutdown(socket->fd(), SHUT_RDWR), 0);
+      original_ = std::thread([this, ids = std::move(ids), response, done] {
+        resume_.wait();
+        {
+          std::lock_guard<std::mutex> lock(cache_mutex_);
+          cache_.clear(ids);
+        }
+        response->set_ok(true);
+        done->Run();
+        done_promise_.set_value();
+      });
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex_);
+      cache_.clear(ids);
+    }
+    response->set_ok(true);
+    done->Run();
+  }
+
+ private:
+  const bool disconnect_first_;
+  DraftInputStateStore cache_{2};
+  std::mutex cache_mutex_;
+  std::atomic<int32_t> calls_{0};
+  std::atomic<bool> resumed_{false};
+  std::promise<void> resume_promise_;
+  std::shared_future<void> resume_;
+  std::promise<void> done_promise_;
+  std::thread original_;
+};
+
+class ReleaseServerGuard final {
+ public:
+  ReleaseServerGuard(ReleaseService& service, brpc::Server& server)
+      : service_(service), server_(server) {}
+  ~ReleaseServerGuard() {
+    service_.resume_original();
+    server_.Stop(/*closewait_ms=*/0);
+    server_.Join();
+  }
+
+ private:
+  ReleaseService& service_;
+  brpc::Server& server_;
+};
+
+TEST(CommChannelReleaseTest, IdleReleaseAcknowledgesCompletedCleanup) {
+  ReleaseService service(/*disconnect_first=*/false);
+  service.store("request");
+  brpc::Server server;
+  ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
+  ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
+  ReleaseServerGuard guard(service, server);
+  CommChannel channel;
+  ASSERT_TRUE(channel.init_brpc("127.0.0.1:" +
+                                std::to_string(server.listen_address().port)));
+  ASSERT_TRUE(channel.release_idle_request_state({1}));
+  EXPECT_EQ(service.calls(), 1);
+  EXPECT_FALSE(service.contains("request"));
+}
+
+TEST(CommChannelReleaseTest, DisconnectedIdleReleaseFailsWithoutRetry) {
+  ReleaseService service(/*disconnect_first=*/true);
+  service.store("request");
+  brpc::Server server;
+  ASSERT_EQ(server.AddService(&service, brpc::SERVER_DOESNT_OWN_SERVICE), 0);
+  ASSERT_EQ(server.Start("127.0.0.1:0", nullptr), 0);
+  ReleaseServerGuard guard(service, server);
+  CommChannel channel;
+  ASSERT_TRUE(channel.init_brpc("127.0.0.1:" +
+                                std::to_string(server.listen_address().port)));
+  EXPECT_FALSE(channel.release_idle_request_state({1}));
+  EXPECT_EQ(service.calls(), 1);
+  EXPECT_TRUE(service.contains("request"));
+  auto completed = service.original_done();
+  service.resume_original();
+  ASSERT_EQ(completed.wait_for(std::chrono::seconds(5)),
+            std::future_status::ready);
+  completed.get();
+  EXPECT_FALSE(service.contains("request"));
+  EXPECT_EQ(service.calls(), 1);
 }
 
 }  // namespace

@@ -138,8 +138,19 @@ class ForwardInputBuilder final {
     std::vector<int32_t> extra_token_ids;
     std::vector<int32_t> mtp_shifted_token_ids;
     std::vector<int32_t> eplb_decode_token_mask;
-    std::vector<int32_t> mtp_bootstrap_row_idxes;
-    std::vector<torch::Tensor> mtp_bootstrap_embeddings;
+    // One-time carried rows (PD seed handoff / target decode bootstrap).
+    // Payload stays on the Sequence: only the Llm domain's
+    // state_to_forward_input consumes it, so other domains leave the
+    // Sequence's speculative state untouched instead of dropping a seed into
+    // rows nobody attaches. Both carried channels share the row shape; what
+    // differs (clear_target_decode_bootstrap vs take_draft_input) lives in
+    // the consumer.
+    struct CarriedSequenceRow {
+      int32_t row = 0;
+      Sequence* sequence = nullptr;
+    };
+    std::vector<CarriedSequenceRow> target_decode_bootstrap_rows;
+    std::vector<CarriedSequenceRow> draft_input_rows;
     std::vector<TransferKVInfo> transfer_kv_infos;
     std::vector<MMData> scheduled_mm_data_vec;
 

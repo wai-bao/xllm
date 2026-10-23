@@ -21,6 +21,7 @@ limitations under the License.
 #include <cstring>
 
 #include "core/common/metrics.h"
+#include "core/util/integer_math.h"
 #include "core/util/slice.h"
 #if defined(USE_NPU)
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
@@ -135,10 +136,24 @@ void JsonObjectGrammarState::copy_trial_state_from(
   // Intentionally leave committed_token_ids_ empty: acceptance never reads it.
 }
 
+JsonObjectGrammarState JsonObjectGrammarState::fork_matcher_only() const {
+  JsonObjectGrammarState state;
+  state.copy_trial_state_from(*this);
+  return state;
+}
+
 bool JsonObjectGrammarState::can_accept_token(int32_t token_id) const {
-  JsonObjectGrammarState candidate;
-  candidate.copy_trial_state_from(*this);
-  return candidate.accept_token(token_id);
+  return fork_matcher_only().accept_token(token_id);
+}
+
+bool JsonObjectGrammarState::try_accept_token(int32_t token_id) {
+  JsonObjectGrammarState candidate = fork_matcher_only();
+  if (!candidate.accept_token(token_id)) {
+    return false;
+  }
+  copy_trial_state_from(candidate);
+  committed_token_ids_.push_back(token_id);
+  return true;
 }
 
 bool JsonObjectGrammarState::accept_token(int32_t token_id) {
@@ -623,12 +638,14 @@ JsonObjectGrammar::JsonObjectGrammar(
         static_cast<size_t>(stop_token_id) >= token_pieces_.size()) {
       continue;
     }
-    const size_t word_index = static_cast<size_t>(stop_token_id) / 32U;
-    const uint32_t bit = 1U << (static_cast<uint32_t>(stop_token_id) & 31U);
+    const size_t word_index =
+        static_cast<size_t>(util::bitmask_word_index(stop_token_id));
+    const uint32_t bit = util::bitmask_bit_mask(stop_token_id);
     reasoning_bitmask_[word_index] &= ~bit;
   }
   // Clear unused high bits in the last word so float expansion stays exact.
-  const size_t remainder = token_pieces_.size() % 32U;
+  const size_t remainder =
+      token_pieces_.size() % static_cast<size_t>(util::kBitmaskBitsPerWord);
   if (remainder != 0U && !reasoning_bitmask_.empty()) {
     const uint32_t keep_mask = (1U << static_cast<uint32_t>(remainder)) - 1U;
     reasoning_bitmask_.back() &= keep_mask;
@@ -760,7 +777,8 @@ std::vector<uint32_t> JsonObjectGrammar::compute_allowed_bitmask(
     if (!state.can_accept_token(static_cast<int32_t>(token_id))) {
       continue;
     }
-    bitmask[token_id / 32U] |= 1U << (static_cast<uint32_t>(token_id) & 31U);
+    bitmask[util::bitmask_word_index(static_cast<int64_t>(token_id))] |=
+        util::bitmask_bit_mask(static_cast<int64_t>(token_id));
   }
   return bitmask;
 }
@@ -774,8 +792,10 @@ torch::Tensor JsonObjectGrammar::float_mask_from_bitmask(
       torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
   auto accessor = mask.accessor<float, 1>();
   for (size_t token_id = 0; token_id < vocab_size; ++token_id) {
-    const uint32_t word = bitmask[token_id / 32U];
-    if ((word & (1U << (static_cast<uint32_t>(token_id) & 31U))) != 0U) {
+    const uint64_t token = static_cast<uint64_t>(token_id);
+    const uint32_t word =
+        bitmask[util::bitmask_word_index(static_cast<int64_t>(token))];
+    if ((word & util::bitmask_bit_mask(static_cast<int64_t>(token))) != 0U) {
       accessor[static_cast<int64_t>(token_id)] = 0.0F;
     }
   }
@@ -848,8 +868,9 @@ std::vector<int32_t> JsonObjectGrammar::allowed_token_ids(
   std::vector<int32_t> allowed;
   allowed.reserve(token_pieces_.size());
   for (size_t token_id = 0; token_id < token_pieces_.size(); ++token_id) {
-    const uint32_t word = bitmask[token_id / 32U];
-    if ((word & (1U << (static_cast<uint32_t>(token_id) & 31U))) != 0U) {
+    const int64_t token = static_cast<int64_t>(token_id);
+    const uint32_t word = bitmask[util::bitmask_word_index(token)];
+    if ((word & util::bitmask_bit_mask(token)) != 0U) {
       allowed.push_back(static_cast<int32_t>(token_id));
     }
   }
@@ -1040,7 +1061,7 @@ void apply_token_bitmask_inplace(torch::Tensor& logits,
       << ", bitmask.size(0)=" << bitmask.size(0);
 
   const int64_t vocab_size = logits.size(1);
-  const int64_t expected_words = (vocab_size + 31) / 32;
+  const int64_t expected_words = util::bitmask_word_count(vocab_size);
   CHECK_EQ(bitmask.size(1), expected_words)
       << "bitmask word count mismatch, bitmask.size(1)=" << bitmask.size(1)
       << ", expected=" << expected_words;

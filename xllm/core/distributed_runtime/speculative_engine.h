@@ -15,7 +15,10 @@ limitations under the License.
 
 #pragma once
 
+#include <optional>
+
 #include "common/macros.h"
+#include "core/framework/speculative/draft_input_spec_provider.h"
 #include "core/kv_cache/storage/kv_cache_utils.h"
 #include "engine.h"
 #include "framework/batch/batch_group.h"
@@ -29,7 +32,7 @@ limitations under the License.
 namespace xllm {
 
 template <typename TargetEngine>
-class SpeculativeEngineBase : public Engine {
+class SpeculativeEngineBase : public Engine, public DraftInputSpecProvider {
  public:
   // create an engine with the given devices
   explicit SpeculativeEngineBase(const runtime::Options& options);
@@ -57,9 +60,14 @@ class SpeculativeEngineBase : public Engine {
   // Return the options used by the target engine.
   const runtime::Options& options() const { return engine_->options(); }
 
+  // The target engine owns the shared worker manager.
   std::shared_ptr<DistributedWorkerManager> get_distributed_worker_manager()
-      const {
-    return distributed_worker_manager_;
+      const override {
+    return engine_->get_distributed_worker_manager();
+  }
+
+  std::optional<DraftInputModelSpec> draft_input_spec() const override {
+    return draft_input_spec_;
   }
 
   const TokenizerArgs& tokenizer_args() const override {
@@ -76,6 +84,9 @@ class SpeculativeEngineBase : public Engine {
   }
 
   void update_last_step_result(BatchGroup& batch);
+  void flush_released_requests() override {
+    engine_->flush_released_requests();
+  }
 
  protected:
   SpeculativeEngineBase(const runtime::Options& options, bool use_draft_engine);
@@ -108,9 +119,7 @@ class SpeculativeEngineBase : public Engine {
   const bool use_draft_engine_;
 
   ModelArgs model_args_;
-
-  std::shared_ptr<DistributedWorkerManager> distributed_worker_manager_ =
-      nullptr;
+  std::optional<DraftInputModelSpec> draft_input_spec_;
 };
 
 class SuffixSpeculativeEngine : public SpeculativeEngineBase<LLMEngine> {

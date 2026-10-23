@@ -26,6 +26,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/speculative/draft_input.h"
 #include "core/util/tensor_helper.h"
 
 namespace xllm {
@@ -61,7 +62,6 @@ void update_sequence_embedding(Sequence* seq, const torch::Tensor& embedding) {
   }
   torch::Tensor cur_seq_embed = safe_to(embedding, torch::kFloat32);
   seq->update_embeddings(cur_seq_embed);
-  seq->update_mtp_bootstrap_embedding(cur_seq_embed);
 }
 
 std::unordered_set<std::string> fail_json_object_requests(
@@ -217,6 +217,9 @@ void BatchOutputHandler::process_sample_output(
     }
 
     const auto& raw_sample_output = raw_output.outputs[output_idx];
+    if (raw_sample_output.draft_input.has_value()) {
+      seq->update_draft_input(*raw_sample_output.draft_input);
+    }
     for (size_t token_idx = 0; token_idx < raw_sample_output.tokens.size();
          ++token_idx) {
       const auto& raw_token = raw_sample_output.tokens[token_idx];
@@ -229,7 +232,6 @@ void BatchOutputHandler::process_sample_output(
       if (!raw_token.embeddings.empty()) {
         torch::Tensor embeddings = torch::tensor(raw_token.embeddings);
         seq->update_embeddings(embeddings);
-        seq->update_mtp_bootstrap_embedding(embeddings);
       }
       // Speculative decoding may append an EOS token at the beginning,
       // followed by bonus tokens, causing the sequence stopping check to fail.

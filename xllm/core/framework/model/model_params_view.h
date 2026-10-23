@@ -31,9 +31,7 @@ class EmbeddingInputView final {
         linear_state_indices(common.linear_state_indices),
         request_ids(common.request_ids),
         extra_token_ids(spec.extra_token_ids),
-        mtp_shifted_token_ids(spec.mtp_shifted_token_ids),
-        mtp_bootstrap_row_idxes(spec.mtp_bootstrap_row_idxes),
-        mtp_bootstrap_embeddings(spec.mtp_bootstrap_embeddings) {}
+        mtp_shifted_token_ids(spec.mtp_shifted_token_ids) {}
   torch::Tensor& input_embedding;
   std::vector<int32_t>& embedding_ids;
   std::vector<int32_t>& linear_state_ids;
@@ -41,8 +39,6 @@ class EmbeddingInputView final {
   std::vector<std::string>& request_ids;
   std::vector<int32_t>& extra_token_ids;
   torch::Tensor& mtp_shifted_token_ids;
-  std::vector<int32_t>& mtp_bootstrap_row_idxes;
-  torch::Tensor& mtp_bootstrap_embeddings;
 };
 
 class GraphInputView final {

@@ -24,6 +24,7 @@ limitations under the License.
 #include "acl/acl.h"
 #include "core/kernels/npu/tilelang/dispatch_registry.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
+#include "core/util/integer_math.h"
 
 #ifndef XLLM_TL_APPLY_TOKEN_BITMASK_REGISTRY_INC
 #error "XLLM_TL_APPLY_TOKEN_BITMASK_REGISTRY_INC is not defined"
@@ -72,8 +73,9 @@ bool can_apply_token_bitmask_inplace(const torch::Tensor& logits,
       logits.size(1) > kMaxVocabSize) {
     return false;
   }
-  const int64_t expected_words = (logits.size(1) + 31) / 32;
-  if (bitmask.size(1) != expected_words || logits.size(1) % 32 != 0) {
+  const int64_t expected_words = util::bitmask_word_count(logits.size(1));
+  if (bitmask.size(1) != expected_words ||
+      logits.size(1) % util::kBitmaskBitsPerWord != 0) {
     return false;
   }
   return logits.size(0) <= std::numeric_limits<int32_t>::max() &&

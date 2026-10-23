@@ -32,6 +32,7 @@ cc_library(
   HDRS
     engine.h
     master.h
+    request_state_cleanup.h
     master_factory.h
     dit_engine.h
     dit_master.h
@@ -53,7 +54,6 @@ cc_library(
     worker_service.h
     comm_channel.h
     shm_channel.h
-    heartbeat_callback_registry.h
     http_callback_channel_cache.h
     kv_transfer_topology.h
     kv_cache_transfer_coordinator.h
@@ -62,6 +62,7 @@ cc_library(
   SRCS
     master.cpp
     master_factory.cpp
+    request_state_cleanup.cpp
     dit_engine.cpp
     dit_master.cpp
     llm_engine.cpp
@@ -95,6 +96,7 @@ cc_library(
     :runtime
     :scheduler
     :kv_cache_manager_factory
+    :speculative_transport_adapter
     :util
     glog::glog
     nlohmann_json::nlohmann_json

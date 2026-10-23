@@ -18,6 +18,7 @@ limitations under the License.
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_deepseek_v32_decoder_layer_impl.h"
 #include "llm_model_base.h"
+#include "models/llm/deepseek_v32_registry.h"
 
 // DeepSeek v32 compatible with huggingface weights
 // ref to:
@@ -517,6 +518,8 @@ TORCH_MODULE(DeepseekV32ForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(deepseek_v32, DeepseekV32ForCausalLM);
+// The platform-agnostic spec-verify registration lives in
+// deepseek_v32_registry.h; see the include at the top of this file.
 
 // register the model args
 // example config:

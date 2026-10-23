@@ -68,6 +68,9 @@ class Worker {
 
   folly::SemiFuture<bool> stop_profile_async();
 
+  folly::SemiFuture<bool> release_idle_request_state_async(
+      std::vector<int32_t> embedding_ids);
+
   std::tuple<int64_t, int64_t> estimate_kv_cache_capacity();
 
   // allocate kv cache. blocking call
@@ -91,7 +94,6 @@ class Worker {
   bool unlink_p2p(const std::string& remote_addr);
 
   const bool is_driver();
-  bool task_pipeline_uses_worker_prepare() const;
 
   std::optional<ForwardOutput> step(const RecForwardInput& inputs);
   std::optional<ForwardOutput> step(const VlmForwardInput& inputs);

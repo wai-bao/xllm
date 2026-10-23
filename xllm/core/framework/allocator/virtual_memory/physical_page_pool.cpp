@@ -22,7 +22,9 @@ limitations under the License.
 #include <unordered_set>
 
 #include "core/framework/allocator/virtual_memory/shared_physical_page_mapping.h"
+#include "core/framework/config/kv_cache_config.h"
 #include "core/platform/device.h"
+#include "core/platform/stream.h"
 
 namespace xllm {
 
@@ -461,6 +463,20 @@ void PhysicalPagePool::activate_pages_locked(
       ++num_active_pages_;
     }
   }
+}
+
+void PhysicalPagePool::observe_elastic_execution_memory(
+    Stream& execution_stream,
+    bool is_warmup,
+    const char* warmup_context) {
+  const auto& cache_config = KVCacheConfig::get_instance();
+  if (!cache_config.enable_virtual_memory() || !cache_config.vmm_elastic()) {
+    return;
+  }
+  if (is_warmup) {
+    CHECK_EQ(execution_stream.synchronize(), 0) << warmup_context;
+  }
+  PhysicalPagePool::get_instance().observe_execution_memory();
 }
 
 void PhysicalPagePool::observe_execution_memory() {

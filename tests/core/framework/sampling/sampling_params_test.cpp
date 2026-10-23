@@ -20,6 +20,8 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include <torch/torch.h>
 
+#include "core/framework/sampling/draft_sampling.h"
+
 namespace xllm {
 
 TEST(SamplingParamsTest, NormalizesGreedyAndSmallTemperatureRows) {
@@ -66,7 +68,7 @@ TEST(SamplingParamsTest, MinimumConstraintsExpandForVerifyAndStayOffDrafts) {
   for (const DraftSamplingMode mode :
        {DraftSamplingMode::GREEDY, DraftSamplingMode::PROBABILISTIC}) {
     SamplingParameters draft = params;
-    prepare_draft_sampling(mode, draft);
+    configure_draft_sampling(draft, mode);
     EXPECT_FALSE(draft.min_token_positions.defined());
     EXPECT_FALSE(draft.min_tokens_remaining.defined());
     EXPECT_FALSE(draft.min_token_ids.defined());

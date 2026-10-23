@@ -46,6 +46,7 @@ limitations under the License.
 #include "core/layers/mlu/deepseek_v4/dsa_empty_dp_input.h"
 #include "core/layers/mlu/deepseek_v4/dsa_metadata_builder_mlu.h"
 #include "core/layers/mlu/hyper_connection.h"
+#include "models/llm/deepseek_v4_registry.h"
 #include "models/llm/llm_model_base.h"
 #include "models/llm/mlu/deepseek_v4_base.h"
 
@@ -332,7 +333,13 @@ class DeepseekV4ForCausalLMImpl final
     : public LlmForCausalLMImplBase<DeepseekV4Model> {
  public:
   explicit DeepseekV4ForCausalLMImpl(const ModelContext& context)
-      : LlmForCausalLMImplBase<DeepseekV4Model>(context) {}
+      : LlmForCausalLMImplBase<DeepseekV4Model>(context),
+        capture_hidden_hook_enabled_(
+            context.get_model_args().num_speculative_tokens() > 0) {}
+
+  bool provides_capture_hidden_hook() const {
+    return capture_hidden_hook_enabled_;
+  }
 
   bool requires_graph_forward_metadata() {
     return this->model_->requires_graph_forward_metadata();
@@ -376,6 +383,9 @@ class DeepseekV4ForCausalLMImpl final
       }
     }
   }
+
+ private:
+  bool capture_hidden_hook_enabled_ = false;
 };
 TORCH_MODULE(DeepseekV4ForCausalLM);
 
@@ -582,6 +592,9 @@ inline void validate_deepseek_v4_args(const ModelArgs& args,
 }
 
 REGISTER_CAUSAL_MODEL(deepseek_v4, DeepseekV4ForCausalLM);
+// Platform-agnostic registrations (verify mode, draft hidden width, MTP
+// model pair) live in deepseek_v4_registry.h; see the include at the top of
+// this file.
 
 REGISTER_MODEL_ARGS(deepseek_v4, [&] {
   const DeepseekV4ArgsPolicy args_policy = build_deepseek_v4_args_policy();

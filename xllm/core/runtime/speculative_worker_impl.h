@@ -31,6 +31,14 @@ namespace xllm {
 
 class JsonObjectGrammarState;
 
+// Target-model options shared by the speculative algorithms: decode-order
+// schedule overlap stays off, the target is not a draft engine, and aux
+// hidden states are captured for the drafter.
+runtime::Options speculative_target_options(const runtime::Options& options);
+runtime::Options speculative_draft_options(const runtime::Options& options);
+
+class LLMWorkerImpl;
+
 // Returns whether this rank may execute the multi-step speculative decode
 // plan for the current global DP batch.
 bool should_run_speculative_decode(const LlmModelParams& params);
@@ -141,9 +149,39 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   virtual std::optional<ForwardOutput> step_empty(
       const TargetInput& inputs) = 0;
 
+  // Common helper: update sampling params for validation
+  void update_sampling_params(SamplingParameters& sampling_params,
+                              const int32_t num_val_tokens,
+                              const int32_t total_num_val_tokens);
+  void update_sampling_params(SamplingParameters& sampling_params,
+                              const std::vector<int32_t>& per_seq_val_tokens,
+                              const int32_t total_num_val_tokens);
+
+  // Speculative-state broadcast shared by every draft-model family. The
+  // sampled token is replicated across all model ranks within one DP replica;
+  // with orthogonal CP x TP both axes are broadcast so every replica caches
+  // the same token without crossing into another DP replica. `stream_guard`
+  // controls which compute stream orders the broadcast (families without a
+  // separate draft stream pass their own compute stream).
+  void broadcast_spec_tokens(torch::Tensor& tokens) const;
+
+  // Gate for broadcast_spec_tokens shared by every draft-model family:
+  // orthogonal CP needs cross-replica consensus unconditionally; otherwise
+  // the spec broadcast config decides, and only for probabilistic sampling
+  // (never all-greedy, where every rank deterministically picks argmax).
+  void maybe_broadcast_spec_tokens(torch::Tensor& tokens,
+                                   bool all_greedy_sample) const;
+
   // prepare inputs for target model at Decode phase (validation).
   void prepare_validate_inputs(const TargetInput& inputs,
                                TargetInput& validate_inputs);
+  // Per-seq variant used by adaptive-speculative pruning: each sequence's
+  // validate row width equals per_seq_val_tokens[i] (must be in [1, N+1]).
+  // The dense meta/token/position/kv-slot buffers are rebuilt as varlen with
+  // total_tokens = Σ per_seq_val_tokens.
+  void prepare_validate_inputs(const TargetInput& inputs,
+                               TargetInput& validate_inputs,
+                               const std::vector<int32_t>& per_seq_val_tokens);
 
  protected:
   // Target model worker

@@ -11,6 +11,7 @@
 
 # vcpkg
 /.vcpkg*
+/vcpkg_installed
 
 # cache
 /.*cache

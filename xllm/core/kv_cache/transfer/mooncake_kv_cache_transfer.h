@@ -91,11 +91,11 @@ class MooncakeKVCacheTransferDefault final
       const std::string& model_type,
       std::unique_ptr<MooncakeKVCacheTransferEngine> engine);
 
-  void register_kv_cache(std::vector<xllm::KVCache>& kv_caches,
+  void register_kv_cache(std::vector<KVCache>& kv_caches,
                          const KVCacheShape& kv_cache_shape,
                          const torch::ScalarType dtype) override;
 
-  void register_kv_cache_spec(std::vector<xllm::KVCache>& kv_caches,
+  void register_kv_cache_spec(std::vector<KVCache>& kv_caches,
                               const KVCacheShape& kv_cache_shape,
                               torch::ScalarType dtype) override;
 
@@ -149,7 +149,7 @@ class MooncakeKVCacheTransferDefault final
           buffer_mappings) const;
 
   // Register per-layer K/V tensor memory.
-  void register_kv_cache_impl(const std::vector<xllm::KVCache>& kv_caches,
+  void register_kv_cache_impl(const std::vector<KVCache>& kv_caches,
                               int64_t ssm_checkpoint_stride);
 
   bool has_v_cache_ = true;
@@ -168,7 +168,7 @@ class MooncakeVirtualKVCacheTransfer final
 
   void set_model_id(const std::string& model_id) { model_id_ = model_id; }
 
-  void register_kv_cache(std::vector<xllm::KVCache>& kv_caches,
+  void register_kv_cache(std::vector<KVCache>& kv_caches,
                          const KVCacheShape& kv_cache_shape,
                          const torch::ScalarType dtype) override;
 

@@ -15,6 +15,7 @@ limitations under the License.
 
 #include <gtest/gtest.h>
 
+#include "core/framework/sampling/draft_sampling.h"
 #include "core/framework/sampling/sampler.h"
 #include "platform/platform.h"
 
@@ -89,6 +90,37 @@ TEST(SamplerFilterMaskTest, PackedMaskFiltersCallerLogitsInPlace) {
   EXPECT_LT(logits.index({0, 1}).item<float>(), -1.0F);
   EXPECT_EQ(logits.index({0, 2}).item<float>(), 2.0F);
   EXPECT_LT(logits.index({0, 3}).item<float>(), -1.0F);
+}
+
+TEST(SamplerFilterMaskTest,
+     GreedyDraftConfidenceKeepsTokenAndProbabilityContract) {
+  Sampler sampler;
+  for (DraftSamplingMode mode :
+       {DraftSamplingMode::GREEDY, DraftSamplingMode::PROBABILISTIC}) {
+    for (bool require_confidence : {false, true}) {
+      SamplingParameters params = make_greedy_params(/*batch_size=*/2);
+      params.logprobs = true;
+      params.max_top_logprobs = 2;
+      configure_draft_sampling(params, mode, require_confidence);
+      torch::Tensor logits = torch::tensor({{0.0F, 1.0F}, {2.0F, 0.0F}});
+
+      const SampleOutput output = sampler.forward(logits, params);
+
+      EXPECT_TRUE(torch::equal(output.next_tokens,
+                               torch::tensor({1, 0}, torch::kLong)));
+      EXPECT_FALSE(output.logprobs.defined());
+      EXPECT_FALSE(output.top_logprobs.defined());
+      if (mode == DraftSamplingMode::PROBABILISTIC && require_confidence) {
+        ASSERT_TRUE(output.probs.defined());
+        ASSERT_EQ(output.probs.dim(), 1);
+        ASSERT_EQ(output.probs.numel(), 2);
+        EXPECT_NEAR(output.probs[0].item<float>(), 0.7310586F, 1.0e-6F);
+        EXPECT_NEAR(output.probs[1].item<float>(), 0.8807971F, 1.0e-6F);
+      } else {
+        EXPECT_FALSE(output.probs.defined());
+      }
+    }
+  }
 }
 
 }  // namespace

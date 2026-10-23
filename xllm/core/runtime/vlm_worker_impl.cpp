@@ -25,8 +25,8 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "core/framework/config/load_config.h"
-#include "core/framework/speculative/draft_extend_input.h"
 #include "core/kv_cache/storage/kv_cache.h"
+#include "core/runtime/speculative_output.h"
 #include "framework/model/model_params_view.h"
 #include "models/model_registry.h"
 #include "util/timer.h"
@@ -199,13 +199,14 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     const bool is_target_prefill =
         !input.input_params.meta.batch_forward_type.is_decode() &&
         !is_spec_draft_;
-    output_spec_hidden_states(output.sample_output,
-                              model_output.hidden_states,
-                              model_output.aux_hidden_states,
-                              lm_head_selected_token_idxes,
-                              selected_hidden_from_lm_head,
-                              is_target_prefill,
-                              /*cp_enabled=*/options_.cp_size() > 1);
+    output_captured_hidden_states(output.sample_output,
+                                  model_output.hidden_states,
+                                  model_output.aux_hidden_states,
+                                  lm_head_selected_token_idxes,
+                                  selected_hidden_from_lm_head,
+                                  capture_hidden_mode_,
+                                  is_target_prefill,
+                                  /*cp_enabled=*/options_.cp_size() > 1);
   }
 
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {

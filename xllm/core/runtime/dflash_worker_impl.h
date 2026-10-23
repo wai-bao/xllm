@@ -22,7 +22,7 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
-#include "core/framework/speculative/embedding_cache.h"
+#include "core/framework/speculative/target_decode_state_store.h"
 #include "core/kv_cache/transfer/kv_cache_transfer.h"
 #include "framework/model/model_args.h"
 #include "framework/sampling/draft_proposal.h"
@@ -83,6 +83,8 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
       std::unique_ptr<TaskExecutionPipeline>& output) override;
 
  protected:
+  using SpeculativeWorkerImpl<LlmForwardInput>::maybe_broadcast_spec_tokens;
+
   std::optional<ForwardOutput> step_prefill(
       const LlmForwardInput& input) override;
 
@@ -97,6 +99,9 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   // per-step outputs an autoregressive drafter (e.g. MTP) yields.
   struct DraftBlock {
     DraftProposal proposal;
+    // Adaptive controller signal: the DSpark ConfidenceHead output when
+    // present, the drafted token's prob under q otherwise.
+    torch::Tensor confidence_probs;
     // No-sync draft inputs must outlive validation's stream sync.
     std::vector<std::shared_ptr<const void>> retained_inputs;
   };
@@ -133,7 +138,8 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
 
   void fill_validate_input_from_draft_outputs(const DraftBlock& draft_block,
                                               LlmForwardInput& validate_input,
-                                              Stream& compute_stream);
+                                              Stream& compute_stream,
+                                              int32_t effective_val_tokens);
 
   std::optional<ForwardOutput> run_validate(const LlmForwardInput& input,
                                             const DraftBlock& draft_block,
@@ -144,13 +150,10 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
                         const ForwardOutput& target_output,
                         int32_t num_val_tokens);
 
-  // Mirrors sampled tokens to rank 0 under schedule-overlap so every rank
-  // commits the same prefix. No-op for a single rank.
-  void maybe_broadcast_spec_tokens(torch::Tensor& tokens);
-
   void update_decode_step_input(
       LlmForwardInput& input,
-      const std::vector<EmbeddingCache::DecodeState>& last_states) const;
+      const std::vector<TargetDecodeStateStore::DecodeState>& last_states)
+      const;
 
   void write_context_kv(const LlmForwardInput& input,
                         const torch::Tensor& context_hidden,
@@ -164,8 +167,8 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   int32_t mask_token_id_ = -1;
   int64_t expected_context_hidden_size_ = 0;
   // Whether the target model owns recurrent (linear attention) layers.
-  // Fixed once the target finishes loading; hybrid spec-verify gates read
-  // this instead of re-scanning layer_types.
+  // Fixed once the target finishes loading; the hybrid spec-verify gates and
+  // the adaptive-pruning guard read this instead of re-scanning layer_types.
   bool target_is_hybrid_recurrent_ = false;
   dflash_detail::DSparkSasMode draft_sas_mode_ =
       dflash_detail::DSparkSasMode::NOT_DSPARK;

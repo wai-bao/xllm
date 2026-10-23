@@ -310,7 +310,10 @@ LlmForwardInput BatchState::build_sequence_input(
     uint32_t min_decoding_batch_size,
     const ModelArgs& args,
     int32_t cp_size) {
-  ForwardInputBuilder builder(data, &args, cp_size);
+  ForwardInputBuilder builder(data,
+                              &args,
+                              cp_size,
+                              /*thread_pool=*/nullptr);
   auto input =
       builder.build_forward_input(num_decoding_tokens, min_decoding_batch_size);
   linear_restore_src_blocks_ = builder.take_linear_restore_src_blocks();

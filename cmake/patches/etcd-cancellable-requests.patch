@@ -1,0 +1,222 @@
+--- a/etcd/SyncClient.hpp
++++ b/etcd/SyncClient.hpp
+@@ -161,6 +161,11 @@
+   SyncClient(std::string const& etcd_url, std::string const& username,
+              std::string const& password, int const auth_token_ttl = 300,
+              std::string const& load_balancer = "round_robin");
++  // Set the initial timeout before authentication, preserving the old overload.
++  SyncClient(std::string const& etcd_url, std::string const& username,
++             std::string const& password, int const auth_token_ttl,
++             std::string const& load_balancer,
++             std::chrono::microseconds request_timeout);
+ 
+   /**
+    * Constructs an etcd client object.
+--- a/src/SyncClient.cpp
++++ b/src/SyncClient.cpp
+@@ -224,10 +224,14 @@
+ 
+ bool authenticate(std::shared_ptr<grpc::Channel> const& channel,
+                   std::string const& username, std::string const& password,
+-                  std::string& token_or_message) {
++                  std::string& token_or_message,
++                  std::chrono::microseconds timeout) {
+   // run a round of auth
+   auto auth_stub = etcdserverpb::Auth::NewStub(channel);
+   ClientContext context;
++  if (timeout != std::chrono::microseconds::zero()) {
++    context.set_deadline(std::chrono::system_clock::now() + timeout);
++  }
+   etcdserverpb::AuthenticateRequest auth_request;
+   etcdserverpb::AuthenticateResponse auth_response;
+   auth_request.set_name(username);
+@@ -310,18 +314,21 @@
+   std::chrono::time_point<std::chrono::system_clock> updated_at;
+   std::mutex mtx_;
+   bool has_token_ = false;
++  const std::chrono::microseconds* timeout_ = nullptr;
+ 
+  public:
+   TokenAuthenticator() : has_token_(false) {}
+ 
+   TokenAuthenticator(std::shared_ptr<grpc::Channel> channel,
+                      std::string const& username, std::string const& password,
+-                     const int ttl = 300)
++                     const int ttl,
++                     const std::chrono::microseconds* timeout)
+       : channel_(channel),
+         username_(username),
+         password_(password),
+         ttl_(ttl),
+-        has_token_(false) {
++        has_token_(false),
++        timeout_(timeout) {
+     if ((!username.empty()) && (!(password.empty()))) {
+       has_token_ = true;
+       renew_if_expired(true);
+@@ -341,7 +348,7 @@
+         updated_at = tp;
+         // auth
+         if (!etcd::detail::authenticate(this->channel_, username_, password_,
+-                                        token_)) {
++                                        token_, *timeout_)) {
+           // n.b.: no throw here as the failure of auth will be propagated
+           // to client when it is asked to issue requests.
+           //
+@@ -433,7 +440,17 @@
+                              std::string const& username,
+                              std::string const& password,
+                              int const auth_token_ttl,
+-                             std::string const& load_balancer) {
++                             std::string const& load_balancer)
++    : SyncClient(address, username, password, auth_token_ttl, load_balancer,
++                 std::chrono::microseconds::zero()) {}
++
++etcd::SyncClient::SyncClient(std::string const& address,
++                             std::string const& username,
++                             std::string const& password,
++                             int const auth_token_ttl,
++                             std::string const& load_balancer,
++                             std::chrono::microseconds request_timeout) {
++  this->grpc_timeout = request_timeout;
+   // create channels
+   grpc::ChannelArguments grpc_args;
+   grpc_args.SetMaxSendMessageSize(std::numeric_limits<int>::max());
+@@ -445,7 +462,7 @@
+ 
+   // auth
+   this->token_authenticator.reset(new TokenAuthenticator(
+-      this->channel, username, password, auth_token_ttl));
++      this->channel, username, password, auth_token_ttl, &this->grpc_timeout));
+ 
+   // setup stubs
+   stubs.reset(new EtcdServerStubs{});
+@@ -471,7 +488,7 @@
+ 
+   // auth
+   this->token_authenticator.reset(new TokenAuthenticator(
+-      this->channel, username, password, auth_token_ttl));
++      this->channel, username, password, auth_token_ttl, &this->grpc_timeout));
+ 
+   // setup stubs
+   stubs.reset(new EtcdServerStubs{});
+--- a/src/KeepAlive.cpp
++++ b/src/KeepAlive.cpp
+@@ -147,15 +147,10 @@
+     return;
+   }
+ 
+-  // stop the thread
++  // Cancel network I/O before joining a refresh that may be waiting for it.
+   cv_for_refresh_.notify_all();
++  stubs->call->CancelKeepAlive();
+   refresh_task_.join();
+-
+-  // send a cancel request
+-  {
+-    std::lock_guard<std::mutex> lock(mutex_for_refresh_);
+-    stubs->call->CancelKeepAlive();
+-  }
+ }
+ 
+ void etcd::KeepAlive::Check() {
+--- a/src/v3/AsyncGRPC.cpp
++++ b/src/v3/AsyncGRPC.cpp
+@@ -545,14 +545,22 @@
+ 
+   void* got_tag = nullptr;
+   bool ok = false;
+-  if (cq_.Next(&got_tag, &ok) && ok &&
+-      got_tag == (void*) etcdv3::KEEPALIVE_CREATE) {
+-    // ok
+-  } else {
++  bool created = false;
++  if (parameters.has_grpc_timeout()) {
++    created = cq_.AsyncNext(&got_tag, &ok, parameters.grpc_deadline()) ==
++              CompletionQueue::NextStatus::GOT_EVENT;
++    if (!created) {
++      context.TryCancel();
++      // Cancellation completes the pending creation locally; drain its tag.
++      cq_.Next(&got_tag, &ok);
++    }
++  } else {
++    created = cq_.Next(&got_tag, &ok);
++  }
++  if (!created || !ok || got_tag != (void*) etcdv3::KEEPALIVE_CREATE) {
++    CancelKeepAlive();
+     status = grpc::Status(grpc::StatusCode::CANCELLED,
+                           "Failed to create a lease keep-alive connection");
+-    // cannot continue for further refresh
+-    isCancelled.store(true);
+   }
+ }
+ 
+@@ -591,6 +599,8 @@
+     // wait write finish
+     switch (cq_.AsyncNext(&got_tag, &ok, parameters.grpc_deadline())) {
+     case CompletionQueue::NextStatus::TIMEOUT: {
++      context.TryCancel();
++      cq_.Next(&got_tag, &ok);  // drain the cancelled operation before Finish
+       status = grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                             "gRPC timeout during keep alive write");
+       break;
+@@ -618,6 +628,8 @@
+     // wait read finish
+     switch (cq_.AsyncNext(&got_tag, &ok, parameters.grpc_deadline())) {
+     case CompletionQueue::NextStatus::TIMEOUT: {
++      context.TryCancel();
++      cq_.Next(&got_tag, &ok);  // drain the cancelled operation before Finish
+       status = grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                             "gRPC timeout during keep alive read");
+       break;
+@@ -660,38 +672,24 @@
+ }
+ 
+ void etcdv3::AsyncLeaseKeepAliveAction::CancelKeepAlive() {
++  // Refresh holds protect_is_cancelled while waiting for CQ events. TryCancel
++  // is thread-safe and must precede that lock, so it can wake an in-flight read.
++  context.TryCancel();
+   std::lock_guard<std::recursive_mutex> scope_lock(this->protect_is_cancelled);
+   if (!isCancelled.exchange(true)) {
+     void* got_tag = nullptr;
+     bool ok = false;
+-
+-    stream->WritesDone((void*) etcdv3::KEEPALIVE_DONE);
+-    if (cq_.Next(&got_tag, &ok) && ok &&
+-        got_tag == (void*) etcdv3::KEEPALIVE_DONE) {
+-      // ok
+-    } else {
+-#ifndef NDEBUG
+-      std::cerr
+-          << "[debug] failed to mark a lease keep-alive connection as DONE: "
+-          << context.debug_error_string() << std::endl;
+-#endif
+-    }
+-
+     stream->Finish(&status, (void*) KEEPALIVE_FINISH);
+-    if (cq_.Next(&got_tag, &ok) && ok && got_tag == (void*) KEEPALIVE_FINISH) {
+-      // ok
+-    } else {
+-#ifndef NDEBUG
+-      std::cerr << "[debug] failed to finish a lease keep-alive connection: "
+-                << status.error_message() << ", "
+-                << context.debug_error_string() << std::endl;
+-#endif
+-    }
+-
+-    // cancel on-the-fly calls
+-    context.TryCancel();
+-
++    // Observe terminal status before shutting down the completion queue.
++    while (cq_.Next(&got_tag, &ok)) {
++      if (got_tag == (void*) KEEPALIVE_FINISH) {
++        break;
++      }
++    }
+     cq_.Shutdown();
++    while (cq_.Next(&got_tag, &ok)) {
++      // Drain cancelled operations before destroying the completion queue.
++    }
+   }
+ }
+ 

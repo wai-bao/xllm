@@ -20,6 +20,8 @@ limitations under the License.
 
 #include <cmath>
 
+#include "platform/platform.h"
+
 namespace xllm {
 namespace {
 
@@ -89,5 +91,26 @@ TEST(LogitsUtilsTest, RepetitionPenaltyPreservesBlockedTokens) {
   EXPECT_EQ(logits[0][2].item<float>(), -4.0F);
 }
 
+TEST(LogitsUtilsTest, GatheredConfidenceMatchesFloatReferenceOnDevice) {
+  const torch::Device device(Platform::type_torch(), /*index=*/0);
+  const torch::Tensor tokens = torch::tensor({2, 1}, torch::kLong);
+  for (torch::ScalarType dtype : {torch::kFloat, torch::kBFloat16}) {
+    const torch::Tensor host_logits =
+        torch::tensor({{1.0F, 2.0F, 3.0F}, {7.0F, 8.0F, 9.0F}}, dtype);
+    const torch::Tensor expected =
+        torch::softmax(host_logits.to(torch::kFloat), /*dim=*/-1)
+            .gather(/*dim=*/1, tokens.view({-1, 1}))
+            .flatten();
+    const torch::Tensor logits = host_logits.to(device);
+    const torch::Tensor selected = tokens.to(device);
+    const torch::Tensor confidence = gather_probs_from_logits(logits, selected);
+    EXPECT_EQ(confidence.scalar_type(), torch::kFloat);
+    EXPECT_EQ(confidence.sizes(), selected.sizes());
+    EXPECT_TRUE(torch::allclose(confidence.to(torch::kCPU).flatten(),
+                                expected,
+                                /*rtol=*/1.0e-5,
+                                /*atol=*/1.0e-6));
+  }
+}
 }  // namespace
 }  // namespace xllm

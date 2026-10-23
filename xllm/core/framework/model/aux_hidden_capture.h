@@ -105,12 +105,22 @@ class AuxHiddenCapture final {
                      layer_idx) != layers_to_capture_.end();
   }
 
+  // Before CP restores global token order, only the local token rows have
+  // been written into the capture buffer. Never slice it with the global row
+  // count before gathering those local rows.
+  torch::Tensor captured_hidden_states(int64_t num_tokens) const {
+    CHECK(enabled()) << "auxiliary hidden capture is disabled";
+    CHECK_GE(num_tokens, 0);
+    CHECK_LE(num_tokens, buffer_.size(0));
+    return buffer_.slice(/*dim=*/0, /*start=*/0, /*end=*/num_tokens);
+  }
+
   ModelOutput finalize(
       const torch::Tensor& hidden_states,
       const std::optional<torch::Tensor>& residual = std::nullopt) const {
     ModelOutput output(hidden_states, residual);
     if (enabled()) {
-      output.aux_hidden_states = buffer_.slice(0, 0, hidden_states.size(0));
+      output.aux_hidden_states = captured_hidden_states(hidden_states.size(0));
     }
     return output;
   }

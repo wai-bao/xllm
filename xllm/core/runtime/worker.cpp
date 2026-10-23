@@ -37,7 +37,6 @@ limitations under the License.
 #include "core/platform/platform.h"
 #include "core/runtime/task_execution_pipeline.h"
 #if defined(USE_NPU)
-#include "core/runtime/unified_mtp_worker_impl.h"
 #endif
 #include "core/kv_cache/storage/kv_cache.h"
 #include "framework/model/model_params_view.h"
@@ -183,15 +182,6 @@ Worker::Worker(const ParallelArgs& parallel_args,
       if (worker_type == WorkerType::VLM) {
         impl_ = new MTPWorkerImpl<VlmForwardInput>(
             parallel_args, device, options, worker_type);
-#if defined(USE_NPU)
-      } else if (worker_type == WorkerType::LLM && device.is_privateuseone() &&
-                 ModelConfig::is_python_model_impl(
-                     ModelConfig::get_instance().model_impl()) &&
-                 ExecutionConfig::get_instance().enable_unified_mtp_graph()) {
-        LOG(INFO) << "Unified MTP worker enabled";
-        impl_ = new UnifiedMtpWorkerImpl(
-            parallel_args, device, options, worker_type);
-#endif
       } else {
         impl_ = new MTPWorkerImpl<LlmForwardInput>(
             parallel_args, device, options, worker_type);
@@ -353,10 +343,6 @@ folly::SemiFuture<std::optional<ForwardOutput>> Worker::step_async(
 
 const bool Worker::is_driver() { return impl_->is_driver(); }
 
-bool Worker::task_pipeline_uses_worker_prepare() const {
-  return impl_->uses_worker_task_pipeline();
-}
-
 folly::SemiFuture<std::tuple<int64_t, int64_t>>
 Worker::estimate_kv_cache_capacity_async() {
   return impl_->estimate_kv_cache_capacity_async();
@@ -517,6 +503,16 @@ folly::SemiFuture<bool> Worker::wakeup_async(const WakeupOptions& options) {
     promise.setValue(this->wakeup(options));
   });
   return future;
+}
+
+folly::SemiFuture<bool> Worker::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  if (enable_task_pipeline_) {
+    CHECK(task_pipeline_ != nullptr);
+    return task_pipeline_->release_idle_request_state_async(
+        std::move(embedding_ids));
+  }
+  return impl_->release_idle_request_state_async(std::move(embedding_ids));
 }
 
 bool Worker::start_profile() { return impl_->start_profile(); }

@@ -40,21 +40,6 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-bool task_worker_supports_json_object(const Options& options) {
-#if defined(USE_NPU)
-  return ExecutionConfig::get_instance().enable_unified_mtp_graph() &&
-         options.num_speculative_tokens() > 0 &&
-         options.draft_model_path().has_value() &&
-         !options.draft_model_path()->empty() &&
-         SpeculativeConfig::is_mtp_algorithm(options.speculative_algorithm()) &&
-         ModelConfig::is_python_model_impl(
-             ModelConfig::get_instance().model_impl());
-#else
-  static_cast<void>(options);
-  return false;
-#endif
-}
-
 bool get_enable_thinking(const nlohmann::json& chat_template_kwargs) {
   const bool default_value =
       !ModelConfig::get_instance().reasoning_parser().empty();
@@ -444,6 +429,14 @@ std::shared_ptr<Request> LLMRequestFactory::create(
                         sp.source_xservice_addr);
     return nullptr;
   }
+  const std::string& speculative_algorithm = options_->speculative_algorithm();
+  if (options_->num_speculative_tokens() > 0 && sampling_param.beam_width > 1 &&
+      SpeculativeConfig::produces_draft_input(speculative_algorithm)) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "Beam search (beam_width > 1) is not supported with " +
+                            speculative_algorithm + " speculative decoding");
+    return nullptr;
+  }
   // Model-aware complement to verify_params' 2000 cap: an oversized top-k
   // would throw inside the sampler and take the whole batch down with it.
   if (const auto error =
@@ -455,8 +448,11 @@ std::shared_ptr<Request> LLMRequestFactory::create(
     return nullptr;
   }
   const bool json_object = sampling_param.json_object;
-  if (json_object && options_->enable_task_pipeline() &&
-      !task_worker_supports_json_object(*options_)) {
+  // The unified MTP worker that accepted JSON-object chat requests was removed
+  // with the draft-input-carry refactor: the speculative task pipeline
+  // validates inputs without json_object_states, so task-pipeline JSON chat
+  // must be rejected at admission instead of failing inside the worker.
+  if (json_object && options_->enable_task_pipeline()) {
     CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
                         "response_format=json_object is not supported with "
                         "enable_task_pipeline",

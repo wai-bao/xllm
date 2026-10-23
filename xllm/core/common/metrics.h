@@ -317,7 +317,7 @@ DECLARE_COUNTER(speculative_num_draft_tokens_plain_total);
 // a valid committed-token result, so it measures actual executions rather
 // than capability checks or HTTP requests.
 DECLARE_COUNTER(speculative_unified_graph_executions_total);
-DECLARE_COUNTER(speculative_legacy_decode_steps_total);
+DECLARE_COUNTER(speculative_pipeline_invalid_draft_input_rows_total);
 
 // latency of proto conversion in seconds
 DECLARE_COUNTER(proto_latency_seconds_proto2i);

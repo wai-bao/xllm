@@ -291,16 +291,6 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
           vlm_engine_.get(),
           speculative_engine_.get()));
 
-  auto finish_engine_initialization = [this](auto* engine) {
-    model_args_ = engine->model_args();
-    if (options_.enable_service_routing()) {
-      XServiceClient* xservice_client = XServiceClient::get_instance();
-      CHECK(xservice_client->init(options_.etcd_addr().value_or(""),
-                                  options_.instance_name().value_or(""),
-                                  options_.etcd_namespace().value_or("")))
-          << "XServiceClient init fail!";
-    }
-  };
   if (use_speculative_engine) {
     const LLMEngine::ModelInitCallback prepare_draft =
         [this](const ModelLoader& model_loader,
@@ -313,12 +303,13 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
         };
     CHECK(speculative_engine_->init(
         options_.master_status(), prepare_draft, kv_transfer_coordinator_));
-    finish_engine_initialization(speculative_engine_.get());
+    model_args_ = speculative_engine_->model_args();
   } else {
     CHECK(vlm_engine_->init(options_.master_status()));
-    finish_engine_initialization(vlm_engine_.get());
+    model_args_ = vlm_engine_->model_args();
   }
 
+  acquire_service_client();
   SchedulerOptions scheduler_options;
   scheduler_options.max_tokens_per_batch(options.max_tokens_per_batch())
       .max_seqs_per_batch(options.max_seqs_per_batch())
@@ -329,8 +320,9 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
       .decode_graph_warmup_config(
           ExecutionConfig::get_instance().decode_graph_warmup_config(
               options_.num_speculative_tokens(),
-              options_.enable_graph_mode_decode_no_padding(),
-              options_.speculative_algorithm()))
+              options_.enable_graph_mode_decode_no_padding()))
+      .speculative_algorithm(options_.speculative_algorithm())
+      .draft_sampling_mode(options_.draft_sampling_mode())
       .dp_size(options_.dp_size())
       .cp_size(options_.cp_size())
       .enable_disagg_pd(options_.enable_disagg_pd())
@@ -348,6 +340,7 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
         scheduler_ = create_continuous_scheduler(
             engine,
             scheduler_options,
+            xservice_client_,
             engine->get_distributed_worker_manager(),
             /*model_residency_coordinator=*/nullptr,
             kv_transfer_coordinator_);
@@ -356,8 +349,13 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
       speculative_engine_.get());
 
   if (options_.enable_service_routing()) {
-    auto& instance_info = scheduler_->get_instance_info();
-    XServiceClient::get_instance()->register_instance(instance_info);
+    dispatch_engine(
+        [this](auto* engine) {
+          discovery_registration_ =
+              bind_service_registration(scheduler_.get(), engine);
+        },
+        vlm_engine_.get(),
+        speculative_engine_.get());
   }
 
   dispatch_engine(
@@ -412,11 +410,15 @@ void VLMMaster::handle_request(std::string prompt,
                                RequestParams sp,
                                OutputCallback callback) {
   scheduler_->incr_pending_requests(1);
-  auto cb = [callback = std::move(callback),
-             scheduler = scheduler_.get()](const RequestOutput& output) {
-    output.log_request_status();
-    return callback(output);
-  };
+  // Stamp the request's streaming mode onto every error output so the
+  // transport layer picks the right envelope (see
+  // Master::stamp_stream_on_error).
+  auto cb =
+      [callback = Master::stamp_stream_on_error(
+           std::move(callback), sp.streaming)](const RequestOutput& output) {
+        output.log_request_status();
+        return callback(output);
+      };
 
   threadpool_->schedule([this,
                          prompt = std::move(prompt),
@@ -464,11 +466,15 @@ void VLMMaster::handle_request(std::vector<Message> messages,
   }
 
   scheduler_->incr_pending_requests(1);
-  auto cb = [callback = std::move(callback),
-             scheduler = scheduler_.get()](const RequestOutput& output) {
-    output.log_request_status();
-    return callback(output);
-  };
+  // Stamp the request's streaming mode onto every error output so the
+  // transport layer picks the right envelope (see
+  // Master::stamp_stream_on_error).
+  auto cb =
+      [callback = Master::stamp_stream_on_error(
+           std::move(callback), sp.streaming)](const RequestOutput& output) {
+        output.log_request_status();
+        return callback(output);
+      };
 
   threadpool_->schedule([this,
                          messages = std::move(messages),

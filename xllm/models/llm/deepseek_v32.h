@@ -21,6 +21,7 @@ limitations under the License.
 #include "deepseek_v2.h"
 #include "layers/common/attention_metadata_builder.h"
 #include "layers/mlu/deepseek_v32_cp_context.h"
+#include "models/llm/deepseek_v32_registry.h"
 #include "platform/platform.h"
 
 namespace xllm {
@@ -158,6 +159,8 @@ TORCH_MODULE(DeepseekV32ForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(deepseek_v32, DeepseekV32ForCausalLM);
+// The platform-agnostic spec-verify registration lives in
+// deepseek_v32_registry.h; see the include at the top of this file.
 // register the model args
 // example config:
 // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json

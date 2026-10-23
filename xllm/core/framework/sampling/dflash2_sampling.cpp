@@ -61,6 +61,11 @@ DFlash2SampleOutput sample_dflash2_path(
                                -std::numeric_limits<float>::infinity(),
                                float_options);
   }
+  // The [batch, num_steps] confidence signal is cheap next to the dense
+  // logits; always fill it so the adaptive controller has it whenever it is
+  // enabled, independent of return_logits.
+  torch::Tensor confidence_probs =
+      torch::empty({batch_size, num_steps}, float_options);
   torch::Tensor previous_indices =
       torch::zeros({batch_size}, candidates.candidate_ids.options());
 
@@ -100,12 +105,16 @@ DFlash2SampleOutput sample_dflash2_path(
       draft_logits.select(/*dim=*/1, step)
           .scatter_(/*dim=*/1, step_candidates, step_log_probs);
     }
+    confidence_probs.select(/*dim=*/1, step)
+        .copy_(
+            index_select_2d(row_log_probs, /*dim=*/1, sampled_indices).exp_());
     token_ids.select(/*dim=*/1, step).copy_(sampled_tokens);
     previous_indices = sampled_indices;
   }
 
   return {.token_ids = std::move(token_ids),
-          .draft_logits = std::move(draft_logits)};
+          .draft_logits = std::move(draft_logits),
+          .confidence_probs = std::move(confidence_probs)};
 }
 
 }  // namespace xllm

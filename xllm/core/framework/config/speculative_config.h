@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "core/common/macros.h"
 #include "core/framework/config/option_category.h"
+#include "core/framework/model/model_args.h"
 
 namespace xllm {
 
@@ -66,7 +67,42 @@ class SpeculativeConfig final {
     return boost::iequals(algorithm, "MTP");
   }
 
-  // Drafts that generate a block of speculative tokens in one forward.
+  // Which MTP draft-variant conversion applies to this model load. The
+  // single source of truth behind every convert_to_mtp_draft gate so the
+  // draft geometry rewrite cannot diverge between engine and worker.
+  enum class MtpDraftConversion {
+    // No conversion: ordinary decode, atb-spec-kernel (num_speculative_tokens
+    // > 0 keeps the target args), or a block-diffusion draft.
+    NONE,
+    // NPU draft engine running algorithm MTP with no fixed speculative
+    // width: load the registered MTP pair variant directly.
+    DRAFT_ENGINE_PAIR,
+    // A worker whose checkpoint carries an embedded MTP layer
+    // (num_nextn_predict_layers != 0) and no fixed speculative width: on NPU
+    // only the non-draft-engine workers, on other platforms any worker.
+    EMBEDDED_LAYER,
+  };
+
+  static MtpDraftConversion resolve_mtp_draft_conversion(
+      bool is_draft_engine,
+      std::string_view algorithm,
+      int32_t num_speculative_tokens,
+      int32_t num_nextn_predict_layers,
+      bool is_block_diffusion,
+      bool is_npu) {
+    if (num_speculative_tokens != 0 || is_block_diffusion) {
+      return MtpDraftConversion::NONE;
+    }
+    if (is_draft_engine && is_mtp_algorithm(algorithm)) {
+      return is_npu ? MtpDraftConversion::DRAFT_ENGINE_PAIR
+                    : MtpDraftConversion::NONE;
+    }
+    if (num_nextn_predict_layers != 0 && (!is_npu || !is_draft_engine)) {
+      return MtpDraftConversion::EMBEDDED_LAYER;
+    }
+    return MtpDraftConversion::NONE;
+  }
+
   static bool is_block_diffusion_algorithm(std::string_view algorithm) {
     return is_dflash_algorithm(algorithm) || is_dflash2_algorithm(algorithm) ||
            is_dspark_algorithm(algorithm);
@@ -91,6 +127,13 @@ class SpeculativeConfig final {
   static bool supports_host_kv_cache(std::string_view algorithm) {
     return is_mtp_algorithm(algorithm) || is_eagle3_algorithm(algorithm) ||
            is_block_diffusion_algorithm(algorithm);
+  }
+
+  // True for the algorithms that carry a per-request MTP draft input across
+  // speculative rounds (MTP and Eagle3). Centralizes the classification so the
+  // PD-handoff transfer path and the request factory stay in agreement.
+  static bool produces_draft_input(std::string_view algorithm) {
+    return is_mtp_algorithm(algorithm) || is_eagle3_algorithm(algorithm);
   }
 
   // DFlash2 carries the dense proposal only when probabilistic rejection
@@ -166,5 +209,14 @@ class SpeculativeConfig final {
   PROPERTY(std::string, adaptive_target_verify_calibration);
   PROPERTY(std::string, adaptive_target_verify_cost_table_output);
 };
+
+// Eagle3.1 drafts can live inside the target checkpoint instead of a separate
+// draft model; the embedded flag lives on ModelArgs while the algorithm
+// classification lives here.
+inline bool uses_embedded_eagle3_draft(std::string_view algorithm,
+                                       const ModelArgs& target_model_args) {
+  return SpeculativeConfig::is_eagle3_algorithm(algorithm) &&
+         target_model_args.enable_embedded_eagle3_draft();
+}
 
 }  // namespace xllm

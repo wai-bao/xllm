@@ -121,20 +121,13 @@ void CompletionServiceImpl::process_request_from_service(
     const std::string& x_request_time) {
   const auto& service_request_id = rpc_request.service_request_id();
   const auto& target_xservice_addr = rpc_request.source_xservice_addr();
-  OutputCallback callback = [service_request_id,
-                             target_xservice_addr,
-                             stream =
-                                 rpc_request.stream()](RequestOutput output) {
-    // Validation failures may contain only a Status. Bind their owner here too.
-    output.service_request_id = service_request_id;
-    output.target_xservice_addr = target_xservice_addr;
-    output.log_request_status();
-    output.stream = stream;
-    const auto results = XServiceClient::get_instance()->generations({output});
-    return results.size() == 1 && results.front();
-  };
   const auto& model = rpc_request.model();
   auto master = get_model_master(model);
+  // Error paths below report through the callback, so it must be callable
+  // before any master (and its xservice client) is resolved. The stream
+  // stamping happens once here instead of at every error site.
+  OutputCallback callback = Master::stamp_stream_on_error(
+      Master::make_error_response_callback(), rpc_request.stream());
   if (unlikely(master == nullptr)) {
     CALLBACK_WITH_ERROR(StatusCode::UNKNOWN,
                         "Model not supported",
@@ -142,6 +135,12 @@ void CompletionServiceImpl::process_request_from_service(
                         target_xservice_addr);
     return;
   }
+  // Masters stamp the stream flag at their request entry (the double wrap is
+  // idempotent); the PD-routing, single-prompt and rate-limit rejections
+  // below fire before handle_request, so this callback still needs the
+  // service-side stamp.
+  callback = Master::stamp_stream_on_error(master->make_rpc_response_callback(),
+                                           rpc_request.stream());
   if (rpc_request.has_routing() &&
       (!master->options().enable_disagg_pd() ||
        rpc_request.routing().decode_name().empty() ||

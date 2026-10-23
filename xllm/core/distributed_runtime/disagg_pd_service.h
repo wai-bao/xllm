@@ -20,6 +20,7 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "core/distributed_runtime/disagg_pd_service_impl.h"
+#include "core/distributed_runtime/xservice_client.h"
 #include "disagg_pd.pb.h"
 
 namespace xllm {
@@ -29,6 +30,7 @@ class DisaggPDService : public proto::DisaggPDService {
   explicit DisaggPDService(DisaggPDScheduler* scheduler,
                            Engine* engine,
                            int32_t kv_cache_block_tokens,
+                           std::shared_ptr<XServiceClient> client = nullptr,
                            DisaggPDServiceOptions response_options = {});
   explicit DisaggPDService() {}
   virtual ~DisaggPDService() = default;

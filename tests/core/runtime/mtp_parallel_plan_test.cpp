@@ -26,7 +26,6 @@ TEST(MtpParallelPlanTest, EveryRankAgreesOnDecodeDespiteIdleShards) {
   input.raw_dp_global_token_nums = input.dp_global_token_nums;
   input.dp_is_decode = {1, 0, 1};
   input.dp_global_kv_max_seq_lens = {20, 0, 10};
-  input.dp_global_batch_generations = {11, 2, 9};
   for (uint32_t rank = 0; rank < 3; ++rank) {
     ParallelInput output;
     bool run_models = false;
@@ -45,8 +44,8 @@ TEST(MtpParallelPlanTest, EveryRankAgreesOnDecodeDespiteIdleShards) {
     EXPECT_TRUE(decode);
     EXPECT_EQ(output.dp_global_token_nums, input.dp_global_token_nums);
     EXPECT_EQ(output.raw_dp_global_token_nums, input.raw_dp_global_token_nums);
-    EXPECT_EQ(output.dp_global_batch_generations,
-              input.dp_global_batch_generations);
+    EXPECT_EQ(output.dp_global_kv_max_seq_lens,
+              input.dp_global_kv_max_seq_lens);
   }
 }
 

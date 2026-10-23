@@ -24,6 +24,7 @@ limitations under the License.
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/metrics.h"
@@ -37,10 +38,10 @@ limitations under the License.
 #include "core/framework/model/rec_model.h"
 #include "core/framework/model_context/model_context.h"
 #include "core/framework/model_loader/model_loader.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/stopping_checker.h"
 #include "core/framework/sampling/sampling_params.h"
-#include "core/framework/speculative/spec_verify.h"
 #include "core/kv_cache/block/block.h"
 #include "core/kv_cache/block/block_manager_impl.h"
 #include "core/kv_cache/storage/kv_cache.h"
@@ -48,6 +49,7 @@ limitations under the License.
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/npu/npu_lm_head_impl.h"
 #include "core/layers/npu/npu_word_embedding_impl.h"
+#include "core/layers/npu_torch/deepseek_v4_cp_context.h"
 #include "core/layers/npu_torch/qwen3_next_attention.h"
 #include "core/layers/npu_torch/tests_utils.h"
 #include "core/runtime/acl_graph_executor_impl.h"
@@ -56,6 +58,8 @@ limitations under the License.
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/runtime/dflash_worker_impl.h"
 #include "core/runtime/options.h"
+#include "core/runtime/spec_verify.h"
+#include "core/runtime/speculative_output.h"
 #include "core/runtime/speculative_worker_impl.h"
 #include "models/llm/deepseek_v4.h"
 #include "models/llm/dspark_weight_source.h"
@@ -952,6 +956,7 @@ TEST(DeepseekV4ModelTest, ReturnsPreHcHiddenStatesForMtp) {
   ASSERT_TRUE(static_cast<bool>(factory));
   std::unique_ptr<CausalLM> model = factory(context);
   ASSERT_NE(model, nullptr);
+  EXPECT_TRUE(model->provides_capture_hidden_hook());
 
   const torch::Tensor pre_hc_hidden =
       torch::tensor({1.0f, 2.0f, 3.0f, 4.0f}, tensor_options).view({1, 2, 2});
@@ -974,6 +979,20 @@ TEST(DeepseekV4ModelTest, ReturnsPreHcHiddenStatesForMtp) {
   ASSERT_TRUE(output.hidden_states.defined());
   EXPECT_EQ(output.hidden_states.sizes(), torch::IntArrayRef({1, 2}));
   EXPECT_EQ(output.aux_hidden_states.sizes(), torch::IntArrayRef({1, 4}));
+
+  SampleOutput speculative_output;
+  output_captured_hidden_states(
+      speculative_output,
+      output.hidden_states,
+      output.aux_hidden_states,
+      torch::zeros({1}, torch::dtype(torch::kLong).device(device)),
+      torch::Tensor(),
+      CaptureHiddenMode::MODEL_HOOK,
+      /*is_target_prefill=*/true,
+      /*cp_enabled=*/false);
+  EXPECT_EQ(speculative_output.embeddings.data_ptr(),
+            output.aux_hidden_states.data_ptr());
+  EXPECT_EQ(speculative_output.selected_embeddings.size(1), 4);
 }
 
 // Test graph creation and execution with different batch sizes
@@ -1774,6 +1793,99 @@ TEST(AuxHiddenCaptureTest, PreservesConfiguredLayerOrderAndResidual) {
                            torch::full({3, 2}, 10.0f)));
   EXPECT_TRUE(torch::equal(output.aux_hidden_states.slice(1, 2, 4),
                            torch::full({3, 2}, 20.0f)));
+}
+
+TEST(AuxHiddenCaptureTest, ExposesOnlyWrittenLocalRowsBeforeCpRestore) {
+  ModelArgs args;
+  args.hidden_size(2).layers_to_capture({0});
+  AuxHiddenCapture capture(
+      args, torch::TensorOptions().dtype(torch::kFloat32), 4);
+  const torch::Tensor local_hidden =
+      torch::tensor({{1.0F, 2.0F}, {3.0F, 4.0F}});
+  capture.capture_layer(/*layer_idx=*/0, local_hidden, std::nullopt);
+
+  const torch::Tensor local_aux = capture.captured_hidden_states(2);
+  EXPECT_EQ(local_aux.size(0), 2);
+  EXPECT_TRUE(torch::equal(local_aux, local_hidden));
+}
+
+namespace {
+
+class FixedCpGatherGroup final : public ProcessGroup {
+ public:
+  explicit FixedCpGatherGroup(torch::Tensor remote_rows)
+      : ProcessGroup(/*rank=*/0,
+                     /*world_size=*/2,
+                     torch::Device(torch::kCPU)),
+        remote_rows_(std::move(remote_rows)) {}
+
+  torch::Tensor allgather_base_sync(const torch::Tensor& local_rows) override {
+    return torch::stack({local_rows, remote_rows_});
+  }
+
+  c10::intrusive_ptr<c10d::Work> allgather_base_async(
+      const torch::Tensor& padded_local_rows,
+      torch::Tensor& output) override {
+    output[0].copy_(padded_local_rows);
+    output[1].copy_(remote_rows_);
+    return {};
+  }
+
+ private:
+  torch::Tensor remote_rows_;
+};
+
+}  // namespace
+
+TEST(AuxHiddenCaptureTest, RestoresCapturedCpRowsBeforeSpeculativeSelection) {
+  ModelArgs args;
+  args.hidden_size(2).layers_to_capture({0});
+  AuxHiddenCapture capture(
+      args, torch::TensorOptions().dtype(torch::kFloat32), 4);
+  capture.capture_layer(
+      /*layer_idx=*/0,
+      torch::tensor({{1.0F, 2.0F}, {3.0F, 4.0F}}),
+      std::nullopt);
+
+  FixedCpGatherGroup cp_group(torch::tensor({{5.0F, 6.0F}, {7.0F, 8.0F}}));
+  layer::v4_cp::DeepseekV4CpContext cp_context;
+  cp_context.cp_size = 2;
+  cp_context.cp_group = &cp_group;
+  cp_context.tokens_per_rank = {2, 2};
+  cp_context.restore_indices = torch::tensor({0, 2, 1, 3}, torch::kLong);
+  const torch::Tensor restored_aux = cp_context.gather_restore(
+      capture.captured_hidden_states(/*num_tokens=*/2));
+  EXPECT_TRUE(torch::equal(
+      restored_aux,
+      torch::tensor({{1.0F, 2.0F}, {5.0F, 6.0F}, {3.0F, 4.0F}, {7.0F, 8.0F}})));
+
+  SampleOutput output;
+  const torch::Tensor selected_rows = torch::tensor({3, 1}, torch::kLong);
+  const torch::Tensor gathered_primary = torch::zeros({2, 2});
+  output_captured_hidden_states(output,
+                                torch::zeros({4, 2}),
+                                restored_aux,
+                                selected_rows,
+                                gathered_primary,
+                                CaptureHiddenMode::CAPTURED_LAYERS,
+                                /*is_target_prefill=*/false,
+                                /*cp_enabled=*/true);
+  EXPECT_TRUE(torch::equal(output.embeddings,
+                           torch::tensor({{7.0F, 8.0F}, {5.0F, 6.0F}})));
+
+  cp_context.tokens_per_rank = {1, 2};
+  cp_context.restore_indices = torch::tensor({0, 1, 2}, torch::kLong);
+  const torch::Tensor uneven_aux = cp_context.gather_restore(
+      capture.captured_hidden_states(/*num_tokens=*/1));
+  EXPECT_TRUE(torch::equal(
+      uneven_aux, torch::tensor({{1.0F, 2.0F}, {5.0F, 6.0F}, {7.0F, 8.0F}})));
+
+  cp_context.tokens_per_rank = {0, 2};
+  cp_context.restore_indices = torch::tensor({0, 1}, torch::kLong);
+  const torch::Tensor empty_local_aux = cp_context.gather_restore(
+      capture.captured_hidden_states(/*num_tokens=*/0));
+  EXPECT_TRUE(torch::equal(empty_local_aux,
+                           torch::tensor({{5.0F, 6.0F}, {7.0F, 8.0F}})));
 }
 
 TEST(DSparkWorkerInputTest, InvalidatesTargetAttentionMetadataOnly) {

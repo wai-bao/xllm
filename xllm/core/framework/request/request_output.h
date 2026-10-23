@@ -119,12 +119,17 @@ struct SequenceOutput {
 struct RequestOutput {
   RequestOutput() = default;
 
+  // The transport layer picks the SSE frame vs plain-JSON error envelope from
+  // `stream`, so error paths that know the request's streaming mode must
+  // propagate it instead of letting it default to false.
   RequestOutput(Status&& _status,
                 std::string service_request_id = "",
-                std::string target_xservice_addr = "")
+                std::string target_xservice_addr = "",
+                bool stream = false)
       : status(std::move(_status)),
         service_request_id(std::move(service_request_id)),
-        target_xservice_addr(std::move(target_xservice_addr)) {}
+        target_xservice_addr(std::move(target_xservice_addr)),
+        stream(stream) {}
 
   void log_request_status() const;
 

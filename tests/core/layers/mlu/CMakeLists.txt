@@ -60,6 +60,7 @@ cc_test(
   DEPS
     :speculative
     :config
+    :runtime
     :mlu_layers
     :common_layers
     :block

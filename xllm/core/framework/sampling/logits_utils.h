@@ -45,6 +45,18 @@ inline torch::Tensor gather_log_probs_from_logits(
   return gather_from_logits(logits, token_ids).to(torch::kFloat32).sub(lse);
 }
 
+// P(token_ids) without materializing the dense softmax; -1 sentinels read 0.
+inline torch::Tensor gather_probs_from_logits(const torch::Tensor& logits,
+                                              const torch::Tensor& token_ids) {
+  return gather_log_probs_from_logits(
+             logits,
+             torch::logsumexp(
+                 logits.to(torch::kFloat32), /*dim=*/-1, /*keepdim=*/false),
+             token_ids)
+      .exp()
+      .masked_fill_(token_ids.lt(0), 0);
+}
+
 // -inf background; a greedy one-hot is the same call with zero `values`.
 inline torch::Tensor embed_sparse_logits(const torch::Tensor& token_ids,
                                          const torch::Tensor& values,

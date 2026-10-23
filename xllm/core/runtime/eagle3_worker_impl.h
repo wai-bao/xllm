@@ -15,7 +15,11 @@ limitations under the License.
 
 #pragma once
 
-#include "forward_params.h"
+#include <cstdint>
+#include <vector>
+
+#include "core/framework/speculative/vocab_map.h"
+#include "core/runtime/forward_params.h"
 #include "runtime/mtp_worker_impl.h"
 
 namespace xllm {
@@ -30,16 +34,13 @@ class Eagle3WorkerImpl final : public MTPWorkerImpl<TargetInput> {
 
   ~Eagle3WorkerImpl() override;
 
-  // Override init_model to load hot_token_id_ for EAGLE-3
+  // Load the EAGLE-3 vocabulary and its sampling map with the drafter.
   bool init_model(const std::string& model_weights_path,
                   int32_t random_seed,
                   MasterStatus master_status) override;
 
-  // EAGLE-3 draft input_embedding is num_aux_layers * target_hidden_size
-  int64_t get_embedding_placeholder_size() const override;
-
-  // Get hot_token_id for draft-to-target token mapping
-  torch::Tensor get_hot_token_id() const { return hot_token_id_; }
+  void release_algorithm_state(
+      const std::vector<int32_t>& embedding_ids) override;
 
  protected:
   using MTPWorkerImpl<TargetInput>::context_;
@@ -47,18 +48,25 @@ class Eagle3WorkerImpl final : public MTPWorkerImpl<TargetInput> {
   using MTPWorkerImpl<TargetInput>::draft_impl_;
   using MTPWorkerImpl<TargetInput>::uses_embedded_eagle3_draft;
 
-  // EAGLE-3 specific draft output post-processing during decode:
-  // selected prob extraction + draft->target token id mapping.
-  void process_draft_sample_output(SampleOutput& sample_output) override;
+  std::vector<uint8_t> prepare_draft_vocabulary_sampling(
+      SamplingParameters& sampling_params,
+      const DraftTokenHistories& histories) override;
+
+  // Map draft token IDs and retained q into the target vocabulary.
+  void remap_draft_sample_output(SampleOutput& sample_output) override;
 
   void check_draft_input_embedding(const torch::Tensor& embedding,
                                    const std::string& phase) const override;
   bool share_target_lm_head_with_draft() const override { return false; }
 
-  // EAGLE-3 specific: hot_token_id for draft-to-target token mapping
-  // hot_token_id = d2t + arange(d2t.size(0))
-  torch::Tensor hot_token_id_;
-  bool use_draft_token_mapping_ = true;
+  VocabMap vocab_map_;
+  DraftHistoryBatch draft_history_batch_;
+
+  // Draft->target vocabulary remapping is active only once the hot-token map
+  // has been loaded.
+  bool draft_token_mapping_active() const {
+    return vocab_map_.draft_to_target().defined();
+  }
 };
 
 }  // namespace xllm

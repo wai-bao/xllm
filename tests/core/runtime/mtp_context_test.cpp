@@ -28,12 +28,8 @@ namespace {
 class MtpContextTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_context(
-                    /*capacity=*/4,
-                    /*hidden_size=*/3,
-                    torch::kFloat32,
-                    device_,
-                    context_)
+    ASSERT_TRUE(TaskPipelineTestPeer::create_spec_context(
+                    /*capacity=*/4, device_, context_)
                     .ok());
     ASSERT_TRUE(
         TaskPipelineTestPeer::context_create(*context_, /*capacity=*/2, first_)
@@ -53,66 +49,52 @@ class MtpContextTest : public ::testing::Test {
     context_.reset();
   }
 
-  void seed(MtpContextView& binding) {
+  void seed(SpecContextView& binding) {
     binding.tokens_.copy_(torch::tensor({101, 202}, torch::kInt64));
     const auto& state = binding.state_;
-    state.previous_tokens.copy_(torch::tensor({100, 201}, torch::kInt64));
+
     state.positions.copy_(torch::tensor({7, 13}, torch::kInt32));
     state.kv_seq_lens.copy_(torch::tensor({8, 14}, torch::kInt32));
-    state.repair_required.copy_(torch::tensor({true, false}, torch::kBool));
-    state.hidden.copy_(torch::arange(12, torch::kFloat32).reshape({2, 2, 3}));
+
     TaskPipelineTestPeer::context_publish(binding);
   }
 
   torch::Device device_{torch::kPrivateUse1, 0};
-  std::unique_ptr<MtpContextStorage> context_;
-  std::unique_ptr<MtpContextView> first_;
-  std::unique_ptr<MtpContextView> second_;
+  std::unique_ptr<SpecContextStorage> context_;
+  std::unique_ptr<SpecContextView> first_;
+  std::unique_ptr<SpecContextView> second_;
   std::array<int32_t, 2> keys_{{1, 2}};
   std::array<std::string, 2> requests_{{"request", "request"}};
 };
 
 TEST_F(MtpContextTest, CapacityAndSchemaRejectWithoutReplacingOutput) {
-  const MtpContextStorage* original = context_.get();
-  EXPECT_FALSE(
-      TaskPipelineTestPeer::create_mtp_context(
-          /*capacity=*/4, /*hidden_size=*/3, torch::kInt32, device_, context_)
-          .ok());
-  EXPECT_FALSE(TaskPipelineTestPeer::create_mtp_context(
-                   std::numeric_limits<uint32_t>::max(),
-                   std::numeric_limits<uint32_t>::max(),
-                   torch::kFloat32,
-                   device_,
-                   context_)
+  const SpecContextStorage* original = context_.get();
+  EXPECT_FALSE(TaskPipelineTestPeer::create_spec_context(
+                   std::numeric_limits<uint32_t>::max(), device_, context_)
+                   .ok());
+  EXPECT_FALSE(TaskPipelineTestPeer::create_spec_context(
+                   4, torch::Device(torch::kCPU), context_)
                    .ok());
   EXPECT_EQ(context_.get(), original);
-  EXPECT_EQ(TaskPipelineTestPeer::mtp_context_bytes(*context_),
-            4U * (8 + 8 + 2 * 3 * 4 + 4 + 4 + 1));
+  EXPECT_EQ(TaskPipelineTestPeer::spec_context_bytes(*context_),
+            4U * (8 + 4 + 4));
   EXPECT_EQ((first_->host_rows_.nbytes()), 2U * 8);
-  EXPECT_EQ(TaskPipelineTestPeer::context_device_bytes(*first_),
-            2U * (8 + 8 + 8 + 2 * 3 * 4 + 4 + 4 + 1 + 16 + 1));
-  const MtpContextView* binding = first_.get();
+  EXPECT_EQ(TaskPipelineTestPeer::context_device_bytes(*first_), 2U * 32);
+  const SpecContextView* binding = first_.get();
   EXPECT_FALSE(
       TaskPipelineTestPeer::context_create(*context_, /*capacity=*/0, first_)
           .ok());
   EXPECT_EQ(first_.get(), binding);
 }
 
-TEST_F(MtpContextTest, BlockDraftAdvancesTokensWithoutAllocatingHiddenState) {
-  std::unique_ptr<MtpContextStorage> storage;
-  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_context(
-                  4, 0, torch::kFloat32, device_, storage)
-                  .ok());
-  EXPECT_EQ(TaskPipelineTestPeer::mtp_context_bytes(*storage),
+TEST_F(MtpContextTest, AlgorithmsShareTargetContinuationState) {
+  std::unique_ptr<SpecContextStorage> storage;
+  ASSERT_TRUE(
+      TaskPipelineTestPeer::create_spec_context(4, device_, storage).ok());
+  EXPECT_EQ(TaskPipelineTestPeer::spec_context_bytes(*storage),
             4U * (8 + 4 + 4));
-  EXPECT_FALSE(storage->mtp_state_.hidden.defined());
-  EXPECT_FALSE(storage->mtp_state_.previous_tokens.defined());
-  EXPECT_FALSE(storage->mtp_state_.repair_required.defined());
-  std::unique_ptr<MtpContextView> view;
+  std::unique_ptr<SpecContextView> view;
   ASSERT_TRUE(TaskPipelineTestPeer::context_create(*storage, 2, view).ok());
-  EXPECT_FALSE(view->storage_.hidden.defined());
-  EXPECT_FALSE(view->storage_.previous_tokens.defined());
-  EXPECT_FALSE(view->storage_.repair_required.defined());
   EXPECT_EQ(TaskPipelineTestPeer::context_device_bytes(*view), 2U * 32);
   Stream prepare(device_);
   ASSERT_TRUE(TaskPipelineTestPeer::context_prepare(
@@ -125,7 +107,7 @@ TEST_F(MtpContextTest, BlockDraftAdvancesTokensWithoutAllocatingHiddenState) {
   const auto accepted =
       torch::tensor({{11, -1, -1}, {21, 22, 23}}, torch::kInt64).to(device_);
   const auto lengths = torch::tensor({1, 3}, torch::kInt32).to(device_);
-  TaskPipelineTestPeer::context_advance(*view, accepted, lengths, {});
+  TaskPipelineTestPeer::context_advance(*view, accepted, lengths);
   TaskPipelineTestPeer::context_publish(*view);
   ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
   TaskPipelineTestPeer::context_release(*view);
@@ -145,20 +127,19 @@ TEST_F(MtpContextTest, BlockDraftAdvancesTokensWithoutAllocatingHiddenState) {
 }
 
 TEST_F(MtpContextTest, ViewsSurviveDeferredEmbeddingAllocation) {
-  std::unique_ptr<MtpContextStorage> storage;
-  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_context(
-                  0, 3, torch::kFloat32, device_, storage)
-                  .ok());
-  std::unique_ptr<MtpContextView> view;
+  std::unique_ptr<SpecContextStorage> storage;
+  ASSERT_TRUE(
+      TaskPipelineTestPeer::create_spec_context(0, device_, storage).ok());
+  std::unique_ptr<SpecContextView> view;
   ASSERT_TRUE(TaskPipelineTestPeer::context_create(*storage, 2, view).ok());
-  const void* snapshot = view->storage_.hidden.data_ptr();
+  const void* snapshot = view->storage_.positions.data_ptr();
   *storage = std::move(*context_);
   Stream prepare(device_);
   ASSERT_TRUE(TaskPipelineTestPeer::context_prepare(
                   *view, keys_, requests_, false, prepare)
                   .ok());
   ASSERT_EQ(prepare.synchronize(), 0);
-  EXPECT_EQ(view->storage_.hidden.data_ptr(), snapshot);
+  EXPECT_EQ(view->storage_.positions.data_ptr(), snapshot);
   EXPECT_EQ(view->context_, storage.get());
   EXPECT_TRUE(
       torch::equal(view->host_rows_, torch::tensor({1, 2}, torch::kInt64)));
@@ -288,11 +269,10 @@ TEST_F(MtpContextTest, ContextSurvivesNonAdjacentBatch) {
     auto guard = task.set_stream_guard();
     ASSERT_TRUE(task.wait_event(ready));
     first_->tokens_.fill_(999);
-    first_->state_.previous_tokens.zero_();
-    first_->state_.hidden.zero_();
+
     first_->state_.positions.zero_();
     first_->state_.kv_seq_lens.zero_();
-    first_->state_.repair_required.zero_();
+
     TaskPipelineTestPeer::context_publish(*first_);
   }
   ASSERT_EQ(task.synchronize(), 0);
@@ -309,8 +289,6 @@ TEST_F(MtpContextTest, ContextSurvivesNonAdjacentBatch) {
   ASSERT_EQ(task.synchronize(), 0);
   EXPECT_TRUE(torch::equal(first_->tokens_.cpu(),
                            torch::tensor({101, 202}, torch::kInt64)));
-  EXPECT_TRUE(torch::equal(first_->state_.hidden.cpu(),
-                           torch::arange(12, torch::kFloat32).view({2, 2, 3})));
 }
 
 TEST_F(MtpContextTest, TwoSlotsGatherReorderedStateBeforeFirstRetires) {
@@ -338,17 +316,11 @@ TEST_F(MtpContextTest, TwoSlotsGatherReorderedStateBeforeFirstRetires) {
   EXPECT_TRUE(torch::equal(second_->tokens_.cpu(),
                            torch::tensor({202, 101}, torch::kInt64)));
   const auto& state = second_->state_;
-  EXPECT_TRUE(torch::equal(state.previous_tokens.cpu(),
-                           torch::tensor({201, 100}, torch::kInt64)));
   EXPECT_TRUE(torch::equal(state.positions.cpu(),
                            torch::tensor({13, 7}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(state.kv_seq_lens.cpu(),
                            torch::tensor({14, 8}, torch::kInt32)));
-  EXPECT_TRUE(torch::equal(state.repair_required.cpu(),
-                           torch::tensor({false, true}, torch::kBool)));
-  const auto expected =
-      torch::arange(12, torch::kFloat32).reshape({2, 2, 3}).flip({0});
-  EXPECT_TRUE(torch::equal(state.hidden.cpu(), expected));
+
   // Releasing or reusing one Slot cannot overwrite the other snapshot.
   TaskPipelineTestPeer::context_release(*first_);
   first_->tokens_.fill_(999);
@@ -365,7 +337,7 @@ TEST_F(MtpContextTest, ShapeChangesAndEmptyTasksKeepBacking) {
           .ok());
   ASSERT_EQ(prepare.synchronize(), 0);
   const void* tokens = first_->tokens_.data_ptr();
-  const void* hidden = first_->state_.hidden.data_ptr();
+  const void* hidden = first_->state_.positions.data_ptr();
   TaskPipelineTestPeer::context_release(*first_);
   ASSERT_TRUE(
       TaskPipelineTestPeer::context_prepare(*first_,
@@ -377,7 +349,7 @@ TEST_F(MtpContextTest, ShapeChangesAndEmptyTasksKeepBacking) {
   ASSERT_EQ(prepare.synchronize(), 0);
   EXPECT_EQ(first_->tokens_.numel(), 1);
   EXPECT_EQ(first_->tokens_.data_ptr(), tokens);
-  EXPECT_EQ(first_->state_.hidden.data_ptr(), hidden);
+  EXPECT_EQ(first_->state_.positions.data_ptr(), hidden);
   TaskPipelineTestPeer::context_release(*first_);
   ASSERT_TRUE(TaskPipelineTestPeer::context_prepare(
                   *first_, {}, {}, /*read_published_state=*/false, prepare)
@@ -399,49 +371,35 @@ TEST_F(MtpContextTest, AcceptedPrefixesAdvanceStateEntirelyOnDevice) {
       torch::tensor({{11, -1, -1, -1}, {21, 22, 23, 24}}, torch::kInt64)
           .to(device_);
   torch::Tensor lengths = torch::tensor({1, 4}, torch::kInt32).to(device_);
-  torch::Tensor hidden =
-      torch::arange(24, torch::kFloat32).view({2, 4, 3}).to(device_);
+
   ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
-  const void* state_address = first_->state_.hidden.data_ptr();
+  const void* state_address = first_->state_.positions.data_ptr();
   {
     auto guard = task.set_stream_guard();
     ASSERT_TRUE(task.wait_event(ready));
     first_->state_.positions.copy_(torch::tensor({6, 12}, torch::kInt32));
     first_->state_.kv_seq_lens.copy_(torch::tensor({7, 13}, torch::kInt32));
-    TaskPipelineTestPeer::context_advance(*first_, tokens, lengths, hidden);
+    TaskPipelineTestPeer::context_advance(*first_, tokens, lengths);
     TaskPipelineTestPeer::context_publish(*first_);
   }
   ASSERT_EQ(task.synchronize(), 0);
   EXPECT_TRUE(torch::equal(first_->tokens_.cpu(),
                            torch::tensor({11, 24}, torch::kInt64)));
-  EXPECT_TRUE(torch::equal(first_->state_.previous_tokens.cpu(),
-                           torch::tensor({11, 23}, torch::kInt64)));
   EXPECT_TRUE(torch::equal(first_->state_.positions.cpu(),
                            torch::tensor({7, 16}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(first_->state_.kv_seq_lens.cpu(),
                            torch::tensor({8, 17}, torch::kInt32)));
-  EXPECT_TRUE(torch::equal(first_->state_.repair_required.cpu(),
-                           torch::tensor({false, true}, torch::kBool)));
-  EXPECT_TRUE(torch::equal(
-      first_->state_.hidden.select(1, 1).cpu(),
-      torch::tensor({{0., 1., 2.}, {21., 22., 23.}}, torch::kFloat32)));
-  EXPECT_TRUE(torch::equal(
-      first_->state_.hidden.select(1, 0).cpu(),
-      torch::tensor({{0., 0., 0.}, {18., 19., 20.}}, torch::kFloat32)));
-  // A partial prefix on the next Task replaces the full-accept repair flag.
+  // A partial prefix advances from the last committed target position.
   tokens.copy_(
       torch::tensor({{31, 32, -1, -1}, {41, 42, 43, -1}}, torch::kInt64));
   lengths.copy_(torch::tensor({2, 3}, torch::kInt32));
-  TaskPipelineTestPeer::context_advance(*first_, tokens, lengths, hidden);
+  TaskPipelineTestPeer::context_advance(*first_, tokens, lengths);
   ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
-  EXPECT_EQ(first_->state_.hidden.data_ptr(), state_address);
+  EXPECT_EQ(first_->state_.positions.data_ptr(), state_address);
   EXPECT_TRUE(torch::equal(first_->tokens_.cpu(),
                            torch::tensor({32, 43}, torch::kInt64)));
-  EXPECT_TRUE(torch::equal(first_->state_.previous_tokens.cpu(),
-                           torch::tensor({31, 42}, torch::kInt64)));
   EXPECT_TRUE(torch::equal(first_->state_.positions.cpu(),
                            torch::tensor({9, 19}, torch::kInt32)));
-  EXPECT_FALSE(first_->state_.repair_required.cpu().any().item<bool>());
 }
 
 TEST_F(MtpContextTest, ChunkedPrefillPublishesOnlyCompletedRows) {
@@ -477,11 +435,10 @@ TEST_F(MtpContextTest, ChunkedPrefillPublishesOnlyCompletedRows) {
     auto guard = task.set_stream_guard();
     ASSERT_TRUE(task.wait_event(ready));
     first_->tokens_.fill_(202);
-    first_->state_.previous_tokens.fill_(201);
-    first_->state_.hidden.fill_(3);
+
     first_->state_.positions.fill_(13);
     first_->state_.kv_seq_lens.fill_(14);
-    first_->state_.repair_required.fill_(false);
+
     TaskPipelineTestPeer::context_publish(*first_);
     TaskPipelineTestPeer::context_gather(*second_);
   }
@@ -548,86 +505,6 @@ TEST_F(MtpContextTest, IncompletePrefillAndInvalidPublicationRows) {
           .ok());
   ASSERT_EQ(prepare.synchronize(), 0);
   TaskPipelineTestPeer::context_release(*first_);
-}
-
-TEST_F(MtpContextTest, BootstrapRowsJoinPublishedStateAndSurviveSlotRelease) {
-  Stream prepare(device_);
-  Stream task(device_);
-  ASSERT_TRUE(
-      TaskPipelineTestPeer::context_prepare(
-          *first_, keys_, requests_, /*read_published_state=*/false, prepare)
-          .ok());
-  auto ready = prepare.record_event();
-  {
-    auto guard = task.set_stream_guard();
-    ASSERT_TRUE(task.wait_event(ready));
-    seed(*first_);
-  }
-  ASSERT_EQ(task.synchronize(), 0);
-  TaskPipelineTestPeer::context_release(*first_);
-
-  const std::array<int32_t, 2> mixed{{keys_[1], 3}};
-  const std::array<int32_t, 1> bootstrap{{1}};
-  ASSERT_TRUE(TaskPipelineTestPeer::context_prepare_decode(
-                  *second_, mixed, requests_, bootstrap, prepare)
-                  .ok());
-  ASSERT_TRUE(TaskPipelineTestPeer::context_prepare_decode(
-                  *first_, mixed, requests_, {}, prepare)
-                  .ok());
-  ready = prepare.record_event();
-  {
-    auto guard = task.set_stream_guard();
-    ASSERT_TRUE(task.wait_event(ready));
-    TaskPipelineTestPeer::context_gather(*second_);
-    second_->tokens_.select(/*dim=*/0, /*index=*/1).fill_(303);
-    const auto& state = second_->state_;
-    state.previous_tokens.select(/*dim=*/0, /*index=*/1).fill_(303);
-    state.hidden.select(/*dim=*/0, /*index=*/1).fill_(7);
-    state.positions.select(/*dim=*/0, /*index=*/1).fill_(21);
-    state.kv_seq_lens.select(/*dim=*/0, /*index=*/1).fill_(22);
-    state.repair_required.select(/*dim=*/0, /*index=*/1).fill_(false);
-    TaskPipelineTestPeer::context_publish(*second_);
-    TaskPipelineTestPeer::context_gather(*first_);
-  }
-  ASSERT_EQ(task.synchronize(), 0);
-  TaskPipelineTestPeer::context_release(*second_);
-  EXPECT_TRUE(torch::equal(first_->tokens_.cpu(),
-                           torch::tensor({202, 303}, torch::kInt64)));
-  EXPECT_TRUE(torch::equal(first_->state_.previous_tokens.cpu(),
-                           torch::tensor({201, 303}, torch::kInt64)));
-  EXPECT_TRUE(torch::equal(first_->state_.positions.cpu(),
-                           torch::tensor({13, 21}, torch::kInt32)));
-  EXPECT_TRUE(torch::equal(first_->state_.kv_seq_lens.cpu(),
-                           torch::tensor({14, 22}, torch::kInt32)));
-  EXPECT_TRUE(torch::equal(first_->state_.hidden.cpu().select(
-                               /*dim=*/0, /*index=*/0),
-                           torch::arange(6, 12, torch::kFloat32).view({2, 3})));
-  EXPECT_TRUE(torch::equal(first_->state_.hidden.cpu().select(
-                               /*dim=*/0, /*index=*/1),
-                           torch::full({2, 3}, 7, torch::kFloat32)));
-  EXPECT_FALSE(first_->state_.repair_required.cpu().any().item<bool>());
-}
-
-TEST_F(MtpContextTest, InvalidBootstrapCannotAdmitUnpublishedRows) {
-  Stream prepare(device_);
-  const std::array<int32_t, 2> duplicate{{0, 0}};
-  const std::array<int32_t, 1> outside{{2}};
-  const std::array<int32_t, 1> partial{{0}};
-  EXPECT_FALSE(TaskPipelineTestPeer::context_prepare_decode(
-                   *first_, keys_, requests_, duplicate, prepare)
-                   .ok());
-  EXPECT_FALSE(TaskPipelineTestPeer::context_prepare_decode(
-                   *first_, keys_, requests_, outside, prepare)
-                   .ok());
-  EXPECT_FALSE(TaskPipelineTestPeer::context_prepare_decode(
-                   *first_, keys_, requests_, partial, prepare)
-                   .ok());
-  EXPECT_FALSE(first_->prepared_);
-  const std::array<int32_t, 2> all{{1, 0}};
-  ASSERT_TRUE(TaskPipelineTestPeer::context_prepare_decode(
-                  *first_, keys_, requests_, all, prepare)
-                  .ok());
-  ASSERT_EQ(prepare.synchronize(), 0);
 }
 
 }  // namespace

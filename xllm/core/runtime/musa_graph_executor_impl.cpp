@@ -42,6 +42,7 @@ limitations under the License.
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/runtime/graph_input_snapshot.h"
 #include "core/runtime/rec_graph_input.h"
+#include "core/runtime/spec_verify.h"
 #include "core/util/env_var.h"
 #include "core/util/rec_model_utils.h"
 #include "core/util/utils.h"
@@ -287,9 +288,10 @@ MusaGraphPersistentParam::MusaGraphPersistentParam(
                               torch::dtype(torch::kInt).device(device));
 
   // Block table tensors with maximum possible size
-  const auto block_size = options.block_size();
+  const int64_t block_size = options.block_size();
   const int64_t max_block_table_len =
-      (max_seq_len + block_size - 1) / block_size + 1;
+      spec_verify::speculative_verify_block_table_capacity(
+          /*max_position_embeddings=*/max_seq_len, block_size);
   persistent_block_tables_ =
       torch::full({max_seqs_per_batch, max_block_table_len},
                   -1,
@@ -1072,8 +1074,7 @@ std::optional<Params> MusaGraphPersistentParam::update_typed(
   // graphs are initially captured with a short synthetic sequence. Generate
   // fresh metadata here, outside capture/replay, and let MusaGraph::replay()
   // copy it into the tensor address retained by the captured attention calls.
-  const bool is_qwen3_5 = args_.model_type() == "qwen3_5_text" ||
-                          args_.model_type() == "qwen3_5_moe_text";
+  const bool is_qwen3_5 = is_qwen3_5_text_model_type(args_.model_type());
   const int64_t gqa_ratio = n_kv_heads > 0 ? n_heads / n_kv_heads : int64_t{0};
   if (s_use_fa3_decode(gqa_ratio) && is_qwen3_5 && !attn_metadata->is_prefill &&
       !attn_metadata->is_chunked_prefill &&
@@ -1915,8 +1916,7 @@ ModelOutput MusaGraphExecutorImpl::run_typed(Model* model,
     return result;
   }
 
-  const bool is_qwen35_mtp = args_.model_type() == "qwen3_5_mtp" ||
-                             args_.model_type() == "qwen3_5_moe_mtp";
+  const bool is_qwen35_mtp = is_qwen3_5_draft_model_type(args_.model_type());
   if (is_decode && is_qwen35_mtp) {
     COUNTER_INC(num_model_execution_total_eager);
     return model->forward(tokens, positions, kv_caches, params);

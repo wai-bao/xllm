@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/sampling/json_object_grammar.h"
 #include "core/framework/sampling/sampling_params.h"
+#include "core/framework/speculative/draft_input.h"
 #include "core/framework/tokenizer/tokenizer.h"
 #include "core/kv_cache/block/block.h"
 #include "core/kv_cache/prefix/block_hasher.h"
@@ -210,11 +211,6 @@ class Sequence {
     return {tokens_, kv_state_.kv_cache_tokens_num()};
   }
 
-  // get token ids in host kv cache
-  Slice<int32_t> cached_host_tokens() const {
-    return {tokens_, host_kv_state_.kv_cache_tokens_num()};
-  }
-
   // get the number of tokens need compute
   size_t num_need_compute_tokens() const {
     return num_tokens_ - kv_cache_tokens_num();
@@ -244,14 +240,28 @@ class Sequence {
                             EmbeddingOutputMetadata metadata = {});
   // update embeddings to the sequence
   void update_embeddings(const torch::Tensor& embedding);
-  void update_mtp_bootstrap_embedding(const torch::Tensor& embedding);
+  void mark_target_decode_bootstrap() {
+    target_decode_bootstrap_pending_ = true;
+  }
   void record_speculative_token_stats(const SpeculativeTokenStats& stats);
-  torch::Tensor get_mtp_bootstrap_embedding() const {
-    return mtp_bootstrap_embedding_;
+  bool has_target_decode_bootstrap() const {
+    return target_decode_bootstrap_pending_;
   }
-  void clear_mtp_bootstrap_embedding() {
-    mtp_bootstrap_embedding_ = torch::Tensor();
+  void clear_target_decode_bootstrap() {
+    target_decode_bootstrap_pending_ = false;
   }
+  void update_draft_input(const DraftInput& draft_input);
+  const std::optional<DraftInput>& get_draft_input() const {
+    return draft_input_;
+  }
+  // Consumes the carried PD draft input: swap disengages the member, so a
+  // decoded first-generation is encoded exactly once.
+  std::optional<DraftInput> take_draft_input() {
+    std::optional<DraftInput> seed;
+    seed.swap(draft_input_);
+    return seed;
+  }
+  void clear_draft_input() { draft_input_.reset(); }
 
   int32_t get_embedding_block_id() const {
     return kv_state_.get_embedding_block_id();
@@ -265,10 +275,6 @@ class Sequence {
   }
   int32_t get_linear_state_slot_id() const {
     return kv_state_.get_linear_block_id();
-  }
-
-  int32_t get_recurrent_state_slot_id() const {
-    return get_linear_state_slot_id();
   }
 
   void set_pending_linear_save(const XXH3Key& hash) {
@@ -398,12 +404,6 @@ class Sequence {
     return generated_tokens_since_latency_;
   }
 
-  void set_wait_time_ms() {
-    wait_time_ms_ = static_cast<int32_t>(
-        absl::ToDoubleSeconds(absl::Now() - latest_generate_time_) * 1000);
-  }
-  int32_t get_wait_time_ms() const { return wait_time_ms_; }
-
   // set sequence ttft
   void set_time_to_first_token_latency_seconds(
       double time_to_first_token_latency_seconds) {
@@ -476,8 +476,6 @@ class Sequence {
                : *sequence_params_.sample_slots;
   }
 
-  bool check_need_unique_tokens() { return need_unique_tokens_; }
-
   // True if this sequence received token updates after the previous
   // SequencesGroup::process_beam_search() round.
   bool updated_since_last_beam_search() const {
@@ -499,9 +497,6 @@ class Sequence {
   }
 
   double estimated_latency() const { return estimated_latency_; }
-
-  // set sequence id
-  void set_seq_id(int32_t seq_id) { seq_id_ = seq_id; }
 
   // get sequence id
   int32_t seq_id() const { return seq_id_; }
@@ -576,7 +571,6 @@ class Sequence {
   void generate_embeddings_output(SequenceOutput& output);
   void generate_mm_embeddings_output(SequenceOutput& output);
 
-  int32_t wait_time_ms_ = 0;
   double estimated_latency_ = 0.0;
 
   // the index of the sequence in the request
@@ -644,8 +638,9 @@ class Sequence {
   // embeddings of the sequence
   torch::Tensor output_embedding_;
 
-  // temporary PD handoff bootstrap hidden state for first MTP decode.
-  torch::Tensor mtp_bootstrap_embedding_;
+  // One-time token-only target decode bootstrap for PD or graph warmup.
+  bool target_decode_bootstrap_pending_ = false;
+  std::optional<DraftInput> draft_input_;
 
   // number of tokens in the sequence
   size_t num_tokens_ = 0;

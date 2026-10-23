@@ -15,7 +15,10 @@ limitations under the License.
 
 #include "core/framework/model_context/dit_model_context.h"
 
+#include <glog/logging.h>
 #include <torch/torch.h>
+
+#include <utility>
 #if defined(USE_NPU)
 #ifdef TORCH_HIGHER_THAN_PTA6
 // #include <torch_npu/csrc/core/npu/NPUFormat.h>
@@ -42,11 +45,12 @@ DiTModelContext::DiTModelContext(
       dit_config_(dit_config),
       model_type_(model_type) {
 #if defined(USE_NPU)
-  int32_t device_id = tensor_options.device().index();
+  const int32_t device_id = tensor_options.device().index();
   void* stream = c10_npu::getCurrentNPUStream(device_id).stream();
-  atb::CreateContext(&context_);
-  context_->SetExecuteStream(stream);
-  context_->SetAsyncTilingCopyStatus(true);
+  context_owner_ = create_owned_atb_context("DiT ATB context");
+  atb::Context* const context = context_owner_.get();
+  context->SetExecuteStream(stream);
+  context->SetAsyncTilingCopyStatus(true);
 #endif
 }
 
@@ -83,7 +87,7 @@ ModelContext DiTModelContext::get_model_context(
                       get_model_args(component),
                       get_quant_args(component),
                       tensor_options_,
-                      context_);
+                      context_owner_);
 #else
   return ModelContext(parallel_args_,
                       get_model_args(component),

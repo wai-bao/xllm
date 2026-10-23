@@ -88,6 +88,7 @@ TORCH_MODULE(GlmMoeDsaMtpForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(glm_moe_dsa_mtp, GlmMoeDsaMtpForCausalLM);
+REGISTER_MTP_MODEL_PAIR(glm_moe_dsa, glm_moe_dsa_mtp);
 
 REGISTER_MODEL_ARGS(
     glm_moe_dsa_mtp,

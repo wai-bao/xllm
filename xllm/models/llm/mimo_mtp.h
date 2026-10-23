@@ -256,6 +256,7 @@ TORCH_MODULE(MiMoMtpForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(mimo_mtp, MiMoMtpForCausalLM);
+REGISTER_MTP_MODEL_PAIR(mimo, mimo_mtp);
 
 // register the model args
 // example config: /root/models2/MiMo-7B-Base/config.json

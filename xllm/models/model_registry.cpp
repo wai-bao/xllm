@@ -352,7 +352,7 @@ int64_t get_npu_linear_state_cache_block_limit(const std::string& model_type) {
   if (!ModelConfig::is_python_model_impl(
           ModelConfig::get_instance().model_impl()) &&
       (is_qwen3_5_target_model_type(model_type) ||
-       model_type == "qwen3_5_mtp" || model_type == "qwen3_5_moe_mtp")) {
+       is_qwen3_5_draft_model_type(model_type))) {
     return 1024;
   }
 #endif
@@ -586,6 +586,12 @@ void ModelRegistry::register_tokenizer_args_loader(const std::string& name,
   }
 }
 
+const ModelMeta* ModelRegistry::find_model_meta(const std::string& name) {
+  const auto& registry = get_instance()->model_registry_;
+  const auto it = registry.find(canonical_model_registration_name(name));
+  return it == registry.end() ? nullptr : &it->second;
+}
+
 void ModelRegistry::register_cp_sharding_mode(const std::string& name,
                                               CpShardingMode mode) {
   ModelRegistry* instance = get_instance();
@@ -593,12 +599,8 @@ void ModelRegistry::register_cp_sharding_mode(const std::string& name,
 }
 
 CpShardingMode ModelRegistry::get_cp_sharding_mode(const std::string& name) {
-  ModelRegistry* instance = get_instance();
-  const auto it = instance->model_registry_.find(name);
-  if (it == instance->model_registry_.end()) {
-    return CpShardingMode::NONE;
-  }
-  return it->second.cp_sharding_mode;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? CpShardingMode::NONE : meta->cp_sharding_mode;
 }
 
 void ModelRegistry::register_dcp_capability(const std::string& name) {
@@ -606,9 +608,77 @@ void ModelRegistry::register_dcp_capability(const std::string& name) {
 }
 
 bool ModelRegistry::supports_dcp(const std::string& name) {
-  const ModelRegistry* instance = get_instance();
-  const auto it = instance->model_registry_.find(name);
-  return it != instance->model_registry_.end() && it->second.supports_dcp;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta != nullptr && meta->supports_dcp;
+}
+
+void ModelRegistry::register_mtp_model_pair(
+    const std::string& target,
+    const std::string& draft,
+    std::function<void(ModelArgs&)> args_adapter) {
+  CHECK(!target.empty() && !draft.empty() && target != draft);
+  auto& registry = get_instance()->model_registry_;
+  auto& target_meta = registry[target];
+  auto& draft_meta = registry[draft];
+  CHECK(target_meta.mtp_draft_model_type.empty() ||
+        target_meta.mtp_draft_model_type == draft);
+  CHECK(draft_meta.mtp_target_model_type.empty() ||
+        draft_meta.mtp_target_model_type == target);
+  target_meta.mtp_draft_model_type = draft;
+  target_meta.mtp_draft_args_adapter = std::move(args_adapter);
+  draft_meta.mtp_target_model_type = target;
+}
+
+std::string ModelRegistry::get_mtp_target_model_type(const std::string& draft) {
+  const ModelMeta* meta = find_model_meta(draft);
+  return meta == nullptr ? std::string() : meta->mtp_target_model_type;
+}
+
+void ModelRegistry::register_draft_hidden_width(
+    const std::string& name,
+    std::function<int64_t(const ModelArgs&)> width_fn) {
+  get_instance()->model_registry_[name].draft_hidden_width_fn =
+      std::move(width_fn);
+}
+
+int64_t ModelRegistry::get_draft_hidden_width(const std::string& name,
+                                              const ModelArgs& model_args) {
+  // Callers hold either the target's or the draft-converted model_type. A
+  // draft entry exists (the pair registration) but carries no width policy,
+  // so resolve to the target whenever the direct hit has no width fn.
+  const ModelMeta* meta = find_model_meta(name);
+  if (meta == nullptr || meta->draft_hidden_width_fn == nullptr) {
+    meta = find_model_meta(get_mtp_target_model_type(name));
+  }
+  if (meta != nullptr && meta->draft_hidden_width_fn != nullptr) {
+    return meta->draft_hidden_width_fn(model_args);
+  }
+  return model_args.hidden_size();
+}
+
+bool ModelRegistry::convert_to_mtp_draft(ModelArgs& args) {
+  const ModelMeta* meta = find_model_meta(args.model_type());
+  if (meta == nullptr || meta->mtp_draft_model_type.empty()) {
+    return false;
+  }
+  args.model_type(meta->mtp_draft_model_type);
+  if (meta->mtp_draft_args_adapter != nullptr) {
+    meta->mtp_draft_args_adapter(args);
+  }
+  return true;
+}
+
+void ModelRegistry::register_target_spec_verify_mode(
+    const std::string& name,
+    TargetSpecVerifyMode mode) {
+  get_instance()->model_registry_[name].target_spec_verify_mode = mode;
+}
+
+TargetSpecVerifyMode ModelRegistry::get_target_spec_verify_mode(
+    const std::string& name) {
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? TargetSpecVerifyMode::GENERIC
+                         : meta->target_spec_verify_mode;
 }
 
 CausalLMFactory ModelRegistry::get_causallm_factory(const std::string& name) {
@@ -632,9 +702,8 @@ CausalLMFactory ModelRegistry::get_causallm_factory(
 }
 
 RecModelFactory ModelRegistry::get_rec_model_factory(const std::string& name) {
-  ModelRegistry* instance = get_instance();
-
-  return instance->model_registry_[name].rec_model_factory;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? RecModelFactory() : meta->rec_model_factory;
 }
 
 CausalVLMFactory ModelRegistry::get_causalvlm_factory(const std::string& name) {
@@ -658,42 +727,36 @@ CausalVLMFactory ModelRegistry::get_causalvlm_factory(
 }
 
 DiTModelFactory ModelRegistry::get_dit_model_factory(const std::string& name) {
-  ModelRegistry* instance = get_instance();
-  return instance->model_registry_[name].dit_model_factory;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? DiTModelFactory() : meta->dit_model_factory;
 }
 
 MultimodalProcessorFactory ModelRegistry::get_multimodal_processor_factory(
     const std::string& name) {
-  ModelRegistry* instance = get_instance();
-  return instance->model_registry_[name].multimodal_processor_factory;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? MultimodalProcessorFactory()
+                         : meta->multimodal_processor_factory;
 }
 
 ModelArgsLoader ModelRegistry::get_model_args_loader(const std::string& name) {
-  ModelRegistry* instance = get_instance();
-
-  return instance->model_registry_[name].model_args_loader;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? ModelArgsLoader() : meta->model_args_loader;
 }
 
 QuantArgsLoader ModelRegistry::get_quant_args_loader(const std::string& name) {
-  ModelRegistry* instance = get_instance();
-
-  return instance->model_registry_[name].quant_args_loader;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? QuantArgsLoader() : meta->quant_args_loader;
 }
 
 TokenizerArgsLoader ModelRegistry::get_tokenizer_args_loader(
     const std::string& name) {
-  ModelRegistry* instance = get_instance();
-
-  return instance->model_registry_[name].tokenizer_args_loader;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? TokenizerArgsLoader() : meta->tokenizer_args_loader;
 }
 
 bool ModelRegistry::has_dit_model_factory(const std::string& name) {
-  ModelRegistry* instance = get_instance();
-  const auto it = instance->model_registry_.find(name);
-  if (it == instance->model_registry_.end()) {
-    return false;
-  }
-  return it->second.dit_model_factory != nullptr;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta != nullptr && meta->dit_model_factory != nullptr;
 }
 
 namespace util {
@@ -774,24 +837,13 @@ std::string resolve_dit_pipeline_type(
 
 }  // namespace util
 
-void ModelRegistry::register_mtp_shared_weight_owner(const std::string& name) {
-  get_instance()->model_registry_[name].owns_mtp_shared_weights = true;
-}
-
-bool ModelRegistry::owns_mtp_shared_weights(const std::string& name) {
-  const auto& models = get_instance()->model_registry_;
-  const auto entry = models.find(name);
-  return entry != models.end() && entry->second.owns_mtp_shared_weights;
-}
-
 std::string ModelRegistry::get_model_backend(const std::string& name) {
   ModelRegistry* instance = get_instance();
   auto it = instance->model_backend_.find(name);
   if (it != instance->model_backend_.end()) {
     return it->second;
   }
-  const std::string canonical_name = canonical_model_registration_name(name);
-  it = instance->model_backend_.find(canonical_name);
+  it = instance->model_backend_.find(canonical_model_registration_name(name));
   return it == instance->model_backend_.end() ? "" : it->second;
 }
 

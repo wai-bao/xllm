@@ -126,6 +126,9 @@ class VLMMaster : public Master {
 
   // flag to indicate if the handler is running
   std::atomic_bool running_{false};
+
+  // Ownership rule: see Master::bind_service_registration.
+  std::unique_ptr<XServiceRegistration> discovery_registration_;
 };
 
 }  // namespace xllm

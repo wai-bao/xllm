@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/types.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -28,6 +29,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/tokenizer/tokenizer.h"
+#include "core/util/integer_math.h"
 
 namespace xllm {
 
@@ -52,6 +54,12 @@ class JsonObjectGrammarState final {
   bool can_accept_token(int32_t token_id) const;
   bool accept_token(int32_t token_id);
 
+  // Trial-then-commit accept that never partially mutates this state: the
+  // transition runs on a matcher-only fork, and only a full success is written
+  // back (matcher fields + the appended token). Equivalent to
+  // can_accept_token+accept_token in one FSM pass instead of two.
+  bool try_accept_token(int32_t token_id);
+
   bool can_accept_piece(std::string_view piece) const;
   bool accept_piece(std::string_view piece);
 
@@ -62,6 +70,10 @@ class JsonObjectGrammarState final {
   bool initialized() const { return grammar_ != nullptr; }
   const JsonObjectGrammar* grammar() const { return grammar_; }
   JsonObjectGrammarSnapshot snapshot() const;
+  size_t committed_token_count() const { return committed_token_ids_.size(); }
+  // Replay matcher transitions without copying the accumulated token history.
+  // The caller must account for the original committed prefix separately.
+  JsonObjectGrammarState fork_matcher_only() const;
   // Fingerprint of the matcher FSM only (not committed token history). Used for
   // mask caching and debug; identical FSMs share the same mask.
   uint64_t fingerprint() const;
@@ -190,7 +202,8 @@ class JsonObjectGrammar final {
 
   size_t vocab_size() const { return token_pieces_.size(); }
   size_t bitmask_num_words() const {
-    return (token_pieces_.size() + 31U) / 32U;
+    return static_cast<size_t>(
+        util::bitmask_word_count(static_cast<int64_t>(token_pieces_.size())));
   }
   const std::string& token_piece(int32_t token_id) const;
 

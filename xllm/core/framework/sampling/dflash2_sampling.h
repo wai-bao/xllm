@@ -24,6 +24,9 @@ struct DFlash2SampleOutput {
   torch::Tensor token_ids;
   // [batch, num_steps, vocab] draft logits when return_logits.
   torch::Tensor draft_logits;
+  // [batch, num_steps] prob of the selected candidate under q, the adaptive
+  // controller's signal; always filled, independent of return_logits.
+  torch::Tensor confidence_probs;
 };
 DFlash2SampleOutput sample_dflash2_path(
     const DFlash2CandidateOutput& candidates,

@@ -60,6 +60,7 @@ add_dependencies(sampler_controls_test brpc-static)
 cc_test(
   NAME
     json_object_grammar_test
+  NO_NPU_RUNTIME
   SRCS
     json_object_grammar_test.cpp
   DEPS

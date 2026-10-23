@@ -212,7 +212,6 @@ std::vector<std::shared_ptr<Request>> SchedulerPolicy::collect_finished(
       if (request->cancelled() && state.release_failed_request) {
         state.release_failed_request(request);
       }
-      clear_mtp_bootstrap(request.get(), state);
       state.kv_cache_manager->deallocate(request.get());
       finished_requests.emplace_back(request);
       *it = nullptr;
@@ -267,7 +266,6 @@ void SchedulerPolicy::schedule_prefill_from_queue(
       if (request->cancelled() && state.release_failed_request) {
         state.release_failed_request(request);
       }
-      clear_mtp_bootstrap(request.get(), state);
       state.kv_cache_manager->deallocate(request.get());
       finished.emplace_back(request);
       queue->pop_top();
@@ -892,16 +890,13 @@ bool SchedulerPolicy::should_wait_for_decode_restore(
 
   return state.options.num_speculative_tokens() == 0 ||
          SpeculativeConfig::is_mtp_algorithm(
-             SpeculativeConfig::get_instance().speculative_algorithm());
+             state.options.speculative_algorithm());
 }
 
 void SchedulerPolicy::enqueue_decode_restore(
     const std::shared_ptr<Request>& request,
     SchedulerState& state) {
   const bool should_wait = should_wait_for_decode_restore(request, state);
-  if (should_wait) {
-    clear_mtp_bootstrap(request.get(), state);
-  }
   state.kv_cache_manager->deallocate(request.get());
   request->set_preempted();
   if (should_wait) {
@@ -944,7 +939,6 @@ void SchedulerPolicy::handle_abnormal_decode_request(
   } else if (candidate_sequences.empty() && state.running_sequences.empty()) {
     // Nothing scheduled at all -- request is unschedulable.
     queue->pop_top();
-    clear_mtp_bootstrap(request.get(), state);
     state.kv_cache_manager->deallocate(request.get());
     if (budget_exhausted) {
       state.output_dispatcher->process_failed_request(
@@ -973,7 +967,6 @@ void SchedulerPolicy::handle_unschedulable_head(
     if (state.release_failed_request) {
       state.release_failed_request(request);
     }
-    clear_mtp_bootstrap(request.get(), state);
     state.kv_cache_manager->deallocate(request.get());
     if (blocks_exhausted) {
       LOG(ERROR) << "Request prompt is too long, no enough memory to schedule "
@@ -1064,20 +1057,6 @@ void SchedulerPolicy::cache_in_batch_prefix(
         sequence->kv_state().kv_cache_tokens_num() + token_budgets[i];
     state.kv_cache_manager->cache(sequence, max_handle_num_tokens);
   }
-}
-
-void SchedulerPolicy::clear_mtp_bootstrap(Request* request,
-                                          const SchedulerState& state) {
-  if (!state.options.enable_disagg_pd() ||
-      state.options.num_speculative_tokens() <= 0 || request == nullptr ||
-      request->sequences().empty()) {
-    return;
-  }
-  Sequence* sequence = request->sequences()[0].get();
-  if (sequence == nullptr) {
-    return;
-  }
-  sequence->clear_mtp_bootstrap_embedding();
 }
 
 // =============================================================================

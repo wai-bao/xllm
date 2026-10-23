@@ -123,10 +123,14 @@ bool is_cpp_chat_template_supported_model(const std::string& model_type) {
   return model_type == "deepseek_v32" || model_type == "deepseek_v4";
 }
 
-bool is_qwen3_5_model_type(std::string_view model_type) {
-  return model_type == "qwen3_5" || model_type == "qwen3_5_moe" ||
-         model_type == "qwen3_5_text" || model_type == "qwen3_5_moe_text" ||
-         model_type.rfind("qwen3_5_", 0) == 0;
+// Any qwen3_5 family member. Intentionally an open prefix match (defensive
+// against future qwen3_5_* variants) and deliberately NOT the closed
+// target/draft predicates in model_args.h -- named distinctly so the two
+// memberships are never confused at a call site. This gate rejects the whole
+// family for Python-executor speculative decoding; the "qwen3_5_" prefix
+// subsumes every current variant except the bare "qwen3_5" base type.
+bool is_any_qwen3_5_model_type(std::string_view model_type) {
+  return model_type == "qwen3_5" || model_type.rfind("qwen3_5_", 0) == 0;
 }
 
 }  // namespace
@@ -168,7 +172,7 @@ std::optional<std::string> ModelConfig::validate_python_speculative_decode(
   if (!is_python_model_impl(model_impl) || num_speculative_tokens <= 0) {
     return std::nullopt;
   }
-  if (is_qwen3_5_model_type(model_type)) {
+  if (is_any_qwen3_5_model_type(model_type)) {
     return "Qwen3.5 Python model executor does not support speculative "
            "decoding; "
            "set num_speculative_tokens=0 or use the native model executor";

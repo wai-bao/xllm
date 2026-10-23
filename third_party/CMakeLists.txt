@@ -26,7 +26,8 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
     endif()
 endif()
 
-add_subdirectory(etcd_cpp_apiv3)
+add_subdirectory("${XLLM_ETCD_SOURCE_DIR}"
+  "${CMAKE_CURRENT_BINARY_DIR}/etcd_cpp_apiv3")
 add_subdirectory(xxHash)
 add_subdirectory(spdlog)
 

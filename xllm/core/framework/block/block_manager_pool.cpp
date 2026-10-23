@@ -73,6 +73,10 @@ BlockManagerPool::BlockManagerPool(const Options& options,
           dp_size);
     }
   }
+  released_embedding_ids_ = std::make_shared<ReleasedEmbeddingIds>();
+  released_embedding_ids_->ids.resize(dp_size);
+  const std::weak_ptr<ReleasedEmbeddingIds> release_queue =
+      released_embedding_ids_;
 
   BlockManager::Options block_options;
   block_options.num_blocks(options_.num_blocks())
@@ -122,17 +126,28 @@ BlockManagerPool::BlockManagerPool(const Options& options,
           std::make_unique<EmbeddingBlockManager>(
               /*num_blocks=*/options_.num_embedding_blocks(),
               /*resource_name=*/"embedding block",
-              /*exhaustion_message=*/"No more embedding-block ids available");
+              /*exhaustion_message=*/"No more embedding-block ids available",
+              [release_queue, i](int32_t block_id) {
+                if (const auto queue = release_queue.lock()) {
+                  std::lock_guard<std::mutex> lock(queue->mutex);
+                  queue->ids[i].emplace_back(block_id);
+                }
+              });
       if (options_.enable_disagg_pd() || options_.enable_kvcache_store() ||
           options_.enable_host_offload()) {
         embedding_leaf = std::make_unique<ConcurrentBlockManagerImpl>(
             std::move(embedding_leaf));
       }
+      // The composite owns the leaf; cache the raw pointer so
+      // take_released_embedding_ids filters without a per-call map lookup.
+      embedding_leaves_.emplace_back(embedding_leaf.get());
       leaves.emplace(
           BlockType::EMBEDDING,
           CompositeBlockManager::LeafEntry{std::move(embedding_leaf),
                                            /*participates_in_admission=*/false,
                                            /*supports_prefix_cache=*/false});
+    } else {
+      embedding_leaves_.emplace_back(nullptr);
     }
     block_managers_.emplace_back(std::make_unique<CompositeBlockManager>(
         std::move(leaves), block_options));
@@ -613,6 +628,32 @@ void BlockManagerPool::reserve_virtual_memory_padding_blocks() {
   // Start preallocation after every DP manager has reserved its padding.
   CHECK(page_allocator_ != nullptr);
   page_allocator_->start_prealloc_thread(options_.model_id());
+}
+
+std::vector<int32_t> BlockManagerPool::take_released_embedding_ids(
+    int32_t dp_rank) {
+  CHECK_GE(dp_rank, 0);
+  CHECK_LT(static_cast<size_t>(dp_rank), released_embedding_ids_->ids.size());
+  std::vector<int32_t> ids;
+  {
+    // Only the swap runs under the notification mutex: is_block_used takes
+    // the leaf manager's own lock, and the free path calls back into this
+    // notification state from under that leaf lock — filtering here would
+    // invert the lock order and can deadlock against a concurrent free.
+    std::lock_guard<std::mutex> lock(released_embedding_ids_->mutex);
+    ids.swap(released_embedding_ids_->ids[dp_rank]);
+  }
+  // A released id that has since been reallocated never left: the block
+  // manager is the owner of that state, so filter at this seam instead of
+  // invalidating notifications at the allocator.
+  if (!ids.empty()) {
+    const BlockManager* leaf = embedding_leaves_[dp_rank];
+    CHECK(leaf != nullptr)
+        << "released embedding ids without an EMBEDDING leaf, dp_rank="
+        << dp_rank;
+    std::erase_if(ids, [&](int32_t id) { return leaf->is_block_used(id); });
+  }
+  return ids;
 }
 
 }  // namespace xllm

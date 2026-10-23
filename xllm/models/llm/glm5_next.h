@@ -214,11 +214,30 @@ REGISTER_MODEL_BACKEND(glm5_next, "llm");
 REGISTER_MODEL_BACKEND(glm5_next_mtp, "llm");
 REGISTER_MODEL_ARGS_LOADER(glm5_next, &glm5_next_args::load_model_args);
 REGISTER_MODEL_ARGS_LOADER(glm5_next_mtp, &glm5_next_args::load_model_args);
+// The adapter carries only the draft-geometry rewrite; the is_draft_engine /
+// algorithm / num_speculative_tokens gating that configure_glm5_next_mtp_args
+// checked is guaranteed by every convert_to_mtp_draft call site.
+REGISTER_MTP_MODEL_PAIR(glm5_next, glm5_next_mtp, [](ModelArgs& args) {
+  CHECK_EQ(args.num_nextn_predict_layers(), 1)
+      << "GLM MTP requires exactly one appended prediction layer.";
+  CHECK_GT(args.n_layers(), 0);
+  args.mtp_start_layer_idx(args.n_layers());
+  args.n_layers(1);
+  args.first_k_dense_replace(0);
+  args.layer_types({"deepseek_sparse_attention"});
+  args.full_attn_layers({0});
+  args.mlp_layer_types({"sparse"});
+  args.indexer_types({"full"});
+  if (args.index_share_for_mtp_iteration()) {
+    args.index_topk_freq(std::max(args.index_topk_freq(), 2));
+    args.index_skip_topk_offset(0);
+    args.index_topk_pattern("S");
+  }
+});
 
-// Exported MTP checkpoints contain their own embedding and LM head weights.
-const bool glm5_next_mtp_shared_weight_owner_registered = []() {
-  ModelRegistry::register_mtp_shared_weight_owner("glm5_next_mtp");
-  return true;
-}();
+// Exported MTP checkpoints contain their own embedding and LM head weights;
+// the Python draft model loads them (glm5_next_mtp.py load_weights), and
+// PyCausalLM::share_weights_from only borrows a target's weights when the
+// draft's lm_head/embed_tokens are None.
 
 }  // namespace xllm

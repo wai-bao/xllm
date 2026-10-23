@@ -456,12 +456,52 @@ TEST_F(BlockManagerPoolTest, DeallocateReleasesSingleBlockId) {
   Sequence seq1 = make_sequence(0, /*prompt_tokens=*/{1, 2, 3});
   ASSERT_TRUE(pool.allocate(&seq1));
   const int32_t id1 = seq1.get_embedding_block_id();
+  EXPECT_TRUE(pool.take_released_embedding_ids(/*dp_rank=*/0).empty());
   pool.deallocate(&seq1);
   EXPECT_FALSE(seq1.get_embedding_block_id() >= 0);
 
   Sequence seq2 = make_sequence(1, /*prompt_tokens=*/{4, 5, 6});
   ASSERT_TRUE(pool.allocate(&seq2));
   EXPECT_EQ(seq2.get_embedding_block_id(), id1);
+  // take_released_embedding_ids filters id1 out: it is allocated again, so
+  // consumers must never see an id that belongs to an active row.
+  EXPECT_TRUE(pool.take_released_embedding_ids(/*dp_rank=*/0).empty());
+  pool.deallocate(&seq2);
+  EXPECT_EQ(pool.take_released_embedding_ids(/*dp_rank=*/0),
+            std::vector<int32_t>{id1});
+}
+
+TEST_F(BlockManagerPoolTest, ReuseDropsOnlyTheMatchingRelease) {
+  ScopedValue<int32_t> max_seqs_guard(
+      &SchedulerConfig::get_instance().max_seqs_per_batch(), 0);
+
+  BlockManagerPool::Options options;
+  options.num_blocks(8).host_num_blocks(0).block_size(1).enable_prefix_cache(
+      false);
+  options.num_embedding_blocks(FLAGS_max_seqs_per_batch + 4)
+      .num_speculative_tokens(1)
+      .enable_linear_state(true)
+      .linear_state_num_slots(64);
+  ScopedValue<int32_t> chunk_guard(
+      &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 4);
+  BlockManagerPool pool(options, /*dp_size=*/1);
+
+  Sequence seq1 = make_sequence(0, /*prompt_tokens=*/{1, 2, 3});
+  Sequence seq2 = make_sequence(1, /*prompt_tokens=*/{4, 5, 6});
+  ASSERT_TRUE(pool.allocate(&seq1));
+  ASSERT_TRUE(pool.allocate(&seq2));
+  const int32_t id1 = seq1.get_embedding_block_id();
+  const int32_t id2 = seq2.get_embedding_block_id();
+  pool.deallocate(&seq1);
+  pool.deallocate(&seq2);
+
+  Sequence seq3 = make_sequence(2, /*prompt_tokens=*/{7, 8, 9});
+  ASSERT_TRUE(pool.allocate(&seq3));
+  // The LIFO free list hands seq3 id2; the take filters that reused id out
+  // while the still-departed id1 stays queued.
+  EXPECT_EQ(seq3.get_embedding_block_id(), id2);
+  EXPECT_EQ(pool.take_released_embedding_ids(/*dp_rank=*/0),
+            std::vector<int32_t>{id1});
 }
 
 TEST_F(BlockManagerPoolTest, EmbeddingBlockCapacityUsesNumEmbeddingBlocks) {

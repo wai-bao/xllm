@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "core/layers/npu/npu_deepseek_v32_decoder_layer_impl.h"
 #include "deepseek_v32.h"
+#include "models/llm/glm_moe_dsa_registry.h"
 #include "models/llm/npu/glm_shared_expert_stream.h"
 
 namespace xllm::npu::model {
@@ -335,6 +336,8 @@ TORCH_MODULE(GlmMoeDsaForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(glm_moe_dsa, GlmMoeDsaForCausalLM);
+// The platform-agnostic spec-verify registration lives in
+// glm_moe_dsa_registry.h; see the include at the top of this file.
 
 // register the model args
 REGISTER_MODEL_ARGS(

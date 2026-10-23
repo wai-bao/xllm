@@ -16,13 +16,19 @@ limitations under the License.
 #include "util/utils.h"
 
 #include <absl/strings/numbers.h>
+#include <absl/strings/str_cat.h>
 #include <absl/strings/str_split.h>
 #include <butil/base64.h>
 
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
+#include <cstdint>
 #include <cstring>
+#include <exception>
 #include <limits>
+#include <optional>
+#include <string>
+#include <utility>
 
 #include "core/util/binary_payload.h"
 #include "util/tensor_helper.h"
@@ -249,7 +255,8 @@ torch::Tensor convert_rec_tensor_to_torch(
   }
 }
 
-torch::ScalarType datatype_proto_to_torch(const std::string& proto_datatype) {
+std::optional<torch::ScalarType> try_datatype_proto_to_torch(
+    const std::string& proto_datatype) {
   static const std::unordered_map<std::string, torch::ScalarType> kDatatypeMap =
       {{"BOOL", torch::kBool},
        {"INT32", torch::kInt},
@@ -261,80 +268,22 @@ torch::ScalarType datatype_proto_to_torch(const std::string& proto_datatype) {
        {"BYTES", torch::kByte},
        {"FP16", torch::kHalf},
        {"BF16", torch::kBFloat16}};
-
   auto iter = kDatatypeMap.find(proto_datatype);
   if (iter == kDatatypeMap.end()) {
-    LOG(FATAL)
-        << "Unsupported proto datatype: " << proto_datatype
-        << " (supported types: BOOL/INT32/INT64/UINT32/UINT64/FP32/FP64/BYTES)";
+    return std::nullopt;
   }
   return iter->second;
 }
 
-namespace {
-template <typename T>
-const void* get_data_from_contents(const proto::TensorContents& contents,
-                                   const std::string& datatype) {
-  if constexpr (std::is_same_v<T, bool>) {
-    if (contents.bool_contents().empty()) {
-      LOG(ERROR) << "TensorContents.bool_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.bool_contents().data();
-  } else if constexpr (std::is_same_v<T, int32_t>) {
-    if (contents.int_contents().empty()) {
-      LOG(ERROR) << "TensorContents.int_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.int_contents().data();
-  } else if constexpr (std::is_same_v<T, int64_t>) {
-    if (contents.int64_contents().empty()) {
-      LOG(ERROR) << "TensorContents.int64_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.int64_contents().data();
-  } else if constexpr (std::is_same_v<T, uint32_t>) {
-    if (contents.uint_contents().empty()) {
-      LOG(ERROR) << "TensorContents.uint_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.uint_contents().data();
-  } else if constexpr (std::is_same_v<T, uint64_t>) {
-    if (contents.uint64_contents().empty()) {
-      LOG(ERROR) << "TensorContents.uint64_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.uint64_contents().data();
-  } else if constexpr (std::is_same_v<T, float>) {
-    if (contents.fp32_contents().empty()) {
-      LOG(ERROR) << "TensorContents.fp32_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.fp32_contents().data();
-  } else if constexpr (std::is_same_v<T, double>) {
-    if (contents.fp64_contents().empty()) {
-      LOG(ERROR) << "TensorContents.fp64_contents is empty (datatype="
-                 << datatype << ")";
-      return nullptr;
-    }
-    return contents.fp64_contents().data();
-  } else if constexpr (std::is_same_v<T, uint8_t>) {
-    return static_cast<const void*>(contents.bytes_contents().data());
-  } else {
-    LOG(FATAL) << "Unsupported data type for TensorContents: "
-               << typeid(T).name();
-    return nullptr;
+torch::ScalarType datatype_proto_to_torch(const std::string& proto_datatype) {
+  auto dtype = try_datatype_proto_to_torch(proto_datatype);
+  if (!dtype.has_value()) {
+    LOG(FATAL) << "Unsupported proto datatype: " << proto_datatype
+               << " (supported types: BOOL/INT32/INT64/UINT32/UINT64/FP32/FP64/"
+                  "BYTES/FP16/BF16)";
   }
-  return nullptr;
+  return *dtype;
 }
-
-}  // namespace
 
 std::string torch_datatype_to_proto(torch::ScalarType torch_dtype) {
   static const std::unordered_map<torch::ScalarType, std::string> kDatatypeMap =
@@ -423,6 +372,15 @@ bool set_data_to_contents(proto::TensorContents* contents,
 }  // namespace
 
 namespace {
+
+// Datatypes whose TensorContents payloads can be converted to torch::Tensor.
+// Derived from try_datatype_proto_to_torch's map so the wire-format lists
+// cannot drift apart. Shared by proto_to_torch_with_payload and
+// proto_tensor_invalid_reason.
+bool is_supported_proto_datatype(const std::string& datatype) {
+  return try_datatype_proto_to_torch(datatype).has_value();
+}
+
 template <typename CopyRange>
 torch::Tensor proto_to_torch_with_payload(const proto::Tensor& proto_tensor,
                                           size_t payload_size,
@@ -462,17 +420,7 @@ torch::Tensor proto_to_torch_with_payload(const proto::Tensor& proto_tensor,
     LOG(ERROR) << "Binary Tensor requires datatype and shape";
     return torch::Tensor();
   }
-  static const std::unordered_set<std::string> kSupportedDatatypes = {"BOOL",
-                                                                      "INT32",
-                                                                      "INT64",
-                                                                      "UINT32",
-                                                                      "UINT64",
-                                                                      "FP32",
-                                                                      "FP64",
-                                                                      "BYTES",
-                                                                      "FP16",
-                                                                      "BF16"};
-  if (!kSupportedDatatypes.contains(proto_tensor.datatype())) {
+  if (!is_supported_proto_datatype(proto_tensor.datatype())) {
     LOG(ERROR) << "Binary Tensor has unsupported datatype: "
                << proto_tensor.datatype();
     return torch::Tensor();
@@ -531,94 +479,165 @@ torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor,
       });
 }
 
-torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor) {
-  if (proto_tensor.datatype().empty()) {
-    LOG(ERROR) << "Proto Tensor missing required field: datatype (e.g., "
-                  "\"FP32\", \"INT64\")";
-    return torch::Tensor();
+namespace {
+
+// Single per-datatype view of a TensorContents payload: the data pointer and
+// the element count must come from the same field, so the decoder
+// (proto_to_torch_unchecked), the validator (proto_tensor_invalid_reason),
+// and the serializer's write-back check cannot disagree about which field
+// holds a datatype. Returns a null pointer with a zero count when the
+// datatype is unsupported; byte-backed FP16/BF16 payloads that do not align
+// to their element size also report zero.
+struct ContentsPayload {
+  const void* data = nullptr;
+  uint64_t element_count = 0;
+};
+
+ContentsPayload contents_payload(const proto::TensorContents& contents,
+                                 const std::string& datatype) {
+  if (datatype == "BOOL") {
+    return {contents.bool_contents().data(),
+            static_cast<uint64_t>(contents.bool_contents_size())};
+  }
+  if (datatype == "INT32") {
+    return {contents.int_contents().data(),
+            static_cast<uint64_t>(contents.int_contents_size())};
+  }
+  if (datatype == "INT64") {
+    return {contents.int64_contents().data(),
+            static_cast<uint64_t>(contents.int64_contents_size())};
+  }
+  if (datatype == "UINT32") {
+    return {contents.uint_contents().data(),
+            static_cast<uint64_t>(contents.uint_contents_size())};
+  }
+  if (datatype == "UINT64") {
+    return {contents.uint64_contents().data(),
+            static_cast<uint64_t>(contents.uint64_contents_size())};
+  }
+  if (datatype == "FP32") {
+    return {contents.fp32_contents().data(),
+            static_cast<uint64_t>(contents.fp32_contents_size())};
+  }
+  if (datatype == "FP64") {
+    return {contents.fp64_contents().data(),
+            static_cast<uint64_t>(contents.fp64_contents_size())};
+  }
+  if (datatype == "BYTES") {
+    return {contents.bytes_contents().data(),
+            static_cast<uint64_t>(contents.bytes_contents().size())};
+  }
+  if (datatype == "FP16" || datatype == "BF16") {
+    const uint64_t bytes =
+        static_cast<uint64_t>(contents.bytes_contents().size());
+    return {contents.bytes_contents().data(), (bytes % 2 != 0) ? 0 : bytes / 2};
+  }
+  return {};
+}
+
+// Upper bound for a Tensor's element count: shape products must stay within
+// int64_t so torch::from_blob shape arguments cannot overflow.
+constexpr uint64_t kMaxTorchElements =
+    static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+
+// Single validation seam shared by proto_to_torch and try_proto_to_torch:
+// returns the reason a Tensor's contents are malformed (empty metadata,
+// unsupported datatype, misaligned FP16/BF16 bytes, non-positive or
+// overflowing shape dimensions, or a payload/shape element-count mismatch), or
+// std::nullopt when the Tensor is well-formed. Callers decide how to report
+// the reason (log vs return), keeping the two entry points from drifting.
+std::optional<std::string> proto_tensor_invalid_reason(
+    const proto::Tensor& proto_tensor) {
+  const std::string& datatype = proto_tensor.datatype();
+  if (datatype.empty()) {
+    return "Proto Tensor missing required field: datatype (e.g., \"FP32\", "
+           "\"INT64\")";
   }
   if (proto_tensor.shape().empty()) {
-    LOG(ERROR) << "Proto Tensor has empty shape (invalid tensor)";
-    return torch::Tensor();
+    return "Proto Tensor has empty shape (invalid tensor)";
   }
   if (!proto_tensor.has_contents()) {
-    LOG(ERROR)
-        << "Proto Tensor missing required field: contents (TensorContents)";
-    return torch::Tensor();
+    return "Proto Tensor missing required field: contents (TensorContents)";
   }
-  const auto& proto_contents = proto_tensor.contents();
+  // contents_payload returns a zero-element view for unsupported datatypes,
+  // so this count check covers them as well.
+  const uint64_t payload_elements =
+      contents_payload(proto_tensor.contents(), datatype).element_count;
+  if (payload_elements == 0 || payload_elements > kMaxTorchElements) {
+    return absl::StrCat(
+        "Unsupported or malformed TensorContents (datatype=", datatype, ")");
+  }
+  uint64_t shape_elements = 1;
+  for (const int64_t dim : proto_tensor.shape()) {
+    if (dim <= 0) {
+      return absl::StrCat("Proto Tensor has invalid dimension: ",
+                          dim,
+                          " (must be positive, datatype=",
+                          datatype,
+                          ")");
+    }
+    if (shape_elements > kMaxTorchElements / static_cast<uint64_t>(dim)) {
+      return absl::StrCat(
+          "Proto Tensor shape overflows int64 (datatype=", datatype, ")");
+    }
+    shape_elements *= static_cast<uint64_t>(dim);
+  }
+  if (shape_elements != payload_elements) {
+    return absl::StrCat(
+        "Proto Tensor data count mismatch (datatype=", datatype, ")");
+  }
+  return std::nullopt;
+}
 
+// Builds the torch::Tensor for an already-validated proto::Tensor; callers are
+// responsible for running proto_tensor_invalid_reason exactly once first.
+torch::Tensor proto_to_torch_unchecked(const proto::Tensor& proto_tensor) {
+  const auto& proto_contents = proto_tensor.contents();
   const std::string& proto_datatype = proto_tensor.datatype();
   torch::ScalarType torch_dtype = datatype_proto_to_torch(proto_datatype);
-  const size_t element_size = torch::elementSize(torch_dtype);
 
   std::vector<int64_t> torch_shape;
-  int64_t total_elements = 1;
-  for (const auto& dim : proto_tensor.shape()) {
-    if (dim <= 0) {
-      LOG(ERROR) << "Proto Tensor has invalid dimension: " << dim
-                 << " (must be positive, datatype=" << proto_datatype << ")";
-      return torch::Tensor();
-    }
+  torch_shape.reserve(static_cast<size_t>(proto_tensor.shape_size()));
+  for (const int64_t dim : proto_tensor.shape()) {
     torch_shape.emplace_back(dim);
-    total_elements *= dim;
   }
   torch::IntArrayRef tensor_shape(torch_shape);
 
-  const void* data_ptr = nullptr;
-  size_t data_count = 0;
-  if (proto_datatype == "BOOL") {
-    data_ptr = get_data_from_contents<bool>(proto_contents, proto_datatype);
-    data_count = proto_contents.bool_contents_size();
-  } else if (proto_datatype == "INT32") {
-    data_ptr = get_data_from_contents<int32_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.int_contents_size();
-  } else if (proto_datatype == "INT64") {
-    data_ptr = get_data_from_contents<int64_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.int64_contents_size();
-  } else if (proto_datatype == "UINT32") {
-    data_ptr = get_data_from_contents<uint32_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.uint_contents_size();
-  } else if (proto_datatype == "UINT64") {
-    data_ptr = get_data_from_contents<uint64_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.uint64_contents_size();
-  } else if (proto_datatype == "FP32") {
-    data_ptr = get_data_from_contents<float>(proto_contents, proto_datatype);
-    data_count = proto_contents.fp32_contents_size();
-  } else if (proto_datatype == "FP64") {
-    data_ptr = get_data_from_contents<double>(proto_contents, proto_datatype);
-    data_count = proto_contents.fp64_contents_size();
-  } else if (proto_datatype == "BF16") {
-    data_ptr = get_data_from_contents<uint8_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.bytes_contents().size() /
-                 static_cast<size_t>(sizeof(torch::BFloat16));
-  } else if (proto_datatype == "FP16") {
-    data_ptr = get_data_from_contents<uint8_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.bytes_contents().size() /
-                 static_cast<size_t>(sizeof(torch::Half));
-  } else if (proto_datatype == "BYTES") {
-    data_ptr = get_data_from_contents<uint8_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.bytes_contents().size();
-  }
+  const ContentsPayload payload =
+      contents_payload(proto_contents, proto_datatype);
+  // proto_tensor_invalid_reason already guarantees a non-zero element count
+  // for the field read above, so the pointer cannot be null here.
+  CHECK(payload.data != nullptr)
+      << "Unsupported datatype (datatype=" << proto_datatype << ")";
 
-  if (data_ptr == nullptr) {
-    LOG(ERROR) << "Failed to get data from TensorContents (datatype="
-               << proto_datatype << ")";
+  return torch::from_blob(
+             const_cast<void*>(payload.data), tensor_shape, torch_dtype)
+      .clone();
+}
+}  // namespace
+
+torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor) {
+  const std::optional<std::string> invalid_reason =
+      proto_tensor_invalid_reason(proto_tensor);
+  if (invalid_reason.has_value()) {
+    LOG(ERROR) << *invalid_reason;
     return torch::Tensor();
   }
-  if (data_count != static_cast<size_t>(total_elements)) {
-    LOG(ERROR) << "Proto Tensor data count mismatch (datatype="
-               << proto_datatype << "): "
-               << "expected " << total_elements
-               << " elements (shape=" << tensor_shape << "), "
-               << "got " << data_count << " elements";
-    return torch::Tensor();
-  }
+  return proto_to_torch_unchecked(proto_tensor);
+}
 
-  torch::Tensor tensor =
-      torch::from_blob(const_cast<void*>(data_ptr), tensor_shape, torch_dtype)
-          .clone();
-  return tensor;
+std::optional<torch::Tensor> try_proto_to_torch(
+    const proto::Tensor& proto_tensor) {
+  if (proto_tensor_invalid_reason(proto_tensor).has_value()) {
+    return std::nullopt;
+  }
+  try {
+    // proto_to_torch_unchecked's only return is from_blob(...).clone(), which
+    // is always defined; an undefined tensor can only arrive as an exception.
+    return proto_to_torch_unchecked(proto_tensor);
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
 }
 
 bool torch_to_proto(const torch::Tensor& torch_tensor,
@@ -770,32 +789,16 @@ bool torch_to_proto(const torch::Tensor& torch_tensor,
   }
 
   size_t actual_count = 0;
-  if (proto_datatype == "BOOL") {
-    actual_count = proto_contents->bool_contents_size();
-  } else if (proto_datatype == "INT32") {
-    actual_count = proto_contents->int_contents_size();
-  } else if (proto_datatype == "INT64") {
-    actual_count = proto_contents->int64_contents_size();
-  } else if (proto_datatype == "UINT32") {
-    actual_count = proto_contents->uint_contents_size();
-  } else if (proto_datatype == "UINT64") {
-    actual_count = proto_contents->uint64_contents_size();
-  } else if (proto_datatype == "FP32") {
-    actual_count = proto_contents->fp32_contents_size();
-  } else if (proto_datatype == "FP64") {
-    actual_count = proto_contents->fp64_contents_size();
-  } else if (proto_datatype == "STRING") {
+  if (proto_datatype == "STRING") {
     for (const auto& bytes : proto_contents->string_contents()) {
       actual_count += bytes.size() / sizeof(uint8_t);
     }
-  } else if (proto_datatype == "BYTES") {
-    actual_count += proto_contents->bytes_contents().size();
-  } else if (proto_datatype == "BF16") {
-    actual_count = proto_contents->bytes_contents().size() /
-                   static_cast<size_t>(sizeof(torch::BFloat16));
-  } else if (proto_datatype == "FP16") {
-    actual_count = proto_contents->bytes_contents().size() /
-                   static_cast<size_t>(sizeof(torch::Half));
+  } else {
+    // Same per-datatype field mapping the decoder and validator use, so the
+    // write-back check cannot disagree with them about where a datatype
+    // lives.
+    actual_count = static_cast<size_t>(
+        contents_payload(*proto_contents, proto_datatype).element_count);
   }
 
   if (actual_count != static_cast<size_t>(total_elements)) {

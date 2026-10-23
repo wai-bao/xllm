@@ -199,3 +199,45 @@ def test_projection_out_updates_caller_buffer(project: _Project, tokens: int, la
         if previous is not None:
             assert not torch.equal(current, previous), "Output buffer retained stale projection values"
         previous = current
+
+
+@pytest.mark.parametrize("layout", ("v_contiguous", "v_narrow"))
+@pytest.mark.parametrize("mode", ("eager", "graph"))
+@pytest.mark.parametrize("heads", (127, 128))
+def test_projection_at_transpose_batch_matmul_limit(
+    project: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    layout: str,
+    mode: str,
+    heads: int,
+) -> None:
+    _, x, weight = _make_inputs(
+        tokens=2,
+        layout=layout,
+        heads=heads,
+        q_dim=128,
+        v_dim=128,
+    )
+    graph = None
+    if mode == "graph":
+        stream = torch.npu.Stream()
+        stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(stream):
+            project(x, weight)
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, stream=stream):
+            actual = project(x, weight)
+        output_address = actual.data_ptr()
+
+    for offset in (0.0, 0.25):
+        x.add_(offset)
+        if graph is None:
+            actual = project(x, weight)
+        else:
+            graph.replay()
+            assert actual.data_ptr() == output_address
+        torch.npu.synchronize()
+        expected = torch.bmm(x.cpu().float().transpose(0, 1), weight.cpu().float()).transpose(0, 1)
+        assert actual.shape == expected.shape
+        assert actual.is_contiguous()
+        torch.testing.assert_close(actual.cpu().float(), expected, rtol=1e-2, atol=2e-2)

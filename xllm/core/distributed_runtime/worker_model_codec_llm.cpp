@@ -21,6 +21,7 @@ limitations under the License.
 #include "core/common/metrics.h"
 #include "core/distributed_runtime/worker_model_codec.h"
 #include "core/framework/config/eplb_config.h"
+#include "core/transport/draft_input_proto.h"
 #include "core/util/tensor_helper.h"
 #include "core/util/timer.h"
 #include "core/util/utils.h"
@@ -151,6 +152,14 @@ bool decode_llm_output(const proto::LLMForwardResponse& response,
         sequence.speculative_token_stats().proposed_tokens();
     sample.speculative_token_stats.verified_rounds =
         sequence.speculative_token_stats().verified_rounds();
+    if (sequence.has_draft_input()) {
+      sample.draft_input =
+          proto_adapter::draft_input_from_proto(sequence.draft_input());
+      if (!sample.draft_input.has_value()) {
+        LOG(ERROR) << "Failed to deserialize MTP draft input";
+        return false;
+      }
+    }
     decoded_output.outputs.emplace_back(std::move(sample));
   }
   output = std::move(decoded_output);
@@ -305,6 +314,15 @@ bool encode_llm_output(
       pb_stats->set_accepted_tokens(stats.accepted_tokens);
       pb_stats->set_proposed_tokens(stats.proposed_tokens);
       pb_stats->set_verified_rounds(stats.verified_rounds);
+    }
+    if (output.draft_input.has_value()) {
+      if (!proto_adapter::draft_input_to_proto(
+              take_draft_input_row(*output.draft_input,
+                                   static_cast<int64_t>(output_idx)),
+              pb_seq_out->mutable_draft_input())) {
+        LOG(ERROR) << "Failed to serialize MTP draft input";
+        return false;
+      }
     }
   }
 

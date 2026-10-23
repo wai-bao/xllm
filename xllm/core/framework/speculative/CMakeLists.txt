@@ -10,18 +10,23 @@ cc_library(
     adaptive/spec_window_collector.h
     adaptive/spec_startup_calibration.h
     draft_config.h
-    spec_input_builder.h
-    mtp_async_input_builder.h
-    mtp_async_state.h
+    draft_input_model_spec.h
+    draft_input_spec_provider.h
     mtp_json_object_state.h
-    mtp_utils.h
     adaptive/draft_step_selector.h
     adaptive/draft_step_controller.h
-    draft_extend_input.h
-    embedding_cache.h
+    draft_input.h
+    draft_input_sampling.h
+    draft_sampling_history.h
+    capture_hidden_mode.h
+    vocab_map.h
+    draft_input_state_store.h
+    target_decode_state_store.h
+    pd_speculative_handoff.h
+    slot_table.h
+    padded_token_row_scan.h
     metrics.h
     verify_layout.h
-    spec_verify.h
   SRCS
     adaptive/verify_budget_planner.cpp
     adaptive/spec_cost_profile_store.cpp
@@ -29,16 +34,17 @@ cc_library(
     adaptive/spec_window_collector.cpp
     adaptive/spec_startup_calibration.cpp
     draft_config.cpp
-    spec_input_builder.cpp
-    mtp_async_input_builder.cpp
-    mtp_async_state.cpp
     adaptive/draft_step_selector.cpp
     adaptive/draft_step_controller.cpp
-    draft_extend_input.cpp
-    embedding_cache.cpp
+    capture_hidden_mode.cpp
+    draft_input_sampling.cpp
+    draft_sampling_history.cpp
+    vocab_map.cpp
+    draft_input_state_store.cpp
+    target_decode_state_store.cpp
+    pd_speculative_handoff.cpp
     metrics.cpp
     verify_layout.cpp
-    spec_verify.cpp
   DEPS
     Threads::Threads
     torch
@@ -47,7 +53,6 @@ cc_library(
     :util
     :sampler
     :json_object_grammar
-    :common_layers
     $<$<BOOL:${USE_NPU}>:xllm_ops>
     glog::glog
     nlohmann_json::nlohmann_json

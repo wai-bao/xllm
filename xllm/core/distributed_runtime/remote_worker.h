@@ -165,6 +165,9 @@ class RemoteWorker : public WorkerClient {
 
   folly::SemiFuture<bool> stop_profile_async() override;
 
+  folly::SemiFuture<bool> release_idle_request_state_async(
+      std::vector<int32_t> embedding_ids) override;
+
  private:
   DISALLOW_COPY_AND_ASSIGN(RemoteWorker);
 

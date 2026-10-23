@@ -84,7 +84,6 @@ limitations under the License.
 #include "core/framework/allocator/virtual_memory/physical_page_pool.h"
 #include "core/framework/model_loader/model_loader.h"
 #include "core/framework/speculative/draft_config.h"
-#include "core/framework/speculative/mtp_utils.h"
 #include "core/kv_cache/layout/layerwise_split_layout.h"
 #include "core/kv_cache/linear_state_restore.h"
 #include "core/kv_cache/storage/kv_cache.h"
@@ -119,6 +118,16 @@ constexpr uint32_t TIMEOUT_S = 60;      // second
 constexpr uint32_t TIMEOUT_MS = 60000;  // millisecond
 
 namespace {
+
+// Rewrites args to the registered MTP draft model type when the checkpoint
+// carries one; shared by the NPU and non-NPU speculative-decode paths.
+void maybe_override_mtp_draft_model_type(ModelArgs& args) {
+  const std::string current_type = args.model_type();
+  if (ModelRegistry::convert_to_mtp_draft(args)) {
+    LOG(INFO) << "Overriding draft model_type from " << current_type << " to "
+              << args.model_type() << " for speculative decoding";
+  }
+}
 
 // During TP model initialization, each rank loads weights concurrently.
 // MoE weight assembly (especially stack/cat on large expert tensors) runs on
@@ -921,6 +930,13 @@ void WorkerImpl::update_last_step_output(
   }
 }
 
+void WorkerImpl::clear_last_step_output() {
+  last_step_output_ = ForwardOutput();
+  last_step_output_valid_ = false;
+  last_step_request_ids_.clear();
+  last_step_sample_sequence_ids_.clear();
+}
+
 template <typename Input>
 bool WorkerImpl::can_use_last_step_output_for_schedule_overlap_impl(
     const Input& input) const {
@@ -1187,7 +1203,7 @@ void WorkerImpl::update_json_object_states_by_output_impl(
       const int32_t token_id =
           static_cast<int32_t>(next_tokens[output_idx].item<int64_t>());
       if (token_id >= 0) {
-        if (!state.can_accept_token(token_id)) {
+        if (!state.try_accept_token(token_id)) {
           const JsonObjectGrammarSnapshot snapshot = state.snapshot();
           LOG(ERROR)
               << "last-step token violates json_object grammar, sequence_id="
@@ -1200,7 +1216,6 @@ void WorkerImpl::update_json_object_states_by_output_impl(
           state = JsonObjectGrammarState();
           continue;
         }
-        CHECK(state.accept_token(token_id));
       }
       continue;
     }
@@ -1212,7 +1227,7 @@ void WorkerImpl::update_json_object_states_by_output_impl(
       if (token_id < 0) {
         break;
       }
-      if (!state.can_accept_token(token_id)) {
+      if (!state.try_accept_token(token_id)) {
         const JsonObjectGrammarSnapshot snapshot = state.snapshot();
         LOG(ERROR)
             << "last-step token violates json_object grammar, sequence_id="
@@ -1225,7 +1240,6 @@ void WorkerImpl::update_json_object_states_by_output_impl(
         state = JsonObjectGrammarState();
         break;
       }
-      CHECK(state.accept_token(token_id));
     }
   }
   input.sampling_params.filter_bitmask =
@@ -1866,16 +1880,11 @@ void WorkerImpl::execute_cuda_block_copy_kernel(
 #endif
 
 void WorkerImpl::observe_execution_memory(bool is_warmup) {
-  const auto& cache_config = KVCacheConfig::get_instance();
-  if (!cache_config.enable_virtual_memory() || !cache_config.vmm_elastic()) {
-    return;
-  }
-  if (is_warmup) {
-    CHECK(compute_stream_ != nullptr);
-    CHECK_EQ(compute_stream_->synchronize(), 0)
-        << "Failed to finish elastic VMM execution warmup";
-  }
-  PhysicalPagePool::get_instance().observe_execution_memory();
+  CHECK(compute_stream_ != nullptr);
+  PhysicalPagePool::observe_elastic_execution_memory(
+      *compute_stream_,
+      is_warmup,
+      "Failed to finish elastic VMM execution warmup");
 }
 
 template <typename Input>
@@ -1976,17 +1985,11 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async_impl(
             promise.setValue(std::move(output));
             return;
           }
-          last_step_output_valid_ = false;
-          last_step_output_ = ForwardOutput();
-          last_step_request_ids_.clear();
-          last_step_sample_sequence_ids_.clear();
+          clear_last_step_output();
           is_recorded_ = true;
           cv_.notify_one();
         } else {
-          last_step_output_valid_ = false;
-          last_step_output_ = ForwardOutput();
-          last_step_request_ids_.clear();
-          last_step_sample_sequence_ids_.clear();
+          clear_last_step_output();
         }
       }
       promise.setValue(output);
@@ -1995,14 +1998,31 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async_impl(
   return future;
 }
 
-void WorkerImpl::prepare_task_pipeline_input(const LlmForwardInput& input,
-                                             LlmForwardInput& prepared) {
-  prepare_work_before_execute(input, prepared);
-}
-
-std::optional<ForwardOutput> WorkerImpl::execute_task_pipeline(
-    const LlmForwardInput& prepared) {
-  return step_for_schedule_overlap(prepared);
+folly::SemiFuture<bool> WorkerImpl::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        ids = std::move(embedding_ids),
+                        promise = std::move(promise)]() mutable {
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      CHECK(!is_recorded_) << "Idle cleanup requires consumed worker output";
+    }
+    CHECK(compute_stream_ != nullptr);
+    c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+    release_request_state(ids);
+    CHECK_EQ(compute_stream_->synchronize(), 0)
+        << "Failed to retire idle worker device work";
+    {
+      std::lock_guard<std::mutex> lock(mtx_);
+      clear_last_step_output();
+    }
+    VLOG(1) << "Released idle request state for " << ids.size()
+            << " embedding slots";
+    promise.setValue(true);
+  });
+  return future;
 }
 
 ForwardOutput WorkerImpl::get_last_step_result() {
@@ -2483,10 +2503,21 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
 
   auto args = model_loader->model_args();
 #if defined(USE_NPU)
-  if (configure_glm5_next_mtp_args(
-          args, options_.speculative_algorithm(), options_.is_draft_engine())) {
-    LOG(INFO) << "Loading GLM MTP directly from " << model_weights_path
-              << ", appended layer " << args.mtp_start_layer_idx();
+  if (SpeculativeConfig::resolve_mtp_draft_conversion(
+          options_.is_draft_engine(),
+          options_.speculative_algorithm(),
+          options_.num_speculative_tokens(),
+          /*num_nextn_predict_layers=*/0,
+          /*is_block_diffusion=*/false,
+          /*is_npu=*/true) ==
+      SpeculativeConfig::MtpDraftConversion::DRAFT_ENGINE_PAIR) {
+    const std::string current_type = args.model_type();
+    if (ModelRegistry::convert_to_mtp_draft(args)) {
+      LOG(INFO) << "Overriding draft model_type from " << current_type << " to "
+                << args.model_type() << "; loading MTP draft directly from "
+                << model_weights_path << ", appended layer "
+                << args.mtp_start_layer_idx();
+    }
   }
 #endif
   auto quant_args = model_loader->quant_args();
@@ -2569,24 +2600,15 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
                  .enable_atb_spec_kernel()) {
     args.num_speculative_tokens(options_.num_speculative_tokens());
   } else if (options_.enable_speculative_decode() &&
-             options_.num_speculative_tokens() == 0 &&
-             args.num_nextn_predict_layers() != 0) {
-    const std::string& current_type = args.model_type();
-    const char* mtp_model_type = nullptr;
-    if (current_type == "qwen3_5_text") {
-      mtp_model_type = "qwen3_5_mtp";
-    } else if (current_type == "qwen3_5_moe_text") {
-      mtp_model_type = "qwen3_5_moe_mtp";
-    }
-    if (mtp_model_type != nullptr) {
-      LOG(INFO) << "Overriding draft model_type from " << current_type << " to "
-                << mtp_model_type << " for speculative decoding";
-      args.model_type(mtp_model_type);
-      const int32_t mtp_layers = args.num_nextn_predict_layers();
-      args.n_layers(mtp_layers);
-      args.layer_types(std::vector<std::string>(mtp_layers, "full_attention"));
-      args.full_attention_interval(1);
-    }
+             SpeculativeConfig::resolve_mtp_draft_conversion(
+                 options_.is_draft_engine(),
+                 speculative_algorithm,
+                 options_.num_speculative_tokens(),
+                 args.num_nextn_predict_layers(),
+                 is_block_diffusion,
+                 /*is_npu=*/true) ==
+                 SpeculativeConfig::MtpDraftConversion::EMBEDDED_LAYER) {
+    maybe_override_mtp_draft_model_type(args);
   }
   if (options_.enable_speculative_decode() && !options_.is_draft_engine() &&
       SpeculativeConfig::requires_aux_hidden_capture(speculative_algorithm) &&
@@ -2623,25 +2645,17 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
     // When running speculative decoding, the draft worker reuses the same
     // checkpoint as the target model. The draft worker needs to instantiate
     // the MTP variant, so override the model_type here without mutating the
-    // original config.
-    if (!is_block_diffusion && options_.num_speculative_tokens() == 0 &&
-        args.num_nextn_predict_layers() != 0) {
-      static const std::unordered_map<std::string, std::string>
-          kModelTypeToMtpType = {
-              {"deepseek_v3", "deepseek_v3_mtp"},
-              {"deepseek_v32", "deepseek_v32_mtp"},
-              {"deepseek_v4", "deepseek_v4_mtp"},
-              {"glm_moe_dsa", "glm_moe_dsa_mtp"},
-              {"joyai_llm_flash", "joyai_llm_flash_mtp"},
-              {"mimo", "mimo_mtp"},
-          };
-      const std::string& current_type = args.model_type();
-      auto it = kModelTypeToMtpType.find(current_type);
-      if (it != kModelTypeToMtpType.end()) {
-        LOG(INFO) << "Overriding draft model_type from " << current_type
-                  << " to " << it->second << " for speculative decoding";
-        args.model_type(it->second);
-      }
+    // original config. Non-NPU platforms convert through the embedded-layer
+    // mode for draft engines and plain workers alike.
+    if (SpeculativeConfig::resolve_mtp_draft_conversion(
+            options_.is_draft_engine(),
+            speculative_algorithm,
+            options_.num_speculative_tokens(),
+            args.num_nextn_predict_layers(),
+            is_block_diffusion,
+            /*is_npu=*/false) ==
+        SpeculativeConfig::MtpDraftConversion::EMBEDDED_LAYER) {
+      maybe_override_mtp_draft_model_type(args);
     }
   }
 #endif
@@ -2671,6 +2685,19 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
     LOG(ERROR) << "init_model failed";
     return false;
   }
+
+  // The model owns whether its aux output is a model-specific speculative
+  // feedback tensor. Resolve that capability once after constructing the
+  // model, instead of teaching the generic worker about model families.
+  const bool model_hook =
+      options_.enable_speculative_decode() &&
+      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm()) &&
+      model_ != nullptr && model_->provides_capture_hidden_hook();
+  capture_hidden_mode_ = resolve_capture_hidden_mode(
+      options_.speculative_algorithm(),
+      options_.is_draft_engine() ? CaptureHiddenRole::DRAFT
+                                 : CaptureHiddenRole::TARGET,
+      model_hook);
 
   // Warm JSON grammars off the forward path so the first constrained request
   // does not pay tokenizer.decode over the full vocab under the step lock.

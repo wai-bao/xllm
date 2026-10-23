@@ -40,12 +40,15 @@ BlockManager::Options make_embedding_block_options(uint32_t num_blocks) {
 
 }  // namespace
 
-EmbeddingBlockManager::EmbeddingBlockManager(uint32_t num_blocks,
-                                             std::string resource_name,
-                                             std::string exhaustion_message)
+EmbeddingBlockManager::EmbeddingBlockManager(
+    uint32_t num_blocks,
+    std::string resource_name,
+    std::string exhaustion_message,
+    std::function<void(int32_t)> on_release)
     : BlockManagerImpl(make_embedding_block_options(num_blocks)),
       resource_name_(std::move(resource_name)),
-      exhaustion_message_(std::move(exhaustion_message)) {}
+      exhaustion_message_(std::move(exhaustion_message)),
+      on_release_(std::move(on_release)) {}
 
 std::optional<std::vector<Block>> EmbeddingBlockManager::allocate_for_sequence(
     Sequence* seq,
@@ -80,9 +83,17 @@ Block EmbeddingBlockManager::allocate() {
       << (exhaustion_message_.empty()
               ? "No more " + resource_name_ + " blocks available"
               : exhaustion_message_);
-  std::vector<Block> blocks = BlockManagerImpl::allocate(1);
+  std::vector<Block> blocks = allocate(1);
   CHECK_EQ(blocks.size(), 1u);
   return std::move(blocks[0]);
+}
+
+void EmbeddingBlockManager::free(int32_t block_id) {
+  // Publish invalidation before the id can be reused by another request.
+  if (block_id != 0 && on_release_) {
+    on_release_(block_id);
+  }
+  BlockManagerImpl::free(block_id);
 }
 
 std::vector<Block> EmbeddingBlockManager::allocate_shared(

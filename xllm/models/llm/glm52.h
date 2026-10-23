@@ -21,6 +21,7 @@ limitations under the License.
 #include "core/layers/common/kv_shard_batch_metadata.h"
 #include "core/layers/mlu/dsa_topk_relay.h"
 #include "models/llm/glm5.h"
+#include "models/llm/glm_moe_dsa_registry.h"
 
 // GLM5.2 shares model_type "glm_moe_dsa" with GLM5.0/5.1 and is told apart by
 // the resolved indexer top-k share plan. GLM5.0/5.1 configs carry no reuse, so
@@ -226,5 +227,7 @@ TORCH_MODULE(Glm52ForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(glm_moe_dsa, Glm52ForCausalLM);
+// The platform-agnostic spec-verify registration lives in
+// glm_moe_dsa_registry.h; see the include at the top of this file.
 
 }  // namespace xllm

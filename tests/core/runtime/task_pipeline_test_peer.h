@@ -26,8 +26,6 @@ struct TaskPipelineTestPeer {
       TaskExecutionPipeline::context_prepare;
   static constexpr auto context_prepare_prefill =
       TaskExecutionPipeline::context_prepare_prefill;
-  static constexpr auto context_prepare_decode =
-      TaskExecutionPipeline::context_prepare_decode;
   static constexpr auto context_gather = TaskExecutionPipeline::context_gather;
   static constexpr auto context_publish =
       TaskExecutionPipeline::context_publish;
@@ -37,7 +35,7 @@ struct TaskPipelineTestPeer {
       TaskExecutionPipeline::context_release;
   static constexpr auto context_device_bytes =
       TaskExecutionPipeline::context_device_bytes;
-  static constexpr auto create_mtp_input = SlotBuffer::create_mtp_input;
+  static constexpr auto create_spec_input = SlotBuffer::create_spec_input;
   static constexpr auto input_scratch = [](SlotBuffer& input) -> auto& {
     return *input.input_scratch_;
   };
@@ -45,6 +43,7 @@ struct TaskPipelineTestPeer {
       [](const TaskExecutionPipeline& pipeline) -> const auto& {
     return *pipeline.speculative_capacity_->adaptive_costs;
   };
+
   static constexpr auto erase_adaptive_unified_binding =
       [](TaskExecutionPipeline& pipeline, uint32_t rows, uint32_t graph_rows) {
         const uint64_t key = (static_cast<uint64_t>(rows) << 32) | graph_rows;
@@ -56,20 +55,19 @@ struct TaskPipelineTestPeer {
         }
         return erased;
       };
-  static constexpr auto plan_mtp_decode = SlotBuffer::plan_mtp_decode;
-  static constexpr auto set_mtp_validate_width =
-      SlotBuffer::set_mtp_validate_width;
-  static constexpr auto prepare_mtp_decode = SlotBuffer::prepare_mtp_decode;
-  static constexpr auto prepare_planned_mtp_decode =
-      SlotBuffer::prepare_planned_mtp_decode;
+
   static constexpr auto prepare_dspark_validate =
       SlotBuffer::prepare_dspark_validate;
-  static constexpr auto patch_mtp_decode = SlotBuffer::patch_mtp_decode;
-  static constexpr auto prepare_mtp_prefill = SlotBuffer::prepare_mtp_prefill;
-  static constexpr auto patch_mtp_prefill = SlotBuffer::patch_mtp_prefill;
-  static constexpr auto create_mtp_context =
-      TaskExecutionPipeline::create_mtp_context;
-  static constexpr auto mtp_context_bytes =
-      TaskExecutionPipeline::mtp_context_bytes;
+  static constexpr auto plan_spec_decode = SlotBuffer::plan_spec_decode;
+  static constexpr auto prepare_spec_decode = SlotBuffer::prepare_spec_decode;
+  static constexpr auto prepare_planned_spec_decode =
+      SlotBuffer::prepare_planned_spec_decode;
+  static constexpr auto patch_spec_decode = SlotBuffer::patch_spec_decode;
+  static constexpr auto prepare_spec_prefill = SlotBuffer::prepare_spec_prefill;
+  static constexpr auto patch_spec_prefill = SlotBuffer::patch_spec_prefill;
+  static constexpr auto create_spec_context =
+      TaskExecutionPipeline::create_spec_context;
+  static constexpr auto spec_context_bytes =
+      TaskExecutionPipeline::spec_context_bytes;
 };
 }  // namespace xllm

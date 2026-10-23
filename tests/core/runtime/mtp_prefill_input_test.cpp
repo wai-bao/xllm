@@ -26,18 +26,14 @@ namespace {
 class MtpPrefillInputTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_context(
-                    /*capacity=*/4,
-                    /*hidden_size=*/3,
-                    torch::kBFloat16,
-                    device_,
-                    context_)
+    ASSERT_TRUE(TaskPipelineTestPeer::create_spec_context(
+                    /*capacity=*/4, device_, context_)
                     .ok());
     ASSERT_TRUE(
         TaskPipelineTestPeer::context_create(*context_, /*capacity=*/2, state_)
             .ok());
     ASSERT_TRUE(
-        TaskPipelineTestPeer::create_mtp_input(
+        TaskPipelineTestPeer::create_spec_input(
             {{8, 2, 2}, /*hidden_size=*/3}, torch::kBFloat16, device_, input_)
             .ok());
     sampling_.selected_token_idxes = torch::tensor({3}, torch::kInt32);
@@ -67,7 +63,7 @@ class MtpPrefillInputTest : public ::testing::Test {
   void run() {
     Stream prepare(device_);
     Stream task(device_);
-    ASSERT_TRUE(TaskPipelineTestPeer::prepare_mtp_prefill(
+    ASSERT_TRUE(TaskPipelineTestPeer::prepare_spec_prefill(
                     *input_, host(), batch_, extra_, sampling_, prepare)
                     .ok());
     std::vector<int32_t> completed_ids;
@@ -78,20 +74,19 @@ class MtpPrefillInputTest : public ::testing::Test {
         completed_requests.push_back(requests_[row]);
       }
     }
-    ASSERT_TRUE(
-        TaskPipelineTestPeer::context_prepare_prefill(
-            *state_,
-            completed_ids,
-            completed_requests,
-            extra_,
-            TaskPipelineTestPeer::input_scratch(*input_).published_rows_,
-            prepare)
-            .ok());
+    ASSERT_TRUE(TaskPipelineTestPeer::context_prepare_prefill(
+                    *state_,
+                    completed_ids,
+                    completed_requests,
+                    extra_,
+                    TaskPipelineTestPeer::input_scratch(*input_).planned_rows_,
+                    prepare)
+                    .ok());
     const auto ready = prepare.record_event();
     {
       auto guard = task.set_stream_guard();
       ASSERT_TRUE(task.wait_event(ready));
-      TaskPipelineTestPeer::patch_mtp_prefill(
+      TaskPipelineTestPeer::patch_spec_prefill(
           *input_, hidden_, samples_, *state_);
       TaskPipelineTestPeer::context_publish(*state_);
     }
@@ -99,8 +94,8 @@ class MtpPrefillInputTest : public ::testing::Test {
   }
 
   torch::Device device_{torch::kPrivateUse1, 0};
-  std::unique_ptr<MtpContextStorage> context_;
-  std::unique_ptr<MtpContextView> state_;
+  std::unique_ptr<SpecContextStorage> context_;
+  std::unique_ptr<SpecContextView> state_;
   std::unique_ptr<SlotBuffer> input_;
   std::array<int32_t, 2> keys_{{1, 2}};
   std::array<std::string, 2> requests_{{"request", "request"}};
@@ -123,32 +118,32 @@ TEST_F(MtpPrefillInputTest, UnifiedSlotAccountsForPromptScratch) {
   ASSERT_TRUE(
       SlotBuffer::create({8, 2, 2}, /*enable_mla=*/true, device_, ordinary)
           .ok());
-  // Only completed-row hidden is owned; prompt hidden is borrowed from the
-  // target output until the draft forward completes.
+  // MTP borrows target hidden until the draft forward completes and keeps
+  // only token/position scratch; seeds own the recurrent draft hidden.
   EXPECT_EQ(input_->pinned_bytes() - ordinary->pinned_bytes(), 32U);
-  EXPECT_EQ(input_->device_bytes() - ordinary->device_bytes(), 52U);
+  EXPECT_EQ(input_->device_bytes() - ordinary->device_bytes(), 40U);
   const auto* original = input_.get();
   EXPECT_FALSE(
-      TaskPipelineTestPeer::create_mtp_input(
+      TaskPipelineTestPeer::create_spec_input(
           {{8, 2, 2}, /*hidden_size=*/0}, torch::kBFloat16, device_, input_)
           .ok());
   EXPECT_FALSE(
-      TaskPipelineTestPeer::create_mtp_input(
+      TaskPipelineTestPeer::create_spec_input(
           {{8, 2, 2}, /*hidden_size=*/3}, torch::kInt32, device_, input_)
           .ok());
   EXPECT_EQ(input_.get(), original);
 }
 
 TEST_F(MtpPrefillInputTest, BlockDraftPrefillStoresOnlyCompletedRowScratch) {
-  MtpInputSpec spec{{8, 2, 2}, 3};
+  SpecInputSpec spec{{8, 2, 2}, 3};
   spec.context_only = true;
   std::unique_ptr<SlotBuffer> small;
-  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+  ASSERT_TRUE(TaskPipelineTestPeer::create_spec_input(
                   spec, torch::kBFloat16, device_, small)
                   .ok());
   spec.model.max_tokens = 8192;
   std::unique_ptr<SlotBuffer> large;
-  ASSERT_TRUE(TaskPipelineTestPeer::create_mtp_input(
+  ASSERT_TRUE(TaskPipelineTestPeer::create_spec_input(
                   spec, torch::kBFloat16, device_, large)
                   .ok());
   EXPECT_EQ(small->pinned_bytes(), large->pinned_bytes());
@@ -162,10 +157,9 @@ TEST_F(MtpPrefillInputTest, MixedPrefillAndDecodePublishesCompletedRows) {
   run();
   EXPECT_TRUE(torch::equal(input_->tokens().cpu(),
                            torch::tensor({12, 13, 14, 90}, torch::kInt32)));
-  EXPECT_EQ(TaskPipelineTestPeer::input_scratch(*input_).published_rows_.size(),
+  EXPECT_EQ(TaskPipelineTestPeer::input_scratch(*input_).planned_rows_.size(),
             1U);
-  EXPECT_EQ(TaskPipelineTestPeer::input_scratch(*input_).published_rows_[0],
-            1U);
+  EXPECT_EQ(TaskPipelineTestPeer::input_scratch(*input_).planned_rows_[0], 1U);
   EXPECT_TRUE(input_->model_params().meta.batch_forward_type.is_mixed());
 }
 
@@ -184,19 +178,8 @@ TEST_F(MtpPrefillInputTest, ShiftAndBootstrapRespectChunkBoundaries) {
                            torch::tensor({7}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(state_->state_.kv_seq_lens.cpu(),
                            torch::tensor({8}, torch::kInt32)));
-  EXPECT_TRUE(torch::equal(state_->state_.previous_tokens.cpu(),
-                           state_->tokens_.cpu()));
-  EXPECT_TRUE(
-      torch::equal(state_->state_.hidden.select(/*dim=*/1, /*index=*/1).cpu(),
-                   hidden_.narrow(/*dim=*/0, /*start=*/3, /*length=*/1).cpu()));
-  EXPECT_EQ(state_->state_.hidden.select(/*dim=*/1, /*index=*/0)
-                .cpu()
-                .count_nonzero()
-                .item<int64_t>(),
-            0);
-  EXPECT_FALSE(state_->state_.repair_required.cpu().item<bool>());
   Stream prepare(device_);
-  std::unique_ptr<MtpContextView> next;
+  std::unique_ptr<SpecContextView> next;
   ASSERT_TRUE(
       TaskPipelineTestPeer::context_create(*context_, /*capacity=*/2, next)
           .ok());
@@ -211,8 +194,7 @@ TEST_F(MtpPrefillInputTest, SamplingOrderControlsPublicationOrder) {
   sampling_.selected_token_idxes = torch::tensor({3, 2}, torch::kInt32);
   samples_ = torch::tensor({{90}, {80}}, torch::kInt64).to(device_);
   run();
-  const auto rows =
-      TaskPipelineTestPeer::input_scratch(*input_).published_rows_;
+  const auto rows = TaskPipelineTestPeer::input_scratch(*input_).planned_rows_;
   ASSERT_EQ(rows.size(), 2U);
   EXPECT_EQ(rows[0], 1U);
   EXPECT_EQ(rows[1], 0U);
@@ -222,12 +204,8 @@ TEST_F(MtpPrefillInputTest, SamplingOrderControlsPublicationOrder) {
                            torch::tensor({7, 6}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(state_->state_.kv_seq_lens.cpu(),
                            torch::tensor({8, 7}, torch::kInt32)));
-  EXPECT_TRUE(torch::equal(
-      TaskPipelineTestPeer::input_scratch(*input_).bootstrap_hidden_.cpu(),
-      hidden_
-          .index_select(/*dim=*/0,
-                        torch::tensor({3, 2}, torch::kInt64).to(device_))
-          .cpu()));
+  EXPECT_FALSE(
+      TaskPipelineTestPeer::input_scratch(*input_).bootstrap_hidden_.defined());
 }
 
 TEST_F(MtpPrefillInputTest, IncompleteChunksRequireNoSampleOrPublishedState) {
@@ -236,7 +214,7 @@ TEST_F(MtpPrefillInputTest, IncompleteChunksRequireNoSampleOrPublishedState) {
   samples_ = torch::Tensor();
   run();
   EXPECT_TRUE(
-      TaskPipelineTestPeer::input_scratch(*input_).published_rows_.empty());
+      TaskPipelineTestPeer::input_scratch(*input_).planned_rows_.empty());
   EXPECT_TRUE(state_->prepared_);
   EXPECT_EQ(state_->tokens_.numel(), 0);
   EXPECT_TRUE(torch::equal(input_->tokens().cpu(),
@@ -249,18 +227,22 @@ TEST_F(MtpPrefillInputTest, RejectedSamplingLeavesActiveMappingAndStorage) {
   const auto before = input_->tokens().cpu();
   Stream prepare(device_);
   sampling_.selected_token_idxes = torch::tensor({1}, torch::kInt32);
-  EXPECT_FALSE(TaskPipelineTestPeer::prepare_mtp_prefill(
+  EXPECT_FALSE(TaskPipelineTestPeer::prepare_spec_prefill(
                    *input_, host(), batch_, extra_, sampling_, prepare)
                    .ok());
-  const auto rows =
-      TaskPipelineTestPeer::input_scratch(*input_).published_rows_;
-  ASSERT_EQ(rows.size(), 1U);
-  EXPECT_EQ(rows[0], 1U);
+  // The failed plan clears the scratch rows it was rebuilding; the committed
+  // input buffers must stay untouched.
+  EXPECT_TRUE(
+      TaskPipelineTestPeer::input_scratch(*input_).planned_rows_.empty());
   EXPECT_EQ(input_->tokens().data_ptr(), tokens);
   EXPECT_TRUE(torch::equal(input_->tokens().cpu(), before));
+  sampling_.selected_token_idxes = torch::tensor({7}, torch::kInt32);
+  EXPECT_FALSE(TaskPipelineTestPeer::prepare_spec_prefill(
+                   *input_, host(), batch_, extra_, sampling_, prepare)
+                   .ok());
   sampling_.selected_token_idxes = torch::tensor({3}, torch::kInt32);
   extra_[0] = -1;
-  EXPECT_FALSE(TaskPipelineTestPeer::prepare_mtp_prefill(
+  EXPECT_FALSE(TaskPipelineTestPeer::prepare_spec_prefill(
                    *input_, host(), batch_, extra_, sampling_, prepare)
                    .ok());
 }
@@ -279,7 +261,7 @@ TEST_F(MtpPrefillInputTest, DecodeRowsCanRefreshStateDuringPeerPrefill) {
   SamplingParameters sampling;
   sampling.selected_token_idxes = torch::tensor({0, 1}, torch::kInt32);
   Stream prepare(device_);
-  ASSERT_TRUE(TaskPipelineTestPeer::prepare_mtp_prefill(
+  ASSERT_TRUE(TaskPipelineTestPeer::prepare_spec_prefill(
                   *input_, view, batch, extra, sampling, prepare)
                   .ok());
   ASSERT_TRUE(TaskPipelineTestPeer::context_prepare_prefill(
@@ -287,7 +269,7 @@ TEST_F(MtpPrefillInputTest, DecodeRowsCanRefreshStateDuringPeerPrefill) {
                   keys_,
                   requests_,
                   extra,
-                  TaskPipelineTestPeer::input_scratch(*input_).published_rows_,
+                  TaskPipelineTestPeer::input_scratch(*input_).planned_rows_,
                   prepare)
                   .ok());
   ASSERT_EQ(prepare.synchronize(), 0);
@@ -295,7 +277,7 @@ TEST_F(MtpPrefillInputTest, DecodeRowsCanRefreshStateDuringPeerPrefill) {
                     .view({2, 3})
                     .to(device_, torch::kBFloat16);
   auto sampled = torch::tensor({{32}, {42}}, torch::kInt64).to(device_);
-  TaskPipelineTestPeer::patch_mtp_prefill(*input_, hidden, sampled, *state_);
+  TaskPipelineTestPeer::patch_spec_prefill(*input_, hidden, sampled, *state_);
   TaskPipelineTestPeer::context_publish(*state_);
   ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
   EXPECT_TRUE(torch::equal(input_->tokens().cpu(),
@@ -304,8 +286,6 @@ TEST_F(MtpPrefillInputTest, DecodeRowsCanRefreshStateDuringPeerPrefill) {
                            torch::tensor({6, 7}, torch::kInt32)));
   EXPECT_TRUE(torch::equal(state_->state_.kv_seq_lens.cpu(),
                            torch::tensor({7, 8}, torch::kInt32)));
-  EXPECT_TRUE(
-      torch::equal(state_->state_.hidden.select(1, 1).cpu(), hidden.cpu()));
 }
 
 TEST_F(MtpPrefillInputTest, BorrowedHiddenSurvivesProducerReleaseAndSlotReuse) {

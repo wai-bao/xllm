@@ -41,6 +41,25 @@ limitations under the License.
 #include "xllm_service.pb.h"
 #include "xservice.pb.h"
 
+namespace xllm {
+
+// get_instance() was removed with the singleton; these tests only exercise
+// HTTP transport against a local brpc server, so a raw client (no etcd
+// discovery, no init) is enough. The process-wide instance keeps the HTTP
+// connection-reuse semantics the removed singleton had. The name matches the
+// friend declaration in xservice_client.h (same pattern as
+// xservice_client_test.cpp).
+class XServiceGenerationTestPeer final {
+ public:
+  static std::shared_ptr<XServiceClient> client() {
+    static const std::shared_ptr<XServiceClient> instance{
+        std::shared_ptr<XServiceClient>(new XServiceClient())};
+    return instance;
+  }
+};
+
+}  // namespace xllm
+
 namespace xllm::api_service {
 namespace {
 
@@ -86,7 +105,7 @@ OutputCallback decode_callback(const proto::DisaggRequest& request,
     output.target_xservice_addr = address;
     output.stream = stream;
     output.response_formatter = formatter;
-    return XServiceClient::get_instance()->generation(output) &&
+    return XServiceGenerationTestPeer::client()->generation(output) &&
            (!output.status.has_value() || output.status->ok());
   };
 }
@@ -660,7 +679,7 @@ TEST_F(PDHttpResponseTest, PrefillErrorsNeedNoTokenResponseSession) {
                            request_.service_req_id(),
                            request_.source_xservice_addr());
       failed.stream = stream;
-      EXPECT_EQ(XServiceClient::get_instance()->generations({failed}),
+      EXPECT_EQ(XServiceGenerationTestPeer::client()->generations({failed}),
                 std::vector<bool>({true}));
       const auto received = service_.outputs();
       const auto& result = received.back();
@@ -679,7 +698,7 @@ TEST_F(PDHttpResponseTest, PrefillErrorsNeedNoTokenResponseSession) {
     }
   }
   RequestOutput invalid(Status(StatusCode::UNKNOWN, "failure"));
-  EXPECT_EQ(XServiceClient::get_instance()->generations({invalid}),
+  EXPECT_EQ(XServiceGenerationTestPeer::client()->generations({invalid}),
             std::vector<bool>({false}));
   EXPECT_EQ(service_.outputs().size(), errors.size() * 2);
 }
@@ -733,7 +752,7 @@ TEST_F(PDHttpResponseTest,
   second.service_request_id = "second";
   second.target_xservice_addr = request_.source_xservice_addr();
   second.response_formatter = second_formatter;
-  EXPECT_EQ(XServiceClient::get_instance()->generations({first, second}),
+  EXPECT_EQ(XServiceGenerationTestPeer::client()->generations({first, second}),
             std::vector<bool>({true, true}));
   ASSERT_EQ(service_.batches().size(), 1U);
   const auto received = service_.outputs();
@@ -747,7 +766,7 @@ TEST_F(PDHttpResponseTest,
   next.service_request_id = "attempt";
   next.target_xservice_addr = request_.source_xservice_addr();
   next.response_formatter = first_formatter;
-  EXPECT_EQ(XServiceClient::get_instance()->generations({next}),
+  EXPECT_EQ(XServiceGenerationTestPeer::client()->generations({next}),
             std::vector<bool>({true}));
   EXPECT_EQ(service_.outputs().back().sequence, "1");
   const auto ports = service_.remote_ports();
@@ -764,20 +783,20 @@ TEST_F(PDHttpResponseTest, BatchAcknowledgementsArePerRequestAndNeverReplayed) {
   ServiceGenerationOutput rejected = healthy;
   rejected.service_request_id = "rejected";
   const std::vector<ServiceGenerationOutput> batch{healthy, rejected};
-  EXPECT_EQ(
-      XServiceClient::get_instance()->generations(transport_outputs(batch)),
-      std::vector<bool>({true, false}));
+  EXPECT_EQ(XServiceGenerationTestPeer::client()->generations(
+                transport_outputs(batch)),
+            std::vector<bool>({true, false}));
   service_.invalidate_ack();
-  EXPECT_EQ(
-      XServiceClient::get_instance()->generations(transport_outputs(batch)),
-      std::vector<bool>({false, false}));
+  EXPECT_EQ(XServiceGenerationTestPeer::client()->generations(
+                transport_outputs(batch)),
+            std::vector<bool>({false, false}));
   service_.reject();
-  EXPECT_EQ(
-      XServiceClient::get_instance()->generations(transport_outputs(batch)),
-      std::vector<bool>({false, false}));
+  EXPECT_EQ(XServiceGenerationTestPeer::client()->generations(
+                transport_outputs(batch)),
+            std::vector<bool>({false, false}));
   EXPECT_EQ(service_.batches().size(), 3U);
   const std::vector<ServiceGenerationOutput> split_batch(257, healthy);
-  const auto accepted = XServiceClient::get_instance()->generations(
+  const auto accepted = XServiceGenerationTestPeer::client()->generations(
       transport_outputs(split_batch));
   EXPECT_EQ(accepted, std::vector<bool>(split_batch.size(), false));
   // The first chunk's ambiguous failure must not issue the second chunk.
@@ -799,11 +818,11 @@ TEST_F(PDHttpResponseTest,
         return true;
       });
   outputs.insert(outputs.begin() + 1, std::move(buffered));
-  EXPECT_EQ(XServiceClient::get_instance()->generations(outputs),
+  EXPECT_EQ(XServiceGenerationTestPeer::client()->generations(outputs),
             std::vector<bool>({true, true, false}));
   EXPECT_EQ(service_.outputs().size(), 2U);
   EXPECT_FALSE(*outputs.back().response_formatter);
-  EXPECT_EQ(XServiceClient::get_instance()->generations({outputs.back()}),
+  EXPECT_EQ(XServiceGenerationTestPeer::client()->generations({outputs.back()}),
             std::vector<bool>({false}));
   EXPECT_EQ(service_.outputs().size(), 2U);
 }
@@ -826,8 +845,8 @@ TEST_F(PDHttpResponseTest, SplitsLargeBatchesAndIsolatesInvalidItemsAndOwners) {
   result.target_xservice_addr = "127.0.0.1:1";
   outputs.emplace_back(result);
   outputs.emplace_back(ServiceGenerationOutput{});
-  const auto accepted =
-      XServiceClient::get_instance()->generations(transport_outputs(outputs));
+  const auto accepted = XServiceGenerationTestPeer::client()->generations(
+      transport_outputs(outputs));
   ASSERT_EQ(accepted.size(), 260U);
   for (size_t index = 0; index < accepted.size(); ++index) {
     EXPECT_EQ(accepted[index], index < 257);
@@ -850,9 +869,9 @@ TEST_F(PDHttpResponseTest, SplitsLargeBatchesAndIsolatesInvalidItemsAndOwners) {
     result.service_request_id = std::to_string(index);
     outputs.emplace_back(result);
   }
-  EXPECT_EQ(
-      XServiceClient::get_instance()->generations(transport_outputs(outputs)),
-      std::vector<bool>(3, true));
+  EXPECT_EQ(XServiceGenerationTestPeer::client()->generations(
+                transport_outputs(outputs)),
+            std::vector<bool>(3, true));
   const auto byte_limited = service_.batches();
   ASSERT_EQ(byte_limited.size(), 4U);
   EXPECT_EQ(byte_limited[2]["results"].size(), 2U);
@@ -876,7 +895,7 @@ TEST_F(PDHttpResponseTest,
     healthy.service_request_id += "-healthy";
     healthy.payload = stream ? "data: A\n\n" : R"({"choices":[]})";
     auto outputs = transport_outputs({result, healthy});
-    EXPECT_EQ(XServiceClient::get_instance()->generations(outputs),
+    EXPECT_EQ(XServiceGenerationTestPeer::client()->generations(outputs),
               std::vector<bool>({false, true}));
     EXPECT_FALSE(*outputs[0].response_formatter);
     const auto batches = service_.batches();
@@ -894,7 +913,7 @@ TEST_F(PDHttpResponseTest,
       EXPECT_TRUE(nlohmann::json::parse(payload).contains("error"));
     }
     const size_t delivered = service_.outputs().size();
-    EXPECT_EQ(XServiceClient::get_instance()->generations({outputs[0]}),
+    EXPECT_EQ(XServiceGenerationTestPeer::client()->generations({outputs[0]}),
               std::vector<bool>({false}));
     EXPECT_EQ(service_.outputs().size(), delivered);
   }
@@ -949,7 +968,8 @@ TEST(PDNativeResponseTest, KeepsLegacyBrpcInterfaceAndFirstTokenMetadata) {
   options.set_model("native-model");
   result.response_formatter = make_decode_output_formatter(options, "", "", "");
   ASSERT_TRUE(result.response_formatter);
-  const auto accepted = XServiceClient::get_instance()->generations({result});
+  const auto accepted =
+      XServiceGenerationTestPeer::client()->generations({result});
   ASSERT_EQ(accepted.size(), 1U);
   EXPECT_TRUE(accepted.front());
   const auto request = service.received();

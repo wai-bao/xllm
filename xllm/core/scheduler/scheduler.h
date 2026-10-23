@@ -77,6 +77,10 @@ struct SchedulerOptions {
   // the number of speculative tokens per step
   PROPERTY(int32_t, num_speculative_tokens) = 0;
 
+  PROPERTY(std::string, speculative_algorithm) = "MTP";
+
+  PROPERTY(std::string, draft_sampling_mode) = "greedy";
+
   // Effective decode graph geometry for profile warmup. This is a resolved
   // scheduler value, not an Engine capability, because speculative target
   // width is known before the scheduler is constructed.

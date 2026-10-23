@@ -117,6 +117,13 @@ class PhysicalPagePool final {
   // Pool growth is excluded from the fallback driver low watermark.
   void observe_execution_memory();
 
+  // Shared gate for the per-execution-path observers: no-op unless virtual
+  // memory with elastic budgets is enabled; warmup additionally synchronizes
+  // the execution stream so the sample covers the fully allocated workspace.
+  static void observe_elastic_execution_memory(class Stream& execution_stream,
+                                               bool is_warmup,
+                                               const char* warmup_context);
+
   // Release idle backing while retaining keep_pages resident idle pages.
   // Callers must return pages only after their device/transfer users finish.
   // Active shared-mapping leases pin the backing and make trimming a no-op.

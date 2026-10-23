@@ -186,7 +186,8 @@ Sequence::Sequence(const Sequence& other, size_t index)
       mrope_position_delta_(other.mrope_position_delta_),
       mrope_positions_(other.mrope_positions_),
       output_embedding_(other.output_embedding_),
-      mtp_bootstrap_embedding_(other.mtp_bootstrap_embedding_),
+      target_decode_bootstrap_pending_(other.target_decode_bootstrap_pending_),
+      draft_input_(other.draft_input_),
       num_tokens_(other.num_tokens_),
       token_to_count_map_(other.token_to_count_map_),
       num_prompt_tokens_(other.num_prompt_tokens_),
@@ -488,10 +489,12 @@ void Sequence::update_embeddings(const torch::Tensor& embeddings) {
   }
 }
 
-void Sequence::update_mtp_bootstrap_embedding(const torch::Tensor& embedding) {
-  if (embedding.defined()) {
-    mtp_bootstrap_embedding_ = embedding.detach().clone();
-  }
+void Sequence::update_draft_input(const DraftInput& seed) {
+  check_draft_input(seed);
+  CHECK_EQ(seed.token_ids.size(0), 1);
+  // Slicing a batch-level seed per request must not copy each [1, vocab]
+  // payload; detached views keep the producer's storage alive instead.
+  draft_input_ = detach_draft_input(seed);
 }
 
 size_t Sequence::num_valid_tokens() const {
@@ -812,6 +815,10 @@ void Sequence::reset() {
   pending_host_restore_.reset();
   host_restore_owners_.clear();
   clear_host_cache_match();
+  // The KV lifetime has ended: after a recompute, the stale target bootstrap
+  // and draft input must not be imported again.
+  clear_target_decode_bootstrap();
+  clear_draft_input();
   volatile_num_prompt_tokens_ = num_tokens_;
 }
 

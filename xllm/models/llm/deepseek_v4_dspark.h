@@ -282,5 +282,6 @@ TORCH_MODULE(DeepseekV4DSparkForCausalLM);
 REGISTER_CAUSAL_MODEL_WITH_VARNAME(deepseek_v4_dspark_draft_model,
                                    deepseek_v4_dspark,
                                    DeepseekV4DSparkForCausalLM);
+REGISTER_TARGET_SPEC_VERIFY_MODE(deepseek_v4_dspark, PYTHON_EXPANDED_VERIFY);
 
 }  // namespace xllm

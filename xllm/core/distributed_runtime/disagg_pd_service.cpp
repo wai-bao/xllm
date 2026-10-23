@@ -24,9 +24,14 @@ namespace xllm {
 DisaggPDService::DisaggPDService(DisaggPDScheduler* scheduler,
                                  Engine* engine,
                                  int32_t kv_cache_block_tokens,
+                                 std::shared_ptr<XServiceClient> client,
                                  DisaggPDServiceOptions response_options) {
-  disagg_pd_service_impl_ = std::make_unique<DisaggPDServiceImpl>(
-      scheduler, engine, kv_cache_block_tokens, std::move(response_options));
+  disagg_pd_service_impl_ =
+      std::make_unique<DisaggPDServiceImpl>(scheduler,
+                                            engine,
+                                            kv_cache_block_tokens,
+                                            std::move(client),
+                                            std::move(response_options));
 }
 
 void DisaggPDService::ReleaseReservation(

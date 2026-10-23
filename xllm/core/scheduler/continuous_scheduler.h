@@ -33,7 +33,6 @@ limitations under the License.
 #include "core/common/macros.h"
 #include "core/common/types.h"
 #include "core/distributed_runtime/engine.h"
-#include "core/distributed_runtime/xservice_client.h"
 #include "core/framework/batch/batch_factory.h"
 #include "core/framework/batch/batch_group.h"
 #include "core/framework/block/kv_cache_manager.h"
@@ -137,12 +136,7 @@ class ContinuousSchedulerBase : public Scheduler {
           nullptr,
       std::shared_ptr<DistributedWorkerManager> distributed_worker_manager =
           nullptr);
-
-  void clear_mtp_bootstrap(Request* request);
   void drain_prefetch_pipeline();
-  void populate_heartbeat_request(
-      xllm_service::proto::HeartbeatRequest& request,
-      bool include_virtual_memory_info);
   // Caller holds prefetch_admission_mutex_ for both admission operations.
   virtual size_t num_queued_requests() const;
   virtual bool enqueue_ready_request(std::shared_ptr<Request> request);
@@ -253,10 +247,6 @@ class ContinuousSchedulerBase : public Scheduler {
   // tokenizer
   std::unique_ptr<Tokenizer> tokenizer_;
 
-  XServiceClient* xservice_client_ = nullptr;
-  XServiceClient::HeartbeatCallbackRegistration
-      heartbeat_callback_registration_ = 0;
-
   // params for enable_schedule_overlap case
   BatchGroup last_batch_;
   std::vector<std::shared_ptr<Request>> last_running_requests_;
@@ -276,7 +266,9 @@ class ContinuousSchedulerBase : public Scheduler {
 
   BatchGroup schedule_request(const absl::Duration& timeout);
 
-  void step_with_schedule_overlap(const absl::Duration& timeout);
+  // Returns true when the engine is idle for this step (current and previous
+  // batch both empty), so the single step() exit can flush released state.
+  bool step_with_schedule_overlap(const absl::Duration& timeout);
 
   void refresh_sequences_from_requests(
       const std::vector<std::shared_ptr<Request>>& requests,

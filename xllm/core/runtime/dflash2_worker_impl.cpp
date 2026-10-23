@@ -20,6 +20,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/sampling/dflash2_sampling.h"
+#include "core/framework/sampling/draft_sampling.h"
 #include "framework/sampling/gumbel_sampling.h"
 #include "util/timer.h"
 
@@ -62,7 +63,7 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
   c10::StreamGuard noise_guard = compute_stream_->set_stream_guard();
   SamplingParameters draft_sampling_params =
       input.sampling_params.to(draft_impl_->device(), torch::kFloat32);
-  prepare_draft_sampling(draft_sampling_mode_, draft_sampling_params);
+  configure_draft_sampling(draft_sampling_params, draft_sampling_mode_);
   torch::Tensor gumbel_noise = sample_gumbel_noise(batch_size,
                                                    num_speculative_tokens,
                                                    selector_top_k,
@@ -119,6 +120,7 @@ DFlashWorkerImpl::DraftBlock DFlash2WorkerImpl::run_decode_draft(
   DraftBlock draft_block;
   draft_block.proposal = DraftProposal(std::move(sampled.token_ids),
                                        std::move(sampled.draft_logits));
+  draft_block.confidence_probs = std::move(sampled.confidence_probs);
   draft_block.retained_inputs = take_retained_inputs(*draft_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               draft_timer.elapsed_seconds());

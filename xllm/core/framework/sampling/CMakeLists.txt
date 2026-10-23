@@ -23,6 +23,7 @@ cc_library(
     dspark_sampling.h
     dflash2_sampling.h
     draft_proposal.h
+    draft_sampling.h
     draft_sampling_mode.h
     sampling_params.h
     logits_utils.h
@@ -35,6 +36,7 @@ cc_library(
   SRCS
     dspark_sampling.cpp
     dflash2_sampling.cpp
+    draft_sampling.cpp
     sampling_params.cpp
     logits_utils.cpp
     gumbel_sampling.cpp

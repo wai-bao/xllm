@@ -39,6 +39,7 @@ TORCH_MODULE(Glm5MtpForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(glm_moe_dsa_mtp, Glm5MtpForCausalLM);
+REGISTER_MTP_MODEL_PAIR(glm_moe_dsa, glm_moe_dsa_mtp);
 
 // register the model args
 // example config:

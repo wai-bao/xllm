@@ -107,20 +107,27 @@ namespace xllm {
 #define CALLBACK_WITH_ERROR_ARGS2(CODE, MSG) callback(Status{CODE, MSG})
 #define CALLBACK_WITH_ERROR_ARGS4(CODE, MSG, ID, TARGET_XSERVICE_ADDR) \
   callback({Status{CODE, MSG}, ID, TARGET_XSERVICE_ADDR})
-#define CALLBACK_WITH_ERROR_INVALID_ARITY(...)                        \
-  static_assert(false,                                                \
-                "CALLBACK_WITH_ERROR expects 2 or 4 args: "           \
-                "CALLBACK_WITH_ERROR(code, msg) or "                  \
-                "CALLBACK_WITH_ERROR(code, msg, service_request_id, " \
-                "target_xservice_addr)")
+// The transport layer picks the SSE frame vs plain-JSON error envelope from
+// RequestOutput::stream; callers that know the request's streaming mode wrap
+// their callback with Master::stamp_stream_on_error instead of per-site
+// stream plumbing here.
+#define CALLBACK_WITH_ERROR_INVALID_ARITY(...)              \
+  static_assert(false,                                      \
+                "CALLBACK_WITH_ERROR expects 2 or 4 args: " \
+                "CALLBACK_WITH_ERROR(code, msg) or (code, " \
+                "msg, service_request_id, target_xservice_addr)")
 
-#define GET_MACRO(_1, _2, _3, _4, _5, NAME, ...) NAME
+// Arity dispatch: the table below maps right-to-left onto argument counts
+// (2 -> ARGS2, 4 -> ARGS4); anything else hits INVALID_ARITY.
+#define GET_MACRO(_1, _2, _3, _4, _5, _6, NAME, ...) NAME
 #define CALLBACK_WITH_ERROR(...)               \
   GET_MACRO(__VA_ARGS__,                       \
             CALLBACK_WITH_ERROR_INVALID_ARITY, \
+            CALLBACK_WITH_ERROR_INVALID_ARITY, \
             CALLBACK_WITH_ERROR_ARGS4,         \
             CALLBACK_WITH_ERROR_INVALID_ARITY, \
-            CALLBACK_WITH_ERROR_ARGS2)(__VA_ARGS__)
+            CALLBACK_WITH_ERROR_ARGS2,         \
+            CALLBACK_WITH_ERROR_INVALID_ARITY)(__VA_ARGS__)
 
 #define CHECK_ACL_SUCCESS(expr, msg)             \
   do {                                           \

@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "scheduler/zero_eviction_scheduler.h"
 
+#include <utility>
+
 #include "common/global_flags.h"
 #include "common/metrics.h"
 #include "core/framework/config/kv_cache_config.h"

@@ -172,6 +172,13 @@ class BlockManager {
   // Physical KV keeps its static capacity; VmmKV supplies a live budget.
   virtual size_t admission_capacity() const { return num_total_blocks(); }
 
+  // Whether a block id is currently allocated. Consumers of release
+  // notifications use this to discard stale ids that were reused after their
+  // release. Only BlockManagerImpl-based leaves implement it; composites do
+  // not route, so consumers must hold the owning leaf directly (as
+  // BlockManagerPool does for the EMBEDDING leaves).
+  virtual bool is_block_used(int32_t /*block_id*/) const { return false; }
+
   // True only for CompositeBlockManager. Leaves and flat managers return false.
   virtual bool is_composite() const { return false; }
 
