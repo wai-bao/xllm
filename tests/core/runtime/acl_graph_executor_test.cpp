@@ -56,6 +56,7 @@ limitations under the License.
 #include "models/llm/deepseek_v4.h"
 #include "models/llm/dspark_weight_source.h"
 #include "models/model_registry.h"
+#include "runtime/spec_runtime_helpers.h"
 #include "tests/npu_test_environment.h"
 
 // Global test environment for ACL graph executor tests
@@ -1105,7 +1106,6 @@ TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
   options.max_tokens_per_batch(64);
   options.num_speculative_tokens(2);
   options.enable_speculative_decode(true);
-  options.is_draft_engine(false);
 
   const torch::Device device("npu:0");
   ::xllm::npu::GraphPersistentParam persistent_param(
@@ -1194,7 +1194,6 @@ TEST_P(HybridSpecVerifyPaddingTest, MetadataCoversBucketPadding) {
   options.max_tokens_per_batch(64);
   options.num_speculative_tokens(kSpecWidth - 1);
   options.enable_speculative_decode(true);
-  options.is_draft_engine(false);
 
   const torch::Device device("npu:0");
   ::xllm::npu::GraphPersistentParam persistent_param(
@@ -1304,7 +1303,6 @@ TEST(AclGraphPersistentParamTest,
   options.max_tokens_per_batch(16);
   options.num_speculative_tokens(kSpecWidth - 1);
   options.enable_speculative_decode(true);
-  options.is_draft_engine(false);
 
   const torch::Device device("npu:0");
   const auto int_options = torch::dtype(torch::kInt).device(device);
@@ -1522,7 +1520,6 @@ TEST(AclGraphPersistentParamTest, SpecVerifyGraphUpdateSupportsRuntimeBatch) {
   options.max_tokens_per_batch(16);
   options.num_speculative_tokens(kSpecWidth - 1);
   options.enable_speculative_decode(true);
-  options.is_draft_engine(false);
 
   const torch::Device device("npu:0");
   ::xllm::npu::GraphPersistentParam persistent_param(

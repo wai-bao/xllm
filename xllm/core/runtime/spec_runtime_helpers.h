@@ -15,16 +15,16 @@ limitations under the License.
 
 #pragma once
 
-namespace xllm {
+#include "runtime/options.h"
 
-template <typename Function, typename Engine, typename OtherEngine>
-decltype(auto) dispatch_engine(const Function& function,
-                               Engine* engine,
-                               OtherEngine* other_engine) {
-  if (engine != nullptr) {
-    return function(engine);
-  }
-  return function(other_engine);
+namespace xllm::spec_detail {
+
+// Draft leaves are always plain-text LLMs even under a VLM target.
+inline void mark_spec_draft_options(runtime::Options& opts) {
+  opts.enable_schedule_overlap(false)
+      .is_draft_model(true)
+      .backend("llm")
+      .enable_graph_aux_hidden_states(false);
 }
 
-}  // namespace xllm
+}  // namespace xllm::spec_detail

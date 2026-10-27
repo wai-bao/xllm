@@ -50,6 +50,7 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
  protected:
   static runtime::Options draft_options(const runtime::Options& options);
 
+  bool eplb_aggregates_output() const override { return true; }
   MTPWorkerImpl(const ParallelArgs& parallel_args,
                 const torch::Device& device,
                 const runtime::Options& options,

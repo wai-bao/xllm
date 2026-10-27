@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "common/types.h"
 #include "core/framework/allocator/virtual_memory/mapped_virtual_memory_region.h"
+#include "core/framework/config/eplb_config.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/transfer/hierarchy_kv_cache_transfer.h"
 #include "core/kv_cache/transfer/kv_cache_store.h"
@@ -356,9 +357,31 @@ class WorkerImpl {
   // model context, includes model args, parallel args and date type etc.
   mutable ModelContext context_;
 
-  OptimizationConfig get_optimization_config() const {
+  const OptimizationConfig& get_optimization_config() const {
     return context_.get_optimization_config();
   }
+
+  // The spec pair's own workers handle their suppression.
+  bool suppresses_step_output() const {
+    return !options_.enable_speculative_decode() &&
+           suppresses_non_driver_output();
+  }
+
+  // Non-driver ranks suppress their step output unless schedule overlap is
+  // active; EPLB-aggregating families (MTP) opt out by overriding
+  // eplb_aggregates_output().
+  bool suppresses_non_driver_output() const {
+    if (enable_schedule_overlap()) {
+      return false;
+    }
+    if (is_driver()) {
+      return false;
+    }
+    return !eplb_aggregates_output() ||
+           !::xllm::EPLBConfig::get_instance().enable_eplb();
+  }
+
+  virtual bool eplb_aggregates_output() const { return false; }
 
  protected:
   virtual void prepare_expert_input(ExpertInput& /*input*/) const {}

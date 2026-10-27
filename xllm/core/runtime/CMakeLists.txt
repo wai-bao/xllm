@@ -44,6 +44,7 @@ cc_library(
     draft_model_spec_worker_impl.h
     speculative_worker_impl.h
     mtp_worker_impl.h
+    spec_runtime_helpers.h
     suffix_worker_impl.h
     eagle3_worker_impl.h
     dflash_worker_impl.h

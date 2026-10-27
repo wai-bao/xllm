@@ -20,6 +20,9 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "framework/model/model_args.h"
+#include "runtime/options.h"
+
 namespace xllm {
 
 // Converts Speculators hidden-state boundary indices (0 = embedding output, v =
@@ -32,5 +35,8 @@ std::vector<int32_t> boundary_to_post_layer_ids(
 std::vector<int32_t> read_capture_layer_ids(
     const std::string& model_weights_path,
     bool required = true);
+
+void configure_speculative_model_args(ModelArgs& args,
+                                      const runtime::Options& options);
 
 }  // namespace xllm

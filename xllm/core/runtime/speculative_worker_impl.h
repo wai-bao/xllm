@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "core/framework/parallel_state/process_group.h"
+#include "core/runtime/spec_runtime_helpers.h"
 #include "framework/sampling/sampling_params.h"
 #include "runtime/options.h"
 #include "runtime/worker_impl.h"
@@ -64,7 +65,7 @@ ForwardOutput finalize_verify_output(
 // draft generation and validation (MTP, Eagle3, Suffix, DFlash, etc.).
 template <typename TargetInput>
 class SpeculativeWorkerImpl : public WorkerImpl {
- public:
+ protected:
   using TargetModelParams = std::remove_reference_t<
       decltype(std::declval<TargetInput&>().input_params)>;
 

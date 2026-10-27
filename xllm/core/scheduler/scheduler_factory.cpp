@@ -25,7 +25,7 @@ namespace xllm {
 
 SchedulerKind select_scheduler_kind(const SchedulerOptions& options) {
   if (options.enable_disagg_pd()) {
-    return SchedulerKind::PD;
+    return SchedulerKind::DISAGG_PD;
   }
 
   return SchedulerKind::CONTINUOUS;
