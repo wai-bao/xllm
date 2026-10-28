@@ -130,7 +130,13 @@ class CausalLM : public torch::nn::Module, public Model {
   virtual xlite::XliteModelHolder* get_xlite_holder() { return nullptr; }
 #endif
 
-  virtual bool share_weights_from(CausalLM& /*source*/) { return false; }
+  virtual bool owns_lm_head() const { return false; }
+
+  virtual bool owns_embed_tokens() const { return false; }
+
+  virtual void share_lm_head(CausalLM& /*target*/) {}
+
+  virtual void share_embed_tokens(CausalLM& /*target*/) {}
 
   virtual void prepare_expert_weight(
       int32_t layer_id,
@@ -474,6 +480,22 @@ class CausalLMImpl : public CausalLM {
     }
   }
 
+  bool owns_lm_head() const override {
+    if constexpr (detail::has_owns_lm_head<ModelType>::value) {
+      return model_->owns_lm_head();
+    } else {
+      return CausalLM::owns_lm_head();
+    }
+  }
+
+  bool owns_embed_tokens() const override {
+    if constexpr (detail::has_owns_embed_tokens<ModelType>::value) {
+      return model_->owns_embed_tokens();
+    } else {
+      return CausalLM::owns_embed_tokens();
+    }
+  }
+
   void set_lm_head(layer::LmHead& head) override {
     if constexpr (detail::has_set_lm_head<ModelType>::value) {
       model_->set_lm_head(head);
@@ -495,6 +517,45 @@ class CausalLMImpl : public CausalLM {
       model_->set_word_embedding(embedding);
     } else {
       CausalLM::set_word_embedding(embedding);
+    }
+  }
+
+  void share_lm_head(CausalLM& target) override {
+    if (owns_lm_head()) {
+      return;
+    }
+#if defined(USE_NPU)
+    if constexpr (detail::has_set_npu_lm_head<ModelType>::value) {
+      auto head = target.get_npu_lm_head();
+      model_->set_npu_lm_head(head);
+    }
+#endif
+    if constexpr (detail::has_set_lm_head<ModelType>::value) {
+      auto head = target.get_lm_head();
+      model_->set_lm_head(head);
+    }
+  }
+
+  void share_embed_tokens(CausalLM& target) override {
+    if (owns_embed_tokens()) {
+      return;
+    }
+#if defined(USE_NPU)
+    if constexpr (detail::has_set_npu_word_embedding<ModelType>::value) {
+      auto word_embedding = target.get_npu_word_embedding();
+      if constexpr (detail::has_set_restored_npu_word_embedding<
+                        ModelType>::value) {
+        if (target.has_restored_npu_word_embedding()) {
+          model_->set_restored_npu_word_embedding(word_embedding);
+          return;
+        }
+      }
+      model_->set_npu_word_embedding(word_embedding);
+    }
+#endif
+    if constexpr (detail::has_set_word_embedding<ModelType>::value) {
+      auto word_embedding = target.get_word_embedding();
+      model_->set_word_embedding(word_embedding);
     }
   }
 

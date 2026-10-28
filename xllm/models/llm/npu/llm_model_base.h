@@ -401,6 +401,11 @@ class LlmModelImplBase : public torch::nn::Module {
     npu_embed_tokens_ = npu_word_embedding;
   }
 
+  bool owns_embed_tokens() const {
+    return !npu_embed_tokens_.is_empty() &&
+           npu_embed_tokens_->is_weight_loaded();
+  }
+
   virtual void set_residual(torch::Tensor residual) {
     for (auto& layer : layers_) {
       layer->set_residual(residual);
@@ -641,6 +646,10 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
   }
 
   virtual void set_npu_lm_head(layer::NpuLmHead& head) { npu_lm_head_ = head; }
+
+  bool owns_lm_head() const {
+    return !npu_lm_head_.is_empty() && npu_lm_head_->is_weight_loaded();
+  }
 
   virtual layer::NpuWordEmbedding get_npu_word_embedding() {
     return model_->get_npu_word_embedding();

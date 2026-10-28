@@ -175,6 +175,10 @@ class LlmModelImplBase : public torch::nn::Module {
     embed_tokens_ = word_embedding;
   }
 
+  bool owns_embed_tokens() const {
+    return !embed_tokens_.is_empty() && embed_tokens_->is_weight_loaded();
+  }
+
  protected:
   torch::Tensor cos_sin_;
   int32_t max_seq_len_ = 0;
@@ -327,6 +331,12 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
 
   virtual void set_lm_head(layer::LmHead& head) { lm_head_ = head; }
 
+  // DFlash2 skips registering a draft-local head, so an empty lm_head_ borrows
+  // the target's.
+  bool owns_lm_head() const {
+    return !lm_head_.is_empty() && lm_head_->is_weight_loaded();
+  }
+
   virtual layer::WordEmbedding get_word_embedding() {
     return model_->get_word_embedding();
   }
@@ -334,6 +344,8 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
   virtual void set_word_embedding(layer::WordEmbedding& word_embedding) {
     model_->set_word_embedding(word_embedding);
   }
+
+  bool owns_embed_tokens() const { return model_->owns_embed_tokens(); }
 
  protected:
   // parameter members, must be registered

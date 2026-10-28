@@ -252,6 +252,24 @@ struct has_set_restored_npu_word_embedding<
         std::declval<layer::NpuWordEmbedding&>()))>> : std::true_type {};
 
 template <typename T, typename = void>
+struct has_owns_lm_head : std::false_type {};
+
+template <typename T>
+struct has_owns_lm_head<
+    T,
+    std::void_t<decltype(std::declval<T>()->owns_lm_head())>> : std::true_type {
+};
+
+template <typename T, typename = void>
+struct has_owns_embed_tokens : std::false_type {};
+
+template <typename T>
+struct has_owns_embed_tokens<
+    T,
+    std::void_t<decltype(std::declval<T>()->owns_embed_tokens())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
 struct has_init_or_refresh_rolling_runtime : std::false_type {};
 
 template <typename T>

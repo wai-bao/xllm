@@ -94,7 +94,6 @@ struct ModelMeta {
   QuantArgsLoader quant_args_loader;
   TokenizerArgsLoader tokenizer_args_loader;
   CpShardingMode cp_sharding_mode = CpShardingMode::NONE;
-  bool owns_mtp_shared_weights = false;
   bool supports_dcp = false;
 };
 
@@ -171,9 +170,6 @@ class ModelRegistry {
 
   static void register_dcp_capability(const std::string& name);
   static bool supports_dcp(const std::string& name);
-
-  static void register_mtp_shared_weight_owner(const std::string& name);
-  static bool owns_mtp_shared_weights(const std::string& name);
 
   static CausalLMFactory get_causallm_factory(const std::string& name);
 

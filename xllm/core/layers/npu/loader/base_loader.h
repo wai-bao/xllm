@@ -60,6 +60,12 @@ class BaseLoader {
   virtual void verify_loaded_weights() const {};
   virtual void verify_loaded_weights(const std::string& prefix) const {};
 
+  // True once the weight slot holds a real weight, not the {1} placeholder.
+  bool is_weight_loaded() const {
+    const auto& wt = working_tensors();
+    return !wt.empty() && !(wt[0].dim() == 1 && wt[0].size(0) == 1);
+  }
+
   // Default merge path:
   //   kEager  : subclass overrides this method (no-op here).
   //   kManual : runs `merge_host_at_weights` + slice init + H2D copy + device

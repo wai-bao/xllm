@@ -212,6 +212,11 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
   void set_word_embedding(layer::WordEmbedding& word_embedding) {
     embed_tokens_ = word_embedding;
   }
+
+  bool owns_embed_tokens() const {
+    return !embed_tokens_.is_empty() && embed_tokens_->is_weight_loaded();
+  }
+
   ModelOutput forward(torch::Tensor tokens,
                       torch::Tensor positions,
                       std::vector<KVCache>& kv_caches,
@@ -1183,11 +1188,5 @@ REGISTER_MODEL_ARGS(deepseek_v4_mtp, [&] {
   validate_deepseek_v4_args(*args, args_policy);
   normalize_deepseek_v4_args(args);
 });
-
-// The draft checkpoint owns its embedding and LM head weights.
-const bool deepseek_v4_mtp_shared_weight_owner_registered = []() {
-  ModelRegistry::register_mtp_shared_weight_owner("deepseek_v4_mtp");
-  return true;
-}();
 
 }  // namespace xllm
