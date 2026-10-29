@@ -18,11 +18,11 @@ limitations under the License.
 #include <cstdint>
 #include <nlohmann/json_fwd.hpp>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "core/common/macros.h"
 #include "core/framework/config/option_category.h"
+#include "core/framework/config/speculative_config.h"
 
 namespace xllm {
 
@@ -61,7 +61,7 @@ class ExecutionConfig final {
   DecodeGraphWarmupConfig decode_graph_warmup_config(
       int32_t num_speculative_tokens,
       bool enable_no_padding,
-      std::string_view speculative_algorithm = "MTP") const;
+      SpeculativeAlgorithm algorithm) const;
 
   [[nodiscard]] static const OptionCategory& option_category() {
     static const OptionCategory kOptionCategory = {

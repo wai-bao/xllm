@@ -18,6 +18,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+# Upper bound on num_speculative_tokens (the bonus row adds one). The C++
+# SpeculativeConfig enforces the same bound as kMaxSpeculativeTokens.
+MAX_SPECULATIVE_TOKENS = 16
+
 
 def block_draft_kv_capacity_buckets(
     page_size: int, max_pages: int, query_width: int, max_kv_length: int = 0

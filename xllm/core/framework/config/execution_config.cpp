@@ -259,11 +259,11 @@ void ExecutionConfig::initialize() {
 DecodeGraphWarmupConfig ExecutionConfig::decode_graph_warmup_config(
     int32_t num_speculative_tokens,
     bool enable_no_padding,
-    std::string_view speculative_algorithm) const {
+    SpeculativeAlgorithm algorithm) const {
   // num_decoding_tokens is owned by this config.
   DecodeGraphWarmupConfig config{
-      .num_decoding_tokens =
-          num_speculative_tokens > 0 ? num_speculative_tokens + 1 : 1,
+      .num_decoding_tokens = SpeculativeConfig::decode_query_len(
+          std::max(num_speculative_tokens, 0)),
       .num_speculative_tokens = num_speculative_tokens,
       .enable_graph_mode_decode_no_padding = enable_no_padding,
       .max_graph_batch_size =
@@ -274,7 +274,7 @@ DecodeGraphWarmupConfig ExecutionConfig::decode_graph_warmup_config(
       enable_no_padding) {
     return config;
   }
-  if (SpeculativeConfig::is_mtp_algorithm(speculative_algorithm)) {
+  if (algorithm == SpeculativeAlgorithm::MTP) {
     if (enable_task_pipeline()) {
       // The first invocation also repairs the previous accepted boundary.
       config.draft_shapes.emplace_back(DraftGraphWarmupShape{2, false});
@@ -283,13 +283,13 @@ DecodeGraphWarmupConfig ExecutionConfig::decode_graph_warmup_config(
       config.draft_shapes.emplace_back(DraftGraphWarmupShape{1, false});
     }
   } else if (enable_task_pipeline() &&
-             SpeculativeConfig::is_dspark_algorithm(speculative_algorithm)) {
+             algorithm == SpeculativeAlgorithm::DSPARK) {
     config.draft_shapes.emplace_back(
         DraftGraphWarmupShape{num_speculative_tokens, true});
   } else if (enable_task_pipeline() &&
-             SpeculativeConfig::is_dflash2_algorithm(speculative_algorithm)) {
-    config.draft_shapes.emplace_back(
-        DraftGraphWarmupShape{num_speculative_tokens + 1, true});
+             algorithm == SpeculativeAlgorithm::DFLASH2) {
+    config.draft_shapes.emplace_back(DraftGraphWarmupShape{
+        SpeculativeConfig::decode_query_len(num_speculative_tokens), true});
   }
   return config;
 }

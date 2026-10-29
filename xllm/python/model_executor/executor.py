@@ -47,6 +47,7 @@ from xllm.python.model_executor.input_batch import (
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
 from xllm.python.model_executor.runners.decode_cuda_graph import DecodeCudaGraphRunner
 from xllm.python.model_executor.runners.eager import EagerRunner
+from xllm.python.model_executor.runners.kv_capacity import MAX_SPECULATIVE_TOKENS
 from xllm.python.model_executor.runners.mtp_acl_graph import (
     ActivateFn,
     ForwardFn,
@@ -91,7 +92,7 @@ def _validate_npu_cp_model_config(config: dict, num_decoding_tokens: int) -> Non
     is_glm5_next = model_type in ("glm5_next", "glm5_3_flash")
     is_glm_mtp_draft = (
         model_type == "glm_moe_dsa_mtp"
-        and config.get("is_draft_engine", False)
+        and config.get("is_drafter", False)
         and bool(config.get("is_mtp_algorithm", False))
     )
     if model_type not in ("qwen3", "glm_moe_dsa", "deepseek_v4") and not is_glm5_next and not is_glm_mtp_draft:
@@ -280,7 +281,7 @@ class ModelExecutor:
         self.execution_model = model.model
         self.supports_layerwise_kv_load = bool(
             getattr(self.execution_model, "supports_layerwise_kv_load", False)
-        ) and not config.get("is_draft_engine", False)
+        ) and not config.get("is_drafter", False)
         self._kv_bound = False
         cp_size = int(config.get("cp_size", 1))
         cp_rank = int(config.get("cp_rank", 0))
@@ -350,11 +351,12 @@ class ModelExecutor:
         first_parameter = next(model.parameters())
         device = first_parameter.device
         ordinary_decode = int(num_decoding_tokens) == 1
+        is_drafter = bool(config.get("is_drafter", False))
         num_decoding_tokens = max(1, int(num_decoding_tokens), int(config.get("num_speculative_tokens", 0)) + 1)
         if config.get("model_type") == "qwen3_5_mtp":
             prefix_width = int(config.get("mtp_draft_prefix_width", 1))
-            if not 1 <= prefix_width <= 17:
-                raise ValueError("Qwen MTP draft prefix width must be in [1, 17]")
+            if not 1 <= prefix_width <= MAX_SPECULATIVE_TOKENS + 1:
+                raise ValueError(f"Qwen MTP draft prefix width must be in [1, {MAX_SPECULATIVE_TOKENS + 1}]")
             num_decoding_tokens = max(num_decoding_tokens, prefix_width)
         # GLM MTP can prepend a repair row after all draft tokens are accepted.
         # Two requests then need up to four attention rows, even though later
@@ -440,35 +442,40 @@ class ModelExecutor:
         )
         if qwen_mtp_requested and config.get("enable_task_pipeline", False) and not qwen_mtp_parallel:
             raise NotImplementedError("Python Qwen MTP requires DP, CP, KV split and layerwise sizes of one")
-        if qwen_mtp_requested and self._prepared_qwen_gdn and not 1 <= self.num_speculative_tokens <= 16:
-            raise NotImplementedError("Python Qwen MTP supports 1 to 16 speculative tokens")
-        self._prepared_qwen_mtp_target = (
-            config.get("model_type") == "qwen3_5_text"
-            and bool(config.get("is_mtp_algorithm", False))
-            and 1 <= self.num_speculative_tokens <= 16
-            and int(config.get("num_speculative_tokens", 0)) + 1 == int(num_decoding_tokens)
-            and not config.get("is_draft_engine", False)
+        if (
+            qwen_mtp_requested
+            and self._prepared_qwen_gdn
+            and not 1 <= self.num_speculative_tokens <= MAX_SPECULATIVE_TOKENS
+        ):
+            raise NotImplementedError(f"Python Qwen MTP supports 1 to {MAX_SPECULATIVE_TOKENS} speculative tokens")
+        # Shared admission for the prepared Qwen MTP modes; the target and
+        # draft flags only differentiate role, model and width.
+        qwen_mtp_admitted = (
+            bool(config.get("is_mtp_algorithm", False))
             and config.get("task_type", "generate") == "generate"
             and qwen_mtp_parallel
             and not config.get("enable_adaptive_draft_step", False)
             and not config.get("enable_adaptive_target_verify", False)
         )
+        self._prepared_qwen_mtp_target = (
+            qwen_mtp_admitted
+            and config.get("model_type") == "qwen3_5_text"
+            and not is_drafter
+            and 1 <= self.num_speculative_tokens <= MAX_SPECULATIVE_TOKENS
+            and int(config.get("num_speculative_tokens", 0)) + 1 == int(num_decoding_tokens)
+        )
         self._prepared_qwen_mtp_draft = (
-            config.get("model_type") == "qwen3_5_mtp"
-            and bool(config.get("is_mtp_algorithm", False))
-            and config.get("is_draft_engine", False)
+            qwen_mtp_admitted
+            and config.get("model_type") == "qwen3_5_mtp"
+            and is_drafter
             and self.num_speculative_tokens == 0
-            and 1 <= num_decoding_tokens <= 17
-            and config.get("task_type", "generate") == "generate"
-            and qwen_mtp_parallel
-            and not config.get("enable_adaptive_draft_step", False)
-            and not config.get("enable_adaptive_target_verify", False)
+            and 1 <= num_decoding_tokens <= MAX_SPECULATIVE_TOKENS + 1
         )
         prepared_qwen_generation = (
             self._prepared_qwen_gdn
             and self.num_speculative_tokens == 0
             and ordinary_decode
-            and not config.get("is_draft_engine", False)
+            and not is_drafter
             and config.get("task_type", "generate") == "generate"
         )
         self._supports_prepared_metadata = (
@@ -587,7 +594,7 @@ class ModelExecutor:
                         dp_size,
                         dp_rank,
                         num_decoding_tokens=num_decoding_tokens,
-                        is_spec_draft=bool(config.get("is_draft_engine", False)),
+                        is_spec_draft=bool(config.get("is_drafter", False)),
                         enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
                         enable_graph_mode_decode_no_padding=bool(
                             config.get("enable_graph_mode_decode_no_padding", False)

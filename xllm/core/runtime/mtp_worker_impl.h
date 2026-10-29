@@ -326,6 +326,9 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
       mtp_async::CombinedDraftExecutionPath::UNSUPPORTED;
   mtp_async::DraftPrefixPolicy draft_prefix_policy_ =
       mtp_async::DraftPrefixPolicy::TAIL_REPAIR;
+  // Resolved once after both leaves load: algorithm and model args are
+  // immutable afterwards, and the decode/validate loops read this per step.
+  mutable std::optional<bool> uses_embedded_eagle3_draft_;
 
 #if defined(USE_NPU)
   // Stable-address sources consumed by the target ACL graph's leading input

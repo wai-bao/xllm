@@ -22,6 +22,7 @@ limitations under the License.
 #include <string_view>
 #include <unordered_map>
 
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/causal_rec.h"
 #include "core/framework/model/causal_vlm.h"
@@ -185,7 +186,7 @@ class ModelRegistry {
                                         MtpArgsAdapter adapter);
 
   static void configure_mtp_args(ModelArgs& args,
-                                 std::string_view algorithm,
+                                 SpeculativeAlgorithm algorithm,
                                  bool is_draft_engine,
                                  bool is_python_model);
 

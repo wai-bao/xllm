@@ -56,7 +56,9 @@ class RecRequestFactoryTest : public ::testing::Test {
         .bos_token_id(0);
     // enable_chunked_prefill defaults true; keep it so the prompt length limit
     // is exactly max_position_embeddings.
-    options_.enable_service_routing(false).num_speculative_tokens(0);
+    options_.enable_service_routing(false)
+        .speculative_config()
+        .num_speculative_tokens(0);
   }
 
   std::unique_ptr<RecRequestFactory> make_llmrec_factory(

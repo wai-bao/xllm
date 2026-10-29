@@ -694,7 +694,10 @@ TEST_F(LLMRequestFactoryTest, TaskPipelineRejectsJsonObjectBeforeGrammarSetup) {
 TEST_F(LLMRequestFactoryTest,
        UnifiedTaskPipelineKeepsJsonObjectChatForLegacyCompatibilityFallback) {
   options_.enable_task_pipeline(true)
-      .num_speculative_tokens(3)
+      .speculative_config()
+      .speculative_algorithm("MTP")
+      .num_speculative_tokens(3);
+  options_.speculative_config()
       .draft_model_path(std::string("/fake/draft"))
       .speculative_algorithm("MTP");
   ModelConfig::get_instance().model_impl("python");
@@ -721,7 +724,10 @@ TEST_F(LLMRequestFactoryTest,
 
 TEST_F(LLMRequestFactoryTest, DisabledUnifiedTaskMtpRejectsJsonObject) {
   options_.enable_task_pipeline(true)
-      .num_speculative_tokens(3)
+      .speculative_config()
+      .speculative_algorithm("MTP")
+      .num_speculative_tokens(3);
+  options_.speculative_config()
       .draft_model_path(std::string("/fake/draft"))
       .speculative_algorithm("MTP");
   ModelConfig::get_instance().model_impl("python");
@@ -773,6 +779,7 @@ TEST_F(LLMRequestFactoryTest, MtpMinimumLengthIsIndependentOfTaskPipeline) {
                    << "pipeline=" << pipeline << ", overlap=" << overlap);
       options_.enable_task_pipeline(pipeline)
           .enable_schedule_overlap(overlap)
+          .speculative_config()
           .num_speculative_tokens(4)
           .speculative_algorithm("MTP");
       auto factory = make_factory(/*vocab_size=*/1000, /*max_position=*/65536);
@@ -798,6 +805,7 @@ TEST_F(LLMRequestFactoryTest, MtpSamplingControlsAreIndependentOfOverlap) {
     SCOPED_TRACE(overlap);
     options_.enable_task_pipeline(false)
         .enable_schedule_overlap(overlap)
+        .speculative_config()
         .num_speculative_tokens(4)
         .speculative_algorithm("MTP");
     auto factory = make_factory(/*vocab_size=*/1000, /*max_position=*/65536);

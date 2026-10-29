@@ -131,7 +131,7 @@ class WorkerForwardCompletionTest
     options.backend(backend);
     options.enable_schedule_overlap(overlap_enabled);
     options.enable_graph(false);
-    options.enable_speculative_decode(false);
+    options.speculative_config().speculative_algorithm("");
     Worker worker(parallel_args, device, options);
     Device execution_device(device);
     std::unique_ptr<Stream> stream = execution_device.get_stream_from_pool();

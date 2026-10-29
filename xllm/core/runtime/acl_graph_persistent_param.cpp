@@ -64,11 +64,11 @@ int64_t get_decode_graph_token_capacity(const runtime::Options& options) {
   CHECK_GT(options.num_decoding_tokens(), 0)
       << "num_decoding_tokens must be > 0 for graph token capacity";
   int64_t token_capacity = options.max_seqs_per_batch();
-  if (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+  if (options.speculative_config().enable_atb_spec_kernel()) {
     return runtime::get_decode_graph_token_bucket(
         token_capacity, options.enable_graph_mode_decode_no_padding());
   }
-  if (options.enable_speculative_decode() && !options.is_draft_engine()) {
+  if (options.speculative_config().enable_speculative_decode()) {
     token_capacity *= options.num_decoding_tokens();
   }
   return runtime::get_decode_graph_token_bucket(

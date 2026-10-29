@@ -59,12 +59,6 @@ namespace xllm {
 
 namespace {
 
-bool should_use_vlm_speculative_engine(const Options& options) {
-  return !SpeculativeConfig::is_suffix_algorithm(
-             options.speculative_algorithm()) &&
-         !options.draft_model_path().value_or("").empty();
-}
-
 std::vector<Message> build_user_messages_from_image_urls(
     std::string prompt,
     const std::vector<std::string>& image_urls) {
@@ -145,13 +139,16 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
   CHECK(!options_.enable_disagg_pd() ||
         options_.kv_cache_transfer_mode() != "PULL")
       << "VLM disaggregated PD does not support KV cache PULL.";
-  const bool use_speculative_engine =
-      should_use_vlm_speculative_engine(options_);
+  // VLM spec is always draft-model-based and never Suffix (text-only).
+  const bool use_speculative_worker =
+      options_.speculative_config().algorithm() !=
+          SpeculativeAlgorithm::SUFFIX &&
+      !options_.speculative_config().draft_model_path().empty();
   const std::string model_type =
       get_model_type(options_.model_path(), options_.backend());
   const std::optional<std::string> cp_error = validate_context_parallel_config(
       options_,
-      use_speculative_engine ? EngineType::VLMSSM : EngineType::VLM,
+      use_speculative_worker ? EngineType::VLMSSM : EngineType::VLM,
       model_type,
       options_.nnodes());
   CHECK(!cp_error.has_value()) << cp_error.value();
@@ -159,8 +156,8 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
       ModelConfig::validate_python_speculative_decode(
           ModelConfig::get_instance().model_impl(),
           model_type,
-          options_.num_speculative_tokens(),
-          options_.speculative_algorithm());
+          options_.speculative_config().num_speculative_tokens(),
+          options_.speculative_config().algorithm());
   CHECK(!speculative_error.has_value()) << speculative_error.value();
   validate_layerwise_split_size_startup_config(
       options_, model_type, options_.nnodes());
@@ -222,43 +219,18 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
       .max_tokens_per_chunk_for_prefill(
           options_.max_tokens_per_chunk_for_prefill());
 
-  if (use_speculative_engine) {
+  if (use_speculative_worker) {
     CHECK(!options_.enable_disagg_pd())
         << "VLM speculative decoding does not support disaggregated PD";
     CHECK(!options_.enable_service_routing())
         << "VLM speculative decoding does not support service routing";
-    CHECK(!options_.enable_adaptive_target_verify())
+    CHECK(!options_.speculative_config().enable_adaptive_target_verify())
         << "VLM speculative decoding does not support adaptive speculative "
            "decode";
-    const std::string draft_model_path =
-        options_.draft_model_path().value_or("");
-    CHECK(!draft_model_path.empty())
+    CHECK(!options_.speculative_config().draft_model_path().empty())
         << "draft model path is required for VLM speculative decoding";
-    engine_options.draft_model_path(draft_model_path)
-        .num_speculative_tokens(options_.num_speculative_tokens())
-        .speculative_algorithm(options_.speculative_algorithm())
-        .enable_probabilistic_draft(options_.enable_probabilistic_draft())
-        .enable_mtp_draft_body_tp1(options_.enable_mtp_draft_body_tp1())
-        .speculative_suffix_cache_max_depth(
-            options_.speculative_suffix_cache_max_depth())
-        .speculative_suffix_max_spec_factor(
-            options_.speculative_suffix_max_spec_factor())
-        .speculative_suffix_max_spec_offset(
-            options_.speculative_suffix_max_spec_offset())
-        .speculative_suffix_min_token_prob(
-            options_.speculative_suffix_min_token_prob())
-        .speculative_suffix_max_cached_requests(
-            options_.speculative_suffix_max_cached_requests())
-        .speculative_suffix_use_tree_spec(
-            options_.speculative_suffix_use_tree_spec())
-        .enable_adaptive_target_verify(options_.enable_adaptive_target_verify())
-        .adaptive_target_verify_min_gain(
-            options_.adaptive_target_verify_min_gain())
-        .adaptive_target_verify_cost_table(
-            options_.adaptive_target_verify_cost_table())
-        .adaptive_target_verify_calibration(
-            options_.adaptive_target_verify_calibration())
-        .kv_cache_transfer_mode(options_.kv_cache_transfer_mode())
+    engine_options.speculative_config(options_.speculative_config());
+    engine_options.kv_cache_transfer_mode(options_.kv_cache_transfer_mode())
         .transfer_listen_port(options_.transfer_listen_port())
         .host_blocks_factor(options_.host_blocks_factor())
         .enable_kvcache_store(options_.enable_kvcache_store())
@@ -306,7 +278,7 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
           << "XServiceClient init fail!";
     }
   };
-  if (use_speculative_engine) {
+  if (use_speculative_worker) {
     const LLMEngine::ModelInitCallback prepare_draft =
         [this](const ModelLoader& model_loader,
                int64_t num_layers,
@@ -331,12 +303,12 @@ VLMMaster::VLMMaster(const Options& options) : Master(options) {
       .request_queue_size(options.request_queue_size())
       .max_tokens_per_chunk_for_prefill(
           options.max_tokens_per_chunk_for_prefill())
-      .num_speculative_tokens(options_.num_speculative_tokens())
+      .speculative_config(options_.speculative_config())
       .decode_graph_warmup_config(
           ExecutionConfig::get_instance().decode_graph_warmup_config(
-              options_.num_speculative_tokens(),
+              options_.speculative_config().num_speculative_tokens(),
               options_.enable_graph_mode_decode_no_padding(),
-              options_.speculative_algorithm()))
+              options_.speculative_config().algorithm()))
       .dp_size(options_.dp_size())
       .cp_size(options_.cp_size())
       .enable_disagg_pd(options_.enable_disagg_pd())

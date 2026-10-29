@@ -18,6 +18,7 @@ limitations under the License.
 #include <algorithm>
 
 #include "common/metrics.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "util/slice.h"
@@ -69,8 +70,8 @@ SuffixWorkerImpl::SuffixWorkerImpl(const ParallelArgs& parallel_args,
                                              options,
                                              SuffixTargetOptions(options)) {
   suffix_cache_ = std::make_unique<SuffixDecodingCache>(
-      options_.speculative_suffix_cache_max_depth(),
-      options_.speculative_suffix_max_cached_requests());
+      options_.speculative_config().speculative_suffix_cache_max_depth(),
+      options_.speculative_config().speculative_suffix_max_cached_requests());
 }
 
 std::optional<ForwardOutput> SuffixWorkerImpl::step_empty(
@@ -82,7 +83,8 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_empty(
   } else {
     LlmForwardInput new_input = input.clone();
     scale_speculative_parallel_token_counts(
-        new_input.input_params, options_.num_speculative_tokens() + 1);
+        new_input.input_params,
+        options_.speculative_config().decode_query_len());
 
     auto future = impl_->step_async(new_input);
     ForwardOutput output = std::move(future).get().value();
@@ -167,9 +169,11 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_prefill(
 
 std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
     const LlmForwardInput& input) {
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  const int32_t num_speculative_tokens =
+      options_.speculative_config().num_speculative_tokens();
+  const int32_t num_val_tokens =
+      options_.speculative_config().decode_query_len();
   const int32_t num_sequences = input.input_params.meta.num_sequences;
-  const int32_t num_val_tokens = num_speculative_tokens + 1;
   const auto& request_ids = input.input_params.embedding.request_ids;
 
   const bool has_request_ids =
@@ -243,10 +247,10 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
         req_id,
         std::span<const int32_t>(history.data(), history.size()),
         /*max_spec_tokens=*/num_speculative_tokens,
-        options_.speculative_suffix_max_spec_factor(),
-        options_.speculative_suffix_max_spec_offset(),
-        options_.speculative_suffix_min_token_prob(),
-        options_.speculative_suffix_use_tree_spec());
+        options_.speculative_config().speculative_suffix_max_spec_factor(),
+        options_.speculative_config().speculative_suffix_max_spec_offset(),
+        options_.speculative_config().speculative_suffix_min_token_prob(),
+        options_.speculative_config().speculative_suffix_use_tree_spec());
 
     const int32_t fill_count =
         std::min<int32_t>(num_speculative_tokens, draft.token_ids.size());
@@ -367,7 +371,8 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
 SampleOutput SuffixWorkerImpl::validate(SamplingParameters sampling_params,
                                         const DraftProposal& draft_proposal,
                                         const ForwardOutput& target_output) {
-  const int32_t num_val_tokens = options_.num_speculative_tokens() + 1;
+  const int32_t num_val_tokens =
+      options_.speculative_config().decode_query_len();
   const int32_t batch_size =
       static_cast<int32_t>(draft_proposal.token_ids().size(/*dim=*/0));
   CHECK_EQ(target_output.logits.size(/*dim=*/0),

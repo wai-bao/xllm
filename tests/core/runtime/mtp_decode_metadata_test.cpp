@@ -49,7 +49,9 @@ TEST(MtpWorkerSelectionTest, UnifiedFlagSelectsPythonMtpWorker) {
       /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
   const torch::Device device("npu:0");
   runtime::Options options;
-  options.enable_speculative_decode(true).num_speculative_tokens(3);
+  options.speculative_config()
+      .speculative_algorithm("MTP")
+      .num_speculative_tokens(3);
   ExecutionConfig::get_instance() = ExecutionConfig();
   {
     Worker default_worker(parallel_args, device, options, WorkerType::LLM);
@@ -60,7 +62,7 @@ TEST(MtpWorkerSelectionTest, UnifiedFlagSelectsPythonMtpWorker) {
     Worker worker(parallel_args, device, options, WorkerType::LLM);
     EXPECT_EQ(worker.task_pipeline_uses_worker_prepare(), unified);
   }
-  options.enable_speculative_decode(false);
+  options.speculative_config().speculative_algorithm("");
   Worker ordinary_worker(parallel_args, device, options, WorkerType::LLM);
   EXPECT_FALSE(ordinary_worker.task_pipeline_uses_worker_prepare());
 }
@@ -70,19 +72,23 @@ TEST(MtpWorkerSelectionTest, RejectsLegacyAdaptiveExecutionBeforeModelSetup) {
       /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
   const torch::Device device(torch::kCPU);
   runtime::Options options;
-  options.enable_speculative_decode(true)
-      .enable_adaptive_target_verify(true)
+  options.speculative_config().speculative_algorithm("MTP");
+  options.speculative_config().enable_adaptive_target_verify(true);
+  options.speculative_config().speculative_algorithm("DSpark");
+  options.speculative_config().num_speculative_tokens(7);
+  EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
+               "requires (MTP/)?DSpark Draft5/7 with task pipeline");
+  options.enable_task_pipeline(true).speculative_config().speculative_algorithm(
+      "MTP");
+  EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
+               "requires (MTP/)?DSpark Draft5/7 with task pipeline");
+  options.speculative_config()
       .speculative_algorithm("DSpark")
-      .num_speculative_tokens(7);
+      .num_speculative_tokens(6);
   EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
                "requires (MTP/)?DSpark Draft5/7 with task pipeline");
-  options.enable_task_pipeline(true).speculative_algorithm("MTP");
-  EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
-               "requires (MTP/)?DSpark Draft5/7 with task pipeline");
-  options.speculative_algorithm("DSpark").num_speculative_tokens(6);
-  EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
-               "requires (MTP/)?DSpark Draft5/7 with task pipeline");
-  options.num_speculative_tokens(5).enable_speculative_decode(false);
+  options.speculative_config().num_speculative_tokens(5);
+  options.speculative_config().speculative_algorithm("");
   EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
                "requires (MTP/)?DSpark Draft5/7 with task pipeline");
 }
@@ -101,14 +107,14 @@ TEST(MtpWorkerSelectionTest, RejectsDsparkDpUnifiedGraphsBeforeModelSetup) {
       /*rank=*/0, /*world_size=*/2, /*dp_size=*/2, /*process_group=*/nullptr);
   const torch::Device device(torch::kCPU);
   runtime::Options options;
-  options.enable_speculative_decode(true)
-      .enable_task_pipeline(true)
-      .enable_graph(true)
-      .speculative_algorithm("dSpArK");
+  options.speculative_config().speculative_algorithm("MTP");
+  options.enable_task_pipeline(true).enable_graph(true);
+  options.speculative_config().speculative_algorithm("dSpArK");
   for (const bool adaptive : {false, true}) {
     for (const int32_t width : {5, 7}) {
-      options.enable_adaptive_target_verify(adaptive).num_speculative_tokens(
-          width);
+      options.speculative_config()
+          .enable_adaptive_target_verify(adaptive)
+          .num_speculative_tokens(width);
       EXPECT_DEATH(Worker(parallel_args, device, options, WorkerType::LLM),
                    "DP DSpark task pipeline requires split ACL graphs");
     }
@@ -170,7 +176,7 @@ class DecodeMetadataTestWorker final : public UnifiedMtpWorkerImpl {
   void retain_prefix(const LlmForwardInput& input, int32_t accepted_count) {
     const int64_t batch_size =
         input.input_params.embedding.embedding_ids.size();
-    const int64_t width = options_.num_speculative_tokens() + 1;
+    const int64_t width = options_.speculative_config().decode_query_len();
     SampleOutput output;
     output.next_tokens = torch::full({batch_size, width}, -1, torch::kLong);
     output.next_tokens.narrow(/*dim=*/1, /*start=*/0, accepted_count).fill_(42);
@@ -300,8 +306,8 @@ TEST(MtpDeviceStateTest,
   }
   for (const bool overlap : {false, true}) {
     runtime::Options options;
-    options.block_size(128).num_speculative_tokens(1).enable_schedule_overlap(
-        overlap);
+    options.block_size(128).speculative_config().num_speculative_tokens(1);
+    options.enable_schedule_overlap(overlap);
     ParallelArgs args(0, 1, nullptr);
     StateBoundaryTestWorker worker(
         args, torch::Device("npu:0"), options, WorkerType::LLM);
@@ -350,11 +356,9 @@ class MtpDecodeMetadataTest : public ::testing::TestWithParam<int32_t> {
     runtime::Options options;
     options.model_id("glm_dcp_metadata_test")
         .block_size(128)
-        .num_speculative_tokens(1)
-        .max_seqs_per_batch(2)
-        .world_size(2)
-        .dp_size(1)
-        .cp_size(1);
+        .speculative_config()
+        .num_speculative_tokens(1);
+    options.max_seqs_per_batch(2).world_size(2).dp_size(1).cp_size(1);
     return options;
   }
 
@@ -460,7 +464,7 @@ TEST_F(MtpDecodeMetadataTest, QwenVerifyKeepsLogicalStateRowsAtEveryWidth) {
   for (const int32_t draft_width : {1, 2, 3, 4, 16}) {
     SCOPED_TRACE(draft_width);
     auto configuration = options();
-    configuration.num_speculative_tokens(draft_width);
+    configuration.speculative_config().num_speculative_tokens(draft_width);
     DecodeMetadataTestWorker worker(
         parallel_args(1), torch::Device("npu:0"), configuration);
     worker.use_qwen_hybrid_verify();
@@ -544,7 +548,8 @@ TEST_F(MtpDecodeMetadataTest, RejectsPendingStateAfterBatchResizeOrReorder) {
 TEST_F(MtpDecodeMetadataTest, PrefixCapacityCoversRejectedPaddingAfterReorder) {
   for (const int32_t speculative_tokens : {1, 2, 3, 4, 16}) {
     runtime::Options worker_options = options();
-    worker_options.num_speculative_tokens(speculative_tokens);
+    worker_options.speculative_config().num_speculative_tokens(
+        speculative_tokens);
     DecodeMetadataTestWorker worker(parallel_args(/*kv_split_size=*/1),
                                     torch::Device("npu:0"),
                                     worker_options);

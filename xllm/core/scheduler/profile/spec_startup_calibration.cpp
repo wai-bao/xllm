@@ -132,12 +132,13 @@ SpecSteadyWindow read_window(const nlohmann::json& data) {
 }  // namespace
 
 std::string spec_calibration_compatibility(const runtime::Options& options) {
-  CHECK(options.draft_model_path().has_value());
+  CHECK(!options.speculative_config().draft_model_path().empty());
   return nlohmann::json{
       {"implementation", "async-steady-full-step-v1"},
       {"model_impl", ModelConfig::get_instance().model_impl()},
       {"target", checkpoint_identity(options.model_path())},
-      {"draft", checkpoint_identity(*options.draft_model_path())},
+      {"draft",
+       checkpoint_identity(options.speculative_config().draft_model_path())},
       {"world_size", options.nnodes() * options.devices().size()},
       {"dp_size", options.dp_size()},
       {"ep_size", options.ep_size()},
@@ -155,21 +156,23 @@ std::string spec_calibration_compatibility(const runtime::Options& options) {
       {"unified_graph",
        ExecutionConfig::get_instance().enable_unified_mtp_graph()},
       {"fia_decode", ExecutionConfig::get_instance().enable_fia_decode()},
-      {"num_speculative_tokens", options.num_speculative_tokens()}}
+      {"num_speculative_tokens",
+       options.speculative_config().num_speculative_tokens()}}
       .dump();
 }
 
 const SpecStartupCalibrationConfig&
 ProfileManager::target_verify_calibration_config() {
+  const SpeculativeConfig& spec = options_.speculative_config();
   if (!target_verify_calibration_config_) {
-    if (options_.adaptive_target_verify_calibration().empty()) {
+    if (spec.adaptive_target_verify_calibration().empty()) {
       target_verify_calibration_config_ = default_spec_startup_calibration(
           static_cast<uint32_t>(
               engine_->model_args().max_position_embeddings()),
           options_.decode_graph_warmup_config().num_speculative_tokens);
     } else {
       target_verify_calibration_config_ = parse_spec_startup_calibration(
-          read_file(options_.adaptive_target_verify_calibration()),
+          read_file(spec.adaptive_target_verify_calibration()),
           options_.decode_graph_warmup_config().num_speculative_tokens);
     }
     CHECK(target_verify_calibration_config_)
@@ -177,9 +180,9 @@ ProfileManager::target_verify_calibration_config() {
            "for defaults; provide an explicit calibration JSON with fewer "
            "steps.";
     LOG(INFO) << "DSpark startup calibration configuration: source="
-              << (options_.adaptive_target_verify_calibration().empty()
+              << (spec.adaptive_target_verify_calibration().empty()
                       ? "built-in defaults"
-                      : options_.adaptive_target_verify_calibration())
+                      : spec.adaptive_target_verify_calibration())
               << ", configuration="
               << serialize_spec_startup_calibration(
                      *target_verify_calibration_config_)
@@ -190,7 +193,8 @@ ProfileManager::target_verify_calibration_config() {
 
 int32_t ProfileManager::adaptive_calibration_warmup_seq_len(
     int32_t default_length) {
-  if (options_.enable_adaptive_draft_step()) {
+  const SpeculativeConfig& spec = options_.speculative_config();
+  if (spec.enable_adaptive_draft_step()) {
     auto* calibration = engine_->draft_step_controller();
     CHECK(calibration != nullptr);
     const uint32_t max_positions =
@@ -206,18 +210,18 @@ int32_t ProfileManager::adaptive_calibration_warmup_seq_len(
     CHECK(length) << "MTP calibration exceeds safe graph warmup KV coverage.";
     return static_cast<int32_t>(*length);
   }
-  if (!options_.enable_adaptive_target_verify() &&
-      options_.adaptive_target_verify_calibration().empty() &&
-      options_.adaptive_target_verify_cost_table().empty()) {
+  if (!spec.effective_adaptive_target_verify(options_.enable_task_pipeline()) &&
+      spec.adaptive_target_verify_calibration().empty() &&
+      spec.adaptive_target_verify_cost_table().empty()) {
     return default_length;
   }
   uint32_t max_kv_length = 0;
-  if (options_.adaptive_target_verify_cost_table().empty()) {
+  if (spec.adaptive_target_verify_cost_table().empty()) {
     max_kv_length =
         target_verify_calibration_config().contexts.back().max_kv_length;
   } else {
     const auto bundle = SpecCostTableBundle::from_json(
-        read_file(options_.adaptive_target_verify_cost_table()),
+        read_file(spec.adaptive_target_verify_cost_table()),
         options_.spec_calibration_compatibility());
     CHECK(bundle) << "Invalid or incompatible DSpark cost table.";
     // Legacy tables may declare an unlimited KV domain. Retain their previous
@@ -239,6 +243,7 @@ int32_t ProfileManager::adaptive_calibration_warmup_seq_len(
 }
 
 void ProfileManager::calibrate_spec_startup() {
+  const SpeculativeConfig& spec = options_.speculative_config();
   CHECK(distributed_worker_manager_ != nullptr);
   CHECK(options_.enable_task_pipeline());
   CHECK_GT(options_.dp_size(), 0);
@@ -267,9 +272,9 @@ void ProfileManager::calibrate_spec_startup() {
         [&](const std::string& value) { return value == serialized; }))
         << "Workers did not install identical DSpark cost tables.";
   };
-  if (!options_.adaptive_target_verify_cost_table().empty()) {
+  if (!spec.adaptive_target_verify_cost_table().empty()) {
     const std::string serialized =
-        read_file(options_.adaptive_target_verify_cost_table());
+        read_file(spec.adaptive_target_verify_cost_table());
     install(serialized);
     const auto bundle =
         SpecCostTableBundle::from_json(serialized, compatibility.dump());
@@ -285,25 +290,24 @@ void ProfileManager::calibrate_spec_startup() {
                                                           : "additive"}});
     }
     const auto data = nlohmann::json::parse(serialized);
-    LOG(INFO) << "DSpark adaptive effective configuration: "
-              << nlohmann::json{{"source", "saved_cost_table"},
-                                {"path",
-                                 options_.adaptive_target_verify_cost_table()},
-                                {"calibration",
-                                 data.value("calibration",
-                                            nlohmann::json::object())},
-                                {"declared_coverage", std::move(coverage)},
-                                {"captured_geometry", geometry}}
-                     .dump();
+    LOG(INFO)
+        << "DSpark adaptive effective configuration: "
+        << nlohmann::json{{"source", "saved_cost_table"},
+                          {"path", spec.adaptive_target_verify_cost_table()},
+                          {"calibration",
+                           data.value("calibration", nlohmann::json::object())},
+                          {"declared_coverage", std::move(coverage)},
+                          {"captured_geometry", geometry}}
+               .dump();
     LOG(INFO) << "DSpark saved full-step costs installed; startup sampling and "
                  "fitting skipped.";
     return;
   }
   CHECK(options_.enable_schedule_overlap());
   SpecStartupCalibrationConfig config = target_verify_calibration_config();
-  if (!options_.adaptive_target_verify_cost_table_output().empty()) {
+  if (!spec.adaptive_target_verify_cost_table_output().empty()) {
     const std::filesystem::path output =
-        options_.adaptive_target_verify_cost_table_output();
+        spec.adaptive_target_verify_cost_table_output();
     const std::filesystem::path parent = output.has_parent_path()
                                              ? output.parent_path()
                                              : std::filesystem::path(".");
@@ -325,7 +329,7 @@ void ProfileManager::calibrate_spec_startup() {
       geometry.at("request_buckets").get<std::vector<uint32_t>>();
   const auto graphs =
       geometry.at("target_graph_rows").get<std::vector<uint32_t>>();
-  if (options_.adaptive_target_verify_calibration().empty()) {
+  if (spec.adaptive_target_verify_calibration().empty()) {
     config.request_buckets = requests;
     std::erase_if(config.request_buckets, [&](uint32_t count) {
       const uint64_t total = static_cast<uint64_t>(count) * options_.dp_size();
@@ -335,16 +339,16 @@ void ProfileManager::calibrate_spec_startup() {
   }
   const auto configuration =
       nlohmann::json::parse(serialize_spec_startup_calibration(config));
-  LOG(INFO)
-      << "DSpark adaptive effective configuration: "
-      << nlohmann::json{{"source",
-                         options_.adaptive_target_verify_calibration().empty()
-                             ? "built-in defaults"
-                             : "JSON file"},
-                        {"path", options_.adaptive_target_verify_calibration()},
-                        {"calibration", configuration},
-                        {"captured_geometry", geometry}}
-             .dump();
+  LOG(INFO) << "DSpark adaptive effective configuration: "
+            << nlohmann::json{{"source",
+                               spec.adaptive_target_verify_calibration().empty()
+                                   ? "built-in defaults"
+                                   : "JSON file"},
+                              {"path",
+                               spec.adaptive_target_verify_calibration()},
+                              {"calibration", configuration},
+                              {"captured_geometry", geometry}}
+                   .dump();
   const auto& coverage = geometry.at("graph_coverage");
   std::vector<SpecCalibrationGraphCoverage> graph_coverage;
   graph_coverage.reserve(coverage.size());
@@ -441,8 +445,8 @@ void ProfileManager::calibrate_spec_startup() {
   }
   const std::string serialized = bundle.dump();
   install(serialized);
-  if (!options_.adaptive_target_verify_cost_table_output().empty()) {
-    save_new_table(options_.adaptive_target_verify_cost_table_output(),
+  if (!spec.adaptive_target_verify_cost_table_output().empty()) {
+    save_new_table(spec.adaptive_target_verify_cost_table_output(),
                    serialized + '\n');
   }
   LOG(INFO) << "DSpark startup calibration complete; immutable full-step costs "

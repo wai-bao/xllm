@@ -211,9 +211,9 @@ VMM 的使用方式和容量配置说明见[KV Cache 与模型权重的虚拟内
 
 | 参数名称 | 类型 | 默认值 | 参数含义 |
 |:---------|:-----|:-------|:---------|
-| `draft_model` | `string` | `""` | draft 模型路径；MTP 使用方式详见 [MTP](/zh/features/mtp/)。 |
-| `num_speculative_tokens` | `int32` | `0` | 每轮 speculative decoding 生成的 speculative token 数。 |
-| `speculative_algorithm` | `string` | `"MTP"` | Speculative decoding 算法，支持 `MTP`、`Eagle3`、`Suffix`、`DFlash`、`DFlash2`（仅 NPU）、`DSpark`。 |
+| `draft_model` | `string` | `""` | draft 模型路径；MTP 使用方式详见 [MTP](/zh/features/mtp/)。未设 `speculative_algorithm` 时按 checkpoint 名自动推导算法（默认 `MTP`）。 |
+| `num_speculative_tokens` | `int32` | `0` | 每步 speculative token 宽度。`0` 表示未设置：从 draft checkpoint 推导（MTP 取 `num_nextn_predict_layers`、DFlash2 取 `dflash2_block_size`、Suffix 取后缀缓存深度），无来源时启动报错。宽度不作为投机开关。 |
+| `speculative_algorithm` | `string` | `""` | Speculative decoding 算法，是投机的唯一开关——空（默认）即完全关闭投机。支持 `MTP`、`Eagle3`、`Suffix`、`DFlash`、`DFlash2`（仅 NPU）、`DSpark`。 |
 | `speculative_suffix_cache_max_depth` | `int32` | `64` | Suffix speculative decoding 的后缀树最大深度。 |
 | `speculative_suffix_max_spec_factor` | `double` | `1.0` | Suffix speculation 相对于匹配长度的最大 token 系数。 |
 | `speculative_suffix_max_spec_offset` | `double` | `0.0` | Suffix speculation 的最大 token 加性偏移。 |

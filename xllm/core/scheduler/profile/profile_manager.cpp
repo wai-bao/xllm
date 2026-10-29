@@ -83,10 +83,8 @@ namespace {
 void configure_profile_sampling(RequestSamplingParam& sampling,
                                 const SpeculativeConfig& speculative_config,
                                 bool enable_task_pipeline) {
-  if (enable_task_pipeline &&
-      speculative_config.enable_adaptive_target_verify() &&
-      SpeculativeConfig::supports_adaptive_target_verify(
-          speculative_config.speculative_algorithm())) {
+  if (speculative_config.effective_adaptive_target_verify(
+          enable_task_pipeline)) {
     // Startup costs use a fixed greedy sampling policy. Serving may sample
     // random target tokens, whose extra sampler cost is not calibrated here.
     sampling.temperature = 0.0F;
@@ -225,12 +223,13 @@ ProfileManager::ProfileManager(
     }
   }
 #endif
-  if (options_.enable_adaptive_target_verify() ||
-      !options_.adaptive_target_verify_calibration().empty() ||
-      !options_.adaptive_target_verify_cost_table().empty()) {
+  const SpeculativeConfig& spec = options_.speculative_config();
+  if (spec.effective_adaptive_target_verify(options_.enable_task_pipeline()) ||
+      !spec.adaptive_target_verify_calibration().empty() ||
+      !spec.adaptive_target_verify_cost_table().empty()) {
     calibrate_spec_startup();
   }
-  if (options_.enable_adaptive_draft_step()) {
+  if (spec.enable_adaptive_draft_step()) {
     calibrate_draft_step_startup();
   }
 }
@@ -764,7 +763,7 @@ std::shared_ptr<Request> ProfileManager::generate_single_request(
 
   RequestState req_state(token_ids);
   configure_profile_sampling(req_state.sampling_param,
-                             SpeculativeConfig::get_instance(),
+                             options_.speculative_config(),
                              options_.enable_task_pipeline());
   req_state.enable_schedule_overlap = options_.enable_schedule_overlap();
   req_state.is_graph_warmup = is_graph_warmup;
@@ -838,7 +837,7 @@ std::shared_ptr<Request> ProfileManager::try_generate_single_decode_request(
 
   RequestState req_state(prompt_token_ids);
   configure_profile_sampling(req_state.sampling_param,
-                             SpeculativeConfig::get_instance(),
+                             options_.speculative_config(),
                              options_.enable_task_pipeline());
   req_state.enable_schedule_overlap = options_.enable_schedule_overlap();
   req_state.is_graph_warmup = is_graph_warmup;

@@ -47,7 +47,8 @@ DraftProposal DSparkWorkerImpl::run_decode_draft(
 
   const torch::Tensor anchors = anchor_token_ids(input);
   const int32_t batch_size = input.input_params.meta.num_sequences;
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  const int32_t num_speculative_tokens =
+      options_.speculative_config().num_speculative_tokens();
 
   CHECK_GT(num_speculative_tokens, 0)
       << "DSpark requires num_speculative_tokens > 0.";

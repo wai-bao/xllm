@@ -65,7 +65,11 @@ from xllm.python.model_executor.runners.base import ModelExecutionOutput
 from xllm.python.model_executor.runners.decode_cuda_graph import (
     _decode_bucket,
 )
-from xllm.python.model_executor.runners.kv_capacity import kv_capacity_bucket, kv_capacity_buckets
+from xllm.python.model_executor.runners.kv_capacity import (
+    MAX_SPECULATIVE_TOKENS,
+    kv_capacity_bucket,
+    kv_capacity_buckets,
+)
 
 _GraphKey = tuple[object, ...]
 
@@ -137,8 +141,10 @@ class DecodeAclGraphRunner(AclGraphRunner):
         if enable_graph_mode_decode_no_padding:
             self._capture_error_mode = "thread_local"
         self._serial_workspace_pool: list[torch.Tensor] | None = [] if enable_graph_mode_decode_no_padding else None
-        if not 1 <= spec_verify_width <= 17 or (is_spec_draft and spec_verify_width != 1):
-            raise ValueError("Speculative verify graph width must be in [1, 17], with width one for draft models")
+        if not 1 <= spec_verify_width <= MAX_SPECULATIVE_TOKENS + 1 or (is_spec_draft and spec_verify_width != 1):
+            raise ValueError(
+                f"Speculative verify graph width must be in [1, {MAX_SPECULATIVE_TOKENS + 1}], with width one for draft models"
+            )
         self._spec_verify_width = spec_verify_width
         if device_kv_lengths and dp_size != 1:
             raise ValueError("Device-length ACL graphs require DP size one")

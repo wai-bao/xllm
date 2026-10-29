@@ -142,8 +142,8 @@ std::optional<std::string> validate_context_parallel_config(
           !LoadConfig::get_instance().enable_vmm_weights() &&
           !options.enable_disagg_pd() &&
           options.instance_role() == InstanceRole::DEFAULT &&
-          options.draft_model_path().value_or("").empty() &&
-          options.num_speculative_tokens() == 0 &&
+          options.speculative_config().draft_model_path().empty() &&
+          !options.speculative_config().enable_speculative_decode() &&
           ExecutionConfig::get_instance().enable_fia_decode() &&
           is_npu_model_dcp_capable(resolved_name);
       if (!supported_runtime) {
@@ -201,7 +201,7 @@ std::optional<std::string> validate_context_parallel_config(
     const bool is_dsv4_model = util::is_deepseek_v4_model_type(model_type);
     if (engine_type == EngineType::SSM &&
         SpeculativeConfig::requires_aux_hidden_capture(
-            options.speculative_algorithm()) &&
+            options.speculative_config().algorithm()) &&
         (!is_dsv4_model || ModelConfig::is_python_model_impl(
                                ModelConfig::get_instance().model_impl()))) {
       return "Current model-side CP does not support aux-hidden-capture "

@@ -28,6 +28,7 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/common/message.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_input.h"
 #include "framework/tokenizer/tokenizer.h"
@@ -184,10 +185,8 @@ std::shared_ptr<Request> VLMRequestFactory::build_request(
   // allocate enough capacity for prompt tokens, max tokens, and speculative
   // tokens, TODO: add image token size as well.
   size_t capacity = prompt_tokens.size() + max_tokens +
-                    options_->num_speculative_tokens() + /*bonus_token*/ 1;
-  if (options_->enable_schedule_overlap()) {
-    capacity += options_->num_speculative_tokens() + 1;
-  }
+                    options_->speculative_config().num_extra_kv_tokens(
+                        options_->enable_schedule_overlap());
   const size_t best_of = sp.best_of.value_or(sp.n);
 
   RequestSamplingParam sampling_param = sp.to_sampling_param(best_of);

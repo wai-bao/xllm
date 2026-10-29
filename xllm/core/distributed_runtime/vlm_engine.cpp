@@ -138,8 +138,8 @@ VLMEngine::VLMEngine(
       std::make_unique<VlmForwardInputFactory>(VlmForwardInputFactoryOptions{
           .dp_size = dp_size_,
           .enable_dp_global_json_object_active =
-              dp_size_ > 1 && !options_.is_draft_engine() &&
-              options_.num_speculative_tokens() > 0});
+              dp_size_ > 1 &&
+              options_.speculative_config().enable_speculative_decode()});
 }
 
 void VLMEngine::process_group_test() {
@@ -300,7 +300,7 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   // initialize block manager
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks())
-      .kv_events_config(options_.is_draft_engine()
+      .kv_events_config(options_.is_drafter()
                             ? std::string()
                             : KVCacheConfig::get_instance().kv_events_config())
       .host_num_blocks(0)  // no host cache for vlm engine currently.
@@ -312,11 +312,13 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
       .num_layers(args_.n_layers())
       .slot_size(kv_cache_cap.slot_size())
       .model_id(options_.model_id())
-      .hasher_type(mtp_hasher_type(BlockHasherType::MM,
-                                   options_.num_speculative_tokens(),
-                                   options_.speculative_algorithm()))
+      .hasher_type(mtp_hasher_type(
+          BlockHasherType::MM,
+          options_.speculative_config().num_speculative_tokens(),
+          options_.speculative_config().algorithm()))
       .max_seqs_per_batch(options_.max_seqs_per_batch())
-      .num_speculative_tokens(options_.num_speculative_tokens())
+      .num_speculative_tokens(
+          options_.speculative_config().num_speculative_tokens())
       // DECODE-side prefix cache participation is per-leaf and gated by the
       // predicate in composite_block_manager.cpp; mirror llm_engine so a
       // linear-attention VLM decode instance disables the LINEAR prefix cache.

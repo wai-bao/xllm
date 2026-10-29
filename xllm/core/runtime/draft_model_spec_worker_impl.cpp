@@ -38,6 +38,7 @@ limitations under the License.
 #include "core/kv_cache/transfer/hierarchy_kv_cache_transfer.h"
 #include "core/kv_cache/transfer/mooncake_kv_cache_transfer.h"
 #include "models/model_registry.h"
+#include "runtime/json_object_decode_continuation.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/hash_util.h"
 #include "util/tensor_helper.h"
@@ -79,15 +80,16 @@ std::string stable_path_digest(const std::string& path_string) {
 }
 
 std::string draft_store_key_component(const runtime::Options& options) {
-  const std::string algorithm =
-      absl::AsciiStrToLower(options.speculative_algorithm());
+  const std::string algorithm = absl::AsciiStrToLower(
+      options.speculative_config().speculative_algorithm());
 
-  const std::string draft_model_path = options.draft_model_path().value_or("");
-  if (draft_model_path.empty()) {
+  const std::string& draft_model =
+      options.speculative_config().draft_model_path();
+  if (draft_model.empty()) {
     return "spec_draft::" + algorithm + "::embedded";
   }
 
-  std::string draft_model_name = std::filesystem::path(draft_model_path)
+  std::string draft_model_name = std::filesystem::path(draft_model)
                                      .lexically_normal()
                                      .filename()
                                      .generic_string();
@@ -95,7 +97,7 @@ std::string draft_store_key_component(const runtime::Options& options) {
     draft_model_name = "checkpoint";
   }
   return "spec_draft::" + algorithm + "::" + draft_model_name +
-         "::" + stable_path_digest(draft_model_path);
+         "::" + stable_path_digest(draft_model);
 }
 
 KVCacheEstimateOptions make_kv_cache_estimate_options(
@@ -126,8 +128,8 @@ KVCacheEstimateOptions make_kv_cache_estimate_options(
   }
   estimate_options.max_seqs_per_batch =
       static_cast<int64_t>(options.max_seqs_per_batch());
-  estimate_options.num_speculative_tokens =
-      static_cast<int64_t>(options.num_speculative_tokens());
+  estimate_options.num_speculative_tokens = static_cast<int64_t>(
+      options.speculative_config().num_speculative_tokens());
   estimate_options.max_tokens_per_batch =
       static_cast<int64_t>(options.max_tokens_per_batch());
   estimate_options.max_tokens_per_chunk_for_prefill =
@@ -136,7 +138,7 @@ KVCacheEstimateOptions make_kv_cache_estimate_options(
       options.max_linear_state_cache_slots();
   estimate_options.linear_state_cache_block_limit =
       get_npu_linear_state_cache_block_limit(model_args.model_type());
-  estimate_options.is_draft_engine = options.is_draft_engine();
+  estimate_options.is_drafter = options.is_drafter();
   estimate_options.enable_chunked_prefill = options.enable_chunked_prefill();
   estimate_options.enable_schedule_overlap = options.enable_schedule_overlap();
   const KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
@@ -166,7 +168,8 @@ DraftModelSpecWorkerImpl<TargetInput>::DraftModelSpecWorkerImpl(
                                          options,
                                          target_options,
                                          worker_type),
-      is_probabilistic_draft_(options.enable_probabilistic_draft()) {
+      is_probabilistic_draft_(
+          options.speculative_config().enable_probabilistic_draft()) {
   CHECK(draft_factory) << "Draft worker factory must not be empty.";
   draft_impl_ = draft_factory();
   CHECK(draft_impl_ != nullptr) << "Draft worker factory must return a worker.";
@@ -452,6 +455,51 @@ void DraftModelSpecWorkerImpl<TargetInput>::prepare_draft_input(
         token_ids[row_idx],
         bootstrap_embeddings.select(/*dim=*/0, i));
   }
+}
+
+template <typename TargetInput>
+std::optional<ForwardOutput>
+DraftModelSpecWorkerImpl<TargetInput>::execute_task_pipeline_json(
+    const LlmForwardInput& prepared) {
+  if (!this->enable_schedule_overlap() || prepared.json_object_states.empty()) {
+    task_json_output_ = ForwardOutput();
+    task_json_sample_sequence_ids_.clear();
+    return step(prepared);
+  }
+  LlmForwardInput input = prepared.clone();
+  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+  CHECK(compute_stream_->wait_event(input.runtime.metadata_ready_event));
+  if (input.token_ids.numel() > 0 &&
+      input.input_params.meta.batch_forward_type.has_decode()) {
+    JsonObjectDecodeContinuation::prepare(input,
+                                          task_json_output_,
+                                          task_json_sample_sequence_ids_,
+                                          device_,
+                                          *compute_stream_);
+  }
+  auto output = step(input);
+  task_json_output_ = ForwardOutput();
+  task_json_sample_sequence_ids_.clear();
+  if (output.has_value()) {
+    output->json_object_errors.insert(output->json_object_errors.end(),
+                                      input.json_object_errors.begin(),
+                                      input.json_object_errors.end());
+    if (output->sample_output.next_tokens.defined()) {
+      if (output->ready_event != nullptr) {
+        CHECK(output->ready_event->synchronize());
+      }
+      // Output tensors may borrow a pinned-result lease. Own the small token
+      // copy so consuming a task cannot invalidate the next grammar update.
+      task_json_output_.sample_output.next_tokens =
+          safe_to(
+              output->sample_output.next_tokens,
+              torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU),
+              /*non_blocking=*/false)
+              .clone();
+      task_json_sample_sequence_ids_ = input.sample_sequence_ids;
+    }
+  }
+  return output;
 }
 
 template class DraftModelSpecWorkerImpl<LlmForwardInput>;

@@ -743,10 +743,20 @@ struct ModelArgs {
   // Storage elements per full-attention K/V head, including backend padding.
   // Zero reuses the logical head_dim.
   FORWARD_PROPERTY(int64_t, kv_cache_storage_head_dim, kv_cache_args);
+  FORWARD_PROPERTY(int64_t, max_batch_size, kv_cache_args);
+  FORWARD_PROPERTY(int64_t, max_seq_len, kv_cache_args);
 
   PROPERTY(SpeculativeArgs, speculative_args);
 
   FORWARD_PROPERTY(int64_t, draft_vocab_size, speculative_args);
+  FORWARD_PROPERTY(int64_t, num_speculative_tokens, speculative_args);
+  FORWARD_PROPERTY(bool, enable_embedded_eagle3_draft, speculative_args);
+  FORWARD_PROPERTY(int32_t, max_concurrent_prefills_per_dp, speculative_args);
+  FORWARD_PROPERTY(std::vector<int32_t>, layers_to_capture, speculative_args);
+  FORWARD_PROPERTY(bool, norm_before_fc, speculative_args);
+  FORWARD_PROPERTY(bool, norm_before_residual, speculative_args);
+  FORWARD_PROPERTY(bool, norm_output, speculative_args);
+  FORWARD_PROPERTY(bool, fc_norm, speculative_args);
 
   PROPERTY(DSparkArgs, dspark_args);
 
@@ -893,9 +903,6 @@ struct ModelArgs {
   FORWARD_PROPERTY(int32_t, hc_sinkhorn_iters, hyperconnection_args);
   FORWARD_PROPERTY(float, hc_eps, hyperconnection_args);
 
-  FORWARD_PROPERTY(int64_t, max_batch_size, kv_cache_args);
-  FORWARD_PROPERTY(int64_t, max_seq_len, kv_cache_args);
-
   PROPERTY(MultimodalTokenArgs, multimodal_token_args);
 
   FORWARD_PROPERTY(int32_t, vision_start_token_id, multimodal_token_args);
@@ -912,6 +919,9 @@ struct ModelArgs {
   PROPERTY(VisionArgs, vision_args);
 
   FORWARD_PROPERTY(int32_t, query_num, vision_args);
+  FORWARD_PROPERTY(int64_t, mm_init_pos_emb_width, vision_args);
+  FORWARD_PROPERTY(int64_t, mm_init_pos_emb_height, vision_args);
+  FORWARD_PROPERTY(int64_t, mm_init_pos_emb_time, vision_args);
   FORWARD_PROPERTY(std::string, vision_custom_adapter, vision_args);
   FORWARD_PROPERTY(int32_t, vision_max_slice_nums, vision_args);
   FORWARD_PROPERTY(float, mm_dropout, vision_args);
@@ -1004,9 +1014,6 @@ struct ModelArgs {
 
   PROPERTY(ImageVideoArgs, image_video_args);
 
-  FORWARD_PROPERTY(int64_t, mm_init_pos_emb_width, vision_args);
-  FORWARD_PROPERTY(int64_t, mm_init_pos_emb_height, vision_args);
-  FORWARD_PROPERTY(int64_t, mm_init_pos_emb_time, vision_args);
   FORWARD_PROPERTY(int64_t, mm_km_in_patch_limit, image_video_args);
   FORWARD_PROPERTY(int64_t, mm_km_patch_size, image_video_args);
   FORWARD_PROPERTY(std::vector<int64_t>, mm_km_image_mean, image_video_args);
@@ -1074,15 +1081,6 @@ struct ModelArgs {
   FORWARD_PROPERTY(int32_t, sliding_window, sliding_window_args);
   FORWARD_PROPERTY(bool, sliding_window_non_causal, sliding_window_args);
   FORWARD_PROPERTY(int32_t, max_window_layers, sliding_window_args);
-
-  FORWARD_PROPERTY(int64_t, num_speculative_tokens, speculative_args);
-  FORWARD_PROPERTY(bool, enable_embedded_eagle3_draft, speculative_args);
-  FORWARD_PROPERTY(int32_t, max_concurrent_prefills_per_dp, speculative_args);
-  FORWARD_PROPERTY(std::vector<int32_t>, layers_to_capture, speculative_args);
-  FORWARD_PROPERTY(bool, norm_before_fc, speculative_args);
-  FORWARD_PROPERTY(bool, norm_before_residual, speculative_args);
-  FORWARD_PROPERTY(bool, norm_output, speculative_args);
-  FORWARD_PROPERTY(bool, fc_norm, speculative_args);
 
   PROPERTY(VaeArgs, vae_args);
 

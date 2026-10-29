@@ -44,9 +44,6 @@ class SpawnWorkerServer final {
                              bool is_local,
                              const std::string& task_type,
                              const std::string& worker_type,
-                             bool enable_speculative_decode,
-                             int32_t num_speculative_tokens,
-                             const std::string& speculative_algorithm,
                              const std::string& communication_backend,
                              const std::string& npu_kernel_backend,
                              const std::string& rank_tablefile,
@@ -64,8 +61,6 @@ class SpawnWorkerServer final {
                              int32_t cfg_size,
                              int32_t text_encoder_tp_size,
                              const InstanceRole& instance_role,
-                             bool enable_mtp_draft_body_tp1,
-                             bool enable_probabilistic_draft,
                              const std::string& model_impl,
                              const std::string& extension_impl);
 

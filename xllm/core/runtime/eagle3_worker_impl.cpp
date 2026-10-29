@@ -30,7 +30,7 @@ namespace {
 runtime::Options eagle3_main_options(const runtime::Options& options) {
   auto opts = options;
   opts.enable_schedule_overlap(false)
-      .is_draft_engine(false)
+
       .enable_graph_aux_hidden_states(true);
   return opts;
 }
@@ -38,10 +38,10 @@ runtime::Options eagle3_main_options(const runtime::Options& options) {
 runtime::Options eagle3_draft_options(const runtime::Options& options) {
   auto opts = options;
   opts.enable_schedule_overlap(false)
-      .is_draft_engine(true)
-      .num_decoding_tokens(1)
-      .num_speculative_tokens(0)
-      .enable_graph(false)
+      .worker_type(WorkerType::DRAFTER)
+      .num_decoding_tokens(1);
+  opts.speculative_config().num_speculative_tokens(0);
+  opts.enable_graph(false)
       .enable_graph_mode_decode_no_padding(false)
       .enable_prefill_piecewise_graph(false)
       .enable_graph_aux_hidden_states(true)

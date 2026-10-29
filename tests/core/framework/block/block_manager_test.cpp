@@ -172,11 +172,10 @@ BlockManagerPool::Options make_linear_state_pool_options(
       true);
   // The EMBEDDING pool is sized directly by num_embedding_blocks and is only
   // built under spec decode, so opt in here.
-  options.max_seqs_per_batch(0)
-      .num_embedding_blocks(4)
-      .num_speculative_tokens(1)
-      .enable_linear_state(true)
-      .linear_state_num_slots(linear_state_num_slots);
+  options.max_seqs_per_batch(0).num_embedding_blocks(4).num_speculative_tokens(
+      1);
+  options.enable_linear_state(true).linear_state_num_slots(
+      linear_state_num_slots);
   return options;
 }
 
@@ -339,9 +338,8 @@ TEST_F(BlockManagerPoolTest, AllocateAssignsSingleBlockWhenEnabled) {
   options.num_blocks(8).host_num_blocks(0).block_size(1).enable_prefix_cache(
       false);
   options.num_embedding_blocks(FLAGS_max_seqs_per_batch + 2)
-      .num_speculative_tokens(1)
-      .enable_linear_state(true)
-      .linear_state_num_slots(64);
+      .num_speculative_tokens(1);
+  options.enable_linear_state(true).linear_state_num_slots(64);
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 4);
   BlockManagerPool pool(options, /*dp_size=*/1);
@@ -448,9 +446,8 @@ TEST_F(BlockManagerPoolTest, DeallocateReleasesSingleBlockId) {
   options.num_blocks(8).host_num_blocks(0).block_size(1).enable_prefix_cache(
       false);
   options.num_embedding_blocks(FLAGS_max_seqs_per_batch + 2)
-      .num_speculative_tokens(1)
-      .enable_linear_state(true)
-      .linear_state_num_slots(64);
+      .num_speculative_tokens(1);
+  options.enable_linear_state(true).linear_state_num_slots(64);
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 4);
   BlockManagerPool pool(options, /*dp_size=*/1);
@@ -478,10 +475,8 @@ TEST_F(BlockManagerPoolTest, EmbeddingBlockCapacityUsesNumEmbeddingBlocks) {
       .block_size(1)
       .enable_prefix_cache(false)
       .max_seqs_per_batch(4);
-  options.num_embedding_blocks(5)
-      .num_speculative_tokens(1)
-      .enable_linear_state(true)
-      .linear_state_num_slots(64);
+  options.num_embedding_blocks(5).num_speculative_tokens(1);
+  options.enable_linear_state(true).linear_state_num_slots(64);
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 4);
   BlockManagerPool pool(options, /*dp_size=*/1);
@@ -503,11 +498,9 @@ TEST_F(BlockManagerPoolTest, TryAllocateKvFailureRollsBackSingleBlock) {
   // ids, enough for the two sequences allocated after the rollback. Zero out
   // max_seqs_per_batch so num_embedding_blocks alone drives the EMBEDDING pool
   // size.
-  options.max_seqs_per_batch(0)
-      .num_embedding_blocks(3)
-      .num_speculative_tokens(1)
-      .enable_linear_state(true)
-      .linear_state_num_slots(64);
+  options.max_seqs_per_batch(0).num_embedding_blocks(3).num_speculative_tokens(
+      1);
+  options.enable_linear_state(true).linear_state_num_slots(64);
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 4);
   BlockManagerPool pool(options, /*dp_size=*/1);
@@ -538,9 +531,8 @@ TEST_F(BlockManagerPoolTest, SingleBlockCapacityCanBeLowerThanMaxSeqs) {
       .max_seqs_per_batch(0)
       .num_embedding_blocks(4)
       .enable_prefix_cache(false);
-  options.num_speculative_tokens(1)
-      .enable_linear_state(true)
-      .linear_state_num_slots(64);
+  options.num_speculative_tokens(1);
+  options.enable_linear_state(true).linear_state_num_slots(64);
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 4);
   BlockManagerPool pool(options, /*dp_size=*/1);
@@ -572,9 +564,8 @@ TEST_F(BlockManagerPoolTest, DpRankSelectionSkipsExhaustedSingleBlockPool) {
       .max_seqs_per_batch(0)
       .num_embedding_blocks(2)
       .enable_prefix_cache(false);
-  options.num_speculative_tokens(1)
-      .enable_linear_state(true)
-      .linear_state_num_slots(64);
+  options.num_speculative_tokens(1);
+  options.enable_linear_state(true).linear_state_num_slots(64);
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 4);
   BlockManagerPool pool(options, /*dp_size=*/2);
@@ -600,9 +591,8 @@ TEST_F(BlockManagerPoolTest,
       .max_seqs_per_batch(0)
       .num_embedding_blocks(2)
       .enable_prefix_cache(false);
-  options.num_speculative_tokens(1)
-      .enable_linear_state(true)
-      .linear_state_num_slots(64);
+  options.num_speculative_tokens(1);
+  options.enable_linear_state(true).linear_state_num_slots(64);
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 4);
   BlockManagerPool pool(options, /*dp_size=*/2);
@@ -632,7 +622,8 @@ TEST_F(BlockManagerPoolTest,
   BlockManagerPool::Options options;
   options.num_blocks(8).host_num_blocks(0).block_size(1).enable_prefix_cache(
       false);
-  options.num_speculative_tokens(1).num_embedding_blocks(4);
+  options.num_speculative_tokens(1);
+  options.num_embedding_blocks(4);
   BlockManagerPool pool(options, /*dp_size=*/1);
 
   Sequence seq = make_sequence(0, /*prompt_tokens=*/{1, 2});
@@ -680,9 +671,8 @@ TEST_F(BlockManagerPoolTest, SequenceCopyDoesNotReuseSingleBlockSlot) {
   options.num_blocks(8).host_num_blocks(0).block_size(1).enable_prefix_cache(
       false);
   options.num_embedding_blocks(FLAGS_max_seqs_per_batch + 2)
-      .num_speculative_tokens(1)
-      .enable_linear_state(true)
-      .linear_state_num_slots(64);
+      .num_speculative_tokens(1);
+  options.enable_linear_state(true).linear_state_num_slots(64);
   ScopedValue<int32_t> chunk_guard(
       &SchedulerConfig::get_instance().max_tokens_per_chunk_for_prefill(), 4);
   BlockManagerPool pool(options, /*dp_size=*/1);

@@ -59,6 +59,7 @@ cc_test(
   SRCS
     spawn_worker_protocol_test.cpp
   DEPS
+    proto::xllm_proto
     GTest::gtest_main
 )
 

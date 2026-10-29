@@ -28,6 +28,7 @@ from xllm.python.layers.npu.qwen3_5.gdn_metadata import (
     GdnStateCache,
     GdnVerifyMetadata,
 )
+from xllm.python.model_executor.runners.kv_capacity import MAX_SPECULATIVE_TOKENS
 
 if TYPE_CHECKING:
     from xllm.python.model_executor.input_batch import InputBatch
@@ -256,8 +257,10 @@ class Qwen3_5GdnMetadataBuilder:
     ) -> GdnVerifyMetadata:
         assert self._state_caches is not None and self._checkpoint_stride is not None
         width = self._checkpoint_stride
-        if not 2 <= width <= 17:
-            raise ValueError("Qwen3.5 MegaGdnMtpDecode requires 2 to 17 checkpoints per state slot")
+        if not 2 <= width <= MAX_SPECULATIVE_TOKENS + 1:
+            raise ValueError(
+                f"Qwen3.5 MegaGdnMtpDecode requires 2 to {MAX_SPECULATIVE_TOKENS + 1} checkpoints per state slot"
+            )
         accepted = metadata.num_accepted_tokens
         accepted_host = tuple(getattr(metadata, "num_accepted_tokens_host_values", ()))
         # Prepared pipeline inputs keep attention at BS one-query rows and

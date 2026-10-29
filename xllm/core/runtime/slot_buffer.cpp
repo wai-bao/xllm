@@ -122,6 +122,8 @@ struct InputField {
   // History fields are 2-D [rows, unique_tokens]. Stop IDs use a separate
   // growable 2-D buffer; other fields are 1-D per-row tensors.
   bool history;
+  // Stop-ID field (min_token_ids): growable, sized to the incoming batch.
+  bool stop;
 };
 
 }  // namespace
@@ -1295,7 +1297,6 @@ void SlotBuffer::prepare_model_state(const LlmForwardInput& input,
     params.num_accepted_tokens =
         model_device_.num_accepted_tokens.narrow(0, 0, rows);
     params.num_accepted_tokens.copy_(accepted, /*non_blocking=*/true);
-    return;
   }
 }
 

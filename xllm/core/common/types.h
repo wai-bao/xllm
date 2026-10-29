@@ -132,6 +132,79 @@ class Status final {
   std::string msg_;
 };
 
+class WorkerType {
+ public:
+  enum Value : int8_t {
+    INVALID = 0,
+    LLM,     // LLM
+    VLM,     // VLM
+    DIT,     // DIT
+    ELM,     // Embedding LM
+    EVLM,    // Embedding VLM
+    REC,     // Rec
+    MMEVLM,  // Encoder Embedding VLM
+    DRAFTER,
+  };
+
+  constexpr WorkerType(Value v) : value_(v) {}
+  WorkerType(const std::string& str) {
+    if (str == "LLM") {
+      value_ = LLM;
+    } else if (str == "VLM") {
+      value_ = VLM;
+    } else if (str == "DIT") {
+      value_ = DIT;
+    } else if (str == "ELM") {
+      value_ = ELM;
+    } else if (str == "EVLM") {
+      value_ = EVLM;
+    } else if (str == "REC") {
+      value_ = REC;
+    } else if (str == "MMEVLM") {
+      value_ = MMEVLM;
+    } else if (str == "DRAFTER") {
+      value_ = DRAFTER;
+    } else {
+      value_ = INVALID;
+    }
+  }
+
+  WorkerType() = delete;
+
+  constexpr operator Value() const { return value_; }
+  explicit operator bool() = delete;
+
+  bool operator==(WorkerType rhs) const { return value_ == rhs.value_; }
+  bool operator!=(WorkerType rhs) const { return value_ != rhs.value_; }
+  bool operator==(Value rhs) const { return value_ == rhs; }
+  bool operator!=(Value rhs) const { return value_ != rhs; }
+
+  constexpr const char* to_string() const {
+    if (this->value_ == LLM) {
+      return "LLM";
+    } else if (this->value_ == VLM) {
+      return "VLM";
+    } else if (this->value_ == DIT) {
+      return "DIT";
+    } else if (this->value_ == ELM) {
+      return "ELM";
+    } else if (this->value_ == EVLM) {
+      return "EVLM";
+    } else if (this->value_ == REC) {
+      return "REC";
+    } else if (this->value_ == MMEVLM) {
+      return "MMEVLM";
+    } else if (this->value_ == DRAFTER) {
+      return "DRAFTER";
+    } else {
+      return "INVALID";
+    }
+  }
+
+ private:
+  Value value_;
+};
+
 class InstanceRole {
  public:
   enum RoleType : int8_t {

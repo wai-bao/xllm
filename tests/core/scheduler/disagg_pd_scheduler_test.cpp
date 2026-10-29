@@ -473,9 +473,11 @@ DisaggPDScheduler::Options make_options() {
 
 DisaggPDScheduler::Options make_mtp_decode_options(int32_t dp_size = 1) {
   DisaggPDScheduler::Options options = make_options();
+  SpeculativeConfig speculative_config;
+  speculative_config.num_speculative_tokens(1);
   options.instance_role(InstanceRole::DECODE)
-      .num_speculative_tokens(1)
-      .dp_size(dp_size);
+      .speculative_config(speculative_config);
+  options.dp_size(dp_size);
   return options;
 }
 
@@ -1174,9 +1176,11 @@ TEST(DisaggPDSchedulerTest, EmptyOverlapOutputPreservesLatencyClock) {
     FakeEngine engine(
         /*num_blocks=*/8, /*block_size=*/2, num_speculative_tokens);
     DisaggPDScheduler::Options options = make_options();
+    SpeculativeConfig speculative_config;
+    speculative_config.num_speculative_tokens(num_speculative_tokens);
     options.enable_schedule_overlap(true)
         .enable_chunked_prefill(true)
-        .num_speculative_tokens(num_speculative_tokens);
+        .speculative_config(speculative_config);
     TestDisaggPDScheduler scheduler(&engine, options);
     std::shared_ptr<Request> request =
         make_request({1, 2, 3, 4}, "req", /*enable_schedule_overlap=*/true);

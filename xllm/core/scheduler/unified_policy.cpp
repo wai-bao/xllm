@@ -247,7 +247,7 @@ void UnifiedPolicy::schedule_from_unified_queue(
         max_handle_num_tokens =
             std::min(max_handle_num_tokens, kv_cache_tokens_num + max_chunk);
       }
-      if (options_.num_speculative_tokens() > 0 &&
+      if (options_.speculative_config().enable_speculative_decode() &&
           !sequence->is_chunked_prefill_stage() && kv_cache_tokens_num > 0) {
         max_handle_num_tokens += state.min_speculative_tokens_required;
       }

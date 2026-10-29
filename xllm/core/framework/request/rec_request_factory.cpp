@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "common/metrics.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "framework/request/request_state.h"
 #include "framework/request/stopping_checker.h"
@@ -586,10 +587,8 @@ std::shared_ptr<Request> RecRequestFactory::build_request_common(
   }
 
   size_t capacity = prompt_tokens.size() + max_tokens +
-                    options_->num_speculative_tokens() + /*bonus_token*/ 1;
-  if (options_->enable_schedule_overlap()) {
-    capacity += options_->num_speculative_tokens() + 1;
-  }
+                    options_->speculative_config().num_extra_kv_tokens(
+                        options_->enable_schedule_overlap());
   const size_t best_of = sp.best_of.value_or(sp.n);
 
   RequestSamplingParam sampling_param = sp.to_sampling_param(best_of);
@@ -661,15 +660,16 @@ std::shared_ptr<Request> RecRequestFactory::build_request_common(
       }
     }
 
-    stopping_checker =
-        StoppingChecker(max_tokens,
-                        max_context_len - options_->num_speculative_tokens(),
-                        model_args_->eos_token_id(),
-                        sp.ignore_eos,
-                        std::move(stop_tokens),
-                        std::move(stop_sequences),
-                        sp.stop.value_or(std::vector<std::string>{}),
-                        sp.min_tokens);
+    stopping_checker = StoppingChecker(
+        max_tokens,
+        max_context_len -
+            options_->speculative_config().num_speculative_tokens(),
+        model_args_->eos_token_id(),
+        sp.ignore_eos,
+        std::move(stop_tokens),
+        std::move(stop_sequences),
+        sp.stop.value_or(std::vector<std::string>{}),
+        sp.min_tokens);
   }
 
   RequestState req_state(std::move(prompt),

@@ -1126,6 +1126,7 @@ class HybridBlockWorkerOptionsTest : public ::testing::Test {
         .enable_schedule_overlap(true)
         .enable_graph(true)
         .enable_task_pipeline(true)
+        .speculative_config()
         .speculative_algorithm("DSpark")
         .num_speculative_tokens(7);
     return result;
@@ -1141,7 +1142,7 @@ TEST_F(HybridBlockWorkerOptionsTest, FixedDflash2LeavesKeepPreparedGraphs) {
     SCOPED_TRACE(model_type);
     ASSERT_TRUE(write_model_type(model_type));
     runtime::Options config = options();
-    config.speculative_algorithm("DFlash2");
+    config.speculative_config().speculative_algorithm("DFlash2");
     DFlash2WorkerImpl worker(ParallelArgs(0, 1, 1, nullptr), device_, config);
     const auto& outer = HybridBlockTaskTestWorker::outer_options(worker);
     const auto& target = HybridBlockTaskTestWorker::target_options(worker);
@@ -1155,7 +1156,7 @@ TEST_F(HybridBlockWorkerOptionsTest, FixedDflash2LeavesKeepPreparedGraphs) {
     EXPECT_TRUE(target.enable_graph_aux_hidden_states());
     EXPECT_FALSE(draft.enable_graph_aux_hidden_states());
     EXPECT_EQ(draft.num_decoding_tokens(), 8);
-    EXPECT_EQ(draft.num_speculative_tokens(), 0);
+    EXPECT_EQ(draft.speculative_config().num_speculative_tokens(), 0);
   }
 }
 
@@ -1163,7 +1164,9 @@ TEST_F(HybridBlockWorkerOptionsTest,
        WiderDflash2RecurrentLeavesKeepPreparedGraphs) {
   ASSERT_TRUE(write_model_type("qwen3_5_text"));
   runtime::Options config = options();
-  config.speculative_algorithm("DFlash2").num_speculative_tokens(15);
+  config.speculative_config()
+      .speculative_algorithm("DFlash2")
+      .num_speculative_tokens(15);
   DFlash2WorkerImpl worker(ParallelArgs(0, 1, 1, nullptr), device_, config);
   const auto& target = HybridBlockTaskTestWorker::target_options(worker);
   const auto& draft = HybridBlockTaskTestWorker::draft_options(worker);
@@ -1180,7 +1183,7 @@ TEST_F(HybridBlockWorkerOptionsTest,
     SCOPED_TRACE(model_type);
     ASSERT_TRUE(write_model_type(model_type));
     runtime::Options config = options();
-    config.enable_adaptive_target_verify(true);
+    config.speculative_config().enable_adaptive_target_verify(true);
     HybridBlockTaskTestWorker worker(device_, config);
     EXPECT_TRUE(worker.outer_options().enable_task_pipeline());
     EXPECT_TRUE(worker.target_options().enable_task_pipeline());

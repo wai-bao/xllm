@@ -66,12 +66,10 @@ LLMMaster::LLMMaster(const Options& options)
 #if defined(USE_NPU)
   resolve_npu_kernel_backend(&options_, /*model_component=*/"causal_lm");
 #endif
-  const bool use_ssm_engine = SpeculativeConfig::uses_ssm_engine(
-      options_.draft_model_path().value_or(""),
-      options_.speculative_algorithm(),
-      options_.num_speculative_tokens());
+  const bool use_speculative_worker =
+      options_.speculative_config().enable_speculative_decode();
   const EngineType engine_type =
-      use_ssm_engine ? EngineType::SSM : EngineType::LLM;
+      use_speculative_worker ? EngineType::SSM : EngineType::LLM;
   const std::string model_type =
       get_model_type(options_.model_path(), options_.backend());
   const std::optional<std::string> cp_error = validate_context_parallel_config(
@@ -81,15 +79,15 @@ LLMMaster::LLMMaster(const Options& options)
       ModelConfig::validate_python_speculative_decode(
           ModelConfig::get_instance().model_impl(),
           model_type,
-          options_.num_speculative_tokens(),
-          options_.speculative_algorithm());
+          options_.speculative_config().num_speculative_tokens(),
+          options_.speculative_config().algorithm());
   CHECK(!speculative_error.has_value()) << speculative_error.value();
   CHECK(
-      !options_.enable_adaptive_draft_step() ||
+      !options_.speculative_config().enable_adaptive_draft_step() ||
       (options_.enable_task_pipeline() && options_.enable_schedule_overlap() &&
        options_.enable_graph() && !options_.enable_disagg_pd() &&
        options_.dp_size() == 1 && options_.cp_size() == 1 &&
-       SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm()) &&
+       options_.speculative_config().algorithm() == SpeculativeAlgorithm::MTP &&
        model_type == "glm_moe_dsa"))
       << "Adaptive MTP requires Python GLM DSA, ordinary graphs, async task "
          "pipeline and DP=CP=1.";
@@ -99,7 +97,7 @@ LLMMaster::LLMMaster(const Options& options)
   if (options_.enable_task_pipeline()) {
     const bool supported_speculation =
         SpeculativeConfig::supports_task_pipeline(
-            options_.speculative_algorithm());
+            options_.speculative_config().algorithm());
     CHECK((engine_type == EngineType::LLM ||
            (engine_type == EngineType::SSM && supported_speculation)) &&
           options_.task_type() == "generate" &&
@@ -113,13 +111,13 @@ LLMMaster::LLMMaster(const Options& options)
     const bool supports_host_offload =
         engine_type == EngineType::LLM ||
         SpeculativeConfig::supports_host_kv_cache(
-            options_.speculative_algorithm());
+            options_.speculative_config().algorithm());
     CHECK(supports_host_offload)
         << "Basic host KV cache offload supports the LLM engine and "
            "model-based speculative engines only.";
   }
 
-  if (!use_ssm_engine &&
+  if (!use_speculative_worker &&
       (options_.task_type() == "embed" || options_.task_type() == "mm_embed")) {
     options_.enable_schedule_overlap(false);
     LOG(WARNING) << "Force to disable schedule overlap for embedding model, "
@@ -188,42 +186,16 @@ LLMMaster::LLMMaster(const Options& options)
       .layers_wise_copy_batchs(options_.layers_wise_copy_batchs())
       .kv_cache_dtype(options_.kv_cache_dtype());
 
-  if (!use_ssm_engine) {
+  if (!use_speculative_worker) {
     llm_engine_ = std::make_unique<LLMEngine>(engine_options);
   } else {
-    const std::string draft_model_path =
-        options_.draft_model_path().value_or("");
-    const bool use_suffix_spec = SpeculativeConfig::is_suffix_algorithm(
-        options_.speculative_algorithm());
-    CHECK(use_suffix_spec || !draft_model_path.empty())
+    CHECK(options_.speculative_config().algorithm() ==
+              SpeculativeAlgorithm::SUFFIX ||
+          !options_.speculative_config().draft_model_path().empty())
         << "draft model path is required unless --speculative_algorithm=Suffix";
-    engine_options.draft_model_path(draft_model_path)
-        .num_speculative_tokens(options_.num_speculative_tokens())
-        .speculative_algorithm(options_.speculative_algorithm())
-        .enable_probabilistic_draft(options_.enable_probabilistic_draft())
-        .enable_mtp_draft_body_tp1(options_.enable_mtp_draft_body_tp1())
-        .speculative_suffix_cache_max_depth(
-            options_.speculative_suffix_cache_max_depth())
-        .speculative_suffix_max_spec_factor(
-            options_.speculative_suffix_max_spec_factor())
-        .speculative_suffix_max_spec_offset(
-            options_.speculative_suffix_max_spec_offset())
-        .speculative_suffix_min_token_prob(
-            options_.speculative_suffix_min_token_prob())
-        .speculative_suffix_max_cached_requests(
-            options_.speculative_suffix_max_cached_requests())
-        .speculative_suffix_use_tree_spec(
-            options_.speculative_suffix_use_tree_spec())
-        .enable_adaptive_target_verify(options_.enable_adaptive_target_verify())
-        .enable_adaptive_draft_step(options_.enable_adaptive_draft_step())
-        .adaptive_draft_step_config(options_.adaptive_draft_step_config())
-        .adaptive_target_verify_min_gain(
-            options_.adaptive_target_verify_min_gain())
-        .adaptive_target_verify_cost_table(
-            options_.adaptive_target_verify_cost_table())
-        .adaptive_target_verify_calibration(
-            options_.adaptive_target_verify_calibration());
-    if (use_suffix_spec) {
+    engine_options.speculative_config(options_.speculative_config());
+    if (options_.speculative_config().algorithm() ==
+        SpeculativeAlgorithm::SUFFIX) {
       suffix_engine_ =
           std::make_unique<SuffixSpeculativeEngine>(engine_options);
     } else {
@@ -290,12 +262,12 @@ LLMMaster::LLMMaster(const Options& options)
       .request_queue_size(options_.request_queue_size())
       .max_tokens_per_chunk_for_prefill(
           options_.max_tokens_per_chunk_for_prefill())
-      .num_speculative_tokens(options_.num_speculative_tokens())
+      .speculative_config(options_.speculative_config())
       .decode_graph_warmup_config(
           ExecutionConfig::get_instance().decode_graph_warmup_config(
-              options_.num_speculative_tokens(),
+              options_.speculative_config().num_speculative_tokens(),
               options_.enable_graph_mode_decode_no_padding(),
-              options_.speculative_algorithm()))
+              options_.speculative_config().algorithm()))
       .nnodes(options_.nnodes())
       .dp_size(options_.dp_size())
       .cp_size(options_.cp_size())
@@ -330,26 +302,22 @@ LLMMaster::LLMMaster(const Options& options)
   }
   auto create_scheduler =
       [this, &scheduler_options, &response_options](auto* engine) {
-        scheduler_options
-            .enable_adaptive_draft_step(options_.enable_adaptive_draft_step())
-            .adaptive_target_verify_calibration(
-                options_.adaptive_target_verify_calibration())
-            .enable_adaptive_target_verify(
-                options_.enable_task_pipeline() &&
-                options_.enable_adaptive_target_verify() &&
-                SpeculativeConfig::supports_adaptive_target_verify(
-                    options_.speculative_algorithm()))
-            .adaptive_target_verify_cost_table(
-                options_.adaptive_target_verify_cost_table())
-            .adaptive_target_verify_cost_table_output(
-                options_.adaptive_target_verify_cost_table_output());
-        CHECK(options_.adaptive_target_verify_cost_table_output().empty() ||
-              scheduler_options.enable_adaptive_target_verify())
+        const bool adaptive_target_verify =
+            options_.speculative_config().effective_adaptive_target_verify(
+                options_.enable_task_pipeline());
+        CHECK(options_.speculative_config()
+                  .adaptive_target_verify_cost_table_output()
+                  .empty() ||
+              adaptive_target_verify)
             << "DSpark cost-table output requires an adaptive DSpark task "
                "pipeline.";
-        if (scheduler_options.enable_adaptive_target_verify() ||
-            !options_.adaptive_target_verify_calibration().empty() ||
-            !options_.adaptive_target_verify_cost_table().empty()) {
+        if (adaptive_target_verify ||
+            !options_.speculative_config()
+                 .adaptive_target_verify_calibration()
+                 .empty() ||
+            !options_.speculative_config()
+                 .adaptive_target_verify_cost_table()
+                 .empty()) {
           scheduler_options.spec_calibration_compatibility(
               spec_calibration_compatibility(engine->options()));
         }

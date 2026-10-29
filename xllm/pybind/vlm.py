@@ -109,7 +109,7 @@ class VLM:
         options.model_path = model
         options.extension_impl = extension_impl
         options.task_type = task
-        options.draft_model_path = draft_model
+        options.draft_model = draft_model
         options.backend = "vlm"
         options.limit_image_per_prompt = limit_image_per_prompt
         options.block_size = block_size

@@ -30,6 +30,7 @@ limitations under the License.
 #include "core/common/macros.h"
 #include "core/common/types.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "framework/request/request.h"
 
 namespace xllm {
@@ -60,11 +61,6 @@ struct SchedulerOptions {
   // the maximum number of sequences per batch
   PROPERTY(int32_t, max_seqs_per_batch) = 256;
   PROPERTY(bool, enable_task_pipeline) = false;
-  PROPERTY(std::string, adaptive_target_verify_calibration);
-  PROPERTY(bool, enable_adaptive_target_verify) = false;
-  PROPERTY(bool, enable_adaptive_draft_step) = false;
-  PROPERTY(std::string, adaptive_target_verify_cost_table);
-  PROPERTY(std::string, adaptive_target_verify_cost_table_output);
   PROPERTY(std::string, spec_calibration_compatibility);
 
   // the capacity of the request queue; requests arriving while it is full
@@ -74,8 +70,7 @@ struct SchedulerOptions {
   // the max tokens per chunk for request in prefill stage.
   PROPERTY(int32_t, max_tokens_per_chunk_for_prefill);
 
-  // the number of speculative tokens per step
-  PROPERTY(int32_t, num_speculative_tokens) = 0;
+  PROPERTY(SpeculativeConfig, speculative_config);
 
   // Effective decode graph geometry for profile warmup. This is a resolved
   // scheduler value, not an Engine capability, because speculative target

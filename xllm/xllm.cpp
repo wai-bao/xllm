@@ -130,6 +130,7 @@ Options create_options(const std::string& instance_name, bool is_local) {
 #endif
 
   Options options;
+  options.speculative_config(speculative_config);
 #if defined(USE_NPU)
   options.npu_kernel_backend(kernel_config.npu_kernel_backend());
   options.enable_flashcomm1(kernel_config.enable_flashcomm1())
@@ -142,7 +143,6 @@ Options create_options(const std::string& instance_name, bool is_local) {
       .model_id(model_config.model_id())
       .extension_impl(execution_config.extension_impl())
       .task_type(model_config.task())
-      .draft_model_path(speculative_config.draft_model())
       .backend(model_config.backend())
       .limit_image_per_prompt(model_config.limit_image_per_prompt())
       .max_encoder_cache_size(model_config.max_encoder_cache_size())
@@ -158,37 +158,6 @@ Options create_options(const std::string& instance_name, bool is_local) {
       .request_queue_size(scheduler_config.request_queue_size())
       .max_tokens_per_chunk_for_prefill(
           scheduler_config.max_tokens_per_chunk_for_prefill())
-      .num_speculative_tokens(speculative_config.num_speculative_tokens())
-      .speculative_algorithm(speculative_config.speculative_algorithm())
-      .enable_probabilistic_draft(
-          speculative_config.enable_probabilistic_draft())
-      .speculative_suffix_cache_max_depth(
-          speculative_config.speculative_suffix_cache_max_depth())
-      .speculative_suffix_max_spec_factor(
-          speculative_config.speculative_suffix_max_spec_factor())
-      .speculative_suffix_max_spec_offset(
-          speculative_config.speculative_suffix_max_spec_offset())
-      .speculative_suffix_min_token_prob(
-          speculative_config.speculative_suffix_min_token_prob())
-      .speculative_suffix_max_cached_requests(
-          speculative_config.speculative_suffix_max_cached_requests())
-      .speculative_suffix_use_tree_spec(
-          speculative_config.speculative_suffix_use_tree_spec())
-      .enable_mtp_draft_body_tp1(speculative_config.enable_mtp_draft_body_tp1())
-      .enable_adaptive_target_verify(
-          speculative_config.enable_adaptive_target_verify())
-      .enable_adaptive_draft_step(
-          speculative_config.enable_adaptive_draft_step())
-      .adaptive_draft_step_config(
-          speculative_config.adaptive_draft_step_config())
-      .adaptive_target_verify_min_gain(
-          speculative_config.adaptive_target_verify_min_gain())
-      .adaptive_target_verify_cost_table(
-          speculative_config.adaptive_target_verify_cost_table())
-      .adaptive_target_verify_calibration(
-          speculative_config.adaptive_target_verify_calibration())
-      .adaptive_target_verify_cost_table_output(
-          speculative_config.adaptive_target_verify_cost_table_output())
       .num_request_handling_threads(
           service_config.num_request_handling_threads())
       .communication_backend(parallel_config.communication_backend())
@@ -346,7 +315,7 @@ void validate_config(const std::string& model_type) {
         kv_cache_config.enable_vmm_kvcache() || kv_cache_config.vmm_elastic())
       << "Weight-only VMM requires --vmm_elastic=true so ordinary KV cache "
          "can allocate device memory outside the weight pool.";
-  if (speculative_config.num_speculative_tokens() > 0 &&
+  if (speculative_config.enable_speculative_decode() &&
       execution_config.enable_graph_double_buffer()) {
     LOG(WARNING) << "enable_graph_double_buffer is not compatible with "
                     "speculative decoding. "

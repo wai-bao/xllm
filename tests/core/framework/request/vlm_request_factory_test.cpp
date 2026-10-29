@@ -127,7 +127,9 @@ class VLMRequestFactoryTest : public ::testing::Test {
         .eos_token_id(-1);
     // enable_chunked_prefill defaults true; keep it so the prompt length limit
     // is exactly max_position_embeddings.
-    options_.enable_service_routing(false).num_speculative_tokens(0);
+    options_.enable_service_routing(false)
+        .speculative_config()
+        .num_speculative_tokens(0);
     return std::make_unique<VLMRequestFactory>(processor_.get(),
                                                chat_template_.get(),
                                                tokenizer_.get(),

@@ -211,9 +211,9 @@ Current support covers ordinary non-PD text inference with prefix caching enable
 
 | Parameter | Type | Default | Description |
 |:----------|:-----|:--------|:------------|
-| `draft_model` | `string` | `""` | Draft model path. See [MTP](/en/features/mtp/) for MTP usage. |
-| `num_speculative_tokens` | `int32` | `0` | Number of speculative tokens generated per speculative decoding step. |
-| `speculative_algorithm` | `string` | `"MTP"` | Speculative decoding algorithm. Supported values: `MTP`, `Eagle3`, `Suffix`, `DFlash`, `DFlash2` (NPU only), `DSpark`. |
+| `draft_model` | `string` | `""` | Draft model path. See [MTP](/en/features/mtp/) for MTP usage. When set without `speculative_algorithm`, the algorithm is auto-detected from the checkpoint name (defaults to `MTP`). |
+| `num_speculative_tokens` | `int32` | `0` | Speculative token width per step. `0` means unset: the width is derived from the draft checkpoint (`num_nextn_predict_layers` for MTP, `dflash2_block_size` for DFlash2, suffix cache depth for Suffix) and startup fails when no source is available. The width never gates speculative decoding on/off. |
+| `speculative_algorithm` | `string` | `""` | Speculative decoding algorithm; this is the single switch — empty (default) disables speculative decoding entirely. Supported values: `MTP`, `Eagle3`, `Suffix`, `DFlash`, `DFlash2` (NPU only), `DSpark`. |
 | `speculative_suffix_cache_max_depth` | `int32` | `64` | Maximum suffix-tree depth for suffix speculative decoding. |
 | `speculative_suffix_max_spec_factor` | `double` | `1.0` | Maximum suffix speculation token factor relative to match length. |
 | `speculative_suffix_max_spec_offset` | `double` | `0.0` | Maximum additive token offset for suffix speculation. |

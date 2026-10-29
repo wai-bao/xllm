@@ -78,7 +78,7 @@ class Embedding:
         options.model_path = model
         options.extension_impl = extension_impl
         options.task_type = "embed"
-        options.draft_model_path = None
+        options.draft_model = ""
         options.backend = "llm"
         options.limit_image_per_prompt = limit_image_per_prompt
         options.block_size = block_size

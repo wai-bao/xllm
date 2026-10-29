@@ -50,9 +50,8 @@ class MtpBlockHasher final : public BaseHasher {
 
 BlockHasherType mtp_hasher_type(BlockHasherType base,
                                 int32_t num_speculative_tokens,
-                                std::string_view algorithm) {
-  if (num_speculative_tokens <= 0 ||
-      !SpeculativeConfig::is_mtp_algorithm(algorithm)) {
+                                SpeculativeAlgorithm algorithm) {
+  if (num_speculative_tokens <= 0 || algorithm != SpeculativeAlgorithm::MTP) {
     return base;
   }
   switch (base) {

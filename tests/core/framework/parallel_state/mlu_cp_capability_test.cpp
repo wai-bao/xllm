@@ -30,6 +30,7 @@ Options make_cp_options(int32_t world_size) {
       .ep_size(world_size)
       .task_type("generate")
       .instance_role(InstanceRole::PREFILL)
+      .speculative_config()
       .speculative_algorithm("Suffix");
   ParallelConfig::get_instance().kv_split_size(1);
   return options;
@@ -117,7 +118,7 @@ TEST(MluCpCapabilityTest, RejectsUnsupportedTopologyAndAcceptsMtp) {
                   .has_value());
 
   Options mtp_options = make_cp_options(kWorldSize);
-  mtp_options.speculative_algorithm("MTP");
+  mtp_options.speculative_config().speculative_algorithm("MTP");
   EXPECT_FALSE(validate_context_parallel_config(
                    mtp_options, EngineType::SSM, "glm_moe_dsa", kWorldSize)
                    .has_value());

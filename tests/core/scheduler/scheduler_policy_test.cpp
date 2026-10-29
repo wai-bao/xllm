@@ -436,7 +436,7 @@ SchedulerOptions create_scheduler_options(
     int32_t max_global_ttft_ms = std::numeric_limits<int32_t>::max(),
     int32_t max_global_tpot_ms = std::numeric_limits<int32_t>::max()) {
   SchedulerOptions opt;
-  opt.num_speculative_tokens_ = num_speculative_tokens;
+  opt.speculative_config_.num_speculative_tokens(num_speculative_tokens);
   opt.max_tokens_per_chunk_for_prefill_ = max_tokens_per_chunk_for_prefill;
   opt.max_tokens_per_batch_ = max_tokens_per_batch;
   opt.max_seqs_per_batch_ = max_seqs_per_batch;

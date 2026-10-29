@@ -162,7 +162,8 @@ DraftProposal DFlash2WorkerImpl::run_decode_draft(
   prepare_query_inputs(input, query_input);
 
   const int32_t batch_size = input.input_params.meta.num_sequences;
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  const int32_t num_speculative_tokens =
+      options_.speculative_config().num_speculative_tokens();
   CHECK_GT(batch_size, 0);
   CHECK_GT(num_speculative_tokens, 0);
   const torch::Tensor anchors = anchor_token_ids(input);

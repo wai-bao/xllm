@@ -175,7 +175,8 @@ void configure_deepseek_v4_dspark_args(ModelArgs& args,
 
   // Default to the checkpoint's block_size; --num_speculative_tokens overrides.
   const int32_t ckpt_block_size = read_block_size(options.model_path());
-  const int32_t user_num_spec = options.num_speculative_tokens();
+  const int32_t user_num_spec =
+      options.speculative_config().num_speculative_tokens();
   if (user_num_spec > 0 && user_num_spec != ckpt_block_size) {
     LOG(WARNING) << "--num_speculative_tokens=" << user_num_spec
                  << " overrides DSpark checkpoint dspark_block_size="
@@ -420,15 +421,17 @@ WorkerImpl::WorkerImpl(const ParallelArgs& parallel_args,
     : options_(options),
       driver_(parallel_args.rank() == 0),
       dp_driver_(is_dp_driver(parallel_args)),
-      schedule_overlap_(is_driver() && !options.enable_task_pipeline(),
-                        EPLBConfig::get_instance().enable_eplb(),
-                        /*retire_unconsumed_inputs=*/
-                        options.enable_task_pipeline() ||
-                            (options.enable_speculative_decode() &&
-                             parallel_args.dp_size() > 1)),
+      schedule_overlap_(
+          is_driver() && !options.enable_task_pipeline(),
+          EPLBConfig::get_instance().enable_eplb(),
+          /*retire_unconsumed_inputs=*/
+          options.enable_task_pipeline() ||
+              (options.speculative_config().enable_speculative_decode() &&
+               parallel_args.dp_size() > 1)),
       device_(device),
       parallel_args_(parallel_args) {
-  if (options_.enable_speculative_decode() &&
+  if ((options_.speculative_config().enable_speculative_decode() ||
+       options_.is_drafter()) &&
       options_.num_decoding_tokens() == 1) {
     is_spec_draft_ = true;
   }
@@ -822,7 +825,7 @@ template <typename Params>
 bool WorkerImpl::can_prepare_npu_graph_decode_input_impl(
     const Params& input_params) const {
 #if defined(USE_NPU)
-  return !options_.enable_speculative_decode() &&
+  return !options_.speculative_config().enable_speculative_decode() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph_double_buffer() &&
          enable_schedule_overlap() &&
@@ -849,7 +852,7 @@ bool WorkerImpl::can_prepare_without_compute_stream_wait_impl(
     const Params& input_params) const {
 #if defined(USE_NPU)
   (void)input_params;
-  return !options_.enable_speculative_decode() &&
+  return !options_.speculative_config().enable_speculative_decode() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph() &&
          ::xllm::ExecutionConfig::get_instance().enable_graph_double_buffer() &&
          (options_.backend() == "llm" || options_.backend() == "vlm");
@@ -876,7 +879,7 @@ bool WorkerImpl::can_skip_npu_graph_decode_sync_impl(
   return can_prepare_npu_graph_decode_input(input_params) &&
          input_params.meta.batch_forward_type.is_decode() &&
          options_.kv_cache_transfer_mode() != "PUSH" &&
-         !options_.enable_speculative_decode();
+         !options_.speculative_config().enable_speculative_decode();
 #else
   (void)input_params;
   return false;
@@ -1123,7 +1126,7 @@ void WorkerImpl::prepare_dp_ep_padding_impl(Params& input_params) {
   const std::vector<int32_t>& raw_token_sizes =
       input_params.parallel.raw_dp_global_token_nums;
   const bool is_prefill = input_params.meta.batch_forward_type.no_decode();
-  const bool use_draft_decode_cache = options_.is_draft_engine() && !is_prefill;
+  const bool use_draft_decode_cache = options_.is_drafter() && !is_prefill;
   if (use_draft_decode_cache) {
     const DpEpPaddingData* cached =
         draft_dp_ep_padding_cache_.find(token_sizes, raw_token_sizes);
@@ -1136,7 +1139,7 @@ void WorkerImpl::prepare_dp_ep_padding_impl(Params& input_params) {
   const bool speculative_target_graph_decode =
       input_params.meta.batch_forward_type.is_decode() &&
       ::xllm::ExecutionConfig::get_instance().enable_graph() &&
-      options_.enable_speculative_decode() && !options_.is_draft_engine() &&
+      options_.speculative_config().enable_speculative_decode() &&
       token_sizes.size() > 1 &&
       input_params.parallel.dp_is_decode.size() == token_sizes.size() &&
       std::all_of(input_params.parallel.dp_is_decode.begin(),
@@ -2040,10 +2043,10 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
        parallel_args_.tp_group_ == nullptr ||
        parallel_args_.cp_group_ == nullptr ||
        parallel_args_.cp_group_ == parallel_args_.tp_group_ ||
-       (options.enable_speculative_decode() &&
-        (!SpeculativeConfig::is_mtp_algorithm(
-             options.speculative_algorithm()) ||
-         options.enable_adaptive_target_verify())))) {
+       (options.speculative_config().enable_speculative_decode() &&
+        (options.speculative_config().algorithm() !=
+             SpeculativeAlgorithm::MTP ||
+         options.speculative_config().enable_adaptive_target_verify())))) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
         "Task pipeline prefill CP requires an NPU GLM DSA target, KV split "
@@ -2054,9 +2057,9 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
       (args.model_type() != "glm_moe_dsa" || !args.enable_mla() ||
        parallel_args_.dp_size() != 1 ||
        parallel_args_.layerwise_split_size() != 1 ||
-       (options.enable_speculative_decode() &&
-        !SpeculativeConfig::is_mtp_algorithm(
-            options.speculative_algorithm())))) {
+       (options.speculative_config().enable_speculative_decode() &&
+        options.speculative_config().algorithm() !=
+            SpeculativeAlgorithm::MTP))) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
         "Task pipeline DCP requires a GLM DSA target with DP/layerwise "
@@ -2113,8 +2116,8 @@ bool WorkerImpl::wakeup_from_remote_weights(const WakeupOptions& options) {
     const int64_t limit = std::max<int64_t>(
         1, ExecutionConfig::get_instance().acl_graph_decode_batch_size_limit());
     const int64_t decode_width =
-        options.enable_speculative_decode()
-            ? static_cast<int64_t>(options.num_speculative_tokens()) + 1
+        options.speculative_config().enable_speculative_decode()
+            ? options.speculative_config().decode_query_len()
             : 1;
     const int64_t tokens = std::min(local_sequences, limit) * decode_width;
     if (tokens > std::numeric_limits<int32_t>::max()) {
@@ -2218,7 +2221,7 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
   device_.set_seed(random_seed);
 
   auto model_loader = ModelLoader::create(model_weights_path);
-  if (options_.is_draft_engine() && !options_.model_path().empty() &&
+  if (options_.is_drafter() && !options_.model_path().empty() &&
       options_.model_path() != model_weights_path) {
     model_loader->set_reference_model_weights_path(options_.model_path());
   }
@@ -2227,15 +2230,16 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
   auto args = model_loader->model_args();
   ModelRegistry::configure_mtp_args(
       args,
-      options_.speculative_algorithm(),
-      options_.is_draft_engine(),
+      options_.speculative_config().algorithm(),
+      options_.is_drafter(),
       ModelConfig::is_python_model_impl(context_.get_model_impl()));
 #if defined(USE_MLU)
   const bool native_glm5_next =
       !ModelConfig::is_python_model_impl(context_.get_model_impl()) &&
       (is_glm5_next_target_model_type(args.model_type()) ||
        args.model_type() == "glm5_next_mtp");
-  CHECK(!(native_glm5_next && options_.enable_speculative_decode()))
+  CHECK(!(native_glm5_next &&
+          options_.speculative_config().enable_speculative_decode()))
       << "Native MLU GLM5-Next speculative decoding is not supported yet: "
          "Dense Validate Span and accepted-span state replay are not wired "
          "into the MTP worker. Disable speculative decoding.";
@@ -2254,7 +2258,7 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
   // reconciles vocab sizes; its JSON grammar restoration below is target-only
   // and never runs on a draft.
   std::unique_ptr<Tokenizer> tokenizer;
-  if (!options_.is_draft_engine()) {
+  if (!options_.is_drafter()) {
     tokenizer = model_loader->tokenizer();
     CHECK(tokenizer != nullptr);
 
@@ -2273,21 +2277,20 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
   }
   tokenizer_ = std::move(tokenizer);
 
-  const std::string& speculative_algorithm = options_.speculative_algorithm();
-  const bool is_block_diffusion =
-      SpeculativeConfig::is_block_diffusion_algorithm(speculative_algorithm);
+  const SpeculativeAlgorithm kind = options_.speculative_config().algorithm();
+  const bool is_block_diffusion = xllm::is_block_diffusion(kind);
 
 #if defined(USE_NPU)
-  if (options_.enable_speculative_decode() &&
-      SpeculativeConfig::is_mtp_algorithm(speculative_algorithm) &&
+  if (options_.speculative_config().enable_speculative_decode() &&
+      kind == SpeculativeAlgorithm::MTP &&
       uses_mtp_target_spec_width(args.model_type())) {
-    args.num_speculative_tokens(options_.num_speculative_tokens());
+    args.num_speculative_tokens(
+        options_.speculative_config().num_speculative_tokens());
   }
   if (is_block_diffusion) {
-    if (options_.is_draft_engine()) {
+    if (options_.is_drafter()) {
       args.layers_to_capture({});
-      const bool is_dspark =
-          SpeculativeConfig::is_dspark_algorithm(speculative_algorithm);
+      const bool is_dspark = kind == SpeculativeAlgorithm::DSPARK;
       const bool is_deepseek_v4_dspark =
           is_dspark && util::is_deepseek_v4_model_type(args.model_type());
       std::string draft_model_type = "DFlashDraftModel";
@@ -2295,8 +2298,7 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
         draft_model_type = args.model_type() == kDSparkGLM5DraftModelType
                                ? std::string(kDSparkGLM5DraftModelType)
                                : "DSparkDraftModel";
-      } else if (SpeculativeConfig::is_dflash2_algorithm(
-                     speculative_algorithm)) {
+      } else if (kind == SpeculativeAlgorithm::DFLASH2) {
         draft_model_type = std::string(kDFlash2DraftModelType);
         CHECK_GT(args.dflash2_block_size(), 0);
       }
@@ -2309,22 +2311,23 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
       args.model_type(draft_model_type);
       // The draft's decode step is num_speculative_tokens + 1 rows wide;
       // record it on ModelArgs so dummy inputs derive the same width.
-      args.num_speculative_tokens(options_.num_speculative_tokens());
+      args.num_speculative_tokens(
+          options_.speculative_config().num_speculative_tokens());
       if (is_deepseek_v4_dspark) {
         configure_deepseek_v4_dspark_args(args, options_);
       }
     } else {
-      CHECK(options_.draft_model_path().has_value())
+      CHECK(!options_.speculative_config().draft_model_path().empty())
           << "block-diffusion speculative decoding requires --draft_model.";
-      args.layers_to_capture(
-          read_capture_layer_ids(options_.draft_model_path().value()));
+      args.layers_to_capture(read_capture_layer_ids(
+          options_.speculative_config().draft_model_path()));
     }
-  } else if (options_.enable_speculative_decode() &&
-             ::xllm::SpeculativeConfig::get_instance()
-                 .enable_atb_spec_kernel()) {
-    args.num_speculative_tokens(options_.num_speculative_tokens());
-  } else if (options_.enable_speculative_decode() &&
-             options_.num_speculative_tokens() == 0 &&
+  } else if (options_.speculative_config().enable_speculative_decode() &&
+             options_.speculative_config().enable_atb_spec_kernel()) {
+    args.num_speculative_tokens(
+        options_.speculative_config().num_speculative_tokens());
+  } else if (options_.speculative_config().enable_speculative_decode() &&
+             !options_.speculative_config().has_speculative_width() &&
              args.num_nextn_predict_layers() != 0) {
     const std::string& current_type = args.model_type();
     const char* mtp_model_type = nullptr;
@@ -2343,16 +2346,17 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
       args.full_attention_interval(1);
     }
   }
-  if (options_.enable_speculative_decode() && !options_.is_draft_engine() &&
-      SpeculativeConfig::requires_aux_hidden_capture(speculative_algorithm) &&
+  if (options_.speculative_config().enable_speculative_decode() &&
+      SpeculativeConfig::requires_aux_hidden_capture(kind) &&
       args.layers_to_capture().empty()) {
     std::vector<int32_t> capture_layer_ids;
-    if (SpeculativeConfig::is_eagle3_algorithm(speculative_algorithm) &&
-        options_.draft_model_path().has_value()) {
+    if (kind == SpeculativeAlgorithm::EAGLE3 &&
+        !options_.speculative_config().draft_model_path().empty()) {
       // Eagle3.1 drafts pin their aux capture layers in the draft config;
       // legacy eagle3 configs omit them and fall back to the default below.
-      capture_layer_ids = read_capture_layer_ids(*options_.draft_model_path(),
-                                                 /*required=*/false);
+      capture_layer_ids = read_capture_layer_ids(
+          options_.speculative_config().draft_model_path(),
+          /*required=*/false);
     }
     if (capture_layer_ids.empty()) {
       const int32_t num_layers = static_cast<int32_t>(args.n_layers());
@@ -2362,24 +2366,26 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
     args.layers_to_capture(std::move(capture_layer_ids));
   }
 #else
-  if (options_.enable_speculative_decode()) {
-    args.num_speculative_tokens(options_.num_speculative_tokens());
+  if (options_.speculative_config().enable_speculative_decode()) {
+    args.num_speculative_tokens(
+        options_.speculative_config().num_speculative_tokens());
     if (is_block_diffusion) {
-      if (options_.is_draft_engine()) {
-        LOG(FATAL) << speculative_algorithm
+      if (options_.is_drafter()) {
+        LOG(FATAL) << options_.speculative_config().speculative_algorithm()
                    << " block-diffusion draft is not supported on "
                    << Platform::type_str() << ".";
       }
-      CHECK(options_.draft_model_path().has_value())
+      CHECK(!options_.speculative_config().draft_model_path().empty())
           << "block-diffusion speculative decoding requires --draft_model.";
-      args.layers_to_capture(
-          read_capture_layer_ids(options_.draft_model_path().value()));
+      args.layers_to_capture(read_capture_layer_ids(
+          options_.speculative_config().draft_model_path()));
     }
     // When running speculative decoding, the draft worker reuses the same
     // checkpoint as the target model. The draft worker needs to instantiate
     // the MTP variant, so override the model_type here without mutating the
     // original config.
-    if (!is_block_diffusion && options_.num_speculative_tokens() == 0 &&
+    if (!is_block_diffusion &&
+        !options_.speculative_config().has_speculative_width() &&
         args.num_nextn_predict_layers() != 0) {
       static const std::unordered_map<std::string, std::string>
           kModelTypeToMtpType = {
@@ -2401,7 +2407,7 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
   }
 #endif
 
-  if (options_.is_draft_engine() || is_spec_draft_) {
+  if (options_.is_drafter() || is_spec_draft_) {
     disable_layerwise_split_for_draft(&parallel_args_);
   }
 
@@ -2431,7 +2437,7 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
   // does not pay tokenizer.decode over the full vocab under the step lock.
   // Draft-engine workers own no tokenizer and never serve constrained requests
   // (the target does), so skip the warmup for them.
-  if (!options_.is_draft_engine()) {
+  if (!options_.is_drafter()) {
     if (ensure_json_object_grammar(/*reasoning_enabled=*/false) == nullptr) {
       LOG(WARNING) << "JSON object grammar warmup failed; will retry lazily";
     }

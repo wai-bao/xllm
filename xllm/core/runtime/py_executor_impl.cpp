@@ -212,8 +212,8 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   // GLM5 KDA targets need fixed-width speculative decoding; adaptive pruning
   // resizes per-step draft widths, which the KDA handoff cannot follow.
   CHECK(!(is_glm5_next_target_model_type(args.model_type()) &&
-          (options.enable_adaptive_target_verify() ||
-           options.enable_adaptive_draft_step())))
+          (options.speculative_config().enable_adaptive_target_verify() ||
+           options.speculative_config().enable_adaptive_draft_step())))
       << "GLM5 KDA does not support adaptive speculative decode; disable "
          "--enable_adaptive_target_verify and --enable_adaptive_draft_step.";
 
@@ -228,18 +228,15 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   executor_config["instance_role"] = options_.instance_role().to_string();
   executor_config["task_type"] = options_.task_type();
   executor_config["max_encoder_cache_size"] = options_.max_encoder_cache_size();
-  executor_config["num_speculative_tokens"] = options_.num_speculative_tokens();
+  executor_config["num_speculative_tokens"] =
+      options_.speculative_config().num_speculative_tokens();
   executor_config["mtp_draft_prefix_width"] = options_.mtp_draft_prefix_width();
   executor_config["enable_adaptive_draft_step"] =
-      options_.enable_adaptive_draft_step();
+      options_.speculative_config().enable_adaptive_draft_step();
   executor_config["enable_adaptive_target_verify"] =
-      options_.enable_adaptive_target_verify();
-  executor_config["engine_type"] = SpeculativeConfig::uses_ssm_engine(
-                                       options_.draft_model_path().value_or(""),
-                                       options_.speculative_algorithm(),
-                                       options_.num_speculative_tokens())
-                                       ? "SSM"
-                                       : "LLM";
+      options_.speculative_config().enable_adaptive_target_verify();
+  executor_config["engine_type"] =
+      options_.speculative_config().enable_speculative_decode() ? "SSM" : "LLM";
   executor_config["enable_chunked_prefill"] = options_.enable_chunked_prefill();
   executor_config["enable_prefix_cache"] =
       KVCacheConfig::get_instance().enable_prefix_cache();
@@ -247,22 +244,19 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
       options_.enable_schedule_overlap();
   executor_config["enable_unified_mtp_graph"] =
       ExecutionConfig::get_instance().enable_unified_mtp_graph();
-  executor_config["is_draft_engine"] = options_.is_draft_engine();
-  executor_config["is_mtp_algorithm"] =
-      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm());
-  executor_config["is_block_diffusion_algorithm"] =
-      SpeculativeConfig::is_block_diffusion_algorithm(
-          options_.speculative_algorithm());
+  executor_config["is_drafter"] = options_.is_drafter();
+  const SpeculativeAlgorithm kind = options_.speculative_config().algorithm();
+  executor_config["is_mtp_algorithm"] = kind == SpeculativeAlgorithm::MTP;
+  executor_config["is_block_diffusion_algorithm"] = is_block_diffusion(kind);
   executor_config["requires_aux_hidden_capture"] =
-      SpeculativeConfig::requires_aux_hidden_capture(
-          options_.speculative_algorithm());
+      SpeculativeConfig::requires_aux_hidden_capture(kind);
   executor_config["enable_task_pipeline"] = options_.enable_task_pipeline();
   executor_config["block_draft_graph_warmup_max_kv_len"] =
       ExecutionConfig::get_instance().block_draft_graph_warmup_max_kv_len();
   executor_config["enable_graph_mode_decode_no_padding"] =
       ExecutionConfig::get_instance().enable_graph_mode_decode_no_padding();
   executor_config["enable_adaptive_target_verify"] =
-      options_.enable_adaptive_target_verify();
+      options_.speculative_config().enable_adaptive_target_verify();
   // DFlash2 defaults to eager in the model config. Hybrid worker pipelines
   // explicitly enable its independent full-block ACL runner on the leaf.
   const bool independent_block_graph =

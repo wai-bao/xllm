@@ -28,6 +28,7 @@ from xllm.python.model_executor.input_batch import InputBatch
 from xllm.python.model_executor.runners.acl_graph import AclGraphEntry, AclGraphRunner, StaticGraphAttentionMetadata
 from xllm.python.model_executor.runners.base import ModelExecutionOutput
 from xllm.python.model_executor.runners.kv_capacity import (
+    MAX_SPECULATIVE_TOKENS,
     block_draft_kv_capacity_buckets,
     kv_capacity_bucket,
     kv_capacity_buckets,
@@ -115,8 +116,10 @@ class PreparedAclGraphRunner(AclGraphRunner):
             and not getattr(attention_backend, "is_mla", False)
             and block_draft_model_window_context(model) is not None
         )
-        if not 1 <= spec_verify_width <= 17 or (block_draft and spec_verify_width != 1):
-            raise ValueError("Speculative verify graph width must be in [1, 17], with width one for block drafts")
+        if not 1 <= spec_verify_width <= MAX_SPECULATIVE_TOKENS + 1 or (block_draft and spec_verify_width != 1):
+            raise ValueError(
+                f"Speculative verify graph width must be in [1, {MAX_SPECULATIVE_TOKENS + 1}], with width one for block drafts"
+            )
         self._spec_verify_width = spec_verify_width
         if device_kv_lengths and dp_size != 1:
             raise ValueError("Device-length ACL graphs require DP size one")

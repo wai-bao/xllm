@@ -285,7 +285,7 @@ SchedulerOptions CreateOptions(int32_t max_tokens_per_batch = 10000,
   opt.enable_schedule_overlap_ = enable_schedule_overlap;
   opt.rec_worker_max_concurrency_ = rec_worker_max_concurrency;
   opt.max_tokens_per_chunk_for_prefill_ = 1024;
-  opt.num_speculative_tokens_ = 0;
+  opt.speculative_config_.num_speculative_tokens(0);
   return opt;
 }
 

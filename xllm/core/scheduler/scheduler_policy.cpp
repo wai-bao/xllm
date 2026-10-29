@@ -954,9 +954,9 @@ bool SchedulerPolicy::should_wait_for_decode_restore(
     return false;
   }
 
-  return state.options.num_speculative_tokens() == 0 ||
-         SpeculativeConfig::is_mtp_algorithm(
-             SpeculativeConfig::get_instance().speculative_algorithm());
+  return !state.options.speculative_config().enable_speculative_decode() ||
+         state.options.speculative_config().algorithm() ==
+             SpeculativeAlgorithm::MTP;
 }
 
 void SchedulerPolicy::enqueue_decode_restore(
@@ -1134,11 +1134,10 @@ void SchedulerPolicy::cache_in_batch_prefix(
   }
 }
 
-void SchedulerPolicy::clear_mtp_bootstrap(Request* request,
-                                          const SchedulerState& state) {
-  if (!state.options.enable_disagg_pd() ||
-      state.options.num_speculative_tokens() <= 0 || request == nullptr ||
-      request->sequences().empty()) {
+void clear_mtp_bootstrap(const SchedulerOptions& options, Request* request) {
+  if (!options.enable_disagg_pd() ||
+      !options.speculative_config().enable_speculative_decode() ||
+      request == nullptr || request->sequences().empty()) {
     return;
   }
   Sequence* sequence = request->sequences()[0].get();
@@ -1146,6 +1145,11 @@ void SchedulerPolicy::clear_mtp_bootstrap(Request* request,
     return;
   }
   sequence->clear_mtp_bootstrap_embedding();
+}
+
+void SchedulerPolicy::clear_mtp_bootstrap(Request* request,
+                                          const SchedulerState& state) {
+  xllm::clear_mtp_bootstrap(state.options, request);
 }
 
 // =============================================================================
@@ -1167,7 +1171,7 @@ BatchMode create_batch_mode(const SchedulerOptions& options) {
   // CP/KV-sharded decode/MTP: prefill cannot mix with decode in one batch.
   if (options.cp_size() > 1 ||
       ParallelConfig::get_instance().kv_split_size_effective() > 1 ||
-      options.num_speculative_tokens() > 0) {
+      options.speculative_config().enable_speculative_decode()) {
     mode.enable_mix_batch = false;
   }
 

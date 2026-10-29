@@ -304,7 +304,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     lm_head_selected_token_idxes = selected_token_idxes;
     const bool need_selected_hidden =
         input.return_selected_hidden ||
-        (options_.cp_size() > 1 && options_.enable_speculative_decode());
+        (options_.cp_size() > 1 &&
+         options_.speculative_config().enable_speculative_decode());
     if (need_selected_hidden) {
       // Emit both selected hidden and logits from a single lm_head pass so the
       // ConfidenceHead and CP speculative paths can consume hidden without a
@@ -338,7 +339,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
   }
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
-      !options_.enable_speculative_decode()) {
+      !options_.speculative_config().enable_speculative_decode()) {
     MULTI_MODEL_STEP_UNLOCK();
     if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
       wait_kv_push();
@@ -390,7 +391,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     output.logits = logits;
   }
 
-  if (options_.enable_speculative_decode()) {
+  if (options_.speculative_config().enable_speculative_decode()) {
     const bool is_target_prefill =
         !input.input_params.meta.batch_forward_type.is_decode() &&
         !is_spec_draft_;

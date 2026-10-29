@@ -436,7 +436,7 @@ void set_positions_tensor(Input& input,
 runtime::Options mtp_target_options(const runtime::Options& options) {
   auto opts = options;
   opts.enable_schedule_overlap(false)
-      .is_draft_engine(false)
+
       .enable_graph_aux_hidden_states(true);
   if (options.backend() == "vlm") {
     opts.enable_task_pipeline(false);
@@ -447,15 +447,15 @@ runtime::Options mtp_target_options(const runtime::Options& options) {
 runtime::Options mtp_draft_options(const runtime::Options& options) {
   runtime::Options draft_options = options;
   draft_options.enable_schedule_overlap(false)
-      .is_draft_engine(true)
-      .mtp_draft_prefix_width(options.num_speculative_tokens() + 1)
+      .worker_type(WorkerType::DRAFTER)
+      .mtp_draft_prefix_width(options.speculative_config().decode_query_len())
       // The task path also restores the verifier prefix (K+1 rows).
       .num_decoding_tokens(
           options.enable_task_pipeline()
-              ? std::max(2, options.num_speculative_tokens() + 1)
-              : 1)
-      .num_speculative_tokens(0)
-      .enable_graph_aux_hidden_states(true);
+              ? std::max(2, options.speculative_config().decode_query_len())
+              : 1);
+  draft_options.speculative_config().num_speculative_tokens(0);
+  draft_options.enable_graph_aux_hidden_states(true);
   if (options.backend() == "vlm") {
     draft_options.enable_task_pipeline(false).num_decoding_tokens(1);
   }
@@ -464,7 +464,7 @@ runtime::Options mtp_draft_options(const runtime::Options& options) {
 
 ParallelArgs mtp_draft_parallel_args(const ParallelArgs& parallel_args,
                                      const runtime::Options& options) {
-  if (!options.enable_mtp_draft_body_tp1()) {
+  if (!options.speculative_config().enable_mtp_draft_body_tp1()) {
     return parallel_args;
   }
   CHECK(parallel_args.single_rank_group_ != nullptr)
@@ -815,7 +815,8 @@ void MTPWorkerImpl<TargetInput>::retire_legacy_prelaunch() {
 template <typename TargetInput>
 ::xllm::Status MTPWorkerImpl<TargetInput>::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
-  if (impl_ == nullptr || draft_impl_ == nullptr) {
+  if (impl_ == nullptr || draft_impl_ == nullptr ||
+      !options_.speculative_config().enable_speculative_decode()) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
         "MTP task pipeline requires loaded Target/Draft models.");
@@ -828,11 +829,13 @@ template <typename TargetInput>
       mtp_async::supports_hybrid_mtp_pipeline_model_pair(target_type,
                                                          draft_type);
   if constexpr (std::is_same_v<TargetInput, VlmForwardInput>) {
-    if (!hybrid_paged_attention || options_.num_speculative_tokens() <= 0 ||
-        options_.num_speculative_tokens() > 16 ||
+    if (!hybrid_paged_attention ||
+        !options_.speculative_config().has_speculative_width() ||
+        options_.speculative_config().num_speculative_tokens() >
+            kMaxSpeculativeTokens ||
         parallel_args_.dp_size() != 1 || parallel_args_.cp_size() != 1 ||
-        options_.enable_adaptive_draft_step() ||
-        options_.enable_adaptive_target_verify()) {
+        options_.speculative_config().enable_adaptive_draft_step() ||
+        options_.speculative_config().enable_adaptive_target_verify()) {
       return ::xllm::Status(
           StatusCode::INVALID_ARGUMENT,
           "VLM MTP task pipeline requires fixed Qwen hybrid models, "
@@ -847,22 +850,23 @@ template <typename TargetInput>
         threadpool_, impl_->task_model(), *this, capacity, output);
     if (status.ok()) {
       LOG(INFO) << "VLM MTP task execution pipeline: slots="
-                << capacity.slot_count
-                << ", speculative_tokens=" << options_.num_speculative_tokens();
+                << capacity.slot_count << ", speculative_tokens="
+                << options_.speculative_config().num_speculative_tokens();
     }
     return status;
   }
-  if (options_.num_speculative_tokens() <= 0 ||
+  if (!options_.speculative_config().has_speculative_width() ||
       (draft_type != "glm_moe_dsa_mtp" && !hybrid_paged_attention)) {
     return ::xllm::Status(StatusCode::INVALID_ARGUMENT,
                           "MTP task pipeline requires fixed-width GLM DSA or "
                           "Qwen hybrid models.");
   }
   if (hybrid_paged_attention &&
-      (options_.num_speculative_tokens() > 16 ||
+      (options_.speculative_config().num_speculative_tokens() >
+           kMaxSpeculativeTokens ||
        parallel_args_.dp_size() != 1 || parallel_args_.cp_size() != 1 ||
-       options_.enable_adaptive_draft_step() ||
-       options_.enable_adaptive_target_verify())) {
+       options_.speculative_config().enable_adaptive_draft_step() ||
+       options_.speculative_config().enable_adaptive_target_verify())) {
     return ::xllm::Status(StatusCode::INVALID_ARGUMENT,
                           "Qwen hybrid MTP task pipeline requires DP=CP=1 and "
                           "1..16 draft tokens.");
@@ -873,10 +877,14 @@ template <typename TargetInput>
     return status;
   }
   const auto& args = draft_impl_->context_.get_model_args();
-  capacity.num_speculative_tokens = options_.num_speculative_tokens();
-  capacity.adaptive_draft_step = options_.enable_adaptive_draft_step();
-  capacity.adaptive_target_verify = options_.enable_adaptive_target_verify();
-  capacity.adaptive_min_gain = options_.adaptive_target_verify_min_gain();
+  capacity.num_speculative_tokens =
+      options_.speculative_config().num_speculative_tokens();
+  capacity.adaptive_draft_step =
+      options_.speculative_config().enable_adaptive_draft_step();
+  capacity.adaptive_target_verify =
+      options_.speculative_config().enable_adaptive_target_verify();
+  capacity.adaptive_min_gain =
+      options_.speculative_config().adaptive_target_verify_min_gain();
   capacity.startup_calibration = capacity.adaptive_target_verify;
   capacity.calibration_leader = parallel_args_.rank() == 0;
   capacity.sparse_dsa_target =
@@ -934,7 +942,7 @@ bool MTPWorkerImpl<TargetInput>::init_model(
     combined_draft_execution_path_ =
         mtp_async::classify_combined_draft_execution_path(draft_model_type);
     const bool draft_owns_shared_weights =
-        (options_.enable_mtp_draft_body_tp1() &&
+        (options_.speculative_config().enable_mtp_draft_body_tp1() &&
          combined_draft_execution_path_ ==
              mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION) ||
         ModelRegistry::owns_mtp_shared_weights(draft_model_type);
@@ -1010,7 +1018,7 @@ KVCacheShape MTPWorkerImpl<TargetInput>::draft_kv_cache_shape(
   if (uses_embedded_eagle3_draft()) {
     return build_draft_kv_cache_shape(target_kv_cache_shape);
   }
-  if (options_.enable_mtp_draft_body_tp1()) {
+  if (options_.speculative_config().enable_mtp_draft_body_tp1()) {
     return build_draft_kv_cache_shape(target_kv_cache_shape,
                                       /*draft_world_size=*/1);
   }
@@ -1024,8 +1032,12 @@ bool MTPWorkerImpl<TargetInput>::uses_embedded_eagle3_draft() const {
       draft_impl_->get_status() == WorkerImpl::Status::UNINITIALIZED) {
     return false;
   }
-  return ::xllm::uses_embedded_eagle3_draft(options_.speculative_algorithm(),
-                                            impl_->context_.get_model_args());
+  if (!uses_embedded_eagle3_draft_.has_value()) {
+    uses_embedded_eagle3_draft_ = ::xllm::uses_embedded_eagle3_draft(
+        options_.speculative_config().algorithm(),
+        impl_->context_.get_model_args());
+  }
+  return *uses_embedded_eagle3_draft_;
 }
 
 template <typename TargetInput>
@@ -1097,7 +1109,8 @@ bool MTPWorkerImpl<TargetInput>::should_use_explicit_spec_verify_replay_update(
       target_spec_verify_mode_ !=
           mtp_async::TargetSpecVerifyMode::EXPANDED_VERIFY ||
       ModelConfig::is_python_model_impl(context_.get_model_impl()) ||
-      impl_ == nullptr || options_.num_speculative_tokens() <= 0 ||
+      impl_ == nullptr ||
+      !options_.speculative_config().enable_speculative_decode() ||
       options_.block_size() <= 0 ||
       !spec_verify::has_speculative_verify_block_table_layout(
           block_tables, input.input_params.multi_block_tables, num_sequences)) {
@@ -1113,8 +1126,7 @@ bool MTPWorkerImpl<TargetInput>::should_use_explicit_spec_verify_replay_update(
       block_table_width > kMaxSpecVerifyGraphUpdateBlockTableWidth) {
     return false;
   }
-  const int64_t spec_width =
-      static_cast<int64_t>(options_.num_speculative_tokens()) + 1;
+  const int64_t spec_width = options_.speculative_config().decode_query_len();
   return kernel::npu::tilelang::has_spec_verify_graph_update_specialization(
       spec_width, options_.block_size());
 #else
@@ -1243,10 +1255,11 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_empty(
   } else {
     LlmForwardInput draft_extend_prepared;
     std::vector<LlmForwardInput> draft_step_prepared(
-        options_.num_speculative_tokens());
+        options_.speculative_config().num_speculative_tokens());
     TargetInput target_prepared;
     std::vector<ForwardOutput> draft_outputs;
-    draft_outputs.reserve(options_.num_speculative_tokens());
+    draft_outputs.reserve(
+        options_.speculative_config().num_speculative_tokens());
 
     LlmForwardInput draft_extend_input = make_llm_draft_input(input);
     scale_speculative_parallel_token_counts(draft_extend_input.input_params,
@@ -1265,7 +1278,9 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_empty(
                                      .value());
     }
 
-    for (int32_t i = 1; i < options_.num_speculative_tokens(); ++i) {
+    for (int32_t i = 1;
+         i < options_.speculative_config().num_speculative_tokens();
+         ++i) {
       LlmForwardInput draft_input = make_llm_draft_input(input);
       draft_outputs.emplace_back(
           run_worker_no_sync(*draft_impl_, draft_input, draft_step_prepared[i])
@@ -1274,7 +1289,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_empty(
 
     TargetInput new_input = input.clone();
     scale_speculative_parallel_token_counts(
-        new_input.input_params, options_.num_speculative_tokens() + 1);
+        new_input.input_params,
+        options_.speculative_config().decode_query_len());
     ForwardOutput output =
         run_worker_no_sync(*impl_, new_input, target_prepared).value();
     for (ForwardOutput& draft_output : draft_outputs) {
@@ -1430,7 +1446,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
   if (use_chunked_prefill_spec_verify_path()) {
     stabilize_decode_host_tensors(input);
   }
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  const int32_t num_speculative_tokens =
+      options_.speculative_config().num_speculative_tokens();
   // Reuse draft-0 prelaunched for this same batch.
   const bool use_prelaunched_first_draft =
       can_use_combined_first_draft() && pending_draft_context_matches(input);
@@ -1938,12 +1955,13 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
     const detail::JsonDraftValidationScratch* json_scratch) {
   Timer target_timer;
   TargetInput target_prepared;
-  fill_validate_input_from_draft_outputs(input,
-                                         draft_outputs,
-                                         validate_input,
-                                         num_speculative_tokens + 1,
-                                         json_scratch,
-                                         *compute_stream_);
+  fill_validate_input_from_draft_outputs(
+      input,
+      draft_outputs,
+      validate_input,
+      SpeculativeConfig::decode_query_len(num_speculative_tokens),
+      json_scratch,
+      *compute_stream_);
   ForwardOutput target_output;
   if (uses_embedded_eagle3_draft()) {
     target_output =
@@ -1961,7 +1979,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
 
   const int32_t batch_size = input.input_params.meta.num_sequences;
   CHECK_EQ(target_output.logits.size(0),
-           static_cast<int64_t>(batch_size) * (num_speculative_tokens + 1));
+           static_cast<int64_t>(batch_size) *
+               SpeculativeConfig::decode_query_len(num_speculative_tokens));
 
   const bool prelaunch_next_first_draft = can_prelaunch_next_first_draft(input);
   LlmForwardInput next_first_draft_input;
@@ -1998,7 +2017,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
       if constexpr (std::is_same_v<TargetInput, VlmForwardInput>) {
         const torch::Tensor& lengths =
             validate_input.input_params.attention.device.kv_seq_lens;
-        const int64_t width = num_speculative_tokens + 1;
+        const int64_t width =
+            SpeculativeConfig::decode_query_len(num_speculative_tokens);
         if (lengths.numel() == batch_size) {
           first_positions = lengths - width;
         } else if (uses_step_major_validate_layout()) {
@@ -2012,7 +2032,9 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
         }
       } else {
         first_positions = validate_input.positions
-                              .view({batch_size, num_speculative_tokens + 1})
+                              .view({batch_size,
+                                     SpeculativeConfig::decode_query_len(
+                                         num_speculative_tokens)})
                               .select(/*dim=*/1, /*index=*/0);
       }
       verify_params.min_tokens_remaining() =
@@ -2055,7 +2077,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
                                   input.json_object_states);
   }
 
-  const int64_t num_val_tokens = options_.num_speculative_tokens() + 1;
+  const int64_t num_val_tokens =
+      options_.speculative_config().decode_query_len();
   torch::Tensor validate_positions = validate_input.positions;
   CHECK_EQ(validate_positions.numel(), batch_size * num_val_tokens)
       << "validate positions must contain one row per speculative token";
@@ -2263,7 +2286,7 @@ torch::Tensor MTPWorkerImpl<TargetInput>::acquire_accepted_tokens_host_buffer(
   const int64_t required_capacity = accepted_tokens.numel();
   const int64_t configured_capacity =
       static_cast<int64_t>(options_.max_seqs_per_batch()) *
-      (static_cast<int64_t>(options_.num_speculative_tokens()) + 1);
+      options_.speculative_config().decode_query_len();
   if (enable_schedule_overlap()) {
     return acquire_pinned_output_buffer(accepted_tokens,
                                         accepted_tokens_host_pool_);
@@ -2347,7 +2370,7 @@ void MTPWorkerImpl<TargetInput>::flush_pending_target_context(
           pending.accepted_tokens_host,
           pending.accepted_embeddings,
           pending.accepted_count_host,
-          options_.num_speculative_tokens(),
+          options_.speculative_config().num_speculative_tokens(),
           pending.allow_immutable_compact_view);
     } else {
       CHECK(pending.request_ids.empty() ||
@@ -2393,7 +2416,7 @@ void MTPWorkerImpl<TargetInput>::flush_pending_target_context(
                 ? pending.accepted_count_host.narrow(
                       /*dim=*/0, /*start=*/sequence_index, /*length=*/1)
                 : torch::Tensor(),
-            options_.num_speculative_tokens(),
+            options_.speculative_config().num_speculative_tokens(),
             pending.allow_immutable_compact_view);
       }
     }
@@ -2426,12 +2449,13 @@ bool MTPWorkerImpl<TargetInput>::uses_verifier_conditioned_draft_prefix()
          ModelConfig::is_python_model_impl(
              ModelConfig::get_instance().model_impl()) &&
          KernelConfig::get_instance().npu_kernel_backend() == "TORCH" &&
-         !options_.enable_adaptive_draft_step() &&
-         !options_.enable_adaptive_target_verify() &&
+         !options_.speculative_config().enable_adaptive_draft_step() &&
+         !options_.speculative_config().enable_adaptive_target_verify() &&
          parallel_args_.dp_size() == 1 && parallel_args_.cp_size() == 1 &&
          parallel_args_.kv_split_size_effective() == 1 &&
-         options_.num_speculative_tokens() >= 1 &&
-         options_.num_speculative_tokens() <= 16;
+         options_.speculative_config().has_speculative_width() &&
+         options_.speculative_config().num_speculative_tokens() <=
+             kMaxSpeculativeTokens;
 #else
   return false;
 #endif
@@ -2469,7 +2493,7 @@ void MTPWorkerImpl<TargetInput>::retain_draft_prefix(
     const torch::Tensor& base_kv_seq_lens) {
   const auto& embedding = input.input_params.embedding;
   const int64_t batch_size = embedding.embedding_ids.size();
-  const int64_t width = options_.num_speculative_tokens() + 1;
+  const int64_t width = options_.speculative_config().decode_query_len();
   CHECK_EQ(embedding.request_ids.size(), embedding.embedding_ids.size());
   CHECK_EQ(validate_output.next_tokens.size(0), batch_size);
   CHECK_EQ(validate_output.next_tokens.size(1), width);
@@ -2516,7 +2540,7 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_prefix(
     LlmForwardInput& draft_input) {
   const auto& embedding = input.input_params.embedding;
   const int32_t batch_size = input.input_params.meta.num_sequences;
-  const int32_t width = options_.num_speculative_tokens() + 1;
+  const int32_t width = options_.speculative_config().decode_query_len();
   CHECK_EQ(embedding.embedding_ids.size(), static_cast<size_t>(batch_size));
   CHECK_EQ(embedding.request_ids.size(), static_cast<size_t>(batch_size));
   CHECK_EQ(parallel_args_.dp_size(), 1);
@@ -2665,7 +2689,7 @@ bool MTPWorkerImpl<TargetInput>::supports_combined_first_draft_execution()
 
   // The ATB speculative path expects CHUNKED_PREFILL metadata instead of the
   // eager two-row DECODE input used by the prelaunch.
-  if (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+  if (options_.speculative_config().enable_atb_spec_kernel()) {
     return false;
   }
 
@@ -2739,7 +2763,8 @@ void MTPWorkerImpl<TargetInput>::prepare_first_draft_template(
       clone_host_tensor(metadata_template.token_ids_host);
   metadata_template.positions_host =
       clone_host_tensor(metadata_template.positions_host);
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  const int32_t num_speculative_tokens =
+      options_.speculative_config().num_speculative_tokens();
   int32_t* template_positions =
       metadata_template.positions_host.template data_ptr<int32_t>();
   int32_t* template_tokens =
@@ -2908,7 +2933,8 @@ void MTPWorkerImpl<TargetInput>::update_decode_step_input(
           seq_id < block_tables.size(0)) {
         const int32_t allocated_kv_len =
             static_cast<int32_t>(block_tables.size(1)) * logical_block_size();
-        const int32_t validate_width = options_.num_speculative_tokens() + 1;
+        const int32_t validate_width =
+            options_.speculative_config().decode_query_len();
         const int32_t max_valid_position = allocated_kv_len - validate_width;
         if (current_position > max_valid_position) {
           CHECK_GT(allocated_kv_len, 0)
@@ -2919,7 +2945,7 @@ void MTPWorkerImpl<TargetInput>::update_decode_step_input(
               << ", allocated_kv_len=" << allocated_kv_len
               << ", validate_width=" << validate_width;
           CHECK_LE(current_position - max_valid_position,
-                   options_.num_speculative_tokens() + 1)
+                   options_.speculative_config().decode_query_len())
               << "decode context position exceeds allocated blocks, seq_id="
               << seq_id << ", current_position=" << current_position
               << ", current_kv_len=" << current_kv_len
@@ -2937,7 +2963,7 @@ void MTPWorkerImpl<TargetInput>::update_decode_step_input(
       // current_position. Normalize only the lag explainable by the current
       // speculative step.
       CHECK_LE(expected_kv_len - current_kv_len,
-               options_.num_speculative_tokens() + 1)
+               options_.speculative_config().decode_query_len())
           << "decode context kv_len lag is too large, seq_id=" << seq_id
           << ", current_position=" << current_position
           << ", current_kv_len=" << current_kv_len;
@@ -2987,7 +3013,8 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
   torch::TensorOptions position_options = validate_input.positions.options();
 
   const int32_t num_sequences = input_params.meta.num_sequences;
-  const int32_t num_val_tokens = options_.num_speculative_tokens() + 1;
+  const int32_t num_val_tokens =
+      options_.speculative_config().decode_query_len();
   const int32_t total_num_val_tokens = num_sequences * num_val_tokens;
   const int32_t logical_block_size = this->logical_block_size();
   const bool positions_decoupled = positions_are_decoupled_from_kv_length();
@@ -3027,7 +3054,7 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
   Slice<int32_t> positions = tensor_slice(input.positions_host);
   Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
   const bool use_atb_spec_kernel =
-      ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
+      options_.speculative_config().enable_atb_spec_kernel() ||
       use_chunked_prefill_spec_verify_path();
   specBuilder::DecodeBuildBuffers buf;
   buf.out_token_ids.reserve(total_num_val_tokens);
@@ -3058,7 +3085,7 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
 
     if (use_atb_spec_kernel) {
       const int32_t kv_len_after_validation =
-          kv_len + options_.num_speculative_tokens();
+          kv_len + options_.speculative_config().num_speculative_tokens();
       specBuilder::update_kv_seq_lens_and_max(
           atb_kv_seq_lens_vec, kv_len_after_validation, atb_kv_max_seq_len);
       specBuilder::append_q_seq_len(
@@ -3389,7 +3416,7 @@ bool MTPWorkerImpl<TargetInput>::
   if (kv_seq_lens.size() != 1) {
     return false;
   }
-  const int64_t spec_width = options_.num_speculative_tokens() + 1;
+  const int64_t spec_width = options_.speculative_config().decode_query_len();
   const int64_t base_kv_seq_len = kv_seq_lens.front();
   const int64_t spec_verify_max_kv_seq_len = base_kv_seq_len + spec_width - 1;
   const SpecVerifyGraphTaskSignal signal{
@@ -3433,7 +3460,7 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_extend_inputs(
 
   const bool dp_enabled = parallel_args_.dp_size() > 1;
   const bool use_chunked_prefill =
-      ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
+      options_.speculative_config().enable_atb_spec_kernel();
   CHECK_EQ(last_states.size(), static_cast<size_t>(num_sequences))
       << "draft extend state count mismatch";
   const bool use_uniform_two_rows =
@@ -3783,7 +3810,8 @@ SampleOutput MTPWorkerImpl<TargetInput>::validate(
     const ForwardOutput& target_output,
     int32_t num_speculative_tokens,
     const std::vector<uint8_t>& invalid_draft) {
-  const int32_t num_val_tokens = num_speculative_tokens + 1;
+  const int32_t num_val_tokens =
+      SpeculativeConfig::decode_query_len(num_speculative_tokens);
   const int32_t batch_size =
       static_cast<int32_t>(draft_proposal.token_ids().size(0));
   const int32_t vocab_size = target_output.logits.size(/*dim=*/-1);

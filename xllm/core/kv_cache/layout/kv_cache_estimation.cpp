@@ -189,7 +189,7 @@ int64_t layerwise_split_block_count(const ModelArgs& model_args,
 
 bool enable_hybrid_spec_verify(const ModelArgs& model_args,
                                const KVCacheEstimateOptions& options) {
-  return options.num_speculative_tokens > 0 && !options.is_draft_engine &&
+  return options.num_speculative_tokens > 0 && !options.is_drafter &&
          options.instance_role != InstanceRole::PREFILL &&
          (is_qwen3_5_target_model_type(model_args.model_type()) ||
           is_glm5_next_target_model_type(model_args.model_type()));
@@ -770,38 +770,38 @@ KVCacheCapacity KVCacheEstimator::estimate(
       options.max_linear_state_cache_slots();
   estimate_options.linear_state_cache_block_limit =
       context.linear_state_cache_block_limit;
-  estimate_options.is_draft_engine = options.is_draft_engine();
+  estimate_options.is_drafter = options.is_drafter();
   estimate_options.enable_chunked_prefill = options.enable_chunked_prefill();
   estimate_options.enable_schedule_overlap = options.enable_schedule_overlap();
   const KVCacheConfig& kv_cache_config = KVCacheConfig::get_instance();
   const bool is_mtp_draft_engine =
-      options.is_draft_engine() &&
-      SpeculativeConfig::is_mtp_algorithm(options.speculative_algorithm());
+      options.is_drafter() &&
+      options.speculative_config().algorithm() == SpeculativeAlgorithm::MTP;
   estimate_options.enable_prefix_cache =
       options.enable_prefix_cache() && !kv_cache_config.enable_vmm_kvcache() &&
       !is_mtp_draft_engine;
   estimate_options.enable_disagg_pd = options.enable_disagg_pd();
   estimate_options.instance_role = options.instance_role();
-  estimate_options.num_speculative_tokens =
-      static_cast<int64_t>(options.num_speculative_tokens());
+  estimate_options.num_speculative_tokens = static_cast<int64_t>(
+      options.speculative_config().num_speculative_tokens());
   if (!context.is_multimodal) {
     estimate_options.dp_size = options.dp_size();
     estimate_options.enable_dp_fair_token_budget =
         ::xllm::SchedulerConfig::get_instance().enable_dp_fair_token_budget();
-    if (options.enable_mtp_draft_body_tp1() && options.is_draft_engine()) {
+    if (options.speculative_config().enable_mtp_draft_body_tp1() &&
+        options.is_drafter()) {
       estimate_options.world_size = 1;
     }
     estimate_options.layerwise_split_size =
-        options.is_draft_engine()
+        options.is_drafter()
             ? 1
             : ParallelConfig::get_instance().layerwise_split_size();
 
     if (options.enable_task_pipeline() &&
-        options.num_speculative_tokens() > 0 && !options.is_draft_engine()) {
+        options.speculative_config().enable_speculative_decode()) {
       estimate_options.embedding_context_bytes_per_block =
           sizeof(int64_t) + 2 * sizeof(int32_t);
-      if (!SpeculativeConfig::is_block_diffusion_algorithm(
-              options.speculative_algorithm())) {
+      if (!is_block_diffusion(options.speculative_config().algorithm())) {
         CHECK_GT(model_args_.hidden_size(), 0);
         const int64_t element_bytes = static_cast<int64_t>(
             torch::scalarTypeToTypeMeta(context.dtype).itemsize());
@@ -934,8 +934,9 @@ KVCacheCapacity estimate_kv_cache_capacity(
           : 0;
   kv_cache_cap.linear_conv_state_len(model_args.linear_conv_kernel_dim() - 1 +
                                      num_speculative_tokens);
-  kv_cache_cap.linear_ssm_checkpoint_stride(num_speculative_tokens + 1);
-  if (options.is_draft_engine && model_args.num_nextn_predict_layers() > 0) {
+  kv_cache_cap.linear_ssm_checkpoint_stride(
+      SpeculativeConfig::decode_query_len(num_speculative_tokens));
+  if (options.is_drafter && model_args.num_nextn_predict_layers() > 0) {
     kv_cache_cap.n_layers(model_args.num_nextn_predict_layers());
   }
 
@@ -955,7 +956,8 @@ KVCacheCapacity estimate_kv_cache_capacity(
     } else {
       // Preserve the MLU asynchronous handoff window.
       const int64_t window = options.num_speculative_tokens > 0
-                                 ? 2 * (options.num_speculative_tokens + 1)
+                                 ? 2 * SpeculativeConfig::decode_query_len(
+                                           options.num_speculative_tokens)
                                  : 0;
       kv_cache_cap.kpool_tail_len(model_args.index_kpool() + window);
     }

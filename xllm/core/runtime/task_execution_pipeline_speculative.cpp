@@ -24,8 +24,10 @@ limitations under the License.
 #include <cmath>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <utility>
 
 #include "core/common/metrics.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/framework/sampling/sampling_params.h"
@@ -126,8 +128,8 @@ void pad_task_parallel(ParallelInput& input, uint32_t rows) {
   }
 }
 
-Status invalid(const char* message) {
-  return Status(StatusCode::INVALID_ARGUMENT, message);
+Status invalid(std::string message) {
+  return Status(StatusCode::INVALID_ARGUMENT, std::move(message));
 }
 
 StreamEventPtr reusable_event(const torch::Device& device) {
@@ -347,10 +349,12 @@ Status TaskExecutionPipeline::create(
       !capacity.hybrid_recurrent_target &&
       (capacity.kind != SpeculativeTaskKind::MTP ||
        capacity.num_speculative_tokens == 0 ||
-       capacity.num_speculative_tokens > 16 || common.dp_size != 1 ||
-       capacity.adaptive_target_verify || capacity.adaptive_draft_step)) {
-    return invalid(
-        "Hybrid MTP requires fixed widths, DP=1 and 1..16 speculative tokens.");
+       capacity.num_speculative_tokens > kMaxSpeculativeTokens ||
+       common.dp_size != 1 || capacity.adaptive_target_verify ||
+       capacity.adaptive_draft_step)) {
+    return invalid("Hybrid MTP requires fixed widths, DP=1 and 1.." +
+                   std::to_string(kMaxSpeculativeTokens) +
+                   " speculative tokens.");
   }
   if (capacity.kind == SpeculativeTaskKind::DSPARK && common.dp_size != 1 &&
       capacity.unified_graph) {
@@ -491,7 +495,7 @@ Status TaskExecutionPipeline::create(
 Status TaskExecutionPipeline::initialize_speculative() {
   const auto& c = capacity_;
   const uint32_t count = c.model.max_sequences;
-  const uint32_t width = speculative_capacity_->num_speculative_tokens + 1;
+  const uint32_t width = decode_query_len(*speculative_capacity_);
   const uint32_t expanded = count * width;
   Status status = create_mtp_context(0,
                                      block_draft() ? 0 : c.hidden_size,
@@ -1044,7 +1048,7 @@ Status TaskExecutionPipeline::validate_input(SpeculativeSlot& slot,
   if (speculative_capacity_->adaptive_draft_step && requested_steps != 0 &&
       capacity_.max_graph_batch_size != 0 && slot.decode && count != 0 &&
       count <= capacity_.max_graph_batch_size /
-                   (speculative_capacity_->num_speculative_tokens + 1) &&
+                   decode_query_len(*speculative_capacity_) &&
       !input.input_params.meta.is_graph_warmup &&
       (slot.target_padded_batch_size == 0 ||
        (slot.prefix_refresh && slot.prefix_refresh->padded_batch_size == 0) ||
@@ -1732,8 +1736,8 @@ Status TaskExecutionPipeline::warmup_speculative_graphs(
       CHECK(status.ok()) << status.message();
       if (capacity_.model.enable_linear_attention) {
         auto input_guard = prepare_stream_.set_stream_guard();
-        binding.prepare_model_state(
-            input, speculative_capacity_->num_speculative_tokens + 1);
+        binding.prepare_model_state(input,
+                                    decode_query_len(*speculative_capacity_));
       }
       CHECK_EQ(prepare_stream_.synchronize(), 0);
 
@@ -2031,7 +2035,7 @@ Status TaskExecutionPipeline::warmup_packed_verify_graphs(
              input.input_params.parallel.dp_global_sequence_nums) {
           raw_counts.emplace_back(
               std::min(static_cast<uint32_t>(count) *
-                           (speculative_capacity_->num_speculative_tokens + 1),
+                           decode_query_len(*speculative_capacity_),
                        physical_rows));
         }
       }
@@ -2721,7 +2725,7 @@ bool TaskExecutionPipeline::prepares_mtp_context() const {
          capacity_.model.enable_linear_attention && !capacity_.enable_mla &&
          capacity_.dp_size == 1 && capacity_.cp_sampling_group == nullptr &&
          speculative_capacity_->num_speculative_tokens >= 1 &&
-         speculative_capacity_->num_speculative_tokens <= 16;
+         speculative_capacity_->num_speculative_tokens <= kMaxSpeculativeTokens;
 }
 
 void TaskExecutionPipeline::bind_mtp_publication(SpeculativeSlot& slot) {
@@ -3351,7 +3355,7 @@ bool TaskExecutionPipeline::launch_unified_block(SpeculativeSlot& slot) {
           result,
           speculative_capacity_->kind == SpeculativeTaskKind::DSPARK,
           capacity_.sampling_group);
-  const uint32_t width = speculative_capacity_->num_speculative_tokens + 1;
+  const uint32_t width = decode_query_len(*speculative_capacity_);
   context_advance(*slot.state,
                   result.tokens,
                   result.lengths,
@@ -3575,7 +3579,7 @@ void TaskExecutionPipeline::launch_packed_verify(SpeculativeSlot& slot) {
     // columns to its last verified row. Refresh's existing storage owns this
     // snapshot before another prepared forward can reuse Target output.
     auto& refresh = *slot.prefix_refresh;
-    const int64_t width = speculative_capacity_->num_speculative_tokens + 1;
+    const int64_t width = decode_query_len(*speculative_capacity_);
     const auto columns =
         torch::minimum(adaptive.hidden_columns,
                        adaptive.widths.to(torch::kInt64).unsqueeze(1) - 1);
@@ -3645,8 +3649,7 @@ void TaskExecutionPipeline::write_block_context(SpeculativeSlot& slot,
       input.model_params().attention.device.new_cache_slots;
   torch::Tensor positions = input.positions();
   if (!prefill && !adaptive_verify_) {
-    const int64_t rows =
-        slot.rows * (speculative_capacity_->num_speculative_tokens + 1);
+    const int64_t rows = slot.rows * decode_query_len(*speculative_capacity_);
     slot.context_slots.copy_(cache_slots.narrow(
         /*dim=*/0, /*start=*/0, slot.context_slots.numel()));
     slot.context_slots.narrow(/*dim=*/0, /*start=*/0, rows)

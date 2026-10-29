@@ -36,6 +36,9 @@ namespace xllm {
 class RequestOutputDispatcher;
 class ModelArgs;
 
+// Release the PD bootstrap embedding once the target worker consumed it.
+void clear_mtp_bootstrap(const SchedulerOptions& options, Request* request);
+
 // SchedulerState provides explicit access to the scheduler's internal state.
 // The SchedulerPolicy operates solely through this boundary -- it never
 // accesses ContinuousScheduler members directly.

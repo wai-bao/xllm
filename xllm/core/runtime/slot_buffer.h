@@ -27,6 +27,7 @@ limitations under the License.
 namespace xllm {
 
 class LlmForwardInput;
+class LlmModelParams;
 struct MtpContextView;
 
 struct ModelInputCapacity {

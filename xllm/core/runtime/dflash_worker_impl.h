@@ -180,9 +180,6 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
       dflash_detail::DSparkSasMode::NOT_DSPARK;
 
  private:
-  // Launch-thread-owned JSON context; never borrows a retired result Slot.
-  ForwardOutput task_json_output_;
-  std::vector<std::string> task_json_sample_sequence_ids_;
 };
 
 }  // namespace xllm

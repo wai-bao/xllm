@@ -51,10 +51,6 @@ class UnifiedMtpWorkerImpl : public MTPWorkerImpl<LlmForwardInput> {
  private:
   bool supports_unified_configuration() const;
   bool unified_graph_capable_ = false;
-  // Launch-thread-only JSON overlap context. Task results remain owned by
-  // the shared pipeline; only a completed token copy survives slot reuse.
-  ForwardOutput task_json_output_;
-  std::vector<std::string> task_json_sample_sequence_ids_;
   std::optional<ForwardOutput> step_unified(const LlmForwardInput& input);
   std::optional<ForwardOutput> run_unified_python_mtp_graph(
       const LlmForwardInput& input,

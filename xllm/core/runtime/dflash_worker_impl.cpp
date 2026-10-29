@@ -48,7 +48,6 @@ limitations under the License.
 #include "core/framework/speculative/spec_input_builder.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/platform/platform.h"
-#include "core/runtime/json_object_decode_continuation.h"
 #include "core/runtime/task_execution_pipeline.h"
 #include "runtime/llm_worker_impl.h"
 #include "util/json_reader.h"
@@ -62,10 +61,10 @@ namespace {
 // Ordinary DFlash retains its worker-owned recurrent target path. DSpark and
 // DFlash2 use the shared block task pipeline and its capability validation.
 bool uses_hybrid_worker_pipeline(const runtime::Options& options) {
+  const SpeculativeConfig& spec = options.speculative_config();
   if (!options.enable_task_pipeline() || !Platform::is_npu() ||
-      options.enable_adaptive_target_verify() ||
-      !SpeculativeConfig::is_dflash_algorithm(
-          options.speculative_algorithm())) {
+      spec.enable_adaptive_target_verify() ||
+      spec.algorithm() != SpeculativeAlgorithm::DFLASH) {
     return false;
   }
   const std::string model_type =
@@ -76,7 +75,7 @@ bool uses_hybrid_worker_pipeline(const runtime::Options& options) {
 runtime::Options target_options(const runtime::Options& options) {
   runtime::Options opts = options;
   opts.enable_schedule_overlap(false)
-      .is_draft_engine(false)
+
       .enable_graph_aux_hidden_states(true);
   if (uses_hybrid_worker_pipeline(options)) {
     // The outer worker owns the pipeline; the recurrent target keeps its
@@ -89,20 +88,20 @@ runtime::Options target_options(const runtime::Options& options) {
 runtime::Options draft_options(const runtime::Options& options) {
   // DSpark sizes its attention window from num_speculative_tokens; other
   // DFlash-style drafts still run one step at a time.
-  const bool is_dspark =
-      SpeculativeConfig::is_dspark_algorithm(options.speculative_algorithm());
-  const bool is_dflash2 =
-      SpeculativeConfig::is_dflash2_algorithm(options.speculative_algorithm());
+  const SpeculativeAlgorithm kind = options.speculative_config().algorithm();
+  const bool is_dspark = kind == SpeculativeAlgorithm::DSPARK;
+  const bool is_dflash2 = kind == SpeculativeAlgorithm::DFLASH2;
   const bool hybrid_pipeline = uses_hybrid_worker_pipeline(options);
   const int32_t draft_num_speculative_tokens =
-      is_dspark ? options.num_speculative_tokens() : 0;
+      is_dspark ? options.speculative_config().num_speculative_tokens() : 0;
   runtime::Options opts = options;
   opts.enable_schedule_overlap(false)
-      .is_draft_engine(true)
-      .num_decoding_tokens(is_dflash2 ? options.num_speculative_tokens() + 1
-                                      : 1)
-      .num_speculative_tokens(draft_num_speculative_tokens)
-      .enable_graph_aux_hidden_states(false);
+      .worker_type(WorkerType::DRAFTER)
+      .num_decoding_tokens(
+          is_dflash2 ? options.speculative_config().decode_query_len() : 1);
+  opts.speculative_config().num_speculative_tokens(
+      draft_num_speculative_tokens);
+  opts.enable_graph_aux_hidden_states(false);
   if (hybrid_pipeline) {
     // The outer worker owns the task queue. Its leaf executors retain their
     // recurrent-aware ACL runners instead of borrowing full-attention slots.
@@ -350,14 +349,14 @@ DFlashWorkerImpl::DFlashWorkerImpl(const ParallelArgs& parallel_args,
       sampling_process_group_(parallel_args.tp_group_ != nullptr
                                   ? parallel_args.tp_group_
                                   : parallel_args.process_group_) {
-  CHECK((options.adaptive_target_verify_cost_table().empty() &&
-         options.adaptive_target_verify_calibration().empty()) ||
+  const SpeculativeConfig& spec = options.speculative_config();
+  CHECK((spec.adaptive_target_verify_cost_table().empty() &&
+         spec.adaptive_target_verify_calibration().empty()) ||
         (options.enable_task_pipeline() &&
-         options.enable_adaptive_target_verify() &&
-         SpeculativeConfig::is_dspark_algorithm(
-             options.speculative_algorithm()) &&
-         (options.num_speculative_tokens() == 5 ||
-          options.num_speculative_tokens() == 7)))
+         spec.enable_adaptive_target_verify() &&
+         spec.algorithm() == SpeculativeAlgorithm::DSPARK &&
+         (spec.num_speculative_tokens() == 5 ||
+          spec.num_speculative_tokens() == 7)))
       << "DSpark startup calibration options require an adaptive DSpark "
          "Draft5/7 "
          "task "
@@ -371,8 +370,9 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
 
 ::xllm::Status DFlashWorkerImpl::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
+  const SpeculativeConfig& spec = options_.speculative_config();
   if (target_is_hybrid_recurrent_ && uses_hybrid_worker_pipeline(options_)) {
-    if (!options_.enable_graph() || options_.enable_adaptive_target_verify() ||
+    if (!options_.enable_graph() || spec.enable_adaptive_target_verify() ||
         parallel_args_.dp_size() != 1) {
       return ::xllm::Status(
           StatusCode::INVALID_ARGUMENT,
@@ -387,18 +387,17 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
     status = TaskExecutionPipeline::create(
         threadpool_, impl_->task_model(), *this, capacity, output);
     if (status.ok()) {
-      LOG(INFO) << options_.speculative_algorithm()
+      LOG(INFO) << spec.speculative_algorithm()
                 << " hybrid worker task execution pipeline: slots="
                 << capacity.slot_count
-                << ", speculative_tokens=" << options_.num_speculative_tokens();
+                << ", speculative_tokens=" << spec.num_speculative_tokens();
     }
     return status;
   }
   if (impl_ == nullptr || draft_impl_ == nullptr ||
-      (options_.enable_adaptive_target_verify() &&
-       !SpeculativeConfig::is_dspark_algorithm(
-           options_.speculative_algorithm())) ||
-      options_.num_speculative_tokens() <= 0) {
+      (spec.enable_adaptive_target_verify() &&
+       spec.algorithm() != SpeculativeAlgorithm::DSPARK) ||
+      !options_.speculative_config().enable_speculative_decode()) {
     return ::xllm::Status(StatusCode::INVALID_ARGUMENT,
                           "Block task pipeline requires fixed-width or "
                           "adaptive DSpark full-attention models.");
@@ -416,8 +415,7 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
         "dense target attention needs a device-length prepared contract.");
   }
   const auto& draft_args = draft_impl_->context_.get_model_args();
-  if (SpeculativeConfig::is_dspark_algorithm(
-          options_.speculative_algorithm()) &&
+  if (spec.algorithm() == SpeculativeAlgorithm::DSPARK &&
       parallel_args_.dp_size() > 1 &&
       ExecutionConfig::get_instance().enable_unified_mtp_graph()) {
     return ::xllm::Status(StatusCode::INVALID_ARGUMENT,
@@ -432,14 +430,18 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
                           "Block task model hidden/vocabulary or captured "
                           "context geometry mismatch.");
   }
-  capacity.kind =
-      SpeculativeConfig::is_dspark_algorithm(options_.speculative_algorithm())
-          ? SpeculativeTaskKind::DSPARK
-      : SpeculativeConfig::is_dflash2_algorithm(
-            options_.speculative_algorithm())
-          ? SpeculativeTaskKind::DFLASH2
-          : SpeculativeTaskKind::DFLASH;
-  capacity.num_speculative_tokens = options_.num_speculative_tokens();
+  switch (spec.algorithm()) {
+    case SpeculativeAlgorithm::DSPARK:
+      capacity.kind = SpeculativeTaskKind::DSPARK;
+      break;
+    case SpeculativeAlgorithm::DFLASH2:
+      capacity.kind = SpeculativeTaskKind::DFLASH2;
+      break;
+    default:
+      capacity.kind = SpeculativeTaskKind::DFLASH;
+      break;
+  }
+  capacity.num_speculative_tokens = spec.num_speculative_tokens();
   capacity.context_hidden_size =
       static_cast<uint32_t>(expected_context_hidden_size_);
   capacity.mask_token_id = mask_token_id_;
@@ -455,15 +457,15 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
        draft_args.model_type() == "DSparkDraftModel") &&
       parallel_args_.dp_size() == 1 && parallel_args_.cp_size() == 1 &&
       parallel_args_.kv_split_size_effective() == 1;
-  capacity.adaptive_target_verify = options_.enable_adaptive_target_verify();
-  capacity.adaptive_min_gain = options_.adaptive_target_verify_min_gain();
+  capacity.adaptive_target_verify = spec.enable_adaptive_target_verify();
+  capacity.adaptive_min_gain = spec.adaptive_target_verify_min_gain();
   capacity.startup_calibration = capacity.adaptive_target_verify;
   capacity.calibration_leader = parallel_args_.rank() == 0;
   if (capacity.startup_calibration &&
       (!options_.enable_graph() || !options_.enable_schedule_overlap() ||
        ExecutionConfig::get_instance().disable_graph_warmup() ||
-       (!options_.adaptive_target_verify_calibration().empty() &&
-        !options_.adaptive_target_verify_cost_table().empty()))) {
+       (!spec.adaptive_target_verify_calibration().empty() &&
+        !spec.adaptive_target_verify_cost_table().empty()))) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
         "Adaptive DSpark calibration requires graph warmup, schedule overlap "
@@ -481,7 +483,7 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
   if (!status.ok()) {
     return status;
   }
-  LOG(INFO) << options_.speculative_algorithm()
+  LOG(INFO) << spec.speculative_algorithm()
             << " task execution pipeline: slots=" << capacity.common.slot_count
             << ", speculative_tokens=" << capacity.num_speculative_tokens
             << ", pinned_bytes=" << output->pinned_bytes()
@@ -492,6 +494,7 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
 bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
                                   int32_t random_seed,
                                   MasterStatus master_status) {
+  const SpeculativeConfig& spec = options_.speculative_config();
   // DFlash draft attends each block non-causally, which the shared QWen3 model
   // only wires up on the chunked-prefill mask path. Without it the draft falls
   // back to a causal mask and proposal quality silently degrades, so require
@@ -500,7 +503,7 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
       << "Block-diffusion speculative decoding requires "
          "--enable_chunked_prefill=true.";
   CHECK(SpeculativeConfig::is_probabilistic_draft_sampling_supported(
-            options_.speculative_algorithm()) ||
+            spec.algorithm()) ||
         !is_probabilistic_draft_)
       << "This drafter only supports greedy drafts.";
   // Draft config's use_sliding_window / sliding_window is intentionally
@@ -552,8 +555,7 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
           draft_impl_->WorkerImpl::share_weights_from(*impl_);
       if (!python_weights_shared) {
 #if defined(USE_NPU)
-        if (!SpeculativeConfig::is_dflash2_algorithm(
-                options_.speculative_algorithm())) {
+        if (spec.algorithm() != SpeculativeAlgorithm::DFLASH2) {
           auto head = impl_->get_npu_lm_head();
           draft_impl_->set_npu_lm_head(head);
           auto word_embedding = impl_->get_npu_word_embedding();
@@ -587,10 +589,8 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
     CHECK_LT(mask_token_id_, draft_vocab_size)
         << "Block-diffusion mask_token_id (" << mask_token_id_
         << ") must be < draft vocab_size (" << draft_vocab_size << ").";
-    if (SpeculativeConfig::is_dflash2_algorithm(
-            options_.speculative_algorithm())) {
-      const int32_t requested_block_size =
-          options_.num_speculative_tokens() + 1;
+    if (spec.algorithm() == SpeculativeAlgorithm::DFLASH2) {
+      const int32_t requested_block_size = spec.decode_query_len();
       CHECK_EQ(requested_block_size, draft_args.dflash2_block_size())
           << "DFlash2 runtime block size must match the checkpoint's trained "
              "dflash_config.block_size.";
@@ -631,6 +631,7 @@ std::tuple<int64_t, int64_t> DFlashWorkerImpl::estimate_kv_cache_capacity() {
 
 std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
     const LlmForwardInput& input) {
+  const SpeculativeConfig& spec = options_.speculative_config();
   if (!input.input_params.meta.batch_forward_type.is_decode()) {
     std::optional<ForwardOutput> output = run_worker_no_sync_impl(
         *impl_, input, *prepare_stream_, *compute_stream_);
@@ -649,7 +650,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   // every block row as a q_len=1 sequence, while Qwen/DFlash keeps one
   // query_width-wide sequence.
   const int32_t draft_width = dflash_detail::decode_draft_width(
-      options_.num_speculative_tokens(), sample_from_anchor());
+      spec.num_speculative_tokens(), sample_from_anchor());
   const bool use_block_parallel_rows = draft_use_block_parallel_rows();
   LlmForwardInput query_input = input.clone();
   dflash_detail::invalidate_draft_model_geometry(query_input.input_params);
@@ -677,8 +678,8 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
   LlmForwardInput validate_input = input.clone();
   // DSpark's N-wide draft geometry must be rescaled to (N+1) for the target's
   // anchor + drafts forward.
-  scale_speculative_parallel_token_counts(
-      validate_input.input_params, options_.num_speculative_tokens() + 1);
+  scale_speculative_parallel_token_counts(validate_input.input_params,
+                                          spec.decode_query_len());
   ForwardOutput output =
       run_worker_no_sync_impl(
           *impl_, validate_input, *prepare_stream_, *compute_stream_)
@@ -769,6 +770,7 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
 DraftProposal DFlashWorkerImpl::run_decode_draft(
     const LlmForwardInput& input,
     LlmForwardInput& validate_input) {
+  const SpeculativeConfig& spec = options_.speculative_config();
   Timer draft_timer;
 
   LlmForwardInput query_input;
@@ -791,7 +793,7 @@ DraftProposal DFlashWorkerImpl::run_decode_draft(
 
   // Draft emits the whole block in one forward; reshape the flat outputs into
   // [batch, num_speculative_tokens] instead of splitting into per-step outputs.
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  const int32_t num_speculative_tokens = spec.num_speculative_tokens();
   const int32_t num_draft_tokens =
       static_cast<int32_t>(draft_output.sample_output.next_tokens.numel());
   CHECK_EQ(num_draft_tokens % num_speculative_tokens, 0)
@@ -807,9 +809,10 @@ void DFlashWorkerImpl::fill_validate_input_from_draft_outputs(
     const DraftProposal& draft_proposal,
     LlmForwardInput& validate_input,
     Stream& compute_stream) {
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  const SpeculativeConfig& spec = options_.speculative_config();
+  const int32_t num_speculative_tokens = spec.num_speculative_tokens();
+  const int32_t num_val_tokens = spec.decode_query_len();
   CHECK_GT(num_speculative_tokens, 0);
-  const int32_t num_val_tokens = num_speculative_tokens + 1;
   const torch::Tensor& draft_token_ids = draft_proposal.token_ids();
   CHECK(draft_token_ids.defined())
       << "DFlash draft token_ids must be defined for validate token fill";
@@ -1014,6 +1017,7 @@ void DFlashWorkerImpl::prepare_validate_inputs(
 
 void DFlashWorkerImpl::prepare_query_inputs(const LlmForwardInput& input,
                                             LlmForwardInput& query_input) {
+  const SpeculativeConfig& spec = options_.speculative_config();
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
   query_input = input.clone();
   query_input.runtime.device_tensors_ready = false;
@@ -1026,7 +1030,7 @@ void DFlashWorkerImpl::prepare_query_inputs(const LlmForwardInput& input,
   const bool use_block_parallel_rows = draft_use_block_parallel_rows();
   build_query_rows(input,
                    mask_token_id_,
-                   options_.num_speculative_tokens(),
+                   spec.num_speculative_tokens(),
                    options_.block_size(),
                    sample_from_anchor(),
                    use_block_parallel_rows,
@@ -1034,7 +1038,7 @@ void DFlashWorkerImpl::prepare_query_inputs(const LlmForwardInput& input,
                    selected_idxes);
   // DFlash: (1 + N) rows per seq; DSpark (sample_from_anchor): N rows.
   const int32_t query_width = dflash_detail::decode_draft_width(
-      options_.num_speculative_tokens(), sample_from_anchor());
+      spec.num_speculative_tokens(), sample_from_anchor());
   // DFlash emits query_width rows per seq unconditionally, so DP shape
   // symmetry holds by construction. Catch scheduler regressions that break
   // the invariant (see MTP dp_enabled idle-rank branch).
@@ -1076,7 +1080,7 @@ void DFlashWorkerImpl::prepare_query_inputs(const LlmForwardInput& input,
   for (const auto& field : kSamplingFields) {
     if (!field.per_request) {
       repeat_interleave_if_defined(field.member(query_input.sampling_params),
-                                   options_.num_speculative_tokens());
+                                   spec.num_speculative_tokens());
     }
   }
   query_input.runtime.device_tensors_ready = true;
@@ -1157,6 +1161,7 @@ void DFlashWorkerImpl::write_context_kv(
 void DFlashWorkerImpl::write_target_context_to_cache(
     const LlmForwardInput& input,
     const SampleOutput& validate_output) {
+  const SpeculativeConfig& spec = options_.speculative_config();
   const torch::Tensor& accepted_embeddings = validate_output.embeddings;
   CHECK(accepted_embeddings.defined())
       << "DFlash validate target embeddings are undefined.";
@@ -1212,7 +1217,7 @@ void DFlashWorkerImpl::write_target_context_to_cache(
       input.input_params.embedding.request_ids,
       validate_output.next_tokens,
       validate_output.embeddings,
-      options_.num_speculative_tokens(),
+      spec.num_speculative_tokens(),
       /*retain_previous_embedding=*/false);
 }
 
@@ -1231,43 +1236,7 @@ void DFlashWorkerImpl::prepare_task_pipeline_input(const LlmForwardInput& input,
 std::optional<ForwardOutput> DFlashWorkerImpl::execute_task_pipeline(
     const LlmForwardInput& prepared) {
   // A worker-owned queue must not use the driver's legacy last-step slot.
-  if (!enable_schedule_overlap() || prepared.json_object_states.empty()) {
-    task_json_output_ = ForwardOutput();
-    task_json_sample_sequence_ids_.clear();
-    return step(prepared);
-  }
-  LlmForwardInput input = prepared.clone();
-  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-  CHECK(compute_stream_->wait_event(input.runtime.metadata_ready_event));
-  if (input.token_ids.numel() > 0 &&
-      input.input_params.meta.batch_forward_type.has_decode()) {
-    JsonObjectDecodeContinuation::prepare(input,
-                                          task_json_output_,
-                                          task_json_sample_sequence_ids_,
-                                          device_,
-                                          *compute_stream_);
-  }
-  auto output = step(input);
-  task_json_output_ = ForwardOutput();
-  task_json_sample_sequence_ids_.clear();
-  if (output.has_value()) {
-    output->json_object_errors.insert(output->json_object_errors.end(),
-                                      input.json_object_errors.begin(),
-                                      input.json_object_errors.end());
-    if (output->sample_output.next_tokens.defined()) {
-      if (output->ready_event != nullptr) {
-        CHECK(output->ready_event->synchronize());
-      }
-      task_json_output_.sample_output.next_tokens =
-          safe_to(
-              output->sample_output.next_tokens,
-              torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU),
-              /*non_blocking=*/false)
-              .clone();
-      task_json_sample_sequence_ids_ = input.sample_sequence_ids;
-    }
-  }
-  return output;
+  return execute_task_pipeline_json(prepared);
 }
 
 }  // namespace xllm

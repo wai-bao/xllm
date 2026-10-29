@@ -368,7 +368,7 @@ TEST_F(MluGraphExecutorTest, MluGraphExecutorVsBaseExecutorImplMultipleRuns) {
 }
 
 TEST_F(MluGraphExecutorTest, DraftDecodeFallsBackToEager) {
-  options_.is_draft_engine(true);
+  options_.worker_type(WorkerType::DRAFTER);
   rebuild_impl();
 
   const int32_t batch_size = 5;
@@ -406,7 +406,7 @@ TEST_F(MluGraphExecutorTest, DraftDecodeFallsBackToEager) {
 
 TEST_F(MluGraphExecutorTest, DraftEagerDoesNotExposeAuxWhenDisabled) {
   model_->return_aux_hidden_states(true);
-  options_.is_draft_engine(true);
+  options_.worker_type(WorkerType::DRAFTER);
   options_.enable_graph_aux_hidden_states(false);
   rebuild_impl();
 
@@ -433,7 +433,7 @@ TEST_F(MluGraphExecutorTest, DraftEagerPreservesTypedTopkWhenAuxIsDisabled) {
       std::make_shared<mlu::model::MluMtpTopkState>(std::move(expected_layers));
   model_->return_aux_hidden_states(true);
   model_->set_mtp_topk_state(expected_state);
-  options_.is_draft_engine(true);
+  options_.worker_type(WorkerType::DRAFTER);
   options_.enable_graph_aux_hidden_states(false);
   rebuild_impl();
 
@@ -501,7 +501,7 @@ TEST_F(MluGraphExecutorTest, NativeRecReplaysAndRecapturesChangedKvStorage) {
 }
 
 TEST_F(MluGraphExecutorTest, TargetDecodeCapturesThenReplays) {
-  options_.is_draft_engine(false);
+  options_.speculative_config().speculative_algorithm("");
   rebuild_impl();
 
   const int32_t batch_size = 5;
@@ -530,7 +530,7 @@ TEST_F(MluGraphExecutorTest, TargetDecodeCapturesThenReplays) {
 }
 
 TEST_F(MluGraphExecutorTest, SpecVerifyFallsBackAndNonSpecStillCaptures) {
-  options_.is_draft_engine(false);
+  options_.speculative_config().speculative_algorithm("");
   rebuild_impl();
 
   const int32_t batch_size = 5;
@@ -582,7 +582,7 @@ TEST_F(MluGraphExecutorTest, SpecVerifyFallsBackAndNonSpecStillCaptures) {
 TEST_F(MluGraphExecutorTest, LargeDecodeBucketCapturesThenReplays) {
   ScopedConfigSnapshot config_snapshot;
   ExecutionConfig::get_instance().max_tokens_for_graph_mode(128);
-  options_.is_draft_engine(false);
+  options_.speculative_config().speculative_algorithm("");
   options_.max_seqs_per_batch(128);
   rebuild_impl();
 
@@ -613,7 +613,7 @@ TEST_F(MluGraphExecutorTest, LargeDecodeBucketCapturesThenReplays) {
 TEST_F(MluGraphExecutorTest, OverConfiguredTokenLimitFallsBackToEager) {
   ScopedConfigSnapshot config_snapshot;
   ExecutionConfig::get_instance().max_tokens_for_graph_mode(33);
-  options_.is_draft_engine(false);
+  options_.speculative_config().speculative_algorithm("");
   options_.max_seqs_per_batch(33);
   rebuild_impl();
 
@@ -693,7 +693,7 @@ TEST_F(MluGraphExecutorTest, LinearStatePaddingTailUsesPaddingId) {
 }
 
 TEST_F(MluGraphExecutorTest, PrefillThenDecodeCapturesAndReplays) {
-  options_.is_draft_engine(false);
+  options_.speculative_config().speculative_algorithm("");
   rebuild_impl();
 
   const int32_t batch_size = 5;
@@ -733,7 +733,7 @@ TEST_F(MluGraphExecutorTest, PrefillThenDecodeCapturesAndReplays) {
 }
 
 TEST_F(MluGraphExecutorTest, EqualDpDecodePadsToTpGraphSize) {
-  options_.is_draft_engine(false);
+  options_.speculative_config().speculative_algorithm("");
   options_.world_size(8);
   options_.dp_size(2);
   rebuild_impl();
@@ -763,7 +763,7 @@ TEST_F(MluGraphExecutorTest, EqualDpDecodePadsToTpGraphSize) {
 }
 
 TEST_F(MluGraphExecutorTest, UnevenDpDecodePadsToTpGraphSize) {
-  options_.is_draft_engine(false);
+  options_.speculative_config().speculative_algorithm("");
   options_.world_size(8);
   options_.dp_size(2);
   rebuild_impl();
@@ -793,10 +793,11 @@ TEST_F(MluGraphExecutorTest, UnevenDpDecodePadsToTpGraphSize) {
 }
 
 TEST_F(MluGraphExecutorTest, MtpSeqLensCapacityUsesSpecFactor) {
-  options_.is_draft_engine(false);
-  options_.num_speculative_tokens(1);
-  options_.num_decoding_tokens(options_.num_speculative_tokens() + 1);
-  options_.enable_speculative_decode(true);
+  options_.speculative_config().speculative_algorithm("");
+  options_.speculative_config().num_speculative_tokens(1);
+  options_.num_decoding_tokens(
+      options_.speculative_config().decode_query_len());
+  options_.speculative_config().speculative_algorithm("MTP");
   options_.max_seqs_per_batch(2);
   rebuild_impl();
 
@@ -822,10 +823,11 @@ TEST_F(MluGraphExecutorTest, MtpSeqLensCapacityUsesSpecFactor) {
 }
 
 TEST_F(MluGraphExecutorTest, MtpSeqLensCapacityIncludesGraphPadding) {
-  options_.is_draft_engine(false);
-  options_.num_speculative_tokens(2);
-  options_.num_decoding_tokens(options_.num_speculative_tokens() + 1);
-  options_.enable_speculative_decode(true);
+  options_.speculative_config().speculative_algorithm("");
+  options_.speculative_config().num_speculative_tokens(2);
+  options_.num_decoding_tokens(
+      options_.speculative_config().decode_query_len());
+  options_.speculative_config().speculative_algorithm("MTP");
   options_.max_seqs_per_batch(8);
   rebuild_impl();
 
@@ -853,7 +855,7 @@ TEST_F(MluGraphExecutorTest, MtpSeqLensCapacityIncludesGraphPadding) {
 }
 
 TEST_F(MluGraphExecutorTest, DpDummyFallsBackToEager) {
-  options_.is_draft_engine(false);
+  options_.speculative_config().speculative_algorithm("");
   rebuild_impl();
 
   const int32_t batch_size = 5;
@@ -882,7 +884,7 @@ TEST_F(MluGraphExecutorTest, DpDummyFallsBackToEager) {
 }
 
 TEST_F(MluGraphExecutorTest, DpUnevenDecodeFallsBackToEager) {
-  options_.is_draft_engine(false);
+  options_.speculative_config().speculative_algorithm("");
   rebuild_impl();
 
   const int32_t batch_size = 5;
@@ -912,7 +914,7 @@ TEST_F(MluGraphExecutorTest, DpUnevenDecodeFallsBackToEager) {
 }
 
 TEST_F(MluGraphExecutorTest, DpDummyDoesNotPoisonGraphCache) {
-  options_.is_draft_engine(false);
+  options_.speculative_config().speculative_algorithm("");
   rebuild_impl();
 
   const int32_t batch_size = 5;
@@ -950,7 +952,7 @@ TEST_F(MluGraphExecutorTest, DpDummyDoesNotPoisonGraphCache) {
 }
 
 TEST_F(MluGraphExecutorTest, DpUnevenDecodeDoesNotPoisonGraphCache) {
-  options_.is_draft_engine(false);
+  options_.speculative_config().speculative_algorithm("");
   rebuild_impl();
 
   const int32_t batch_size = 5;

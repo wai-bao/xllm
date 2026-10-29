@@ -93,8 +93,9 @@ runtime::Options make_runtime_options(double host_blocks_factor) {
   runtime::Options options;
   options.model_id("test_target")
       .block_size(kBlockSize)
-      .num_speculative_tokens(1)
-      .host_blocks_factor(host_blocks_factor)
+      .speculative_config()
+      .num_speculative_tokens(1);
+  options.host_blocks_factor(host_blocks_factor)
       .layers_wise_copy_batchs(1)
       .world_size(1)
       .dp_size(1)
@@ -523,7 +524,7 @@ TEST_F(MTPHostOffloadTest, DFlashUsesSpeculativeHierarchyTransferLifecycle) {
   const ParallelArgs parallel_args(
       /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
   runtime::Options options = make_runtime_options(2.0);
-  options.speculative_algorithm("DFlash");
+  options.speculative_config().speculative_algorithm("DFlash");
   const ModelArgs model_args =
       make_model_args("test_dflash", /*layer_count=*/2, /*head_dim=*/8);
   const KVCacheShape cache_shape = make_cache_shape(model_args);

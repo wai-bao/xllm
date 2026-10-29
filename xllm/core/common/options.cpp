@@ -21,7 +21,7 @@ std::string Options::to_string() const {
   ss << "Options: [";
   ss << "model_path: " << model_path()
      << ", extension_impl: " << extension_impl()
-     << ", draft_model_path: " << draft_model_path().value_or("null")
+     << ", draft_model: " << speculative_config().draft_model_path()
      << ", backend: " << backend()
      << ", limit_image_per_prompt: " << limit_image_per_prompt()
      << ", block_size: " << block_size()
@@ -34,34 +34,8 @@ std::string Options::to_string() const {
      << ", max_tokens_per_batch: " << max_tokens_per_batch()
      << ", max_seqs_per_batch: " << max_seqs_per_batch()
      << ", max_tokens_per_chunk_for_prefill: "
-     << max_tokens_per_chunk_for_prefill()
-     << ", num_speculative_tokens: " << num_speculative_tokens()
-     << ", speculative_algorithm: " << speculative_algorithm()
-     << ", enable_probabilistic_draft: " << enable_probabilistic_draft()
-     << ", speculative_suffix_cache_max_depth: "
-     << speculative_suffix_cache_max_depth()
-     << ", speculative_suffix_max_spec_factor: "
-     << speculative_suffix_max_spec_factor()
-     << ", speculative_suffix_max_spec_offset: "
-     << speculative_suffix_max_spec_offset()
-     << ", speculative_suffix_min_token_prob: "
-     << speculative_suffix_min_token_prob()
-     << ", speculative_suffix_max_cached_requests: "
-     << speculative_suffix_max_cached_requests()
-     << ", speculative_suffix_use_tree_spec: "
-     << speculative_suffix_use_tree_spec()
-     << ", enable_mtp_draft_body_tp1: " << enable_mtp_draft_body_tp1()
-     << ", enable_adaptive_target_verify: " << enable_adaptive_target_verify()
-     << ", enable_adaptive_draft_step: " << enable_adaptive_draft_step()
-     << ", adaptive_draft_step_config: " << adaptive_draft_step_config()
-     << ", adaptive_target_verify_min_gain: "
-     << adaptive_target_verify_min_gain()
-     << ", adaptive_target_verify_cost_table: "
-     << adaptive_target_verify_cost_table()
-     << ", adaptive_target_verify_calibration: "
-     << adaptive_target_verify_calibration()
-     << ", adaptive_target_verify_cost_table_output: "
-     << adaptive_target_verify_cost_table_output()
+     << max_tokens_per_chunk_for_prefill() << ", speculative_config: {"
+     << speculative_config().to_string() << "}"
      << ", num_request_handling_threads: " << num_request_handling_threads()
      << ", communication_backend: " << communication_backend().value_or("null")
      << ", rank_tablefile: " << rank_tablefile().value_or("null")

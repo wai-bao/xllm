@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
 #include "core/framework/config/parallel_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_controller.h"
 #include "core/kv_cache/layout/kv_cache_estimation.h"
 #include "framework/speculative/mtp_utils.h"
@@ -48,18 +49,20 @@ SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
     const runtime::Options& options,
     bool use_draft_engine)
     : options_(options), use_draft_engine_(use_draft_engine) {
-  CHECK_GT(options.num_speculative_tokens(), 0)
-      << "speculative tokens should not be zero";
+  // The algorithm is the switch; width 0 is derived from the checkpoint.
+  CHECK_GE(options.speculative_config().num_speculative_tokens(), 0)
+      << "num_speculative_tokens must be >= 0 (0 means unset).";
 
   runtime::Options dist_options = options;
-  dist_options.num_decoding_tokens(options.num_speculative_tokens() + 1);
-  dist_options.enable_speculative_decode(true);
+  dist_options.num_decoding_tokens(
+      static_cast<int64_t>(options.speculative_config().decode_query_len()));
+  dist_options.worker_type(WorkerType::LLM);
   distributed_worker_manager_ =
       std::make_shared<DistributedWorkerManager>(dist_options);
 
   runtime::Options target_engine_options = options_;
-  target_engine_options.num_decoding_tokens(options.num_speculative_tokens() +
-                                            1);
+  target_engine_options.num_decoding_tokens(
+      static_cast<int64_t>(options.speculative_config().decode_query_len()));
   engine_ = std::make_unique<TargetEngine>(target_engine_options,
                                            distributed_worker_manager_);
 
@@ -69,13 +72,13 @@ SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
     // draft engine.
     runtime::Options draft_engine_options = options_;
     // The draft engine always runs on the target's device list.
-    draft_engine_options.model_path(options_.draft_model_path().value_or(""))
+    draft_engine_options
+        .model_path(options_.speculative_config().draft_model_path())
         .devices(options.devices())
         .backend("llm")
         .num_decoding_tokens(1)
-        .enable_speculative_decode(/*enable_speculative_decode=*/false)
         .enable_graph(/*enable_graph=*/false)
-        .is_draft_engine(true);
+        .worker_type(WorkerType::DRAFTER);
     draft_engine_ = std::make_unique<LLMEngine>(draft_engine_options,
                                                 distributed_worker_manager_);
   }
@@ -241,7 +244,7 @@ bool SpeculativeEngineBase<TargetEngine>::should_skip_external_draft_kv_cache()
   if (!use_draft_engine_ || draft_engine_ == nullptr) {
     return false;
   }
-  return uses_embedded_eagle3_draft(options_.speculative_algorithm(),
+  return uses_embedded_eagle3_draft(options_.speculative_config().algorithm(),
                                     model_args_);
 }
 
@@ -308,7 +311,7 @@ int64_t SpeculativeEngineBase<TargetEngine>::calculate_kv_cache(
       draft_kv_cache_cap.num_indexer_layers() *
           draft_kv_cache_cap.index_block_bytes();
   const int32_t layerwise_split_size =
-      options_.is_draft_engine()
+      options_.is_drafter()
           ? 1
           : ParallelConfig::get_instance().layerwise_split_size();
   if (layerwise_split_size > 1) {

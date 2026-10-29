@@ -24,6 +24,7 @@ limitations under the License.
 #include "core/common/native_library.h"
 #include "core/distributed_runtime/spawn_worker_server/spawn_worker_protocol.h"
 #include "core/distributed_runtime/spawn_worker_server/spawn_worker_server.h"
+#include "core/framework/config/speculative_config.h"
 
 // Worker argv from engine process:
 // @master_node_addr
@@ -39,7 +40,7 @@ limitations under the License.
 // @is_local
 // @task_type
 // @worker_type
-// @enable_speculative_decode
+// @spec_decode_enabled (argv bool; speculative_algorithm set)
 // @num_speculative_tokens
 // @speculative_algorithm
 // @input_shm_size
@@ -96,9 +97,8 @@ int main(int argc, char* argv[]) {
   int32_t is_local = static_cast<int32_t>(atoi(argv[11]));
   std::string task_type = std::string(argv[12]);
   std::string worker_type = std::string(argv[13]);
-  int32_t enable_speculative_decode = static_cast<int32_t>(atoi(argv[14]));
-  int32_t num_speculative_tokens = static_cast<int32_t>(atoi(argv[15]));
-  std::string speculative_algorithm = std::string(argv[16]);
+  const xllm::spawn_worker_protocol::SpawnSpeculativeConfig spawn_spec =
+      xllm::spawn_worker_protocol::parse_speculative_config(argc, argv);
   uint64_t input_shm_size = static_cast<uint64_t>(atoll(argv[17]));
   uint64_t output_shm_size = static_cast<uint64_t>(atoll(argv[18]));
   std::string communication_backend = std::string(argv[19]);
@@ -130,20 +130,17 @@ int main(int argc, char* argv[]) {
           : 1;
   std::string instance_role_str = std::string(argv[33]);
   const std::string& indexer_cache_dtype = parsed_indexer_cache_dtype.value();
-  const bool enable_probabilistic_draft =
-      xllm::spawn_worker_protocol::parse_bool_flag(
-          argc,
-          argv,
-          xllm::spawn_worker_protocol::kEnableProbabilisticDraftArgumentIndex);
   const std::string model_impl =
       xllm::spawn_worker_protocol::parse_model_impl(argc, argv);
   const std::string extension_impl =
       xllm::spawn_worker_protocol::parse_extension_impl(argc, argv);
-  const bool enable_mtp_draft_body_tp1 =
-      xllm::spawn_worker_protocol::parse_bool_flag(
-          argc,
-          argv,
-          xllm::spawn_worker_protocol::kEnableMtpDraftBodyTp1ArgumentIndex);
+  // This process never parses gflags; carry the parent's speculative settings
+  // (passed via argv) into the config singleton the worker reads.
+  xllm::SpeculativeConfig::get_instance()
+      .num_speculative_tokens(spawn_spec.num_speculative_tokens)
+      .speculative_algorithm(spawn_spec.speculative_algorithm)
+      .enable_mtp_draft_body_tp1(spawn_spec.enable_mtp_draft_body_tp1)
+      .enable_probabilistic_draft(spawn_spec.enable_probabilistic_draft);
   if (world_size < 1 || global_rank < 0 || global_rank >= world_size ||
       cp_size < 1 || ep_size < 1 || text_encoder_tp_size < 1 ||
       kv_split_size < 0 ||
@@ -173,9 +170,8 @@ int main(int argc, char* argv[]) {
       << ", cp_size = " << cp_size << ", ep_size = " << ep_size
       << ", instance_role = " << instance_role.to_string()
       << ", task_type = " << task_type << ", worker_type = " << worker_type
-      << ", enable_speculative_decode = " << (enable_speculative_decode > 0)
-      << ", num_speculative_tokens = " << num_speculative_tokens
-      << ", speculative_algorithm = " << speculative_algorithm
+      << ", num_speculative_tokens = " << spawn_spec.num_speculative_tokens
+      << ", speculative_algorithm = " << spawn_spec.speculative_algorithm
       << ", communication_backend = " << communication_backend
       << ", npu_kernel_backend = " << npu_kernel_backend
       << ", rank_tablefile = " << rank_tablefile
@@ -189,8 +185,10 @@ int main(int argc, char* argv[]) {
       << ", sp_size = " << sp_size << ", cfg_size = " << cfg_size
       << ", text_encoder_tp_size = " << text_encoder_tp_size
       << ", indexer_cache_dtype = " << indexer_cache_dtype
-      << ", enable_mtp_draft_body_tp1 = " << enable_mtp_draft_body_tp1
-      << ", enable_probabilistic_draft = " << enable_probabilistic_draft
+      << ", enable_mtp_draft_body_tp1 = "
+      << spawn_spec.enable_mtp_draft_body_tp1
+      << ", enable_probabilistic_draft = "
+      << spawn_spec.enable_probabilistic_draft
       << ", kv_split_size = " << kv_split_size
       << ", model_impl = " << model_impl
       << ", extension_impl = " << extension_impl;
@@ -211,9 +209,6 @@ int main(int argc, char* argv[]) {
                                  is_local > 0,
                                  task_type,
                                  worker_type,
-                                 enable_speculative_decode > 0,
-                                 num_speculative_tokens,
-                                 speculative_algorithm,
                                  communication_backend,
                                  npu_kernel_backend,
                                  rank_tablefile,
@@ -231,8 +226,6 @@ int main(int argc, char* argv[]) {
                                  cfg_size,
                                  text_encoder_tp_size,
                                  instance_role,
-                                 enable_mtp_draft_body_tp1,
-                                 enable_probabilistic_draft,
                                  model_impl,
                                  extension_impl);
 

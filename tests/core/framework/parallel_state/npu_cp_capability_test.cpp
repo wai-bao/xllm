@@ -211,6 +211,7 @@ TEST(NpuCpCapabilityTest, PythonCpPreservesQwenAndRestrictsGlm) {
       .ep_size(16)
       .instance_role(InstanceRole::PREFILL)
       .enable_graph(false)
+      .speculative_config()
       .speculative_algorithm("MTP");
   EXPECT_FALSE(validate_context_parallel_config(options,
                                                 EngineType::LLM,
@@ -228,7 +229,7 @@ TEST(NpuCpCapabilityTest, PythonCpPreservesQwenAndRestrictsGlm) {
                                                 /*global_world_size=*/16)
                    .has_value());
 
-  options.speculative_algorithm("DSpark");
+  options.speculative_config().speculative_algorithm("DSpark");
   EXPECT_EQ(validate_context_parallel_config(options,
                                              EngineType::SSM,
                                              "glm_moe_dsa",
@@ -247,6 +248,7 @@ TEST(NpuCpCapabilityTest, PythonCpPreservesQwenAndRestrictsGlm) {
   options.cp_size(4)
       .instance_role(InstanceRole::PREFILL)
       .enable_disagg_pd(false)
+      .speculative_config()
       .speculative_algorithm("MTP");
 
   // EP topology validation belongs to model construction, not this Python CP
@@ -469,6 +471,7 @@ TEST(NpuCpCapabilityTest, PythonGlmMtpSupportsCpWithDecodeAclGraph) {
       .ep_size(1)
       .instance_role(InstanceRole::DEFAULT)
       .enable_graph(true)
+      .speculative_config()
       .speculative_algorithm("MTP");
   EXPECT_FALSE(validate_context_parallel_config(options,
                                                 EngineType::SSM,

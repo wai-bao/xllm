@@ -157,7 +157,7 @@ RecMaster::RecMaster(const Options& options) : Master(options) {
       .request_queue_size(options_.request_queue_size())
       .max_tokens_per_chunk_for_prefill(
           options_.max_tokens_per_chunk_for_prefill())
-      .num_speculative_tokens(options_.num_speculative_tokens())
+      .speculative_config(options_.speculative_config())
       .dp_size(options_.dp_size())
       .cp_size(options_.cp_size())
       .enable_disagg_pd(options_.enable_disagg_pd())

@@ -248,7 +248,7 @@ def test_classification_matches_cpp_truth_table(
             {
                 "enable_unified_mtp_graph": True,
                 "model_type": "glm_moe_dsa",
-                "is_draft_engine": False,
+                "is_drafter": False,
                 "num_speculative_tokens": 3,
                 "is_mtp_algorithm": True,
             },
@@ -258,7 +258,7 @@ def test_classification_matches_cpp_truth_table(
             {
                 "enable_unified_mtp_graph": True,
                 "model_type": "glm_moe_dsa_mtp",
-                "is_draft_engine": True,
+                "is_drafter": True,
                 "num_speculative_tokens": 0,
                 "is_mtp_algorithm": True,
             },
@@ -268,7 +268,7 @@ def test_classification_matches_cpp_truth_table(
             {
                 "enable_unified_mtp_graph": False,
                 "model_type": "glm_moe_dsa_mtp",
-                "is_draft_engine": True,
+                "is_drafter": True,
                 "num_speculative_tokens": 0,
                 "is_mtp_algorithm": True,
             },
@@ -278,7 +278,7 @@ def test_classification_matches_cpp_truth_table(
             {
                 "enable_unified_mtp_graph": True,
                 "model_type": "glm_moe_dsa",
-                "is_draft_engine": False,
+                "is_drafter": False,
                 "num_speculative_tokens": 0,
                 "is_mtp_algorithm": True,
             },
@@ -288,7 +288,7 @@ def test_classification_matches_cpp_truth_table(
             {
                 "enable_unified_mtp_graph": True,
                 "model_type": "qwen3",
-                "is_draft_engine": False,
+                "is_drafter": False,
                 "num_speculative_tokens": 3,
                 "is_mtp_algorithm": False,
             },
@@ -300,7 +300,7 @@ def test_classification_matches_cpp_truth_table(
             {
                 "enable_unified_mtp_graph": True,
                 "model_type": "glm_moe_dsa_mtp",
-                "is_draft_engine": True,
+                "is_drafter": True,
                 "num_speculative_tokens": 0,
                 "is_mtp_algorithm": False,
             },
@@ -1480,7 +1480,7 @@ def test_cp_admission_preserves_model_specific_kv_support(
     config = _classify(
         {
             "model_type": model_type,
-            "is_draft_engine": is_draft,
+            "is_drafter": is_draft,
             "is_mtp_algorithm": model_type == "glm_moe_dsa_mtp",
             "num_speculative_tokens": speculative_tokens,
             "cp_size": 2,
@@ -1500,7 +1500,7 @@ def test_cp_admission_preserves_model_specific_kv_support(
 def test_glm_cp_draft_admission_requires_mtp_draft_engine(is_draft: bool, algorithm: str) -> None:
     config = {
         "model_type": "glm_moe_dsa_mtp",
-        "is_draft_engine": is_draft,
+        "is_drafter": is_draft,
         "is_mtp_algorithm": algorithm == "mtp",
         "cp_size": 2,
         "kv_split_size": 1,
@@ -1982,7 +1982,13 @@ class TestExecuteRouting:
         result = executor.execute(input_ids, positions, metadata)
 
         graph_runner.warmup.assert_called_once_with(
-            input_ids, positions, metadata, None, None, eplb=None, input_batch=None
+            input_ids,
+            positions,
+            metadata,
+            None,
+            eplb=None,
+            is_graph_warmup=False,
+            input_batch=None,
         )
         graph_runner.execute.assert_called_once_with(
             input_ids,
@@ -2267,7 +2273,7 @@ def test_executor_rejects_token_row_scoped_accepted_counts() -> None:
 @pytest.mark.parametrize("model_type", ["qwen3_5_mtp"])
 def test_executor_prepares_qwen_draft_device_lengths_only_for_decode(model_type: str) -> None:
     backend = _PreparedStubAttentionBackend()
-    config = {"model_type": model_type, "is_mtp_algorithm": True, "is_draft_engine": True}
+    config = {"model_type": model_type, "is_mtp_algorithm": True, "is_drafter": True}
     with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=backend):
         executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=2)
     cache = torch.empty(2, 4, 2, 64)
@@ -2286,7 +2292,7 @@ def test_qwen_draft_prefix_capacity_reaches_backend_and_both_graph_paths(draft_t
     width = draft_tokens + 1
     config = {
         "model_type": "qwen3_5_mtp",
-        "is_draft_engine": True,
+        "is_drafter": True,
         "is_mtp_algorithm": True,
         # Ordinary draft still decodes one token in later steps. The first
         # pass must independently reserve the complete accepted target prefix.
@@ -2316,7 +2322,7 @@ def test_qwen_draft_prefix_capacity_reaches_backend_and_both_graph_paths(draft_t
 def test_glm_draft_ignores_qwen_prefix_capacity_option() -> None:
     config = {
         "model_type": "glm_moe_dsa_mtp",
-        "is_draft_engine": True,
+        "is_drafter": True,
         "is_mtp_algorithm": True,
         "mtp_draft_prefix_width": 17,
         "python_graph_backend": "aclgraph",
@@ -2413,7 +2419,7 @@ def test_executor_rejects_prepared_qwen_multimodal_acl_graph(model_type: str) ->
         ({"num_speculative_tokens": 1}, 1),
         ({}, 0),
         ({}, 2),
-        ({"is_draft_engine": True}, 1),
+        ({"is_drafter": True}, 1),
         ({"task_type": "embed"}, 1),
     ],
 )
@@ -2526,7 +2532,7 @@ def test_executor_accepts_prepared_glm_prefill_cp(
     config = _classify(
         {
             "model_type": model_type,
-            "is_draft_engine": model_type == "glm_moe_dsa_mtp",
+            "is_drafter": model_type == "glm_moe_dsa_mtp",
             "num_speculative_tokens": 2,
             "is_mtp_algorithm": True,
             "kv_split_size": kv_split,
@@ -2688,7 +2694,7 @@ def test_prepared_executor_rejects_mtp_state_before_model_execution() -> None:
 def test_kv_transfer_uses_eager_and_preserves_step_inputs(prepared: bool, is_mtp: bool) -> None:
     config = {
         "model_type": "glm_moe_dsa_mtp" if is_mtp else "glm_moe_dsa",
-        "is_draft_engine": is_mtp,
+        "is_drafter": is_mtp,
         "is_mtp_algorithm": is_mtp,
     }
     backend = _PreparedStubAttentionBackend() if prepared else StubAttentionBackend()
@@ -2851,7 +2857,7 @@ def test_prepared_mtp_preserves_hidden_and_topk(dp_size: int, cp_size: int) -> N
     backend = _PreparedStubAttentionBackend()
     config = {
         "model_type": "glm_moe_dsa_mtp",
-        "is_draft_engine": True,
+        "is_drafter": True,
         "is_mtp_algorithm": True,
         "dp_size": dp_size,
         "cp_size": cp_size,
@@ -2908,7 +2914,7 @@ def test_prepared_block_draft_uses_device_lengths(model_type: str, dp_size: int)
 def test_prepared_mtp_graph_receives_bound_hidden_and_topk(dp_size: int, cp_size: int) -> None:
     config = {
         "model_type": "glm_moe_dsa_mtp",
-        "is_draft_engine": True,
+        "is_drafter": True,
         "is_mtp_algorithm": True,
         "dp_size": dp_size,
         "dp_rank": 0,
@@ -3012,7 +3018,7 @@ def test_executor_passes_no_padding_policy_to_ordinary_acl_runner(
 ) -> None:
     config = {
         "model_type": model_type,
-        "is_draft_engine": model_type == "qwen3_5_mtp",
+        "is_drafter": model_type == "qwen3_5_mtp",
         "is_mtp_algorithm": True,
         "python_graph_backend": "aclgraph",
         "max_position_embeddings": 4096,

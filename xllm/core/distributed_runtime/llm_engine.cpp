@@ -123,30 +123,33 @@ LLMEngine::LLMEngine(
           .max_tokens_per_batch =
               static_cast<int64_t>(options_.max_tokens_per_batch()),
           .enable_dp_global_json_object_active =
-              dp_size_ > 1 && !options_.is_draft_engine() &&
-              options_.num_speculative_tokens() > 0,
+              dp_size_ > 1 &&
+              options_.speculative_config().enable_speculative_decode(),
       });
   worker_clients_num_ = worker_clients_.size();
   dp_local_size_ = worker_clients_num_ / dp_size_;
   // MLU and NPU model-side CP both use orthogonal CP x attention-TP, so the
   // DP-local TP width is divided by CP.
   dp_local_tp_size_ = dp_local_size_ / cp_size;
-  if (dp_size_ > 1 && options_.enable_adaptive_target_verify() &&
-      SpeculativeConfig::is_dspark_algorithm(
-          options_.speculative_algorithm()) &&
-      !options_.is_draft_engine()) {
+  if (dp_size_ > 1 &&
+      options_.speculative_config().enable_adaptive_target_verify() &&
+      options_.speculative_config().algorithm() ==
+          SpeculativeAlgorithm::DSPARK &&
+      options_.speculative_config().enable_speculative_decode()) {
     dspark_dp_coordinator_ = std::make_unique<DSparkDpCoordinator>(
-        options_.num_speculative_tokens());
+        options_.speculative_config().num_speculative_tokens());
   }
 
   process_group_test();
-  if (options_.enable_adaptive_draft_step() && !options_.is_draft_engine()) {
+  if (options_.speculative_config().enable_adaptive_draft_step() &&
+      options_.speculative_config().enable_speculative_decode()) {
     CHECK(options_.enable_task_pipeline() && options_.dp_size() == 1 &&
-          options_.cp_size() == 1 && options_.num_speculative_tokens() > 0 &&
-          options_.num_speculative_tokens() <= 64);
+          options_.cp_size() == 1 &&
+          options_.speculative_config().num_speculative_tokens() <= 64);
     draft_step_controller_ = std::make_unique<DraftStepController>(
-        options_.adaptive_draft_step_config(),
-        static_cast<uint32_t>(options_.num_speculative_tokens()));
+        options_.speculative_config().adaptive_draft_step_config(),
+        static_cast<uint32_t>(
+            options_.speculative_config().num_speculative_tokens()));
   }
 }
 
@@ -214,31 +217,31 @@ bool LLMEngine::init_model(MasterStatus master_status,
   args_ = model_loader->model_args();
   ModelRegistry::configure_mtp_args(
       args_,
-      options_.speculative_algorithm(),
-      options_.is_draft_engine(),
+      options_.speculative_config().algorithm(),
+      options_.is_drafter(),
       ModelConfig::is_python_model_impl(
           ModelConfig::get_instance().model_impl()));
-  if (!options_.is_draft_engine() &&
-      SpeculativeConfig::is_block_diffusion_algorithm(
-          options_.speculative_algorithm())) {
-    CHECK(options_.draft_model_path().has_value())
+  if (!options_.is_drafter() &&
+      is_block_diffusion(options_.speculative_config().algorithm())) {
+    CHECK(!options_.speculative_config().draft_model_path().empty())
         << "Block-diffusion Target requires a draft checkpoint.";
     // Scheduler warmup must use the same auxiliary-state width as the workers.
-    args_.layers_to_capture(
-        read_capture_layer_ids(options_.draft_model_path().value()));
+    args_.layers_to_capture(read_capture_layer_ids(
+        options_.speculative_config().draft_model_path()));
   }
 
 #if defined(USE_NPU)
-  if (options_.enable_speculative_decode() &&
-      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm()) &&
+  if (options_.speculative_config().enable_speculative_decode() &&
+      options_.speculative_config().algorithm() == SpeculativeAlgorithm::MTP &&
       uses_mtp_target_spec_width(args_.model_type())) {
-    args_.num_speculative_tokens(options_.num_speculative_tokens());
+    args_.num_speculative_tokens(
+        options_.speculative_config().num_speculative_tokens());
   }
 #endif
 
   // A draft engine is fed token ids and detokenized by the target, so it
   // shares the target vocabulary and loads no tokenizer of its own.
-  if (!options_.is_draft_engine()) {
+  if (!options_.is_drafter()) {
     tokenizer_ = model_loader->tokenizer();
     CHECK(tokenizer_ != nullptr);
     tokenizer_args_ = model_loader->tokenizer_args();
@@ -406,12 +409,13 @@ bool LLMEngine::allocate_kv_cache(
       ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
   BlockManagerPool::Options options;
   options.num_blocks(kv_cache_cap.n_blocks())
-      .kv_events_config(options_.is_draft_engine()
+      .kv_events_config(options_.is_drafter()
                             ? std::string()
                             : kv_cache_config.kv_events_config())
-      .hasher_type(mtp_hasher_type(BlockHasherType::TEXT,
-                                   options_.num_speculative_tokens(),
-                                   options_.speculative_algorithm()))
+      .hasher_type(mtp_hasher_type(
+          BlockHasherType::TEXT,
+          options_.speculative_config().num_speculative_tokens(),
+          options_.speculative_config().algorithm()))
       .block_size(kv_split_size_eff > 1 ? block_size * kv_split_size_eff
                                         : block_size)
       .host_num_blocks(kv_cache_cap.n_blocks() * options_.host_blocks_factor())
@@ -425,7 +429,8 @@ bool LLMEngine::allocate_kv_cache(
       .slot_size(kv_cache_cap.slot_size())
       .model_id(options_.model_id())
       .max_seqs_per_batch(options_.max_seqs_per_batch())
-      .num_speculative_tokens(options_.num_speculative_tokens())
+      .num_speculative_tokens(
+          options_.speculative_config().num_speculative_tokens())
       // DECODE-side prefix cache participation is per-leaf and gated by the
       // predicate in composite_block_manager.cpp. P and MIX are treated
       // identically (both admit prefix cache on every leaf).
@@ -486,8 +491,8 @@ bool LLMEngine::allocate_kv_cache(
   }
 
   const bool is_mtp_draft_engine =
-      options_.is_draft_engine() &&
-      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm());
+      options_.is_drafter() &&
+      options_.speculative_config().algorithm() == SpeculativeAlgorithm::MTP;
   if (is_mtp_draft_engine) {
     // The speculative scheduler owns only the target engine BlockManager.
     // Keep the draft engine's placeholder manager non-caching so a Draft
@@ -583,8 +588,8 @@ void LLMEngine::select_draft_steps(std::vector<LlmForwardInput>& inputs) {
   }
   const uint32_t rows =
       static_cast<uint32_t>(input.input_params.embedding.embedding_ids.size());
-  const uint32_t maximum =
-      static_cast<uint32_t>(options_.num_speculative_tokens());
+  const uint32_t maximum = static_cast<uint32_t>(
+      options_.speculative_config().num_speculative_tokens());
   const auto& lengths = input.input_params.attention.host.kv_seq_lens;
   CHECK(!lengths.empty());
   const int32_t max_kv = *std::max_element(lengths.begin(), lengths.end());
@@ -605,7 +610,8 @@ void LLMEngine::observe_draft_step_acceptance(const RawForwardOutput& output) {
     if (stats.verified_rounds != 1 || stats.proposed_tokens <= 0) {
       continue;
     }
-    CHECK_LE(stats.proposed_tokens, options_.num_speculative_tokens());
+    CHECK_LE(stats.proposed_tokens,
+             options_.speculative_config().num_speculative_tokens());
     CHECK_GE(stats.accepted_tokens, 0);
     CHECK_LE(stats.accepted_tokens, stats.proposed_tokens);
     observations.emplace_back(DraftStepAcceptanceObservation{
@@ -674,7 +680,9 @@ ForwardOutput LLMEngine::step(BatchGroup& batch) {
             std::any_of(tokens.const_data_ptr<int32_t>(),
                         tokens.const_data_ptr<int32_t>() + tokens.numel(),
                         [](int32_t token) { return token < 0; });
-        kv_bounds[shard] += pending ? options_.num_speculative_tokens() : 0;
+        kv_bounds[shard] +=
+            pending ? options_.speculative_config().num_speculative_tokens()
+                    : 0;
       }
     }
     for (auto& input : forward_inputs) {

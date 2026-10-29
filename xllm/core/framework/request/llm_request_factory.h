@@ -170,7 +170,7 @@ class LLMRequestFactory final {
   // embed tasks, service routing) so create() only applies the numbers.
   int32_t prompt_token_limit_ = 0;
   int32_t max_generated_context_len_ = 0;
-  size_t seq_capacity_extra_ = 0;
+  size_t num_extra_kv_tokens_ = 0;
   bool skip_prompt_finish_check_ = false;
   OutputsFunc batch_callback_;
 

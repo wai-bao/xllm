@@ -944,9 +944,9 @@ void DisaggPDScheduler::prefill_send_first_generation() {
         gen->set_dp_size(instance_info_.dp_size);
         gen->set_dp_rank(sequence->dp_rank());
       }
-      if (options_.num_speculative_tokens() > 0 &&
-          SpeculativeConfig::requires_bootstrap_hidden(
-              SpeculativeConfig::get_instance().speculative_algorithm())) {
+      if (options_.speculative_config().enable_speculative_decode() &&
+          requires_bootstrap_hidden(
+              options_.speculative_config().algorithm())) {
         torch::Tensor embedding =
             request->sequences()[0]->get_mtp_bootstrap_embedding();
         if (!embedding.defined()) {
@@ -1203,11 +1203,10 @@ bool DisaggPDScheduler::decode_recv_first_generation(
   }
   request->record_num_prefix_cache_tokens(
       static_cast<size_t>(num_cached_tokens));
-  const bool requires_bootstrap_hidden =
-      options_.num_speculative_tokens() > 0 &&
-      SpeculativeConfig::requires_bootstrap_hidden(
-          SpeculativeConfig::get_instance().speculative_algorithm());
-  if (requires_bootstrap_hidden) {
+  const bool needs_bootstrap_hidden =
+      options_.speculative_config().enable_speculative_decode() &&
+      requires_bootstrap_hidden(options_.speculative_config().algorithm());
+  if (needs_bootstrap_hidden) {
     const int32_t slot_id = sequence->get_embedding_block_id();
     if (slot_id < 0) {
       LOG(ERROR) << "Invalid MTP bootstrap slot, request_id: " << req_id;

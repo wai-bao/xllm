@@ -79,8 +79,9 @@ class BlockManagerPool : public KVCacheManager {
     // Hasher type bound to the engine (TEXT for LLM, MM for VLM).
     PROPERTY(BlockHasherType, hasher_type) = BlockHasherType::TEXT;
     PROPERTY(uint32_t, num_embedding_blocks) = 0;
-    PROPERTY(uint32_t, num_speculative_tokens) = 0;
-    // Role flag: true on the DECODE side of disaggregated PD. Forwarded to
+    PROPERTY(uint32_t,
+             num_speculative_tokens) = 0;  // Role flag: true on the DECODE side
+                                           // of disaggregated PD. Forwarded to
     // BlockManager::Options for every composite leaf; the leaf's prefix
     // cache participation goes through the shared predicate (see
     // composite_block_manager.cpp::leaf_participates_in_prefix_cache).

@@ -1,3 +1,18 @@
+/* Copyright 2026 The xLLM Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/xLLM-AI/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 #include "continuous_scheduler.h"
 
 #include <absl/time/clock.h>
@@ -419,7 +434,7 @@ SchedulerOptions create_scheduler_options(
     int32_t max_global_ttft_ms = std::numeric_limits<int32_t>::max(),
     int32_t max_global_tpot_ms = std::numeric_limits<int32_t>::max()) {
   SchedulerOptions opt;
-  opt.num_speculative_tokens_ = num_speculative_tokens;
+  opt.speculative_config_.num_speculative_tokens(num_speculative_tokens);
   opt.max_tokens_per_chunk_for_prefill_ = max_tokens_per_chunk_for_prefill;
   opt.max_tokens_per_batch_ = max_tokens_per_batch;
   opt.max_seqs_per_batch_ = max_seqs_per_batch;
@@ -1065,6 +1080,8 @@ TEST(ContinuousSchedulerTest,
       auto options = create_scheduler_options(64, 4, 2, 64, 1);
       options.enable_schedule_overlap(true);
       options.enable_task_pipeline(stateful_pipeline);
+      // Consume-before-step retirement is target-worker behavior.
+      options.speculative_config().speculative_algorithm("MTP");
       PipelinePhaseEngine engine;
       TestableContinuousScheduler scheduler(&engine, options);
       auto pending = generate_request_with_prompt_tokens({1, 2}, 16, 256);

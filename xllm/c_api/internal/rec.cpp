@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/rec_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/model_loader/model_loader.h"
 #include "core/util/cpu_affinity.h"
 #include "helper.h"
@@ -93,7 +94,6 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
     options.model_path(model_path)
         .task_type(xllm_init_options.task)
         .extension_impl(xllm_init_options.extension_impl)
-        .draft_model_path(xllm_init_options.draft_model)
         .backend("rec")
         .block_size(xllm_init_options.block_size)
         .max_cache_size(xllm_init_options.max_cache_size)
@@ -103,7 +103,6 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
         .max_seqs_per_batch(xllm_init_options.max_seqs_per_batch)
         .max_tokens_per_chunk_for_prefill(
             xllm_init_options.max_tokens_per_chunk_for_prefill)
-        .num_speculative_tokens(xllm_init_options.num_speculative_tokens)
         .num_request_handling_threads(
             xllm_init_options.num_request_handling_threads)
         .communication_backend(xllm_init_options.communication_backend)
@@ -209,6 +208,10 @@ XLLM_CAPI_EXPORT bool xllm_rec_initialize(
         << ", max_decode_rounds="
         << ::xllm::RecConfig::get_instance().max_decode_rounds();
 
+    options.speculative_config().draft_model_path(
+        xllm_init_options.draft_model);
+    // No gflags here; derive like initialize() would.
+    options.speculative_config().normalize();
     handler->master = std::make_unique<xllm::RecMaster>(options);
     handler->master->run();
 

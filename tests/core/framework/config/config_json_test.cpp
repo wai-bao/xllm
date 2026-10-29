@@ -48,15 +48,18 @@ TEST(SpeculativeConfigTest, AdaptiveVerifyRequiresMtpOrDsparkDraftFiveOrSeven) {
   for (const std::string& algorithm :
        {"DFlash", "DFlash2", "Eagle3", "Suffix", "unknown"}) {
     SCOPED_TRACE(algorithm);
-    config.speculative_algorithm(algorithm).num_speculative_tokens(7);
+    config.speculative_algorithm(algorithm);
+    config.num_speculative_tokens(7);
     EXPECT_DEATH(config.validate(), "supports MTP/DSpark Draft5/7");
-    EXPECT_FALSE(SpeculativeConfig::supports_adaptive_target_verify(algorithm));
+    EXPECT_FALSE(SpeculativeConfig::supports_adaptive_target_verify(
+        SpeculativeConfig::from_string(algorithm)));
   }
   for (const std::string& algorithm :
        {"MTP", "mtp", "MtP", "DSpark", "dspark", "DSPARK", "dSpArK"}) {
     SCOPED_TRACE(algorithm);
     config.speculative_algorithm(algorithm);
-    EXPECT_TRUE(SpeculativeConfig::supports_adaptive_target_verify(algorithm));
+    EXPECT_TRUE(SpeculativeConfig::supports_adaptive_target_verify(
+        SpeculativeConfig::from_string(algorithm)));
     for (const int32_t width : {5, 7}) {
       config.num_speculative_tokens(width);
       EXPECT_NO_FATAL_FAILURE(config.validate());
@@ -73,7 +76,8 @@ TEST(SpeculativeConfigTest, FixedWidthAlgorithmsDoNotRequireAdaptiveSupport) {
   for (const std::string& algorithm :
        {"MTP", "DFlash", "DFlash2", "DSpark", "Eagle3", "Suffix"}) {
     SCOPED_TRACE(algorithm);
-    config.speculative_algorithm(algorithm).num_speculative_tokens(3);
+    config.speculative_algorithm(algorithm);
+    config.num_speculative_tokens(3);
     EXPECT_FALSE(config.enable_adaptive_target_verify());
     EXPECT_NO_FATAL_FAILURE(config.validate());
   }
@@ -187,9 +191,9 @@ TEST(SpeculativeConfigTest, ThroughputMtpHasSeparateAdmissionAndJsonKey) {
   EXPECT_FALSE(saved.contains("enable_adaptive_mtp"));
   EXPECT_FALSE(saved.contains("adaptive_mtp_config"));
   config.speculative_algorithm("DSpark");
-  EXPECT_DEATH(config.validate(),
-               "draft-step selection currently requires MTP");
-  config.speculative_algorithm("MTP").adaptive_draft_step_config("");
+  EXPECT_DEATH(config.validate(), "requires speculative_algorithm=MTP");
+  config.speculative_algorithm("MTP");
+  config.adaptive_draft_step_config("");
   EXPECT_NO_FATAL_FAILURE(config.validate());
   config.enable_adaptive_target_verify(true);
   EXPECT_DEATH(config.validate(), "disabled adaptive target verification");
@@ -286,9 +290,9 @@ TEST(SpeculativeConfigTest, StartupDsparkOutputAllowsDefaultCalibration) {
   SpeculativeConfig config;
   config.adaptive_target_verify_cost_table_output("/tmp/output.json");
   EXPECT_DEATH(config.validate(), "requires startup calibration");
-  config.enable_adaptive_target_verify(true)
-      .speculative_algorithm("DSpark")
-      .num_speculative_tokens(7);
+  config.enable_adaptive_target_verify(true);
+  config.speculative_algorithm("DSpark");
+  config.num_speculative_tokens(7);
   config.validate();
   EXPECT_TRUE(config.adaptive_target_verify_calibration().empty());
   config.adaptive_target_verify_cost_table("/tmp/saved.json");
@@ -555,7 +559,10 @@ TEST(ModelConfigValidationTest, AcceptsQwen35PythonMtpSupportedWidths) {
                        std::string(model_type) + "/" + std::string(algorithm) +
                        "/" + std::to_string(width));
           EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
-                           implementation, model_type, width, algorithm)
+                           implementation,
+                           model_type,
+                           width,
+                           SpeculativeConfig::from_string(algorithm))
                            .has_value());
         }
       }
@@ -567,12 +574,12 @@ TEST(ModelConfigValidationTest, AcceptsQwen35PythonMtpSupportedWidths) {
 TEST(ModelConfigValidationTest, RejectsQwen35PythonSpeculativeDecode) {
   const std::optional<std::string> error =
       ModelConfig::validate_python_speculative_decode(
-          "python", "qwen3_5_moe_text", 4, "MTP");
+          "python", "qwen3_5_moe_text", 4, SpeculativeAlgorithm::MTP);
 
   ASSERT_TRUE(error.has_value());
   EXPECT_NE(error->find("supports dense NPU"), std::string::npos);
   EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
-                  "py", "qwen3_5_text", 1, "Eagle3")
+                  "py", "qwen3_5_text", 1, SpeculativeAlgorithm::EAGLE3)
                   .has_value());
 }
 
@@ -583,7 +590,7 @@ TEST(ModelConfigValidationTest, RejectsQwen35PythonMtpUnsupportedWidths) {
       SCOPED_TRACE(std::string(model_type) + "/" + std::to_string(width));
       const std::optional<std::string> error =
           ModelConfig::validate_python_speculative_decode(
-              "python", model_type, width, "MTP");
+              "python", model_type, width, SpeculativeAlgorithm::MTP);
       ASSERT_TRUE(error.has_value());
       EXPECT_NE(error->find("1 to 16"), std::string::npos);
     }
@@ -598,7 +605,7 @@ TEST(ModelConfigValidationTest, RejectsQwen35PythonNonMtpSpeculation) {
       SCOPED_TRACE(std::string(model_type) + "/" + std::string(algorithm));
       const std::optional<std::string> error =
           ModelConfig::validate_python_speculative_decode(
-              "py", model_type, 3, algorithm);
+              "py", model_type, 3, SpeculativeConfig::from_string(algorithm));
       ASSERT_TRUE(error.has_value());
       EXPECT_NE(error->find("supports dense NPU"), std::string::npos);
     }
@@ -613,7 +620,7 @@ TEST(ModelConfigValidationTest, RejectsQwen35PythonUnsupportedModelTypes) {
     SCOPED_TRACE(std::string(model_type));
     const std::optional<std::string> error =
         ModelConfig::validate_python_speculative_decode(
-            "python", model_type, 3, "MTP");
+            "python", model_type, 3, SpeculativeAlgorithm::MTP);
     ASSERT_TRUE(error.has_value());
     EXPECT_NE(error->find("supports dense NPU"), std::string::npos);
   }
@@ -621,16 +628,16 @@ TEST(ModelConfigValidationTest, RejectsQwen35PythonUnsupportedModelTypes) {
 
 TEST(ModelConfigValidationTest, AcceptsSupportedPythonExecutionModes) {
   EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
-                   "python", "qwen3_5_text", 0, "MTP")
+                   "python", "qwen3_5_text", 0, SpeculativeAlgorithm::MTP)
                    .has_value());
   EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
-                   "python", "qwen3_5_text", -1, "MTP")
+                   "python", "qwen3_5_text", -1, SpeculativeAlgorithm::MTP)
                    .has_value());
   EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
-                   "native", "qwen3_5_text", 4, "MTP")
+                   "native", "qwen3_5_text", 4, SpeculativeAlgorithm::MTP)
                    .has_value());
   EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
-                   "python", "qwen3", 4, "MTP")
+                   "python", "qwen3", 4, SpeculativeAlgorithm::MTP)
                    .has_value());
 }
 
@@ -638,13 +645,22 @@ TEST(ModelConfigValidationTest, AcceptsSupportedPythonExecutionModes) {
 TEST(ModelConfigValidationTest, AcceptsDenseQwen35PythonBlockDrafts) {
   for (const std::string_view algorithm : {"DFlash2", "DSpark"}) {
     EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
-                     "python", "qwen3_5_text", 7, algorithm)
+                     "python",
+                     "qwen3_5_text",
+                     7,
+                     SpeculativeConfig::from_string(algorithm))
                      .has_value());
     EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
-                    "python", "qwen3_5_moe_text", 7, algorithm)
+                    "python",
+                    "qwen3_5_moe_text",
+                    7,
+                    SpeculativeConfig::from_string(algorithm))
                     .has_value());
     EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
-                    "python", "qwen3_5_text", 17, algorithm)
+                    "python",
+                    "qwen3_5_text",
+                    17,
+                    SpeculativeConfig::from_string(algorithm))
                     .has_value());
   }
 }
@@ -654,11 +670,11 @@ TEST(ModelConfigValidationTest, PreservesDenseQwen35PythonMtpAdmission) {
        {"qwen3_5", "qwen3_5_text", "qwen3_5_mtp"}) {
     for (const int32_t width : {1, 3, 16}) {
       EXPECT_FALSE(ModelConfig::validate_python_speculative_decode(
-                       "python", model_type, width, "MTP")
+                       "python", model_type, width, SpeculativeAlgorithm::MTP)
                        .has_value());
     }
     EXPECT_TRUE(ModelConfig::validate_python_speculative_decode(
-                    "python", model_type, 17, "MTP")
+                    "python", model_type, 17, SpeculativeAlgorithm::MTP)
                     .has_value());
   }
 }
@@ -683,7 +699,7 @@ TEST(ModelConfigValidationTest, AcceptsGlmPythonMtpWithSpeculativeTokens) {
                      test_case.model_impl,
                      "glm_moe_dsa",
                      test_case.num_speculative_tokens,
-                     test_case.algorithm)
+                     SpeculativeConfig::from_string(test_case.algorithm))
                      .has_value());
   }
 }

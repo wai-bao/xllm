@@ -19,6 +19,7 @@ limitations under the License.
 
 #include <algorithm>
 
+#include "core/framework/config/speculative_config.h"
 #include "core/util/tensor_helper.h"
 
 #if defined(USE_NPU)
@@ -193,7 +194,7 @@ void prepare_draft_prefix_from_target(LlmForwardInput& draft_input,
   const int64_t width = accepted_tokens.size(1);
   CHECK_GT(batch_size, 0);
   CHECK_GE(width, 2);
-  CHECK_LE(width, 17);
+  CHECK_LE(width, kMaxSpeculativeTokens + 1);
   CHECK_EQ(target_hidden.size(0), batch_size);
   CHECK_EQ(target_hidden.size(1), width);
   CHECK_EQ(base_positions.numel(), batch_size);

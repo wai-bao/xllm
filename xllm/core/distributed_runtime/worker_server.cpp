@@ -272,14 +272,14 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
   const char* is_local_ptr = is_local_str.c_str();
   std::string instance_role_str = options.instance_role().to_string();
   const char* instance_role_ptr = instance_role_str.c_str();
-  std::string enable_speculative_decode_str =
-      std::to_string(options.enable_speculative_decode());
-  const char* enable_speculative_decode_ptr =
-      enable_speculative_decode_str.c_str();
+  std::string spec_decode_enabled_str =
+      std::to_string(options.speculative_config().enable_speculative_decode());
+  const char* spec_decode_enabled_ptr = spec_decode_enabled_str.c_str();
   std::string num_speculative_tokens_str =
-      std::to_string(options.num_speculative_tokens());
+      std::to_string(options.speculative_config().num_speculative_tokens());
   const char* num_speculative_tokens_ptr = num_speculative_tokens_str.c_str();
-  std::string speculative_algorithm_str = options.speculative_algorithm();
+  std::string speculative_algorithm_str =
+      options.speculative_config().speculative_algorithm();
   const char* speculative_algorithm_ptr = speculative_algorithm_str.c_str();
   std::string enable_graph_str = std::to_string(options.enable_graph());
   const char* enable_graph_ptr = enable_graph_str.c_str();
@@ -326,11 +326,11 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
       KVCacheConfig::get_instance().indexer_cache_dtype();
   const char* indexer_cache_dtype_ptr = indexer_cache_dtype.c_str();
   std::string enable_mtp_draft_body_tp1_str =
-      std::to_string(options.enable_mtp_draft_body_tp1());
+      std::to_string(options.speculative_config().enable_mtp_draft_body_tp1());
   const char* enable_mtp_draft_body_tp1_ptr =
       enable_mtp_draft_body_tp1_str.c_str();
   const char* enable_probabilistic_draft_ptr =
-      options.enable_probabilistic_draft() ? "1" : "0";
+      options.speculative_config().enable_probabilistic_draft() ? "1" : "0";
   const char* worker_type_ptr = worker_type.to_string();
   std::string spawn_worker_bin_path =
       options.spawn_worker_path() + "/spawn_worker";
@@ -359,7 +359,7 @@ void WorkerServer::create_spawn_server(int32_t local_rank,
                         is_local_ptr,
                         options.task_type().c_str(),
                         worker_type_ptr,
-                        enable_speculative_decode_ptr,
+                        spec_decode_enabled_ptr,
                         num_speculative_tokens_ptr,
                         speculative_algorithm_ptr,
                         input_shm_size_ptr,
@@ -440,10 +440,11 @@ WorkerServer::WorkerServer(int32_t local_worker_idx,
   server_name_.append(std::to_string(options.server_idx()));
   // Eagle3/DFlash targets capture aux hidden states and don't support spawned
   // workers yet.
-  const std::string& speculative_algorithm = options.speculative_algorithm();
-  if (use_spawn_worker && options.enable_speculative_decode() &&
-      SpeculativeConfig::requires_aux_hidden_capture(speculative_algorithm)) {
-    LOG(FATAL) << speculative_algorithm
+  const SpeculativeAlgorithm kind = options.speculative_config().algorithm();
+  if (use_spawn_worker &&
+      options.speculative_config().enable_speculative_decode() &&
+      SpeculativeConfig::requires_aux_hidden_capture(kind)) {
+    LOG(FATAL) << options.speculative_config().speculative_algorithm()
                << " does not support spawned workers yet. Disable offline "
                   "spawn workers or use --speculative_algorithm=MTP.";
   }

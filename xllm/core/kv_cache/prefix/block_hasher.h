@@ -21,6 +21,7 @@ limitations under the License.
 #include <string_view>
 #include <vector>
 
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "util/hash_util.h"
 #include "util/slice.h"
@@ -48,7 +49,7 @@ enum class BlockHasherType {
 // Select the MTP identity variant only when MTP speculation is enabled.
 BlockHasherType mtp_hasher_type(BlockHasherType base,
                                 int32_t num_speculative_tokens,
-                                std::string_view algorithm);
+                                SpeculativeAlgorithm algorithm);
 
 size_t block_hash_lookahead(BlockHasherType type);
 

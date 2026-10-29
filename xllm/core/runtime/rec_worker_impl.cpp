@@ -488,7 +488,8 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
 
   ForwardOutput output;
   if (!runtime_.worker.driver_ && !runtime_.worker.dp_driver_ &&
-      !runtime_.worker.options_.enable_speculative_decode()) {
+      !runtime_.worker.options_.speculative_config()
+           .enable_speculative_decode()) {
     auto ret = runtime_.stream->synchronize();
     // in p-d disaggregation scene, all micro batches should be in same
     // prefill/decode stage, so, to judge transfer_kv_infos.empty,
@@ -533,7 +534,8 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
     output.beam_search_output = beam_search_output;
   }
 
-  if (runtime_.worker.options_.enable_speculative_decode()) {
+  if (runtime_.worker.options_.speculative_config()
+          .enable_speculative_decode()) {
     if (!input_params.meta.batch_forward_type.is_decode() &&
         !runtime_.worker.is_spec_draft_) {
       output.sample_output.embeddings = model_output.hidden_states;
@@ -766,7 +768,8 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
   }
 
   if (!runtime_.worker.driver_ && !runtime_.worker.dp_driver_ &&
-      !runtime_.worker.options_.enable_speculative_decode()) {
+      !runtime_.worker.options_.speculative_config()
+           .enable_speculative_decode()) {
     runtime_.stream->synchronize();
     COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
     DeviceMonitor::get_instance().update_active_activation_memory(
@@ -1642,7 +1645,8 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
     }
 
     if (!runtime_.worker.driver_ && !runtime_.worker.dp_driver_ &&
-        !runtime_.worker.options_.enable_speculative_decode()) {
+        !runtime_.worker.options_.speculative_config()
+             .enable_speculative_decode()) {
       runtime_.stream->synchronize();
       COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
       DeviceMonitor::get_instance().update_active_activation_memory(

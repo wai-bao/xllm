@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "common/types.h"
+#include "core/framework/config/speculative_config.h"
 
 namespace xllm {
 namespace runtime {
@@ -36,8 +37,6 @@ struct Options {
   PROPERTY(std::string, model_impl);
 
   PROPERTY(std::string, extension_impl);
-
-  PROPERTY(std::optional<std::string>, draft_model_path);
 
   // model backend
   PROPERTY(std::string, backend);
@@ -73,40 +72,11 @@ struct Options {
   // itself still has num_speculative_tokens == 0.
   PROPERTY(int32_t, mtp_draft_prefix_width) = 1;
 
-  // the number of speculative tokens per step
-  PROPERTY(int32_t, num_speculative_tokens) = 0;
+  PROPERTY(SpeculativeConfig, speculative_config);
 
-  PROPERTY(std::string, speculative_algorithm) = "mtp";
+  PROPERTY(WorkerType, worker_type) = WorkerType::LLM;
 
-  PROPERTY(bool, enable_probabilistic_draft) = false;
-
-  PROPERTY(int32_t, speculative_suffix_cache_max_depth) = 64;
-
-  PROPERTY(double, speculative_suffix_max_spec_factor) = 1.0;
-
-  PROPERTY(double, speculative_suffix_max_spec_offset) = 0.0;
-
-  PROPERTY(double, speculative_suffix_min_token_prob) = 0.1;
-
-  PROPERTY(int32_t, speculative_suffix_max_cached_requests) = -1;
-
-  PROPERTY(bool, speculative_suffix_use_tree_spec) = false;
-
-  PROPERTY(bool, enable_adaptive_target_verify) = false;
-  PROPERTY(bool, enable_adaptive_draft_step) = false;
-  PROPERTY(std::string, adaptive_draft_step_config);
-
-  PROPERTY(double, adaptive_target_verify_min_gain) = 0.0;
-
-  PROPERTY(std::string, adaptive_target_verify_cost_table);
-  PROPERTY(std::string, adaptive_target_verify_calibration);
-
-  // enable speculative decode
-  PROPERTY(bool, enable_speculative_decode) = false;
-
-  PROPERTY(bool, enable_mtp_draft_body_tp1) = false;
-
-  PROPERTY(bool, is_draft_engine) = false;
+  bool is_drafter() const { return worker_type() == WorkerType::DRAFTER; }
 
   PROPERTY(int32_t, world_size) = 1;
 

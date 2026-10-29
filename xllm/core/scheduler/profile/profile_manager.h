@@ -28,6 +28,7 @@ limitations under the License.
 #include "core/distributed_runtime/engine.h"
 #include "core/framework/batch/batch_factory.h"
 #include "core/framework/block/block_manager_pool.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/request/request.h"
 #include "core/framework/request/sequence.h"
 #include "core/framework/speculative/adaptive/spec_startup_calibration.h"
@@ -37,7 +38,6 @@ limitations under the License.
 
 namespace xllm {
 class DistributedWorkerManager;
-class SpeculativeConfig;
 
 std::vector<int32_t> build_step_time_profile_batch_sizes(
     int32_t max_seqs_per_batch);
@@ -59,12 +59,9 @@ class ProfileManager {
     PROPERTY(bool, enable_schedule_overlap) = false;
 
     PROPERTY(bool, enable_task_pipeline) = false;
-    PROPERTY(bool, enable_adaptive_target_verify) = false;
-    PROPERTY(bool, enable_adaptive_draft_step) = false;
-    PROPERTY(std::string, adaptive_target_verify_calibration);
-    PROPERTY(std::string, adaptive_target_verify_cost_table);
-    PROPERTY(std::string, adaptive_target_verify_cost_table_output);
     PROPERTY(std::string, spec_calibration_compatibility);
+
+    PROPERTY(SpeculativeConfig, speculative_config);
 
     PROPERTY(int32_t, dp_size) = 1;
 

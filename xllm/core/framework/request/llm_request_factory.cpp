@@ -44,10 +44,10 @@ namespace {
 bool task_worker_supports_json_object(const Options& options) {
 #if defined(USE_NPU)
   return ExecutionConfig::get_instance().enable_unified_mtp_graph() &&
-         options.num_speculative_tokens() > 0 &&
-         options.draft_model_path().has_value() &&
-         !options.draft_model_path()->empty() &&
-         SpeculativeConfig::is_mtp_algorithm(options.speculative_algorithm()) &&
+         options.speculative_config().enable_speculative_decode() &&
+         !options.speculative_config().draft_model_path().empty() &&
+         options.speculative_config().algorithm() ==
+             SpeculativeAlgorithm::MTP &&
          ModelConfig::is_python_model_impl(
              ModelConfig::get_instance().model_impl());
 #else
@@ -123,13 +123,11 @@ LLMRequestFactory::LLMRequestFactory(const Tokenizer* tokenizer,
     prompt_token_limit_ =
         std::min(prompt_token_limit_, options_->max_tokens_per_batch());
   }
-  const int32_t num_speculative_tokens = options_->num_speculative_tokens();
+  const int32_t num_speculative_tokens =
+      options_->speculative_config().num_speculative_tokens();
   max_generated_context_len_ = max_context_len - num_speculative_tokens;
-  seq_capacity_extra_ =
-      static_cast<size_t>(num_speculative_tokens) + /*bonus_token*/ 1;
-  if (options_->enable_schedule_overlap()) {
-    seq_capacity_extra_ += static_cast<size_t>(num_speculative_tokens) + 1;
-  }
+  num_extra_kv_tokens_ = options_->speculative_config().num_extra_kv_tokens(
+      options_->enable_schedule_overlap());
   skip_prompt_finish_check_ = task_type == "embed" || task_type == "mm_embed";
   if (options_->enable_service_routing()) {
     // Capture the handler by move rather than the factory: the callback is
@@ -399,7 +397,7 @@ std::shared_ptr<Request> LLMRequestFactory::create(
   // allocate enough capacity for prompt tokens, max tokens, and speculative
   // tokens
   const size_t capacity =
-      local_prompt_tokens.size() + effective_max_tokens + seq_capacity_extra_;
+      local_prompt_tokens.size() + effective_max_tokens + num_extra_kv_tokens_;
 
   const size_t best_of = sp.best_of.value_or(sp.n);
   RequestSamplingParam sampling_param = build_sampling_param(sp, best_of);
@@ -415,8 +413,8 @@ std::shared_ptr<Request> LLMRequestFactory::create(
         sp.source_xservice_addr);
     return nullptr;
   }
-  if (options_->num_speculative_tokens() > 0 &&
-      !SpeculativeConfig::is_mtp_algorithm(options_->speculative_algorithm()) &&
+  if (options_->speculative_config().enable_speculative_decode() &&
+      options_->speculative_config().algorithm() != SpeculativeAlgorithm::MTP &&
       (sp.seed.has_value() ||
        (sp.min_tokens > 0 && !sampling_param.device_min_tokens) ||
        !sp.bad_words.empty())) {

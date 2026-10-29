@@ -89,9 +89,8 @@ class ScopedSpeculativeSamplingConfigSnapshot final {
         algorithm_(SpeculativeConfig::get_instance().speculative_algorithm()) {}
 
   ~ScopedSpeculativeSamplingConfigSnapshot() {
-    SpeculativeConfig::get_instance()
-        .enable_adaptive_target_verify(adaptive_)
-        .speculative_algorithm(algorithm_);
+    SpeculativeConfig::get_instance().enable_adaptive_target_verify(adaptive_);
+    SpeculativeConfig::get_instance().speculative_algorithm(algorithm_);
   }
 
  private:
@@ -105,7 +104,8 @@ TEST(DecodeGraphWarmupConfigTest, OrdinaryTargetUsesSingleTokenShape) {
   const DecodeGraphWarmupConfig warmup_config =
       config.decode_graph_warmup_config(
           /*num_speculative_tokens=*/0,
-          /*enable_no_padding=*/false);
+          /*enable_no_padding=*/false,
+          SpeculativeAlgorithm::MTP);
 
   EXPECT_EQ(warmup_config.num_decoding_tokens, 1);
   EXPECT_EQ(warmup_config.num_speculative_tokens, 0);
@@ -119,7 +119,8 @@ TEST(DecodeGraphWarmupConfigTest, PreservesResolvedSpeculativeTargetWidth) {
   const DecodeGraphWarmupConfig warmup_config =
       config.decode_graph_warmup_config(
           /*num_speculative_tokens=*/3,
-          /*enable_no_padding=*/false);
+          /*enable_no_padding=*/false,
+          SpeculativeAlgorithm::MTP);
 
   EXPECT_EQ(warmup_config.num_decoding_tokens, 4);
   EXPECT_EQ(warmup_config.num_speculative_tokens, 3);
@@ -132,7 +133,9 @@ TEST(DecodeGraphWarmupConfigTest, PaddingFollowsTargetOptions) {
     config.enable_graph_mode_decode_no_padding(!enable_no_padding);
     EXPECT_EQ(config
                   .decode_graph_warmup_config(
-                      /*num_speculative_tokens=*/3, enable_no_padding)
+                      /*num_speculative_tokens=*/3,
+                      enable_no_padding,
+                      SpeculativeAlgorithm::MTP)
                   .enable_graph_mode_decode_no_padding,
               enable_no_padding);
   }
@@ -385,14 +388,14 @@ TEST(GraphWarmupTest, AdaptiveVerifyPipelineUsesGreedySyntheticRequests) {
   ExecutionConfig::get_instance().enable_graph(false);
   for (const bool adaptive : {false, true}) {
     for (const bool pipeline : {false, true}) {
-      for (const std::string algorithm :
+      for (const std::string& algorithm :
            {"DSpark", "dspark", "MTP", "DFlash", "DFlash2"}) {
         SCOPED_TRACE(algorithm);
         SCOPED_TRACE(adaptive);
         SCOPED_TRACE(pipeline);
-        SpeculativeConfig::get_instance()
-            .enable_adaptive_target_verify(adaptive)
-            .speculative_algorithm(algorithm);
+        SpeculativeConfig::get_instance().enable_adaptive_target_verify(
+            adaptive);
+        SpeculativeConfig::get_instance().speculative_algorithm(algorithm);
         RecordingProfileEngine engine;
         ProfileManager::Options options;
         options.max_tokens_per_batch(8)
@@ -416,7 +419,8 @@ TEST(GraphWarmupTest, AdaptiveVerifyPipelineUsesGreedySyntheticRequests) {
 
         const bool expected_greedy =
             adaptive && pipeline &&
-            SpeculativeConfig::supports_adaptive_target_verify(algorithm);
+            SpeculativeConfig::supports_adaptive_target_verify(
+                SpeculativeConfig::from_string(algorithm));
         ASSERT_EQ(engine.observed_greedy_samples().size(), 8);
         for (const bool greedy : engine.observed_greedy_samples()) {
           EXPECT_EQ(greedy, expected_greedy);
@@ -628,40 +632,52 @@ TEST(DecodeGraphWarmupPlanTest, CoversEveryPaddedMtpTokenBucket) {
 
 TEST(DecodeGraphWarmupPlanTest, ResolvesIndependentDraftInvocationShapes) {
   ExecutionConfig execution;
-  auto config = execution.decode_graph_warmup_config(3, false, "mTp");
+  auto config = execution.decode_graph_warmup_config(
+      3, false, SpeculativeConfig::from_string("mTp"));
   ASSERT_EQ(config.draft_shapes.size(), 1);
   EXPECT_EQ(config.draft_shapes.front().tokens_per_sequence, 1);
   EXPECT_FALSE(config.draft_shapes.front().bucket_by_sequence);
 
   execution.enable_task_pipeline(true);
-  config = execution.decode_graph_warmup_config(3, false, "MTP");
+  config = execution.decode_graph_warmup_config(
+      3, false, SpeculativeConfig::from_string("MTP"));
   ASSERT_EQ(config.draft_shapes.size(), 2);
   EXPECT_EQ(config.draft_shapes[0].tokens_per_sequence, 2);
   EXPECT_EQ(config.draft_shapes[1].tokens_per_sequence, 1);
-  config = execution.decode_graph_warmup_config(1, false, "MTP");
+  config = execution.decode_graph_warmup_config(
+      1, false, SpeculativeConfig::from_string("MTP"));
   ASSERT_EQ(config.draft_shapes.size(), 1);
   EXPECT_EQ(config.draft_shapes.front().tokens_per_sequence, 2);
 
   for (const int32_t width : {5, 7}) {
-    config = execution.decode_graph_warmup_config(width, false, "dSpArK");
+    config = execution.decode_graph_warmup_config(
+        width, false, SpeculativeConfig::from_string("dSpArK"));
     ASSERT_EQ(config.draft_shapes.size(), 1);
     EXPECT_EQ(config.draft_shapes.front().tokens_per_sequence, width);
     EXPECT_TRUE(config.draft_shapes.front().bucket_by_sequence);
   }
-  config = execution.decode_graph_warmup_config(7, false, "DFlash2");
+  config = execution.decode_graph_warmup_config(
+      7, false, SpeculativeConfig::from_string("DFlash2"));
   ASSERT_EQ(config.draft_shapes.size(), 1);
   EXPECT_EQ(config.draft_shapes.front().tokens_per_sequence, 8);
   EXPECT_TRUE(config.draft_shapes.front().bucket_by_sequence);
-  for (const std::string algorithm : {"DFlash", "Suffix"}) {
+  for (const SpeculativeAlgorithm algorithm :
+       {SpeculativeAlgorithm::DFLASH, SpeculativeAlgorithm::SUFFIX}) {
     EXPECT_TRUE(execution.decode_graph_warmup_config(7, false, algorithm)
                     .draft_shapes.empty());
   }
-  EXPECT_TRUE(execution.decode_graph_warmup_config(0, false, "MTP")
+  EXPECT_TRUE(execution
+                  .decode_graph_warmup_config(
+                      0, false, SpeculativeConfig::from_string("MTP"))
                   .draft_shapes.empty());
-  EXPECT_TRUE(execution.decode_graph_warmup_config(3, true, "MTP")
+  EXPECT_TRUE(execution
+                  .decode_graph_warmup_config(
+                      3, true, SpeculativeConfig::from_string("MTP"))
                   .draft_shapes.empty());
   execution.enable_unified_mtp_graph(true);
-  EXPECT_TRUE(execution.decode_graph_warmup_config(7, false, "DSpark")
+  EXPECT_TRUE(execution
+                  .decode_graph_warmup_config(
+                      7, false, SpeculativeConfig::from_string("DSpark"))
                   .draft_shapes.empty());
 }
 
@@ -673,8 +689,8 @@ TEST(DecodeGraphWarmupPlanTest,
   ExecutionConfig execution;
   execution.enable_task_pipeline(true).acl_graph_decode_batch_size_limit(8);
   for (const int32_t width : {5, 7}) {
-    const auto config =
-        execution.decode_graph_warmup_config(width, false, "DSpark");
+    const auto config = execution.decode_graph_warmup_config(
+        width, false, SpeculativeConfig::from_string("DSpark"));
     const auto plan = build_decode_graph_warmup_plan(config, 8, 1);
     EXPECT_EQ(plan.batch_sizes,
               width == 5 ? (std::vector<int32_t>{1, 2, 4, 8})
@@ -686,7 +702,7 @@ TEST(DecodeGraphWarmupPlanTest, JointCoverageUsesLocalDpGeometryAndGraphLimit) {
   if (!Platform::supports_mtp_decode_graph_warmup()) {
     GTEST_SKIP() << "Token-bucket graph warmup is not supported.";
   }
-  for (const std::string algorithm : {"MTP", "DSpark"}) {
+  for (const std::string& algorithm : {"MTP", "DSpark"}) {
     for (const int32_t width : {1, 3, 5, 7}) {
       for (const int32_t dp_size : {1, 2, 4}) {
         for (const int32_t local_capacity : {3, 5, 8, 17}) {
@@ -697,8 +713,8 @@ TEST(DecodeGraphWarmupPlanTest, JointCoverageUsesLocalDpGeometryAndGraphLimit) {
           ExecutionConfig execution;
           execution.enable_task_pipeline(true)
               .acl_graph_decode_batch_size_limit(8);
-          const auto config =
-              execution.decode_graph_warmup_config(width, false, algorithm);
+          const auto config = execution.decode_graph_warmup_config(
+              width, false, SpeculativeConfig::from_string(algorithm));
           const int32_t global_capacity = local_capacity * dp_size;
           const auto plan =
               build_decode_graph_warmup_plan(config, global_capacity, dp_size);
@@ -1108,7 +1124,8 @@ TEST(GraphWarmupTest, DecodeProfileUsesConfiguredSpeculativeGeometry) {
       .decode_graph_warmup_config(
           ExecutionConfig::get_instance().decode_graph_warmup_config(
               /*num_speculative_tokens=*/3,
-              /*enable_no_padding=*/false));
+              /*enable_no_padding=*/false,
+              SpeculativeAlgorithm::MTP));
   ProfileManager profile_manager(&engine, options);
 
   profile_manager.profile_decode_step_time(/*token_length=*/5,

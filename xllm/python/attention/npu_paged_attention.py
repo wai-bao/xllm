@@ -54,6 +54,7 @@ from xllm.python.model_executor.forward_context import (
     get_forward_context,
     in_acl_graph,
 )
+from xllm.python.model_executor.runners.kv_capacity import MAX_SPECULATIVE_TOKENS
 
 if TYPE_CHECKING:
     from xllm.python.layers.attention import Attention
@@ -475,7 +476,7 @@ class NpuPagedAttentionBackend(KdaLinearAttentionMixin, AttentionBackend):
                 or accepted is None
                 or accepted.numel() != indices.numel()
                 or batch_size % indices.numel()
-                or not 2 <= batch_size // indices.numel() <= 17
+                or not 2 <= batch_size // indices.numel() <= MAX_SPECULATIVE_TOKENS + 1
                 or query_ends != list(range(1, batch_size + 1))
             ):
                 raise ValueError("prepared Qwen MTP requires expanded one-token attention rows and logical state slots")

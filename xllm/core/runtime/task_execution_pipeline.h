@@ -25,6 +25,7 @@ limitations under the License.
 #include <thread>
 #include <vector>
 
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/draft_proposal.h"
@@ -123,6 +124,12 @@ struct SpeculativeTaskCapacity {
   bool calibration_leader = false;
   bool startup_calibration = false;
 };
+
+// Verify rows per decode step: width + bonus token.
+inline uint32_t decode_query_len(const SpeculativeTaskCapacity& capacity) {
+  return static_cast<uint32_t>(
+      SpeculativeConfig::decode_query_len(capacity.num_speculative_tokens));
+}
 
 struct MtpContextStorage;
 struct MtpContextView;

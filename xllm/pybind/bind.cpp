@@ -45,7 +45,30 @@ PYBIND11_MODULE(xllm_export, m) {
       .def(py::init())
       .def_readwrite("model_path", &Options::model_path_)
       .def_readwrite("extension_impl", &Options::extension_impl_)
-      .def_readwrite("draft_model_path", &Options::draft_model_path_)
+      .def_property(
+          "draft_model",
+          [](const Options& o) {
+            return o.speculative_config().draft_model_path();
+          },
+          [](Options& o, const std::string& v) {
+            o.speculative_config().draft_model_path(v);
+          })
+      .def_property(
+          "num_speculative_tokens",
+          [](const Options& o) {
+            return o.speculative_config().num_speculative_tokens();
+          },
+          [](Options& o, int32_t v) {
+            o.speculative_config().num_speculative_tokens(v);
+          })
+      .def_property(
+          "speculative_algorithm",
+          [](const Options& o) {
+            return o.speculative_config().speculative_algorithm();
+          },
+          [](Options& o, const std::string& v) {
+            o.speculative_config().speculative_algorithm(v);
+          })
       .def_readwrite("backend", &Options::backend_)
       .def_readwrite("limit_image_per_prompt",
                      &Options::limit_image_per_prompt_)
@@ -62,9 +85,6 @@ PYBIND11_MODULE(xllm_export, m) {
       .def_readwrite("max_seqs_per_batch", &Options::max_seqs_per_batch_)
       .def_readwrite("max_tokens_per_chunk_for_prefill",
                      &Options::max_tokens_per_chunk_for_prefill_)
-      .def_readwrite("num_speculative_tokens",
-                     &Options::num_speculative_tokens_)
-      .def_readwrite("speculative_algorithm", &Options::speculative_algorithm_)
       .def_readwrite("num_request_handling_threads",
                      &Options::num_request_handling_threads_)
       .def_readwrite("communication_backend", &Options::communication_backend_)

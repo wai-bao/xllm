@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "core/common/macros.h"
 #include "core/framework/config/option_category.h"
+#include "core/framework/config/speculative_config.h"
 
 namespace xllm {
 
@@ -46,7 +47,7 @@ class ModelConfig final {
   validate_python_speculative_decode(std::string_view model_impl,
                                      std::string_view model_type,
                                      int32_t num_speculative_tokens,
-                                     std::string_view speculative_algorithm);
+                                     SpeculativeAlgorithm algorithm);
 
   [[nodiscard]] static const OptionCategory& option_category() {
     static const OptionCategory kOptionCategory = {

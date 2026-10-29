@@ -24,7 +24,6 @@ limitations under the License.
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/speculative/draft_proposal.h"
 #include "core/framework/speculative/verify_layout.h"
-#include "core/runtime/json_object_decode_continuation.h"
 #include "core/runtime/llm_worker_impl.h"
 #include "core/runtime/mtp_runtime_helpers.h"
 #include "core/runtime/py_executor_impl.h"
@@ -39,10 +38,11 @@ runtime::Options unified_leaf_options(const runtime::Options& options,
   runtime::Options leaf_options = options;
   leaf_options.enable_task_pipeline(false)
       .enable_schedule_overlap(false)
-      .is_draft_engine(draft)
+      .worker_type(draft ? WorkerType::DRAFTER : WorkerType::LLM)
       .enable_graph_aux_hidden_states(true);
   if (draft) {
-    leaf_options.num_decoding_tokens(1).num_speculative_tokens(0);
+    leaf_options.num_decoding_tokens(1);
+    leaf_options.speculative_config().num_speculative_tokens(0);
   }
   return leaf_options;
 }
@@ -124,8 +124,8 @@ bool UnifiedMtpWorkerImpl::init_model(const std::string& model_weights_path,
 ::xllm::Status UnifiedMtpWorkerImpl::create_task_pipeline(
     std::unique_ptr<TaskExecutionPipeline>& output) {
   if (impl_ == nullptr || draft_impl_ == nullptr ||
-      options_.num_speculative_tokens() <= 0 ||
-      options_.enable_adaptive_target_verify()) {
+      !options_.speculative_config().enable_speculative_decode() ||
+      options_.speculative_config().enable_adaptive_target_verify()) {
     return ::xllm::Status(
         StatusCode::INVALID_ARGUMENT,
         "Unified MTP task pipeline requires fixed greedy MTP models.");
@@ -141,8 +141,8 @@ bool UnifiedMtpWorkerImpl::init_model(const std::string& model_weights_path,
     return status;
   }
   LOG(INFO) << "Unified MTP task execution pipeline: slots="
-            << capacity.slot_count
-            << ", speculative_tokens=" << options_.num_speculative_tokens();
+            << capacity.slot_count << ", speculative_tokens="
+            << options_.speculative_config().num_speculative_tokens();
   return status;
 }
 
@@ -165,46 +165,7 @@ std::optional<ForwardOutput> UnifiedMtpWorkerImpl::execute_task_pipeline(
     const LlmForwardInput& prepared) {
   // The queue owns execution and results. JSON needs the preceding accepted
   // tokens as well, but must not use the driver's legacy last-step slot.
-  if (!enable_schedule_overlap() || prepared.json_object_states.empty()) {
-    task_json_output_ = ForwardOutput();
-    task_json_sample_sequence_ids_.clear();
-    return step(prepared);
-  }
-
-  LlmForwardInput input = prepared.clone();
-  c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-  CHECK(compute_stream_->wait_event(input.runtime.metadata_ready_event));
-  if (input.token_ids.numel() > 0 &&
-      input.input_params.meta.batch_forward_type.has_decode()) {
-    JsonObjectDecodeContinuation::prepare(input,
-                                          task_json_output_,
-                                          task_json_sample_sequence_ids_,
-                                          device_,
-                                          *compute_stream_);
-  }
-  auto output = step(input);
-  task_json_output_ = ForwardOutput();
-  task_json_sample_sequence_ids_.clear();
-  if (output.has_value()) {
-    output->json_object_errors.insert(output->json_object_errors.end(),
-                                      input.json_object_errors.begin(),
-                                      input.json_object_errors.end());
-    if (output->sample_output.next_tokens.defined()) {
-      if (output->ready_event != nullptr) {
-        CHECK(output->ready_event->synchronize());
-      }
-      // Output tensors may borrow a pinned-result lease. Own the small token
-      // copy so consuming a task cannot invalidate the next grammar update.
-      task_json_output_.sample_output.next_tokens =
-          safe_to(
-              output->sample_output.next_tokens,
-              torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU),
-              /*non_blocking=*/false)
-              .clone();
-      task_json_sample_sequence_ids_ = input.sample_sequence_ids;
-    }
-  }
-  return output;
+  return execute_task_pipeline_json(prepared);
 }
 
 bool UnifiedMtpWorkerImpl::supports_unified_python_mtp_graph(
@@ -239,8 +200,8 @@ bool UnifiedMtpWorkerImpl::supports_unified_configuration() const {
                            backend == "aclgraph";
   const bool unsupported_shape =
       !acl_backend || !::xllm::ExecutionConfig::get_instance().enable_graph() ||
-      options_.num_speculative_tokens() <= 0 || impl_ == nullptr ||
-      draft_impl_ == nullptr || !attention_topology_valid ||
+      !options_.speculative_config().enable_speculative_decode() ||
+      impl_ == nullptr || draft_impl_ == nullptr || !attention_topology_valid ||
       !moe_topology_valid || parallel_args_.dp_size() != 1 ||
       parallel_args_.cp_size() != 1 ||
       parallel_args_.kv_split_size_effective() != 1 ||
@@ -252,7 +213,8 @@ bool UnifiedMtpWorkerImpl::supports_unified_configuration() const {
           draft_impl_->context_.get_model_impl());
   if (unsupported_shape) {
     VLOG(1) << "MTP unified Python graph rejected: k="
-            << options_.num_speculative_tokens() << ", enable_graph="
+            << options_.speculative_config().num_speculative_tokens()
+            << ", enable_graph="
             << ::xllm::ExecutionConfig::get_instance().enable_graph()
             << ", tp=" << parallel_args_.tp_size()
             << ", dp=" << parallel_args_.dp_size()
@@ -270,7 +232,7 @@ bool UnifiedMtpWorkerImpl::supports_unified_configuration() const {
                     : draft_impl_->context_.get_model_impl());
     return false;
   }
-  if (SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
+  if (options_.speculative_config().enable_atb_spec_kernel()) {
     VLOG(1) << "MTP unified Python graph rejected: ATB speculative kernel";
     return false;
   }
@@ -284,7 +246,7 @@ bool UnifiedMtpWorkerImpl::supports_unified_configuration() const {
       target_python_executor_ready && draft_python_executor_ready;
   if (supported) {
     VLOG(1) << "MTP unified Python graph capable: speculative_tokens="
-            << options_.num_speculative_tokens();
+            << options_.speculative_config().num_speculative_tokens();
   } else {
     VLOG(1) << "MTP unified Python graph rejected: Python executor is not "
                "ready, target_python_executor="
@@ -443,7 +405,9 @@ std::optional<ForwardOutput> UnifiedMtpWorkerImpl::step_unified(
                               embedding_cache_->embedding_placeholder(),
                               logical_block_size());
     return run_unified_python_mtp_graph(
-        input, prepared, options_.num_speculative_tokens());
+        input,
+        prepared,
+        options_.speculative_config().num_speculative_tokens());
   }
 
   // Bootstrap or changed request order: flush completed generations once,
@@ -469,7 +433,9 @@ std::optional<ForwardOutput> UnifiedMtpWorkerImpl::step_unified(
       /*force_two_rows=*/true,
       /*wait_for_compute_stream=*/!options_.enable_task_pipeline());
   return run_unified_python_mtp_graph(
-      corrected, prepared, options_.num_speculative_tokens());
+      corrected,
+      prepared,
+      options_.speculative_config().num_speculative_tokens());
 }
 
 UnifiedMtpExecutor& UnifiedMtpWorkerImpl::unified_executor() {

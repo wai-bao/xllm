@@ -31,6 +31,7 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/platform/device.h"
 #include "core/platform/platform.h"
 #if defined(USE_CUDA) || defined(USE_MLU) || defined(USE_DCU)
@@ -75,9 +76,6 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
                                      bool is_local,
                                      const std::string& task_type,
                                      const std::string& worker_type,
-                                     bool enable_speculative_decode,
-                                     int32_t num_speculative_tokens,
-                                     const std::string& speculative_algorithm,
                                      const std::string& communication_backend,
                                      const std::string& npu_kernel_backend,
                                      const std::string& rank_tablefile,
@@ -95,12 +93,12 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
                                      int32_t cfg_size,
                                      int32_t text_encoder_tp_size,
                                      const InstanceRole& instance_role,
-                                     bool enable_mtp_draft_body_tp1,
-                                     bool enable_probabilistic_draft,
                                      const std::string& model_impl,
                                      const std::string& extension_impl) {
   // TODO: pass whole xllm::runtime::Options here from main process.
   xllm::runtime::Options runner_options;
+  // The spawned process never runs initialize_configs(); main() filled the
+  // singleton from the forwarded argv, so copy that one snapshot here.
   const std::string backend = get_backend_from_worker_type(worker_type);
   CHECK(!backend.empty()) << "Unsupported worker_type for backend mapping: "
                           << worker_type;
@@ -117,11 +115,7 @@ SpawnWorkerServer::SpawnWorkerServer(const std::string& master_node_addr,
       .max_tokens_per_batch(max_tokens_per_batch)
       .max_seqs_per_batch(max_seqs_per_batch)
       .num_decoding_tokens(num_decoding_tokens)
-      .enable_speculative_decode(enable_speculative_decode)
-      .enable_mtp_draft_body_tp1(enable_mtp_draft_body_tp1)
-      .num_speculative_tokens(num_speculative_tokens)
-      .speculative_algorithm(speculative_algorithm)
-      .enable_probabilistic_draft(enable_probabilistic_draft)
+      .speculative_config(SpeculativeConfig::get_instance())
       .enable_schedule_overlap(/*enable_schedule_overlap=*/false)
       .enable_offline_inference(/*enable_offline_inference=*/true)
       .master_node_addr(master_node_addr)

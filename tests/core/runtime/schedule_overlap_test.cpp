@@ -148,7 +148,8 @@ class OverlapTestWorker final : public WorkerImpl {
   static runtime::Options options(bool speculative_decode) {
     runtime::Options options;
     options.enable_schedule_overlap(true);
-    options.enable_speculative_decode(speculative_decode);
+    options.speculative_config().speculative_algorithm(
+        speculative_decode ? "MTP" : "");
     return options;
   }
 

@@ -15,9 +15,9 @@ limitations under the License.
 
 #pragma once
 
-#include <boost/algorithm/string/predicate.hpp>
 #include <cstdint>
 #include <nlohmann/json_fwd.hpp>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -28,6 +28,34 @@ namespace xllm {
 
 class JsonReader;
 
+// The algorithm is the switch: NONE (empty user string) means speculative
+// decoding is off; the token width never gates anything.
+enum class SpeculativeAlgorithm : uint8_t {
+  NONE,
+  MTP,
+  EAGLE3,
+  SUFFIX,
+  DFLASH,
+  DFLASH2,
+  DSPARK,
+};
+
+constexpr bool is_block_diffusion(SpeculativeAlgorithm algorithm) {
+  return algorithm == SpeculativeAlgorithm::DFLASH ||
+         algorithm == SpeculativeAlgorithm::DFLASH2 ||
+         algorithm == SpeculativeAlgorithm::DSPARK;
+}
+
+// Whether the PD handoff must carry the bootstrap hidden state.
+constexpr bool requires_bootstrap_hidden(SpeculativeAlgorithm algorithm) {
+  return algorithm == SpeculativeAlgorithm::MTP ||
+         algorithm == SpeculativeAlgorithm::EAGLE3;
+}
+
+// Width upper bound from the NPU fused-attention TND layout; mirrors the
+// Python-side MAX_SPECULATIVE_TOKENS.
+inline constexpr int32_t kMaxSpeculativeTokens = 16;
+
 class SpeculativeConfig final {
  public:
   SpeculativeConfig() = default;
@@ -35,81 +63,82 @@ class SpeculativeConfig final {
 
   static SpeculativeConfig& get_instance();
 
-  static bool is_eagle3_algorithm(std::string_view algorithm) {
-    return boost::iequals(algorithm, "Eagle3");
+  // Case-insensitive string -> enum parse.
+  static SpeculativeAlgorithm from_string(std::string_view algorithm);
+
+  // Lazy so PROPERTY-built snapshots (spawn path, tests) see the same truth
+  // as the initialized singleton.
+  SpeculativeAlgorithm algorithm() const {
+    return from_string(speculative_algorithm());
   }
 
-  static bool is_dflash_algorithm(std::string_view algorithm) {
-    return boost::iequals(algorithm, "DFlash");
+  // Lazy so partially-configured instances see the normalized truth.
+  bool enable_speculative_decode() const {
+    return !speculative_algorithm().empty();
   }
 
-  static bool is_dflash2_algorithm(std::string_view algorithm) {
-    return boost::iequals(algorithm, "DFlash2");
+  // True when a fixed width is set (0 = unset, derived by normalize()).
+  bool has_speculative_width() const { return num_speculative_tokens() > 0; }
+
+  // Verify rows per decode step: width + bonus token.
+  int32_t decode_query_len() const {
+    return decode_query_len(num_speculative_tokens());
   }
 
-  static bool is_dspark_algorithm(std::string_view algorithm) {
-    return boost::iequals(algorithm, "DSpark");
+  // Overload for call sites holding the raw token count.
+  static constexpr int32_t decode_query_len(int32_t num_speculative_tokens) {
+    return num_speculative_tokens + 1;
   }
 
-  static bool is_suffix_algorithm(std::string_view algorithm) {
-    return boost::iequals(algorithm, "Suffix");
-  }
-
-  static bool uses_ssm_engine(std::string_view draft_model_path,
-                              std::string_view algorithm,
-                              int32_t num_speculative_tokens) {
-    return !draft_model_path.empty() ||
-           (is_suffix_algorithm(algorithm) && num_speculative_tokens > 0);
-  }
-
-  static bool is_mtp_algorithm(std::string_view algorithm) {
-    return boost::iequals(algorithm, "MTP");
-  }
-
-  // Whether the PD handoff must carry the bootstrap hidden state.
-  static bool requires_bootstrap_hidden(std::string_view algorithm) {
-    return is_mtp_algorithm(algorithm) || is_eagle3_algorithm(algorithm);
-  }
-
-  // Drafts that generate a block of speculative tokens in one forward.
-  static bool is_block_diffusion_algorithm(std::string_view algorithm) {
-    return is_dflash_algorithm(algorithm) || is_dflash2_algorithm(algorithm) ||
-           is_dspark_algorithm(algorithm);
+  // Per-sequence verify-row padding, doubled under schedule overlap.
+  size_t num_extra_kv_tokens(bool enable_schedule_overlap) const {
+    const size_t verify_rows = decode_query_len();
+    return enable_schedule_overlap ? verify_rows * 2 : verify_rows;
   }
 
   // Algorithm-level admission only; callers validate runtime geometry.
-  static bool supports_task_pipeline(std::string_view algorithm) {
-    return is_mtp_algorithm(algorithm) ||
-           is_block_diffusion_algorithm(algorithm);
+  static bool supports_task_pipeline(SpeculativeAlgorithm kind) {
+    return kind == SpeculativeAlgorithm::MTP || is_block_diffusion(kind);
   }
 
-  static bool supports_adaptive_target_verify(std::string_view algorithm) {
-    return is_dspark_algorithm(algorithm) || is_mtp_algorithm(algorithm);
+  static bool supports_adaptive_target_verify(SpeculativeAlgorithm kind) {
+    return kind == SpeculativeAlgorithm::DSPARK ||
+           kind == SpeculativeAlgorithm::MTP;
   }
 
-  static bool requires_aux_hidden_capture(std::string_view algorithm) {
-    return is_eagle3_algorithm(algorithm) ||
-           is_block_diffusion_algorithm(algorithm);
+  // User flag ANDed with algorithm admission and the task-pipeline switch.
+  bool effective_adaptive_target_verify(bool enable_task_pipeline) const {
+    return enable_task_pipeline && enable_adaptive_target_verify() &&
+           supports_adaptive_target_verify(algorithm());
+  }
+
+  static bool requires_aux_hidden_capture(SpeculativeAlgorithm kind) {
+    return kind == SpeculativeAlgorithm::EAGLE3 || is_block_diffusion(kind);
   }
 
   // Aux-capture drafts share the target's KV layout, so they are included.
-  static bool supports_host_kv_cache(std::string_view algorithm) {
-    return is_mtp_algorithm(algorithm) || is_eagle3_algorithm(algorithm) ||
-           is_block_diffusion_algorithm(algorithm);
+  static bool supports_host_kv_cache(SpeculativeAlgorithm kind) {
+    return kind == SpeculativeAlgorithm::MTP ||
+           kind == SpeculativeAlgorithm::EAGLE3 || is_block_diffusion(kind);
   }
 
   // DFlash2 carries the dense proposal only when probabilistic rejection
   // requires it; greedy-only DFlash and Suffix stay out.
   static bool is_probabilistic_draft_sampling_supported(
-      std::string_view algorithm) {
-    return is_mtp_algorithm(algorithm) || is_dspark_algorithm(algorithm) ||
-           is_dflash2_algorithm(algorithm) || is_eagle3_algorithm(algorithm);
+      SpeculativeAlgorithm kind) {
+    return kind == SpeculativeAlgorithm::MTP ||
+           kind == SpeculativeAlgorithm::DSPARK ||
+           kind == SpeculativeAlgorithm::DFLASH2 ||
+           kind == SpeculativeAlgorithm::EAGLE3;
   }
+
+  std::string to_string() const;
 
   void from_flags();
   void from_json(const JsonReader& json);
   void append_config_json(nlohmann::ordered_json& config_json) const;
   void initialize();
+  void normalize();
   void validate() const;
 
   [[nodiscard]] static const OptionCategory& option_category() {
@@ -137,11 +166,13 @@ class SpeculativeConfig final {
     return kOptionCategory;
   }
 
-  PROPERTY(std::string, draft_model);
+  // User-facing flag/JSON key stays "draft_model".
+  PROPERTY(std::string, draft_model_path);
 
   PROPERTY(int32_t, num_speculative_tokens) = 0;
 
-  PROPERTY(std::string, speculative_algorithm) = "MTP";
+  // Raw user string; empty = not configured. Read algorithm() instead.
+  PROPERTY(std::string, speculative_algorithm);
 
   PROPERTY(int32_t, speculative_suffix_cache_max_depth) = 64;
 
@@ -162,14 +193,22 @@ class SpeculativeConfig final {
   PROPERTY(bool, enable_atb_spec_kernel) = false;
 
   PROPERTY(bool, enable_adaptive_target_verify) = false;
+
   PROPERTY(bool, enable_adaptive_draft_step) = false;
+
   PROPERTY(std::string, adaptive_draft_step_config);
 
   PROPERTY(double, adaptive_target_verify_min_gain) = 0.0;
 
   PROPERTY(std::string, adaptive_target_verify_cost_table);
+
   PROPERTY(std::string, adaptive_target_verify_calibration);
+
   PROPERTY(std::string, adaptive_target_verify_cost_table_output);
+
+ private:
+  template <typename T>
+  std::optional<T> read_draft_config(std::string_view key) const;
 };
 
 }  // namespace xllm

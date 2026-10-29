@@ -313,9 +313,11 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
   torch::TensorOptions token_options = validate_input.token_ids.options();
   torch::TensorOptions position_options = validate_input.positions.options();
 
-  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  const int32_t num_speculative_tokens =
+      options_.speculative_config().num_speculative_tokens();
+  const int32_t num_val_tokens =
+      options_.speculative_config().decode_query_len();
   const int32_t num_sequences = input_params.meta.num_sequences;
-  const int32_t num_val_tokens = num_speculative_tokens + 1;
   const int32_t total_num_val_tokens = num_sequences * num_val_tokens;
   const int32_t block_size = options_.block_size();
   // Hybrid targets (for example Qwen3.8 GDN) mark validation as spec-verify
@@ -324,7 +326,7 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
   // by the model's spec-verify kernel instead of being expanded into N+1
   // independent decode rows.
   const bool use_chunked_spec_verify =
-      ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
+      options_.speculative_config().enable_atb_spec_kernel() ||
       input.input_params.is_spec_verify;
   specBuilder::DecodeRowContext row_ctx =
       specBuilder::make_decode_row_context(input);

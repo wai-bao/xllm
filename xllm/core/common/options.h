@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "common/macros.h"
 #include "common/types.h"
+#include "core/framework/config/speculative_config.h"
 
 namespace xllm {
 
@@ -41,8 +42,6 @@ class Options {
 
   // Select a named extension family for this instance.
   PROPERTY(std::string, extension_impl);
-
-  PROPERTY(std::optional<std::string>, draft_model_path);
 
   // model backend
   PROPERTY(std::string, backend);
@@ -80,35 +79,7 @@ class Options {
   // the max tokens per chunk for request in prefill stage.
   PROPERTY(int32_t, max_tokens_per_chunk_for_prefill);
 
-  // sps tokens
-  PROPERTY(int32_t, num_speculative_tokens) = 0;
-
-  PROPERTY(std::string, speculative_algorithm) = "MTP";
-
-  PROPERTY(bool, enable_probabilistic_draft) = false;
-
-  PROPERTY(int32_t, speculative_suffix_cache_max_depth) = 64;
-
-  PROPERTY(double, speculative_suffix_max_spec_factor) = 1.0;
-
-  PROPERTY(double, speculative_suffix_max_spec_offset) = 0.0;
-
-  PROPERTY(double, speculative_suffix_min_token_prob) = 0.1;
-
-  PROPERTY(int32_t, speculative_suffix_max_cached_requests) = -1;
-
-  PROPERTY(bool, speculative_suffix_use_tree_spec) = false;
-
-  PROPERTY(bool, enable_mtp_draft_body_tp1) = false;
-  PROPERTY(bool, enable_adaptive_target_verify) = false;
-  PROPERTY(bool, enable_adaptive_draft_step) = false;
-  PROPERTY(std::string, adaptive_draft_step_config);
-
-  PROPERTY(double, adaptive_target_verify_min_gain) = 0.0;
-
-  PROPERTY(std::string, adaptive_target_verify_cost_table);
-  PROPERTY(std::string, adaptive_target_verify_calibration);
-  PROPERTY(std::string, adaptive_target_verify_cost_table_output);
+  PROPERTY(SpeculativeConfig, speculative_config);
 
   // thread num to handle requests
   PROPERTY(size_t, num_request_handling_threads) = 4;

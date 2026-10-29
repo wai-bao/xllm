@@ -16,7 +16,6 @@ limitations under the License.
 #pragma once
 
 #include <cstdint>
-#include <string_view>
 
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/model/model_args.h"
@@ -38,9 +37,9 @@ inline int64_t mtp_hidden_state_width(const ModelArgs& model_args) {
   return model_args.hidden_size();
 }
 
-inline bool uses_embedded_eagle3_draft(std::string_view algorithm,
+inline bool uses_embedded_eagle3_draft(SpeculativeAlgorithm algorithm,
                                        const ModelArgs& target_model_args) {
-  return SpeculativeConfig::is_eagle3_algorithm(algorithm) &&
+  return algorithm == SpeculativeAlgorithm::EAGLE3 &&
          target_model_args.enable_embedded_eagle3_draft();
 }
 

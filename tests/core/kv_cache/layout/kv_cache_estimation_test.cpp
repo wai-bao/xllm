@@ -166,9 +166,9 @@ TEST(KVCacheEstimationTest, DraftTp1OverridesTensorParallelHeadDerivation) {
   ModelArgs model_args = make_standard_args();
   model_args.n_heads(8).n_kv_heads(4);
   runtime::Options runtime_options;
-  runtime_options.block_size(16)
-      .enable_mtp_draft_body_tp1(true)
-      .is_draft_engine(true);
+  runtime_options.block_size(16).speculative_config().enable_mtp_draft_body_tp1(
+      true);
+  runtime_options.worker_type(WorkerType::DRAFTER);
 
   KVCacheEstimateContext context;
   context.dtype = torch::kFloat16;
@@ -189,17 +189,19 @@ TEST(KVCacheEstimationTest, SpeculativeEmbeddingCostDependsOnAlgorithm) {
   runtime::Options runtime_options;
   runtime_options.block_size(16)
       .enable_task_pipeline(true)
+      .speculative_config()
+      .speculative_algorithm("MTP")
       .num_speculative_tokens(2);
 
   KVCacheEstimateContext context;
   context.dtype = torch::kFloat16;
   context.virtual_memory_cache_size = 1024 * 1024;
 
-  runtime_options.speculative_algorithm("DFlash");
+  runtime_options.speculative_config().speculative_algorithm("DFlash");
   const KVCacheCapacity block_diffusion_capacity =
       KVCacheEstimator(model_args).estimate(runtime_options, context);
 
-  runtime_options.speculative_algorithm("MTP");
+  runtime_options.speculative_config().speculative_algorithm("MTP");
   const KVCacheCapacity mtp_capacity =
       KVCacheEstimator(model_args).estimate(runtime_options, context);
 
@@ -447,6 +449,7 @@ TEST(KVCacheEstimationTest, MultimodalRuntimeReservesMtpCheckpoints) {
   runtime_options.block_size(16)
       .max_seqs_per_batch(8)
       .max_linear_state_cache_slots(16)
+      .speculative_config()
       .num_speculative_tokens(4);
 
   KVCacheEstimateContext context;
@@ -461,7 +464,7 @@ TEST(KVCacheEstimationTest, MultimodalRuntimeReservesMtpCheckpoints) {
   EXPECT_EQ(capacity.linear_ssm_checkpoint_stride(), 5);
   EXPECT_EQ(capacity.linear_conv_state_len(), 6);
 
-  runtime_options.num_speculative_tokens(0);
+  runtime_options.speculative_config().num_speculative_tokens(0);
   const KVCacheCapacity without_mtp =
       KVCacheEstimator(model_args).estimate(runtime_options, context);
   EXPECT_EQ(without_mtp.linear_ssm_checkpoint_stride(), 1);
@@ -805,6 +808,7 @@ TEST(KVCacheEstimationTest, MultimodalMtpReservesPerTokenRecurrentCheckpoints) {
       .max_tokens_per_batch(64)
       .max_linear_state_cache_slots(16)
       .enable_prefix_cache(false)
+      .speculative_config()
       .num_speculative_tokens(0);
   KVCacheEstimateContext context;
   context.dtype = torch::kFloat16;
@@ -813,7 +817,7 @@ TEST(KVCacheEstimationTest, MultimodalMtpReservesPerTokenRecurrentCheckpoints) {
   context.is_multimodal = true;
   const KVCacheCapacity ordinary =
       KVCacheEstimator(model_args).estimate(options, context);
-  options.num_speculative_tokens(4);
+  options.speculative_config().num_speculative_tokens(4);
   const KVCacheCapacity speculative =
       KVCacheEstimator(model_args).estimate(options, context);
 
@@ -1300,7 +1304,7 @@ TEST(KVCacheEstimationTest,
   target_options.max_seqs_per_batch = 4;
   target_options.max_tokens_per_batch = 2176;
   KVCacheEstimateOptions draft_options = target_options;
-  draft_options.is_draft_engine = true;
+  draft_options.is_drafter = true;
 
   const KVCacheCapacity target_only_capacity =
       estimate_kv_cache_capacity(target_args, target_options);

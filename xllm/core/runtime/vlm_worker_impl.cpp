@@ -178,7 +178,7 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   }
 
   if (sampling_params.num_sample_seqs() > 0) {
-    if (options_.enable_speculative_decode()) {
+    if (options_.speculative_config().enable_speculative_decode()) {
       logits = model_->logits(model_output.hidden_states,
                               lm_head_selected_token_idxes,
                               selected_hidden_from_lm_head);
@@ -191,7 +191,7 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
-      !options_.enable_speculative_decode()) {
+      !options_.speculative_config().enable_speculative_decode()) {
     if (sync_policy == ForwardSyncPolicy::LEGACY) {
       auto ret = device_.synchronize_default_stream();
       (void)ret;
@@ -212,7 +212,7 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
     output.logits = logits;
   }
 
-  if (options_.enable_speculative_decode()) {
+  if (options_.speculative_config().enable_speculative_decode()) {
     const bool is_target_prefill =
         !input.input_params.meta.batch_forward_type.is_decode() &&
         !is_spec_draft_;

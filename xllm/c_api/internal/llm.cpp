@@ -29,6 +29,7 @@ limitations under the License.
 #include "core/common/native_library.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "helper.h"
 
 XLLM_CAPI_EXPORT XLLM_LLM_Handler* xllm_llm_create(void) {
@@ -83,7 +84,6 @@ XLLM_CAPI_EXPORT bool xllm_llm_initialize(
     options.model_path(model_path)
         .task_type(xllm_init_options.task)
         .extension_impl(xllm_init_options.extension_impl)
-        .draft_model_path(xllm_init_options.draft_model)
         .backend("llm")
         .block_size(xllm_init_options.block_size)
         .max_cache_size(xllm_init_options.max_cache_size)
@@ -93,7 +93,6 @@ XLLM_CAPI_EXPORT bool xllm_llm_initialize(
         .max_seqs_per_batch(xllm_init_options.max_seqs_per_batch)
         .max_tokens_per_chunk_for_prefill(
             xllm_init_options.max_tokens_per_chunk_for_prefill)
-        .num_speculative_tokens(xllm_init_options.num_speculative_tokens)
         .num_request_handling_threads(
             xllm_init_options.num_request_handling_threads)
         .communication_backend(xllm_init_options.communication_backend)
@@ -122,6 +121,10 @@ XLLM_CAPI_EXPORT bool xllm_llm_initialize(
 #if !defined(USE_NPU) && !defined(USE_CUDA) && !defined(USE_MUSA)
     xllm::BeamSearchConfig::get_instance().enable_block_copy_kernel(false);
 #endif
+    options.speculative_config().draft_model_path(
+        xllm_init_options.draft_model);
+    // No gflags here; derive like initialize() would.
+    options.speculative_config().normalize();
     handler->master = std::make_unique<xllm::LLMMaster>(options);
     handler->master->run();
 

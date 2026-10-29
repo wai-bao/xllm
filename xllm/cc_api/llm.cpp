@@ -26,6 +26,7 @@ limitations under the License.
 
 #include "core/common/native_library.h"
 #include "core/framework/config/beam_search_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "internal.h"
 
 namespace xllm {
@@ -76,7 +77,6 @@ bool LLM::Initialize(const std::string& model_path,
     options.model_path(model_path)
         .task_type(init_options.task)
         .extension_impl(init_options.extension_impl)
-        .draft_model_path(init_options.draft_model)
         .backend("llm")
         .block_size(init_options.block_size)
         .max_cache_size(init_options.max_cache_size)
@@ -86,7 +86,6 @@ bool LLM::Initialize(const std::string& model_path,
         .max_seqs_per_batch(init_options.max_seqs_per_batch)
         .max_tokens_per_chunk_for_prefill(
             init_options.max_tokens_per_chunk_for_prefill)
-        .num_speculative_tokens(init_options.num_speculative_tokens)
         .num_request_handling_threads(init_options.num_request_handling_threads)
         .communication_backend(init_options.communication_backend)
         .rank_tablefile(init_options.rank_tablefile)
@@ -114,6 +113,10 @@ bool LLM::Initialize(const std::string& model_path,
     BeamSearchConfig::get_instance().enable_block_copy_kernel(false);
 #endif
     llm_core_ = new LLMCore();
+    options.speculative_config().draft_model_path(
+        init_options.draft_model.value_or(""));
+    // No gflags here; derive like initialize() would.
+    options.speculative_config().normalize();
     llm_core_->master = std::make_unique<LLMMaster>(options);
     llm_core_->master->run();
 

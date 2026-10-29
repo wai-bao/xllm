@@ -160,7 +160,6 @@ class SchedulerFixture final {
     options.max_tokens_per_batch(kMaxTokensPerBatch)
         .max_seqs_per_batch(kMaxSeqsPerBatch)
         .max_tokens_per_chunk_for_prefill(kMaxTokensPerBatch)
-        .num_speculative_tokens(0)
         .dp_size(1)
         .enable_schedule_overlap(false)
         .disable_log_stats(true);

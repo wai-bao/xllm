@@ -1458,8 +1458,10 @@ TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
   options.max_seqs_per_batch(10);
   options.max_tokens_per_batch(64);
   options.num_decoding_tokens(3);
-  options.enable_speculative_decode(true);
-  options.is_draft_engine(false);
+  options.speculative_config().speculative_algorithm("MTP");
+  options.speculative_config().speculative_algorithm("");
+  options.speculative_config().enable_atb_spec_kernel(
+      speculative_config.enable_atb_spec_kernel());
 
   const torch::Device device("npu:0");
   ::xllm::npu::GraphPersistentParam persistent_param(
@@ -1557,8 +1559,8 @@ TEST_P(HybridSpecVerifyPaddingTest, MetadataCoversBucketPadding) {
   options.max_seqs_per_batch(4);
   options.max_tokens_per_batch(64);
   options.num_decoding_tokens(kSpecWidth);
-  options.enable_speculative_decode(true);
-  options.is_draft_engine(false);
+  options.speculative_config().speculative_algorithm("MTP");
+  options.worker_type(WorkerType::LLM);
 
   const torch::Device device("npu:0");
   ::xllm::npu::GraphPersistentParam persistent_param(
@@ -1670,8 +1672,8 @@ TEST(AclGraphPersistentParamTest,
   options.max_seqs_per_batch(4);
   options.max_tokens_per_batch(16);
   options.num_decoding_tokens(kSpecWidth);
-  options.enable_speculative_decode(true);
-  options.is_draft_engine(false);
+  options.speculative_config().speculative_algorithm("MTP");
+  options.speculative_config().speculative_algorithm("");
 
   const torch::Device device("npu:0");
   const auto int_options = torch::dtype(torch::kInt).device(device);
@@ -1749,8 +1751,10 @@ TEST(AclGraphPersistentParamTest, AuxHiddenStatesUseGraphTokenCapacity) {
   options.max_seqs_per_batch(10);
   options.max_tokens_per_batch(64);
   options.num_decoding_tokens(3);
-  options.enable_speculative_decode(true);
-  options.is_draft_engine(false);
+  options.speculative_config().speculative_algorithm("MTP");
+  options.speculative_config().speculative_algorithm("");
+  options.speculative_config().enable_atb_spec_kernel(
+      speculative_config.enable_atb_spec_kernel());
 
   const torch::Device device("npu:0");
   const torch::TensorOptions tensor_options =
@@ -1766,7 +1770,7 @@ TEST(AclGraphPersistentParamTest, AuxHiddenStatesUseGraphTokenCapacity) {
           options.enable_graph_mode_decode_no_padding());
   EXPECT_EQ(target_param.aux_hidden_states().size(0), expected_target_capacity);
 
-  options.is_draft_engine(true);
+  options.worker_type(WorkerType::DRAFTER);
   ::xllm::npu::GraphPersistentParam draft_param(args, device, options);
   draft_param.set_aux_hidden_states(aux_hidden_states.slice(
       /*dim=*/0, /*start=*/0, /*end=*/options.max_seqs_per_batch()));
@@ -1913,8 +1917,8 @@ TEST(AclGraphPersistentParamTest, SpecVerifyGraphUpdateSupportsRuntimeBatch) {
   options.max_seqs_per_batch(4);
   options.max_tokens_per_batch(16);
   options.num_decoding_tokens(kSpecWidth);
-  options.enable_speculative_decode(true);
-  options.is_draft_engine(false);
+  options.speculative_config().speculative_algorithm("MTP");
+  options.speculative_config().speculative_algorithm("");
 
   const torch::Device device("npu:0");
   ::xllm::npu::GraphPersistentParam persistent_param(

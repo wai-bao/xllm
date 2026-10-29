@@ -65,28 +65,30 @@ Worker::Worker(const ParallelArgs& parallel_args,
                WorkerType worker_type)
     : enable_task_pipeline_(options.enable_task_pipeline()) {
   const std::string& extension_impl = options.extension_impl();
+  const SpeculativeConfig& spec = options.speculative_config();
+  const SpeculativeAlgorithm kind = spec.algorithm();
   CHECK(extension_impl.empty() ||
         ExtensionRegistry::get_instance().has_implementation(extension_impl))
       << "Unknown extension implementation: " << extension_impl;
-  CHECK(!options.enable_adaptive_draft_step() ||
-        (enable_task_pipeline_ && options.enable_speculative_decode() &&
+  CHECK(!spec.enable_adaptive_draft_step() ||
+        (enable_task_pipeline_ &&
+         options.speculative_config().enable_speculative_decode() &&
          options.enable_schedule_overlap() && options.enable_graph() &&
          options.dp_size() == 1 && options.cp_size() == 1 &&
-         SpeculativeConfig::is_mtp_algorithm(options.speculative_algorithm()) &&
+         kind == SpeculativeAlgorithm::MTP &&
          !ExecutionConfig::get_instance().enable_unified_mtp_graph() &&
          !ExecutionConfig::get_instance().disable_graph_warmup()))
       << "Adaptive MTP requires ordinary prewarmed Python graphs, async MTP "
          "task pipeline and DP=CP=1; unified MTP is not supported yet.";
-  CHECK(
-      !options.enable_adaptive_target_verify() ||
-      (options.enable_speculative_decode() && enable_task_pipeline_ &&
-       SpeculativeConfig::supports_adaptive_target_verify(
-           options.speculative_algorithm()) &&
-       (!SpeculativeConfig::is_mtp_algorithm(options.speculative_algorithm()) ||
-        (options.enable_graph() && options.enable_schedule_overlap() &&
-         options.dp_size() == 1 && options.cp_size() == 1)) &&
-       (options.num_speculative_tokens() == 5 ||
-        options.num_speculative_tokens() == 7)))
+  CHECK(!spec.enable_adaptive_target_verify() ||
+        (options.speculative_config().enable_speculative_decode() &&
+         enable_task_pipeline_ &&
+         SpeculativeConfig::supports_adaptive_target_verify(kind) &&
+         (kind != SpeculativeAlgorithm::MTP ||
+          (options.enable_graph() && options.enable_schedule_overlap() &&
+           options.dp_size() == 1 && options.cp_size() == 1)) &&
+         (spec.num_speculative_tokens() == 5 ||
+          spec.num_speculative_tokens() == 7)))
       << "Adaptive speculative decoding requires MTP/DSpark Draft5/7 with task "
          "pipeline; the legacy synchronous adaptive path is not supported.";
   if (enable_task_pipeline_) {
@@ -94,9 +96,8 @@ Worker::Worker(const ParallelArgs& parallel_args,
         ModelConfig::get_instance().model_impl()))
         << "Task pipeline requires the Python model implementation.";
     const auto& execution = ExecutionConfig::get_instance();
-    CHECK(!options.enable_speculative_decode() ||
-          !SpeculativeConfig::is_dspark_algorithm(
-              options.speculative_algorithm()) ||
+    CHECK(!options.speculative_config().enable_speculative_decode() ||
+          kind != SpeculativeAlgorithm::DSPARK ||
           parallel_args.dp_size() <= 1 || !execution.enable_unified_mtp_graph())
         << "DP DSpark task pipeline requires split ACL graphs; "
            "disable unified graphs.";
@@ -110,20 +111,18 @@ Worker::Worker(const ParallelArgs& parallel_args,
     CHECK(!options.enable_graph() || !execution.disable_graph_warmup())
         << "Task pipeline ACL graphs require initialization warmup.";
     const int32_t kv_split_size = parallel_args.kv_split_size_effective();
+    const bool is_mtp = kind == SpeculativeAlgorithm::MTP;
     CHECK(
         parallel_args.cp_size() == 1 ||
         (Platform::is_npu() && parallel_args.dp_size() == 1 &&
          (kv_split_size > 0 && parallel_args.cp_size() % kv_split_size == 0) &&
-         (!options.enable_speculative_decode() ||
-          SpeculativeConfig::is_mtp_algorithm(
-              options.speculative_algorithm()))))
+         (!options.speculative_config().enable_speculative_decode() || is_mtp)))
         << "Task pipeline prefill CP requires NPU, DP=1, KV split dividing CP "
            "and ordinary or fixed MTP decoding.";
-    CHECK(kv_split_size == 1 ||
-          (kv_split_size > 1 && parallel_args.dp_size() == 1 &&
-           (!options.enable_speculative_decode() ||
-            SpeculativeConfig::is_mtp_algorithm(
-                options.speculative_algorithm()))))
+    CHECK(
+        kv_split_size == 1 ||
+        (kv_split_size > 1 && parallel_args.dp_size() == 1 &&
+         (!options.speculative_config().enable_speculative_decode() || is_mtp)))
         << "Task pipeline DCP requires DP=1 and ordinary or fixed MTP "
            "decoding.";
     if (options.enable_disagg_pd()) {
@@ -131,10 +130,8 @@ Worker::Worker(const ParallelArgs& parallel_args,
             kv_split_size == 1 &&
             (options.instance_role() == InstanceRole::PREFILL ||
              options.instance_role() == InstanceRole::DECODE) &&
-            (!options.enable_speculative_decode() ||
-             (SpeculativeConfig::is_mtp_algorithm(
-                  options.speculative_algorithm()) &&
-              !options.enable_adaptive_target_verify())))
+            (!options.speculative_config().enable_speculative_decode() ||
+             (is_mtp && !spec.enable_adaptive_target_verify())))
           << "Task pipeline PD requires NPU PUSH, PREFILL or DECODE roles, "
              "replicated KV caches and ordinary or fixed MTP decoding.";
       CHECK(options.instance_role() != InstanceRole::PREFILL ||
@@ -143,12 +140,10 @@ Worker::Worker(const ParallelArgs& parallel_args,
     }
     CHECK((worker_type == WorkerType::LLM || worker_type == WorkerType::VLM) &&
           options.task_type() == "generate" &&
-          (!options.enable_speculative_decode() ||
-           (SpeculativeConfig::supports_task_pipeline(
-                options.speculative_algorithm()) &&
-            (!options.enable_adaptive_target_verify() ||
-             (SpeculativeConfig::supports_adaptive_target_verify(
-                  options.speculative_algorithm()) &&
+          (!options.speculative_config().enable_speculative_decode() ||
+           (SpeculativeConfig::supports_task_pipeline(kind) &&
+            (!spec.enable_adaptive_target_verify() ||
+             (SpeculativeConfig::supports_adaptive_target_verify(kind) &&
               options.enable_graph())))) &&
           !options.enable_prefill_piecewise_graph() &&
           !options.enable_offline_inference() &&
@@ -162,26 +157,24 @@ Worker::Worker(const ParallelArgs& parallel_args,
            "a layerwise split of one.";
     if (worker_type == WorkerType::VLM) {
       CHECK(parallel_args.dp_size() == 1 && parallel_args.cp_size() == 1 &&
-            (!options.enable_speculative_decode() ||
-             (SpeculativeConfig::is_mtp_algorithm(
-                  options.speculative_algorithm()) &&
+            (!options.speculative_config().enable_speculative_decode() ||
+             (kind == SpeculativeAlgorithm::MTP &&
               !execution.enable_unified_mtp_graph())))
           << "VLM task pipeline requires DP=CP=1 and ordinary or fixed MTP "
              "decode without unified graphs.";
     }
     CHECK(options.host_blocks_factor() <= 1.0 ||
-          (Platform::is_npu() && (!options.enable_speculative_decode() ||
-                                  (SpeculativeConfig::is_mtp_algorithm(
-                                       options.speculative_algorithm()) &&
-                                   !options.enable_adaptive_draft_step() &&
-                                   !options.enable_adaptive_target_verify()))))
+          (Platform::is_npu() &&
+           (!options.speculative_config().enable_speculative_decode() ||
+            (is_mtp && !spec.enable_adaptive_draft_step() &&
+             !spec.enable_adaptive_target_verify()))))
         << "Task pipeline Host KV cache requires NPU ordinary or fixed MTP "
            "decoding.";
   }
-  if (options.enable_speculative_decode()) {
-    const std::string& algorithm = options.speculative_algorithm();
-    LOG(INFO) << "Speculative decode is enabled, algorithm: " << algorithm;
-    if (SpeculativeConfig::is_eagle3_algorithm(algorithm)) {
+  if (options.speculative_config().enable_speculative_decode()) {
+    LOG(INFO) << "Speculative decode is enabled, algorithm: "
+              << spec.speculative_algorithm();
+    if (kind == SpeculativeAlgorithm::EAGLE3) {
       if (worker_type == WorkerType::VLM) {
         impl_ = new Eagle3WorkerImpl<VlmForwardInput>(
             parallel_args, device, options, worker_type);
@@ -189,18 +182,18 @@ Worker::Worker(const ParallelArgs& parallel_args,
         impl_ = new Eagle3WorkerImpl<LlmForwardInput>(
             parallel_args, device, options, worker_type);
       }
-    } else if (SpeculativeConfig::is_dflash_algorithm(algorithm)) {
+    } else if (kind == SpeculativeAlgorithm::DFLASH) {
       impl_ = new DFlashWorkerImpl(parallel_args, device, options);
-    } else if (SpeculativeConfig::is_dflash2_algorithm(algorithm)) {
+    } else if (kind == SpeculativeAlgorithm::DFLASH2) {
 #if !defined(USE_NPU)
       LOG(FATAL) << "DFlash2 speculative decoding is only supported on NPU.";
 #endif
       impl_ = new DFlash2WorkerImpl(parallel_args, device, options);
-    } else if (SpeculativeConfig::is_dspark_algorithm(algorithm)) {
+    } else if (kind == SpeculativeAlgorithm::DSPARK) {
       impl_ = new DSparkWorkerImpl(parallel_args, device, options);
-    } else if (SpeculativeConfig::is_suffix_algorithm(algorithm)) {
+    } else if (kind == SpeculativeAlgorithm::SUFFIX) {
       impl_ = new SuffixWorkerImpl(parallel_args, device, options);
-    } else if (SpeculativeConfig::is_mtp_algorithm(algorithm)) {
+    } else if (kind == SpeculativeAlgorithm::MTP) {
       if (worker_type == WorkerType::VLM) {
         impl_ = new MTPWorkerImpl<VlmForwardInput>(
             parallel_args, device, options, worker_type);
@@ -218,7 +211,8 @@ Worker::Worker(const ParallelArgs& parallel_args,
             parallel_args, device, options, worker_type);
       }
     } else {
-      LOG(FATAL) << "Unsupported speculative decoding algorithm: " << algorithm;
+      LOG(FATAL) << "Unsupported speculative decoding algorithm: "
+                 << spec.speculative_algorithm();
     }
   } else if (worker_type == WorkerType::LLM) {
     impl_ = new LLMWorkerImpl(parallel_args, device, options);

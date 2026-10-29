@@ -81,12 +81,12 @@ ContinuousSchedulerBase::ContinuousSchedulerBase(
   CHECK(kv_cache_manager_ != nullptr);
   kv_cache_manager_->set_prefetch_completion_callback(
       [notifier = notifier_]() { notifier->notify(); });
-  scheduler_metrics_ =
-      std::make_unique<SchedulerMetrics>(distributed_worker_manager_,
-                                         kv_cache_manager_,
-                                         options_.dp_size(),
-                                         options_.num_speculative_tokens(),
-                                         options_.enable_disagg_pd());
+  scheduler_metrics_ = std::make_unique<SchedulerMetrics>(
+      distributed_worker_manager_,
+      kv_cache_manager_,
+      options_.dp_size(),
+      options_.speculative_config().num_speculative_tokens(),
+      options_.enable_disagg_pd());
 
   enable_prefix_cache_ =
       ::xllm::KVCacheConfig::get_instance().enable_prefix_cache();
@@ -99,14 +99,7 @@ ContinuousSchedulerBase::ContinuousSchedulerBase(
       .decode_graph_warmup_config(options.decode_graph_warmup_config())
       .enable_schedule_overlap(options.enable_schedule_overlap())
       .enable_task_pipeline(options.enable_task_pipeline())
-      .adaptive_target_verify_calibration(
-          options.adaptive_target_verify_calibration())
-      .enable_adaptive_target_verify(options.enable_adaptive_target_verify())
-      .enable_adaptive_draft_step(options.enable_adaptive_draft_step())
-      .adaptive_target_verify_cost_table(
-          options.adaptive_target_verify_cost_table())
-      .adaptive_target_verify_cost_table_output(
-          options.adaptive_target_verify_cost_table_output())
+      .speculative_config(options.speculative_config())
       .spec_calibration_compatibility(options.spec_calibration_compatibility())
       .enable_profile_step_time(options.enable_profile_step_time())
       .profile_max_prompt_length(options.profile_max_prompt_length())
@@ -164,10 +157,12 @@ ContinuousSchedulerBase::ContinuousSchedulerBase(
   instance_info_.kv_split_size =
       ::xllm::ParallelConfig::get_instance().kv_split_size_effective();
 
+  const int32_t num_speculative_tokens =
+      options_.speculative_config().num_speculative_tokens();
   if (options_.enable_schedule_overlap()) {
-    min_speculative_tokens_required_ = options_.num_speculative_tokens() * 2;
+    min_speculative_tokens_required_ = num_speculative_tokens * 2;
   } else {
-    min_speculative_tokens_required_ = options_.num_speculative_tokens();
+    min_speculative_tokens_required_ = num_speculative_tokens;
   }
 }
 
@@ -357,15 +352,7 @@ void ContinuousSchedulerBase::create_queues(const Options& options) {
 }
 
 void ContinuousSchedulerBase::clear_mtp_bootstrap(Request* request) {
-  if (!options_.enable_disagg_pd() || options_.num_speculative_tokens() <= 0 ||
-      request == nullptr || request->sequences().empty()) {
-    return;
-  }
-  Sequence* sequence = request->sequences()[0].get();
-  if (sequence == nullptr) {
-    return;
-  }
-  sequence->clear_mtp_bootstrap_embedding();
+  xllm::clear_mtp_bootstrap(options_, request);
 }
 
 void ContinuousSchedulerBase::drain_decode_restore_waiting(
@@ -595,7 +582,7 @@ void ContinuousSchedulerBase::step_with_schedule_overlap(
 
   bool needs_prefill_state = false;
   if (options_.enable_task_pipeline() &&
-      options_.num_speculative_tokens() > 0) {
+      options_.speculative_config().enable_speculative_decode()) {
     // Speculative pipelines use accepted device state during pure
     // Decode. Prefill, including mixed DP phases, requires concrete Host tokens
     // and lengths before preparing the target/draft inputs. Retire the previous

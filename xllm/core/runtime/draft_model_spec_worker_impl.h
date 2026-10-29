@@ -56,8 +56,20 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl<TargetInput> {
       TargetInput& inputs,
       const ForwardOutput& prior_output) override;
 
+  // Task-pipeline step with JSON continuation: the queue owns execution and
+  // results; only a completed token copy survives slot reuse.
+  std::optional<ForwardOutput> execute_task_pipeline_json(
+      const LlmForwardInput& prepared);
+
+  // Launch-thread-only JSON overlap context for execute_task_pipeline_json.
+  ForwardOutput task_json_output_;
+  std::vector<std::string> task_json_sample_sequence_ids_;
+
   using TargetModelParams =
       typename SpeculativeWorkerImpl<TargetInput>::TargetModelParams;
+  // step(const TargetInput&) hides WorkerImpl's other input-type overloads;
+  // execute_task_pipeline_json() calls the LlmForwardInput one.
+  using WorkerImpl::step;
   using SpeculativeWorkerImpl<TargetInput>::compute_stream_;
   using SpeculativeWorkerImpl<TargetInput>::context_;
   using SpeculativeWorkerImpl<TargetInput>::device_;

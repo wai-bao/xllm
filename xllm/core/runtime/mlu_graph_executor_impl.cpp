@@ -159,7 +159,7 @@ uint32_t get_tp_size(const xllm::runtime::Options& options) {
 int64_t get_graph_token_capacity(const xllm::runtime::Options& options) {
   int64_t capacity = options.max_seqs_per_batch();
 
-  if (options.enable_speculative_decode() && !options.is_draft_engine()) {
+  if (options.speculative_config().enable_speculative_decode()) {
     capacity *= options.num_decoding_tokens();
   }
 
@@ -206,7 +206,7 @@ Params make_graph_params(const Params& params, uint32_t padding_num_tokens) {
 template <typename Params>
 RunMode get_run_mode(const xllm::runtime::Options& options,
                      const Params& params) {
-  if (options.is_draft_engine()) {
+  if (options.is_drafter()) {
     return RunMode::kDraft;
   }
 
