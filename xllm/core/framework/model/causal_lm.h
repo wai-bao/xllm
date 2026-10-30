@@ -35,6 +35,7 @@ limitations under the License.
 #include "core/framework/model/model_output.h"
 #include "core/framework/model/model_params_view.h"
 #include "core/framework/model/model_traits.h"
+#include "core/framework/model_context/model_context.h"
 #include "core/framework/quantization/quant_args.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/kv_cache/storage/kv_cache.h"
@@ -130,7 +131,14 @@ class CausalLM : public torch::nn::Module, public Model {
   virtual xlite::XliteModelHolder* get_xlite_holder() { return nullptr; }
 #endif
 
-  virtual bool share_weights_from(CausalLM& /*source*/) { return false; }
+  virtual void share_lm_head(CausalLM& /*target*/) {}
+
+  virtual void share_embed_tokens(CausalLM& /*target*/) {}
+
+  // State-dict key prefixes for the lm-head weight, tried in order. Models
+  // with a non-standard checkpoint layout override this (e.g. deepseek's
+  // "layers.0.head.").
+  virtual std::vector<std::string> lm_head_keys() const { return {"lm_head."}; }
 
   virtual void prepare_expert_weight(
       int32_t layer_id,
@@ -196,8 +204,31 @@ class CausalLM : public torch::nn::Module, public Model {
 template <typename ModelType>
 class CausalLMImpl : public CausalLM {
  public:
-  CausalLMImpl(ModelType model, const torch::TensorOptions& options)
-      : model_(std::move(model)), options_(options) {}
+  CausalLMImpl(ModelType model, const ModelContext& context)
+      : model_(std::move(model)), options_(context.get_tensor_options()) {
+    const auto& args = context.get_model_args();
+    tie_word_embeddings_ = args.tie_word_embeddings();
+    embedding_mode_ = args.embedding_mode();
+    // DFlash2 shares the target lm-head after loading; skip registering a
+    // draft-local copy so the unused vocabulary projection does not stay
+    // resident on device.
+    const bool shares_target_lm_head =
+        is_dflash2_draft_model_type(args.model_type());
+    // Models that own a non-standard head (e.g. rwkv7's nn::Linear) provide
+    // their own logits; skip registering a framework-owned lm_head for them.
+    const bool owns_custom_head = detail::has_logits<ModelType>::value;
+    if (!embedding_mode_ && !shares_target_lm_head && !owns_custom_head) {
+#if defined(USE_NPU)
+      if constexpr (detail::has_get_npu_lm_head<ModelType>::value) {
+        npu_lm_head_ =
+            register_module("npu_lm_head", layer::NpuLmHead(context));
+      } else
+#endif
+      {
+        lm_head_ = register_module("lm_head", layer::LmHead(context));
+      }
+    }
+  }
 
   ModelOutput forward(const torch::Tensor& tokens,
                       const torch::Tensor& positions,
@@ -257,21 +288,79 @@ class CausalLMImpl : public CausalLM {
 
   torch::Tensor logits(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes) override {
-    return model_->logits(hidden_states, seleted_idxes);
+    if constexpr (detail::has_logits<ModelType>::value) {
+      return model_->logits(hidden_states, seleted_idxes);
+    }
+#if defined(USE_NPU)
+    if constexpr (detail::has_get_npu_lm_head<ModelType>::value) {
+      return npu_lm_head_(hidden_states, seleted_idxes, 0);
+    }
+#endif
+    auto h = hidden_states;
+    if (seleted_idxes.defined()) {
+      h = h.index_select(/*dim=*/0, seleted_idxes);
+    }
+    return lm_head_(h);
   }
 
   torch::Tensor logits(const torch::Tensor& hidden_states,
                        const torch::Tensor& seleted_idxes,
                        torch::Tensor& out_hidden) override {
-    if constexpr (detail::has_logits_with_hidden<ModelType>::value) {
-      return model_->logits(hidden_states, seleted_idxes, out_hidden);
-    } else {
+    if constexpr (detail::has_logits<ModelType>::value) {
       return CausalLM::logits(hidden_states, seleted_idxes, out_hidden);
     }
+#if defined(USE_NPU)
+    if constexpr (detail::has_get_npu_lm_head<ModelType>::value) {
+      return npu_lm_head_->forward_with_hidden(
+          hidden_states, seleted_idxes, out_hidden, 0);
+    }
+#endif
+    if (seleted_idxes.defined()) {
+      out_hidden = hidden_states.index_select(/*dim=*/0, seleted_idxes);
+    } else {
+      out_hidden = hidden_states;
+    }
+    return lm_head_(out_hidden);
   }
 
   void load_model(std::unique_ptr<ModelLoader> loader) override {
+    if (!embedding_mode_ && !detail::has_logits<ModelType>::value) {
+      for (const auto& state_dict : loader->get_state_dicts()) {
+#if defined(USE_NPU)
+        if constexpr (detail::has_get_npu_lm_head<ModelType>::value) {
+          if (tie_word_embeddings_) {
+            npu_lm_head_->load_state_dict(
+                state_dict->get_dict_with_prefix(std::vector<std::string>{
+                    "model.embed_tokens.", "embed_tokens."}));
+          } else {
+            npu_lm_head_->load_state_dict(
+                state_dict->get_dict_with_prefix(lm_head_keys()));
+          }
+        } else
+#endif
+        {
+          if constexpr (detail::has_load_lm_head<ModelType>::value) {
+            model_->load_lm_head(*state_dict, lm_head_);
+          } else if (tie_word_embeddings_) {
+            lm_head_->load_state_dict(state_dict->get_dict_with_prefix(
+                std::vector<std::string>{"embed_tokens.", "embed."}));
+          } else {
+            lm_head_->load_state_dict(
+                state_dict->get_dict_with_prefix(lm_head_keys()));
+          }
+        }
+      }
+    }
     model_->load_model(std::move(loader));
+    if (!embedding_mode_ && !detail::has_logits<ModelType>::value) {
+#if defined(USE_NPU)
+      if constexpr (detail::has_get_npu_lm_head<ModelType>::value) {
+        npu_lm_head_->verify_loaded_weights(
+            tie_word_embeddings_ ? "embed_tokens." : "lm_head.");
+        npu_lm_head_->merge_loaded_weights();
+      }
+#endif
+    }
   }
 
   ModelOutput write_context_kv(const torch::Tensor& target_hidden,
@@ -390,17 +479,16 @@ class CausalLMImpl : public CausalLM {
   layer::NpuLmHead get_npu_lm_head() override {
     if constexpr (detail::has_get_npu_lm_head<ModelType>::value) {
       return model_->get_npu_lm_head();
-    } else {
-      return CausalLM::get_npu_lm_head();
     }
+    return npu_lm_head_;
   }
 
   void set_npu_lm_head(layer::NpuLmHead& head) override {
     if constexpr (detail::has_set_npu_lm_head<ModelType>::value) {
       model_->set_npu_lm_head(head);
-    } else {
-      CausalLM::set_npu_lm_head(head);
+      return;
     }
+    npu_lm_head_ = head;
   }
 
   layer::NpuWordEmbedding get_npu_word_embedding() override {
@@ -469,17 +557,16 @@ class CausalLMImpl : public CausalLM {
   layer::LmHead get_lm_head() override {
     if constexpr (detail::has_get_lm_head<ModelType>::value) {
       return model_->get_lm_head();
-    } else {
-      return CausalLM::get_lm_head();
     }
+    return lm_head_;
   }
 
   void set_lm_head(layer::LmHead& head) override {
     if constexpr (detail::has_set_lm_head<ModelType>::value) {
       model_->set_lm_head(head);
-    } else {
-      CausalLM::set_lm_head(head);
+      return;
     }
+    lm_head_ = head;
   }
 
   layer::WordEmbedding get_word_embedding() override {
@@ -498,6 +585,77 @@ class CausalLMImpl : public CausalLM {
     }
   }
 
+  void share_lm_head(CausalLM& target) override {
+#if defined(USE_NPU)
+    if constexpr (detail::has_set_npu_lm_head<ModelType>::value) {
+      if (get_npu_lm_head().is_empty() ||
+          !get_npu_lm_head()->is_weight_loaded()) {
+        auto head = target.get_npu_lm_head();
+        set_npu_lm_head(head);
+      }
+      return;
+    }
+    // Framework-owned head with no model setter (e.g. DFlash2 shares the
+    // target head and skips registering a draft-local copy, leaving the
+    // holder empty until shared here). Models with a custom head own their
+    // logits and must not share.
+    if constexpr (!detail::has_logits<ModelType>::value) {
+      if (npu_lm_head_.is_empty() || !npu_lm_head_->is_weight_loaded()) {
+        npu_lm_head_ = target.get_npu_lm_head();
+      }
+    }
+    return;
+#endif
+    if constexpr (detail::has_set_lm_head<ModelType>::value) {
+      if (get_lm_head().is_empty() || !get_lm_head()->is_weight_loaded()) {
+        auto head = target.get_lm_head();
+        set_lm_head(head);
+      }
+      return;
+    }
+    // Framework-owned head with no model setter; share the target head when the
+    // holder is empty (DFlash2) or not yet loaded. Models with a custom head
+    // own their logits and must not share.
+    if constexpr (!detail::has_logits<ModelType>::value) {
+      if (lm_head_.is_empty() || !lm_head_->is_weight_loaded()) {
+        lm_head_ = target.get_lm_head();
+      }
+    }
+  }
+
+  void share_embed_tokens(CausalLM& target) override {
+#if defined(USE_NPU)
+    if constexpr (detail::has_set_npu_word_embedding<ModelType>::value) {
+      if (!get_npu_word_embedding().is_empty() &&
+          get_npu_word_embedding()->is_weight_loaded()) {
+        return;
+      }
+      auto word_embedding = target.get_npu_word_embedding();
+      if (target.has_restored_npu_word_embedding()) {
+        set_restored_npu_word_embedding(word_embedding);
+        return;
+      }
+      set_npu_word_embedding(word_embedding);
+      return;
+    }
+#endif
+    if constexpr (detail::has_set_word_embedding<ModelType>::value) {
+      if (!get_word_embedding().is_empty() &&
+          get_word_embedding()->is_weight_loaded()) {
+        return;
+      }
+      auto word_embedding = target.get_word_embedding();
+      set_word_embedding(word_embedding);
+    }
+  }
+
+  std::vector<std::string> lm_head_keys() const override {
+    if constexpr (detail::has_lm_head_keys<ModelType>::value) {
+      return model_->lm_head_keys();
+    }
+    return CausalLM::lm_head_keys();
+  }
+
   torch::Device device() const override { return options_.device(); }
 
   const torch::TensorOptions& options() const override { return options_; }
@@ -506,6 +664,14 @@ class CausalLMImpl : public CausalLM {
   ModelType model_;
 
   torch::TensorOptions options_;
+
+  bool tie_word_embeddings_{false};
+  bool embedding_mode_{false};
+
+#if defined(USE_NPU)
+  layer::NpuLmHead npu_lm_head_{nullptr};
+#endif
+  layer::LmHead lm_head_{nullptr};
 };
 
 }  // namespace xllm
