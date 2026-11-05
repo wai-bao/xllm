@@ -313,8 +313,10 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       // Emit both selected hidden and logits from a single lm_head pass so the
       // ConfidenceHead and CP speculative paths can consume hidden without a
       // second projection.
-      logits = model_->logits(
-          model_output.hidden_states, selected_token_idxes, selected_hidden);
+      logits = logits_processor_.forward(*model_,
+                                         model_output.hidden_states,
+                                         selected_token_idxes,
+                                         selected_hidden);
       if (!selected_hidden.defined() && model_output.hidden_states.defined()) {
         // ATB lm_head backend does not expose a second output tensor
         // (LmHeadParam::outputHidden is false), so we surface the hidden here.
@@ -330,7 +332,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
             /*dim=*/0, selected_token_idxes.to(torch::kLong));
       }
     } else {
-      logits = model_->logits(model_output.hidden_states, selected_token_idxes);
+      logits = logits_processor_.forward(
+          *model_, model_output.hidden_states, selected_token_idxes);
     }
   }
 

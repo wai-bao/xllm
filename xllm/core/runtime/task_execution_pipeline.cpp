@@ -1044,8 +1044,8 @@ void TaskExecutionPipeline::launch(uint32_t slot_id) {
   }
   auto& params = slot.sampling;
   if (params.num_sample_seqs() > 0) {
-    slot.logits = model_.logits(slot.model_output.hidden_states,
-                                params.selected_token_idxes());
+    slot.logits = logits_processor_.forward(
+        model_, slot.model_output.hidden_states, params.selected_token_idxes());
     slot.buffer->refresh_min_tokens();
     slot.sample_output = ::xllm::sample(slot.logits, params);
     const auto& result = slot.buffer->device_result();

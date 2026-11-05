@@ -24,7 +24,6 @@ limitations under the License.
 
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/causal_rec.h"
-#include "core/framework/model/causal_vlm.h"
 #include "core/framework/model/dit_model.h"
 #include "core/framework/model/generic_rec.h"
 #include "core/framework/model/rec_model.h"
@@ -45,8 +44,8 @@ using CausalLMFactory =
 using RecModelFactory =
     std::function<std::unique_ptr<RecModel>(const ModelContext& context)>;
 
-using CausalVLMFactory =
-    std::function<std::unique_ptr<CausalVLM>(const ModelContext& context)>;
+using VlmFactory =
+    std::function<std::unique_ptr<CausalLM>(const ModelContext& context)>;
 
 using DiTModelFactory =
     std::function<std::unique_ptr<DiTModel>(const DiTModelContext& context)>;
@@ -76,8 +75,8 @@ struct CausalLMRegistration {
   int32_t priority = 0;
 };
 
-struct CausalVLMRegistration {
-  CausalVLMFactory factory;
+struct VlmRegistration {
+  VlmFactory factory;
   int32_t priority = 0;
 };
 
@@ -95,8 +94,6 @@ using MtpArgsAdapter =
 
 struct MtpModelCapabilities {
   bool native_draft_requires_accepted_span_replay = false;
-  bool native_draft_owns_embedding_and_lm_head = false;
-  bool python_draft_owns_embedding_and_lm_head = false;
 };
 
 // TODO: add default args loader.
@@ -104,7 +101,7 @@ struct ModelMeta {
   std::unordered_map<std::string, CausalLMRegistration> causal_lm_factories;
   RecModelFactory rec_model_factory;
   SpeechModelFactory speech_model_factory;
-  std::unordered_map<std::string, CausalVLMRegistration> causal_vlm_factories;
+  std::unordered_map<std::string, VlmRegistration> vlm_factories;
   DiTModelFactory dit_model_factory;
   MultimodalProcessorFactory multimodal_processor_factory;
   ModelArgsLoader model_args_loader;
@@ -147,17 +144,16 @@ class ModelRegistry {
   static void register_rec_model_factory(const std::string& name,
                                          RecModelFactory factory);
 
-  static void register_causalvlm_factory(const std::string& name,
-                                         CausalVLMFactory factory);
+  static void register_vlm_factory(const std::string& name, VlmFactory factory);
 
-  static bool register_causalvlm_factory(std::string name,
-                                         CausalVLMFactory factory,
-                                         int32_t priority);
+  static bool register_vlm_factory(std::string name,
+                                   VlmFactory factory,
+                                   int32_t priority);
 
-  static bool register_causalvlm_factory(std::string name,
-                                         std::string implementation,
-                                         CausalVLMFactory factory,
-                                         int32_t priority = 0);
+  static bool register_vlm_factory(std::string name,
+                                   std::string implementation,
+                                   VlmFactory factory,
+                                   int32_t priority = 0);
 
   static void register_dit_model_factory(const std::string& name,
                                          DiTModelFactory factory);
@@ -193,8 +189,6 @@ class ModelRegistry {
   static void register_dcp_capability(const std::string& name);
   static bool supports_dcp(const std::string& name);
 
-  static void register_mtp_shared_weight_owner(const std::string& name);
-
   static void register_mtp_args_adapter(const std::string& name,
                                         MtpArgsAdapter adapter);
 
@@ -216,11 +210,10 @@ class ModelRegistry {
 
   static RecModelFactory get_rec_model_factory(const std::string& name);
 
-  static CausalVLMFactory get_causalvlm_factory(const std::string& name);
+  static VlmFactory get_vlm_factory(const std::string& name);
 
-  static CausalVLMFactory get_causalvlm_factory(
-      const std::string& name,
-      const std::string& implementation);
+  static VlmFactory get_vlm_factory(const std::string& name,
+                                    const std::string& implementation);
 
   static DiTModelFactory get_dit_model_factory(const std::string& name);
 
@@ -293,7 +286,7 @@ std::unique_ptr<CausalLM> create_llm_model(const ModelContext& context);
 
 std::unique_ptr<RecModel> create_rec_model(const ModelContext& context);
 
-std::unique_ptr<CausalVLM> create_vlm_model(const ModelContext& context);
+std::unique_ptr<CausalLM> create_vlm_model(const ModelContext& context);
 
 std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
 
@@ -306,7 +299,7 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
           ModelClass model(context);                               \
           model->eval();                                           \
           return std::make_unique<xllm::CausalLMImpl<ModelClass>>( \
-              std::move(model), context.get_tensor_options());     \
+              std::move(model), context);                          \
         } __VA_OPT__(, ) __VA_ARGS__);                             \
     return true;                                                   \
   }()
@@ -349,7 +342,7 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
           ModelClass model(context);                                           \
           model->eval();                                                       \
           return std::make_unique<xllm::CausalRecImpl<ModelClass>>(            \
-              std::move(model), context.get_tensor_options());                 \
+              std::move(model), context);                                      \
         });                                                                    \
     return true;                                                               \
   }()
@@ -365,7 +358,7 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
           ModelClass model(context);                                 \
           model->eval();                                             \
           return std::make_unique<xllm::GenericRecImpl<ModelClass>>( \
-              std::move(model), context.get_tensor_options());       \
+              std::move(model), context);                            \
         });                                                          \
     return true;                                                     \
   }()
@@ -373,17 +366,19 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
 #define REGISTER_GENERIC_REC_MODEL(ModelType, ModelClass) \
   REGISTER_GENERIC_REC_MODEL_WITH_VARNAME(ModelType, ModelType, ModelClass)
 
-#define REGISTER_CAUSAL_VLM_MODEL_WITH_VARNAME(                     \
-    VarName, ModelType, ModelClass, ...)                            \
-  const bool VarName##_registered = []() {                          \
-    ::xllm::ModelRegistry::register_causalvlm_factory(              \
-        #ModelType, [](const ::xllm::ModelContext& context) {       \
-          ModelClass model(context);                                \
-          model->eval();                                            \
-          return std::make_unique<xllm::CausalVLMImpl<ModelClass>>( \
-              std::move(model), context.get_tensor_options());      \
-        } __VA_OPT__(, ) __VA_ARGS__);                              \
-    return true;                                                    \
+#define REGISTER_CAUSAL_VLM_MODEL_WITH_VARNAME(                    \
+    VarName, ModelType, ModelClass, ...)                           \
+  const bool VarName##_registered = []() {                         \
+    ::xllm::ModelRegistry::register_vlm_factory(                   \
+        #ModelType,                                                \
+        [](const ::xllm::ModelContext& context)                    \
+            -> std::unique_ptr<::xllm::CausalLM> {                 \
+          ModelClass model(context);                               \
+          model->eval();                                           \
+          return std::make_unique<xllm::CausalLMImpl<ModelClass>>( \
+              std::move(model), context);                          \
+        } __VA_OPT__(, ) __VA_ARGS__);                             \
+    return true;                                                   \
   }()
 
 #define REGISTER_CAUSAL_VLM_MODEL(ModelType, ModelClass, ...) \
@@ -394,7 +389,7 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
     VarName, ModelType, Implementation, ModelClass, ...)                  \
   namespace {                                                             \
   const bool CONCAT_MODEL_REGISTRATION(VarName, _causal_vlm_registered) = \
-      ::xllm::ModelRegistry::register_causalvlm_factory(                  \
+      ::xllm::ModelRegistry::register_vlm_factory(                        \
           #ModelType,                                                     \
           Implementation,                                                 \
           [](const ::xllm::ModelContext& context) {                       \

@@ -23,6 +23,14 @@ limitations under the License.
 #include "core/framework/model/mtp_topk_state.h"
 
 namespace xllm {
+
+// How much hidden state a forward must publish for downstream consumers
+// (mirrors SGLang's CaptureHiddenMode). NONE: hidden is not consumed after
+// sampling; LAST: only the sampled rows feed the drafter; FULL: the complete
+// hidden tensor feeds the drafter (EAGLE-style capture). The runtime states
+// its need up front so models can skip capture work when nothing reads it.
+enum class CaptureHiddenMode { NONE, LAST, FULL };
+
 struct ModelOutput {
   // [num_tokens, hidden_size]
   torch::Tensor hidden_states;

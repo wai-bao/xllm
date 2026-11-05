@@ -482,8 +482,9 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
 
   torch::Tensor logits;
   if (sampling_params.num_sample_seqs() > 0) {
-    logits = runtime_.model->logits(model_output.hidden_states,
-                                    sampling_params.selected_token_idxes());
+    logits = logits_processor_.forward(*runtime_.model,
+                                       model_output.hidden_states,
+                                       sampling_params.selected_token_idxes());
   }
 
   ForwardOutput output;
@@ -776,8 +777,8 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecWorkPipeline::step(
 
   torch::Tensor logits;
   if (sampling_params.num_sample_seqs() > 0) {
-    logits = runtime_.model->logits(hidden_states,
-                                    sampling_params.selected_token_idxes());
+    logits = logits_processor_.forward(
+        *runtime_.model, hidden_states, sampling_params.selected_token_idxes());
   }
 
   ForwardOutput output;
@@ -1513,8 +1514,8 @@ std::optional<ForwardOutput> RecWorkerImpl::OneRecXAttentionWorkPipeline::step(
         }
       }
 #endif
-      result.logits =
-          runtime_.model->logits(hidden_states, selected_token_idxes);
+      result.logits = logits_processor_.forward(
+          *runtime_.model, hidden_states, selected_token_idxes);
       log_stage_timing("logits", stage_round, stage_timer);
       torch::Tensor filter_mask;
       if (filter_mask_future.has_value()) {
@@ -2139,8 +2140,10 @@ std::optional<ForwardOutput> RecWorkerImpl::LlmRecMultiRoundPipeline::step(
     torch::Tensor hidden_states = model_output.hidden_states;
 
     if (sampling_params.num_sample_seqs() > 0) {
-      logits = runtime_.model->logits(hidden_states,
-                                      sampling_params.selected_token_idxes());
+      logits =
+          logits_processor_.forward(*runtime_.model,
+                                    hidden_states,
+                                    sampling_params.selected_token_idxes());
       sample_output = rec_sampler_->forward(logits, round_sampling_params);
     }
 

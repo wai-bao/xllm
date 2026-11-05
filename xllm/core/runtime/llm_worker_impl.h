@@ -22,6 +22,7 @@ limitations under the License.
 #include "forward_params.h"
 #include "framework/eplb/eplb_executor.h"
 #include "framework/model/causal_lm.h"
+#include "framework/model/logits_processor.h"
 #include "framework/model/model_params_view.h"
 #include "options.h"
 #include "runtime/worker_impl.h"
@@ -112,6 +113,7 @@ class LLMWorkerImpl : public WorkerImpl {
   std::unique_ptr<BeamSearcher> beam_searcher_;
   torch::Tensor expert_load_data_;
   std::unique_ptr<EplbExecutor> eplb_executor_;
+  LogitsProcessor logits_processor_;
 };
 
 }  // namespace xllm

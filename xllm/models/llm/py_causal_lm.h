@@ -28,7 +28,6 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/causal_lm.h"
-#include "core/framework/model/causal_vlm.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model_context/model_context.h"
 
@@ -40,9 +39,6 @@ class MegaMoeCommResource;
 #endif
 
 namespace detail {
-void share_python_model_weights(pybind11::object& draft_model,
-                                const pybind11::object& target_model);
-
 int64_t python_mega_moe_max_num_tokens_per_rank(int64_t max_seqs_per_batch,
                                                 int64_t num_speculative_tokens,
                                                 int64_t dp_size);
@@ -53,13 +49,12 @@ int64_t python_qwen3_5_mega_moe_max_num_tokens_per_rank(
     int64_t num_speculative_tokens);
 }  // namespace detail
 
-// Inherits CausalVLM so that ``--backend vlm --model_impl python`` can route a
-// Python VLM (e.g. GLM-5.3-Flash-VL) through the VLM engine while
-// PyExecutorImpl drives it. The CausalVLM ``encode`` / ``get_input_embeddings``
-// virtuals are stubbed: in the Python path, PyExecutorImpl::run calls the
-// Python model's own encode/get_input_embeddings via pybind (they are never
-// reached here).
-class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
+// Python-backed model. Routes ``--backend vlm --model_impl python`` VLMs
+// (e.g. GLM-5.3-Flash-VL) through the VLM engine while PyExecutorImpl drives
+// them. The multimodal virtuals stay at their CausalLM aborting defaults: in
+// the Python path, PyExecutorImpl::run calls the Python model's own
+// encode/get_input_embeddings via pybind (they are never reached here).
+class __attribute__((visibility("hidden"))) PyCausalLM : public CausalLM {
  public:
   explicit PyCausalLM(const ModelContext& context,
                       std::string python_model_name = {});
@@ -69,20 +64,6 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
                       const torch::Tensor& positions,
                       std::vector<KVCache>& kv_caches,
                       const ModelParamsView& parameters) override;
-
-  MMDict encode(const ModelParamsView& parameters) override {
-    LOG(FATAL) << "PyCausalLM::encode must not be called directly; "
-               << "PyExecutorImpl drives the Python model's encode via pybind.";
-    return MMDict{};
-  }
-
-  torch::Tensor get_input_embeddings(
-      const torch::Tensor& input_ids,
-      const ModelParamsView& input_params) override {
-    LOG(FATAL) << "PyCausalLM::get_input_embeddings must not be called "
-               << "directly; PyExecutorImpl drives it via pybind.";
-    return torch::Tensor();
-  }
 
   torch::Tensor pooler(const torch::Tensor& hidden_states,
                        const torch::Tensor& selected_idxes) override;
@@ -126,7 +107,8 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   void update_expert_weight(int32_t layer_id) override;
   bool last_prepare_expert_weight_ok(int32_t layer_id) const override;
 
-  bool share_weights_from(CausalLM& source) override;
+  void share_lm_head(CausalLM& target) override;
+  void share_embed_tokens(CausalLM& target) override;
 
   void tp_all_reduce(torch::Tensor& tensor);
   torch::Tensor tp_all_gather(const torch::Tensor& tensor, int64_t dim);

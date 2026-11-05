@@ -3050,7 +3050,8 @@ void TaskExecutionPipeline::launch_prefill(SpeculativeSlot& slot) {
                                          target_input.model_params());
   if (slot.samples != 0) {
     slot.target_prefill->refresh_min_tokens();
-    slot.target_logits = model_.logits(
+    slot.target_logits = logits_processor_.forward(
+        model_,
         slot.target_output.hidden_states,
         slot.target_prefill->sampling_params().selected_token_idxes());
     sample(*slot.target_sampling, slot.target_logits);
@@ -3174,7 +3175,8 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
                                                      draft_->kv_caches,
                                                      binding.model_params());
       }
-      invocation.logits = draft_->model.logits(
+      invocation.logits = logits_processor_.forward(
+          draft_->model,
           invocation.output.hidden_states,
           invocation.sampling->params.selected_token_idxes());
       invocation.sampled = sample(*invocation.sampling, invocation.logits);
@@ -3233,7 +3235,8 @@ void TaskExecutionPipeline::launch_decode(SpeculativeSlot& slot) {
               /*dim=*/0, /*start=*/0, slot.rows * width);
     }
   }
-  slot.target_logits = model_.logits(
+  slot.target_logits = logits_processor_.forward(
+      model_,
       slot.target_output.hidden_states,
       slot.validate_input->sampling_params().selected_token_idxes());
   finish_fixed_verify(slot);
@@ -3384,8 +3387,8 @@ void TaskExecutionPipeline::launch_block_draft(SpeculativeSlot& slot) {
                                                input.positions(),
                                                draft_->kv_caches,
                                                input.model_params());
-  invocation.logits =
-      draft_->model.logits(invocation.output.hidden_states, selected);
+  invocation.logits = logits_processor_.forward(
+      draft_->model, invocation.output.hidden_states, selected);
   if (speculative_capacity_->kind == SpeculativeTaskKind::DFLASH2) {
     auto hidden = invocation.output.hidden_states.index_select(
         /*dim=*/0, selected.to(torch::kInt64));
@@ -3523,9 +3526,10 @@ void TaskExecutionPipeline::launch_packed_verify(SpeculativeSlot& slot) {
                                          validate.positions(),
                                          kv_caches_,
                                          validate.model_params());
-  slot.target_logits =
-      model_.logits(slot.target_output.hidden_states,
-                    validate.sampling_params().selected_token_idxes());
+  slot.target_logits = logits_processor_.forward(
+      model_,
+      slot.target_output.hidden_states,
+      validate.sampling_params().selected_token_idxes());
   if (!adaptive_verify_) {
     // Full-width packed rows are request-major, exactly the fixed verifier's
     // sampling order. Keep its penalties, random sampling and logprobs intact.

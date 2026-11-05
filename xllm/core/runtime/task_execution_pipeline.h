@@ -27,6 +27,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/causal_lm.h"
+#include "core/framework/model/logits_processor.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/draft_proposal.h"
 #include "core/framework/speculative/draft_vocab_mapping.h"
@@ -427,6 +428,7 @@ class TaskExecutionPipeline final {
   std::vector<std::shared_ptr<MtpContextPublication>> context_publications_;
   std::shared_ptr<MtpContextPublication> last_context_publication_;
   CausalLM& model_;
+  LogitsProcessor logits_processor_;
   Executor& executor_;
   std::vector<KVCache>& kv_caches_;
   TaskKVPush push_kv_;

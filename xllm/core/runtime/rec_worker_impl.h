@@ -23,6 +23,7 @@ limitations under the License.
 #include <optional>
 #include <vector>
 
+#include "core/framework/model/logits_processor.h"
 #include "core/framework/model/rec_model.h"
 #include "runtime/rec_executor.h"
 #include "runtime/rec_forward_params.h"
@@ -98,6 +99,7 @@ class RecWorkerImpl : public WorkerImpl {
 
    protected:
     RecPipelineRuntime runtime_;
+    LogitsProcessor logits_processor_;
   };
 
   class LlmRecWorkPipeline final : public RecWorkPipeline {

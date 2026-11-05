@@ -25,6 +25,7 @@ limitations under the License.
 #include "common/macros.h"
 #include "common/metrics.h"
 #include "core/framework/config/load_config.h"
+#include "core/framework/model/logits_processor.h"
 #include "core/framework/model/model_params_view.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/framework/speculative/draft_extend_input.h"
@@ -184,12 +185,13 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
 
   if (sampling_params.num_sample_seqs() > 0) {
     if (options_.enable_speculative_decode()) {
-      logits = model_->logits(model_output.hidden_states,
-                              lm_head_selected_token_idxes,
-                              selected_hidden_from_lm_head);
+      logits = logits_processor_.forward(*model_,
+                                         model_output.hidden_states,
+                                         lm_head_selected_token_idxes,
+                                         selected_hidden_from_lm_head);
     } else {
-      logits = model_->logits(model_output.hidden_states,
-                              lm_head_selected_token_idxes);
+      logits = logits_processor_.forward(
+          *model_, model_output.hidden_states, lm_head_selected_token_idxes);
     }
   }
 
