@@ -20,6 +20,7 @@ limitations under the License.
 
 #include "core/framework/batch/sampling_input_builder.h"
 #include "core/framework/config/scheduler_config.h"
+#include "core/framework/model/domain_attention_input.h"
 #include "core/framework/request/onerec_sequence.h"
 #include "core/util/rec_model_utils.h"
 #include "core/util/tensor_helper.h"
