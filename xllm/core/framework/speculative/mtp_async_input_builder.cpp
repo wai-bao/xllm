@@ -18,7 +18,9 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cstdint>
 
+#include "core/util/slice.h"
 #include "core/util/tensor_helper.h"
 
 #if defined(USE_NPU)
@@ -32,42 +34,41 @@ limitations under the License.
 namespace xllm::mtp_async {
 namespace {
 void shift_host_rows(std::vector<int32_t>& values,
-                     const torch::Tensor& base_values,
+                     const Slice<int64_t>& base,
                      int64_t batch_size,
                      int64_t row_width,
-                     bool step_major_layout) {
+                     bool step_major_layout,
+                     int64_t base_offset = 0) {
   if (values.empty()) {
     return;
   }
-  CHECK_EQ(base_values.numel(), batch_size);
   CHECK(values.size() == static_cast<size_t>(batch_size) ||
         values.size() == static_cast<size_t>(batch_size * row_width));
-  // tensor_to_vector() owns the device-to-host copy and reads only after the
-  // copy has completed. Calling to(torch::kCPU) here first can expose a
-  // pending asynchronous NPU copy as stale host memory.
-  const std::vector<int64_t> base = tensor_to_vector<int64_t>(base_values);
   if (values.size() == static_cast<size_t>(batch_size)) {
-    for (int64_t seq_id = 0; seq_id < batch_size; ++seq_id) {
-      values[static_cast<size_t>(seq_id)] =
-          static_cast<int32_t>(base[static_cast<size_t>(seq_id)]);
+    int64_t seq_id = 0;
+    for (const int64_t value : base) {
+      values.at(static_cast<size_t>(seq_id++)) =
+          static_cast<int32_t>(value + base_offset);
     }
     return;
   }
-  for (int64_t seq_id = 0; seq_id < batch_size; ++seq_id) {
-    const int64_t first_index = step_major_layout ? seq_id : seq_id * row_width;
-    const int32_t delta =
-        static_cast<int32_t>(base[static_cast<size_t>(seq_id)]) -
-        values[static_cast<size_t>(first_index)];
+  int64_t seq_cursor = 0;
+  for (const int64_t value : base) {
+    const int64_t first_index =
+        step_major_layout ? seq_cursor : (seq_cursor * row_width);
+    const int32_t delta = static_cast<int32_t>(value + base_offset) -
+                          values.at(static_cast<size_t>(first_index));
     for (int64_t row = 0; row < row_width; ++row) {
-      const int64_t index = step_major_layout ? row * batch_size + seq_id
-                                              : seq_id * row_width + row;
-      values[static_cast<size_t>(index)] += delta;
+      const int64_t index = step_major_layout ? (row * batch_size) + seq_cursor
+                                              : (seq_cursor * row_width) + row;
+      values.at(static_cast<size_t>(index)) += delta;
     }
+    ++seq_cursor;
   }
 }
 
 void shift_host_tensor(torch::Tensor& tensor,
-                       const torch::Tensor& base_values,
+                       const Slice<int64_t>& base,
                        int64_t batch_size,
                        int64_t row_width,
                        bool step_major_layout) {
@@ -77,8 +78,7 @@ void shift_host_tensor(torch::Tensor& tensor,
   CHECK(tensor.device().is_cpu());
   CHECK_EQ(tensor.scalar_type(), torch::kInt);
   std::vector<int32_t> values = tensor_to_vector<int32_t>(tensor);
-  shift_host_rows(
-      values, base_values, batch_size, row_width, step_major_layout);
+  shift_host_rows(values, base, batch_size, row_width, step_major_layout);
   std::copy(values.begin(), values.end(), tensor.data_ptr<int32_t>());
 }
 
@@ -375,29 +375,43 @@ void prepare_target_verify_from_accepted_state(
 
   AcceptedTokenMetadata metadata = build_accepted_token_metadata(
       accepted_tokens, base_positions, base_kv_seq_lens);
-  shift_host_tensor(validate_input.positions_host,
-                    metadata.base_positions,
+  auto& host = validate_input.input_params.attention.host;
+  auto& graph = validate_input.input_params.graph;
+  const bool has_host_positions = validate_input.positions_host.defined() &&
+                                  validate_input.positions_host.numel() > 0;
+  if (has_host_positions || !host.kv_seq_lens.empty() ||
+      (graph.expanded_kv_seq_lens.defined() &&
+       !graph.expanded_kv_seq_lens_vec.empty())) {
+    const std::vector<int64_t> host_bases = tensor_to_vector<int64_t>(
+        torch::stack({metadata.base_positions, metadata.base_kv_seq_lens}));
+    const std::vector<int64_t> position_base(host_bases.begin(),
+                                             host_bases.begin() + batch_size);
+    const std::vector<int64_t> kv_len_base(host_bases.begin() + batch_size,
+                                           host_bases.end());
+    const Slice<int64_t> host_positions(position_base);
+    const Slice<int64_t> host_kv_seq_lens(kv_len_base);
+    shift_host_tensor(validate_input.positions_host,
+                      host_positions,
+                      batch_size,
+                      validate_width,
+                      step_major_layout);
+    shift_host_rows(host.kv_seq_lens,
+                    host_kv_seq_lens,
                     batch_size,
                     validate_width,
-                    step_major_layout);
-  shift_host_rows(validate_input.input_params.attention.host.kv_seq_lens,
-                  use_chunked_prefill
-                      ? metadata.base_kv_seq_lens + (validate_width - 1)
-                      : metadata.base_kv_seq_lens,
-                  batch_size,
-                  validate_width,
-                  step_major_layout);
-  if (validate_input.input_params.graph.expanded_kv_seq_lens.defined()) {
-    shift_host_rows(validate_input.input_params.graph.expanded_kv_seq_lens_vec,
-                    metadata.base_kv_seq_lens,
-                    batch_size,
-                    validate_width,
-                    step_major_layout);
+                    step_major_layout,
+                    use_chunked_prefill ? validate_width - 1 : 0);
+    if (graph.expanded_kv_seq_lens.defined()) {
+      shift_host_rows(graph.expanded_kv_seq_lens_vec,
+                      host_kv_seq_lens,
+                      batch_size,
+                      validate_width,
+                      step_major_layout);
+    }
   }
-  if (!validate_input.input_params.attention.host.kv_seq_lens.empty()) {
-    validate_input.input_params.meta.kv_max_seq_len = *std::max_element(
-        validate_input.input_params.attention.host.kv_seq_lens.begin(),
-        validate_input.input_params.attention.host.kv_seq_lens.end());
+  if (!host.kv_seq_lens.empty()) {
+    validate_input.input_params.meta.kv_max_seq_len =
+        *std::max_element(host.kv_seq_lens.begin(), host.kv_seq_lens.end());
   }
   torch::Tensor template_position_rows;
   if (step_major_layout) {
