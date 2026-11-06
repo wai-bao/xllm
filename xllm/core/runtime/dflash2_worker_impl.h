@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include "core/framework/speculative/draft_proposal.h"
+#include "core/framework/speculative/draft_vocab_mapping.h"
 #include "runtime/dflash_worker_impl.h"
 
 namespace xllm {
@@ -24,12 +25,13 @@ class ProcessGroup;
 
 // Gumbel-noise walk of the DFlash2 candidate tree; undefined noise (greedy
 // draft) degrades to the raw argmax. Shared with the task pipeline; TP
-// noise consensus is the caller's.
+// noise consensus is the caller's. A non-identity vocab_mapping moves ids
+// and the published q into the target domain.
 DraftProposal sample_dflash2_path(
-    const DFlash2CandidateOutput& candidates,
+    DFlash2CandidateOutput candidates,
     const SamplingParameters& sampling_params,
     torch::Tensor gumbel_noise,
-    int64_t vocab_size,
+    const DraftVocabMapping& vocab_mapping,
     torch::Tensor token_ids_out = torch::Tensor());
 // Selector noise for the DFlash2 candidate walk; only a deterministic draft
 // (SamplingMode::GREEDY) returns an undefined tensor — callers key
@@ -52,10 +54,6 @@ class DFlash2WorkerImpl final : public DFlashWorkerImpl {
                     const runtime::Options& options);
 
   ~DFlash2WorkerImpl() override = default;
-
-  bool init_model(const std::string& model_weights_path,
-                  int32_t random_seed,
-                  MasterStatus master_status) override;
 
  protected:
   DraftProposal run_decode_draft(const LlmForwardInput& input,

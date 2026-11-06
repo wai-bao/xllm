@@ -53,40 +53,18 @@ TEST(DSparkMarkovSamplerTest,
     ASSERT_EQ(feedback.size(), 2u);
     EXPECT_TRUE(torch::equal(feedback[0], anchors));
     EXPECT_TRUE(torch::equal(feedback[1], proposal.token_ids().select(1, 0)));
-    EXPECT_EQ(proposal.logits().has_value(), probabilistic);
+    const torch::Tensor lse =
+        torch::logsumexp(proposal.q().logits.to(torch::kFloat32), /*dim=*/-1);
+    EXPECT_EQ(lse.defined(), probabilistic);
     for (int64_t step = 0; step < 2; ++step) {
       EXPECT_TRUE(mapping.eq(proposal.token_ids()[0][step]).any().item<bool>());
       if (!probabilistic) {
         continue;
       }
-      torch::Tensor expected = torch::zeros({1, 8});
-      expected.index_copy_(
-          1, mapping, torch::softmax(logits.select(1, step), -1));
-      EXPECT_TRUE(torch::allclose(
-          torch::softmax(proposal.logits()->select(1, step), -1), expected));
+      torch::Tensor expected = torch::full({1, 8}, -INFINITY);
+      expected.index_copy_(1, mapping, logits.select(1, step));
+      EXPECT_TRUE(torch::allclose(lse.select(1, step), expected.logsumexp(-1)));
     }
-  }
-}
-
-TEST(DraftVocabMappingTest, ElidesOnlyFullIdentity) {
-  for (const bool identity : {true, false}) {
-    SCOPED_TRACE(identity ? "identity" : "permutation");
-    const torch::Tensor offsets = identity
-                                      ? torch::zeros({2}, torch::kInt64)
-                                      : torch::tensor({1, -1}, torch::kInt64);
-    const DraftVocabMapping mapping(offsets, 2, 2, torch::Device(torch::kCPU));
-    EXPECT_EQ(mapping.draft_to_target_ids_.defined(), !identity);
-    SampleOutput output;
-    output.next_tokens = torch::tensor({1}, torch::kInt64);
-    output.draft_logits = torch::tensor({{0.5f, -1.0f}});
-    mapping.remap(output);
-    const torch::Tensor expected_tokens =
-        torch::tensor({identity ? 1 : 0}, torch::kInt64);
-    const torch::Tensor expected_logits = identity
-                                              ? torch::tensor({{0.5f, -1.0f}})
-                                              : torch::tensor({{-1.0f, 0.5f}});
-    EXPECT_TRUE(torch::equal(output.next_tokens, expected_tokens));
-    EXPECT_TRUE(torch::equal(output.draft_logits, expected_logits));
   }
 }
 

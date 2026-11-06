@@ -20,6 +20,12 @@ limitations under the License.
 #include "core/util/tensor_helper.h"
 #include "platform/platform.h"
 
+#if defined(USE_NPU)
+#include <torch_npu/csrc/aten/NPUGeneratorImpl.h>
+
+#include <mutex>
+#endif
+
 namespace xllm {
 namespace testutil {
 
@@ -97,6 +103,20 @@ inline torch::TensorOptions get_test_options(
     torch::ScalarType dtype = torch::kFloat32) {
   return torch::dtype(dtype).device(get_test_device());
 }
+
+#if defined(USE_NPU)
+inline torch::Tensor rng_state() {
+  auto generator = at_npu::detail::getDefaultNPUGenerator(/*device_index=*/0);
+  std::lock_guard<std::mutex> lock(generator.mutex());
+  return generator.get_state();
+}
+
+inline void set_rng_state(const torch::Tensor& state) {
+  auto generator = at_npu::detail::getDefaultNPUGenerator(/*device_index=*/0);
+  std::lock_guard<std::mutex> lock(generator.mutex());
+  generator.set_state(state);
+}
+#endif
 
 // Drives random rejection_sample() over normalized
 // per-position probs. Without an explicit bonus_row, the bonus row repeats

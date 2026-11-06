@@ -33,11 +33,27 @@ class DraftVocabMapping final {
                     const torch::Device& device);
   DraftVocabMapping() = default;
 
+  bool is_identity() const { return !draft_to_target_ids_.defined(); }
+
+  int64_t target_vocab_size() const { return target_vocab_size_; }
+
+  torch::Tensor remap_ids(const torch::Tensor& ids) const {
+    if (!draft_to_target_ids_.defined()) {
+      return ids;
+    }
+    return draft_to_target_ids_
+        .index_select(0, ids.view(-1).to(draft_to_target_ids_.scalar_type()))
+        .view(ids.sizes())
+        .to(ids.scalar_type());
+  }
+
+  void expand_to_target(const torch::Tensor& draft_logits,
+                        torch::Tensor& target_logits) const;
+
+  void remap(SampleOutput& sample_output) const;
+
   torch::Tensor draft_to_target_ids_;
   int64_t target_vocab_size_ = 0;
-
-  void remap(SampleOutput& sample_output,
-             torch::Tensor target_logits = torch::Tensor()) const;
 };
 
 }  // namespace xllm

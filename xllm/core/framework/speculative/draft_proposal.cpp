@@ -17,42 +17,57 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <utility>
+
 namespace xllm {
 
-DraftProposal DraftProposal::from_token_buffer(
-    torch::Tensor token_ids,
-    int64_t vocab_size,
-    bool is_probabilistic_draft,
-    const torch::TensorOptions& logits_options) {
-  CHECK(token_ids.defined());
-  CHECK_EQ(token_ids.dim(), 2);
-  // Greedy drafts carry tokens only (no logits buffer), so callers pass
-  // vocab_size = 0; the vocabulary bound is only meaningful when q is
-  // reported.
-  DraftProposal proposal(std::move(token_ids));
-  if (is_probabilistic_draft) {
-    CHECK_GT(vocab_size, 0);
-    proposal.logits_ = torch::empty(
-        {proposal.token_ids_.size(0), proposal.token_ids_.size(1), vocab_size},
-        logits_options);
-  }
-  return proposal;
+DraftProposal::DraftProposal() = default;
+DraftProposal::DraftProposal(DraftProposal&&) noexcept = default;
+DraftProposal& DraftProposal::operator=(DraftProposal&&) noexcept = default;
+DraftProposal::~DraftProposal() = default;
+
+DraftProposal::DraftProposal(torch::Tensor token_ids)
+    : token_ids_(std::move(token_ids)) {
+  validate();
 }
 
-DraftProposal DraftProposal::preallocate(
-    int64_t batch,
-    int64_t num_speculative_tokens,
-    int64_t vocab_size,
-    bool is_probabilistic_draft,
-    const torch::TensorOptions& token_options,
-    const torch::TensorOptions& logits_options) {
-  CHECK_GT(batch, 0);
-  CHECK_GT(num_speculative_tokens, 0);
-  return from_token_buffer(
-      torch::empty({batch, num_speculative_tokens}, token_options),
-      vocab_size,
-      is_probabilistic_draft,
-      logits_options);
+DraftProposal::DraftProposal(torch::Tensor token_ids, torch::Tensor logits)
+    : token_ids_(std::move(token_ids)), q_(DraftQ{{}, {}, std::move(logits)}) {
+  validate();
+}
+
+DraftProposal::DraftProposal(torch::Tensor token_ids,
+                             torch::Tensor candidate_ids,
+                             torch::Tensor positions,
+                             torch::Tensor logits)
+    : token_ids_(std::move(token_ids)),
+      q_(DraftQ{std::move(candidate_ids),
+                std::move(positions),
+                std::move(logits)}) {
+  validate();
+  CHECK_EQ(q_.candidate_ids.sizes(), q_.logits.sizes());
+  CHECK_EQ(q_.positions.sizes(),
+           torch::IntArrayRef({token_ids_.size(0), token_ids_.size(1)}));
+}
+
+DraftProposal DraftProposal::from_step_logits(
+    torch::Tensor token_ids,
+    const std::vector<torch::Tensor>& pages) {
+  if (pages.empty()) {
+    return DraftProposal(std::move(token_ids));
+  }
+  return DraftProposal(std::move(token_ids), torch::stack(pages, /*dim=*/1));
+}
+
+void DraftProposal::validate() const {
+  CHECK(token_ids_.defined());
+  CHECK_EQ(token_ids_.dim(), 2);
+  if (!q_.logits.defined()) {
+    return;
+  }
+  CHECK_EQ(q_.logits.dim(), 3);
+  CHECK_EQ(q_.logits.size(0), token_ids_.size(0));
+  CHECK_EQ(q_.logits.size(1), token_ids_.size(1));
 }
 
 }  // namespace xllm

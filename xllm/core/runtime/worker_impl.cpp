@@ -2429,6 +2429,8 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
   if (is_spec_draft_ && (SpeculativeConfig::is_eagle3_algorithm(
                              options_.speculative_algorithm()) ||
                          SpeculativeConfig::is_dspark_algorithm(
+                             options_.speculative_algorithm()) ||
+                         SpeculativeConfig::is_dflash2_algorithm(
                              options_.speculative_algorithm()))) {
     for (const std::unique_ptr<StateDict>& state_dict :
          model_loader->get_state_dicts()) {

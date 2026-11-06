@@ -31,8 +31,6 @@ namespace xllm::detail {
 struct JsonDraftValidationScratch final {
   // State after each draft step, indexed [draft_step][sequence].
   std::vector<std::vector<JsonObjectGrammarState>> states_after;
-  // Invalid suffix flags in [draft_step][sequence] order.
-  std::vector<uint8_t> invalid_draft_step_major;
 };
 
 struct JsonAcceptedTokenMismatch final {
@@ -57,41 +55,41 @@ inline std::vector<int32_t> copy_json_draft_token_ids(const int64_t* token_ids,
   return result;
 }
 
-inline bool append_json_draft_step(
+inline std::vector<uint8_t> append_json_draft_step(
     std::vector<JsonObjectGrammarState>& current_states,
-    std::vector<uint8_t>& invalid_suffix,
+    const std::vector<uint8_t>& invalid_suffix,
     const std::vector<int32_t>& token_ids,
-    JsonDraftValidationScratch& scratch) {
+    JsonDraftValidationScratch& scratch,
+    bool& halt_json_draft) {
   CHECK_EQ(token_ids.size(), current_states.size())
       << "JSON draft token count must match grammar state count";
   CHECK_EQ(invalid_suffix.size(), current_states.size())
       << "JSON invalid suffix count must match grammar state count";
 
   std::vector<JsonObjectGrammarState> next_states = current_states;
-  bool halt_json_draft = false;
+  std::vector<uint8_t> invalid(current_states.size(), 0);
+  halt_json_draft = false;
   for (size_t state_idx = 0; state_idx < next_states.size(); ++state_idx) {
     const JsonObjectGrammarState& state = current_states[state_idx];
-    bool invalid = invalid_suffix[state_idx] != 0;
-    if (!invalid && state.initialized()) {
-      invalid = !state.can_accept_token(token_ids[state_idx]);
-      if (!invalid) {
+    bool is_invalid = invalid_suffix[state_idx] != 0;
+    if (!is_invalid && state.initialized()) {
+      is_invalid = !state.can_accept_token(token_ids[state_idx]);
+      if (!is_invalid) {
         CHECK(next_states[state_idx].accept_token(token_ids[state_idx]));
       } else {
         halt_json_draft = true;
       }
     }
-    invalid_suffix[state_idx] = static_cast<uint8_t>(invalid);
-    scratch.invalid_draft_step_major.push_back(static_cast<uint8_t>(invalid));
+    invalid[state_idx] = static_cast<uint8_t>(is_invalid);
   }
   scratch.states_after.push_back(next_states);
   current_states = std::move(next_states);
-  return halt_json_draft;
+  return invalid;
 }
 
 inline std::vector<JsonObjectGrammarState> build_json_validation_states(
     const std::vector<JsonObjectGrammarState>& initial_states,
-    const JsonDraftValidationScratch& scratch,
-    std::vector<uint8_t>& invalid_draft) {
+    const JsonDraftValidationScratch& scratch) {
   CHECK(!scratch.states_after.empty())
       << "JSON validation requires at least one draft state";
   const size_t num_sequences = initial_states.size();
@@ -100,22 +98,14 @@ inline std::vector<JsonObjectGrammarState> build_json_validation_states(
     CHECK_EQ(states.size(), num_sequences)
         << "JSON draft state rows must match validation sequences";
   }
-  CHECK_EQ(scratch.invalid_draft_step_major.size(),
-           num_sequences * num_draft_steps)
-      << "JSON invalid draft flags must cover every draft row";
 
   std::vector<JsonObjectGrammarState> validation_states;
   validation_states.reserve(num_sequences * (num_draft_steps + 1));
-  invalid_draft.clear();
-  invalid_draft.reserve(num_sequences * num_draft_steps);
   for (size_t seq_idx = 0; seq_idx < num_sequences; ++seq_idx) {
     for (size_t draft_idx = 0; draft_idx < num_draft_steps; ++draft_idx) {
       validation_states.push_back(
           draft_idx == 0 ? initial_states[seq_idx]
                          : scratch.states_after[draft_idx - 1][seq_idx]);
-      invalid_draft.push_back(
-          scratch
-              .invalid_draft_step_major[draft_idx * num_sequences + seq_idx]);
     }
     validation_states.push_back(scratch.states_after.back()[seq_idx]);
   }

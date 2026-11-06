@@ -16,11 +16,9 @@ limitations under the License.
 #include "core/runtime/slot_buffer.h"
 
 #include <gtest/gtest.h>
-#include <torch_npu/csrc/aten/NPUGeneratorImpl.h>
 
 #include <array>
 #include <limits>
-#include <mutex>
 #include <numeric>
 
 #include "core/framework/config/model_config.h"
@@ -1027,18 +1025,6 @@ SamplingParameters make_input(int32_t rows, int32_t width) {
   return input;
 }
 
-torch::Tensor rng_state() {
-  auto generator = at_npu::detail::getDefaultNPUGenerator(/*device_index=*/0);
-  std::lock_guard<std::mutex> lock(generator.mutex());
-  return generator.get_state();
-}
-
-void set_rng_state(const torch::Tensor& state) {
-  auto generator = at_npu::detail::getDefaultNPUGenerator(/*device_index=*/0);
-  std::lock_guard<std::mutex> lock(generator.mutex());
-  generator.set_state(state);
-}
-
 void expect_equal(const torch::Tensor& expected, const torch::Tensor& actual) {
   ASSERT_EQ(expected.defined(), actual.defined());
   if (expected.defined()) {
@@ -1340,7 +1326,7 @@ TEST_P(SlotSamplingInputTest,
 
 TEST_P(SlotSamplingInputTest,
        RealSamplerMatchesTokensProbabilitiesAndRngProgress) {
-  const torch::Tensor original_rng = rng_state();
+  const torch::Tensor original_rng = testutil::rng_state();
   for (int32_t mode = 0; mode < 7; ++mode) {
     SCOPED_TRACE(mode);
     SamplingParameters input = make_input(/*rows=*/4, /*width=*/6);
@@ -1389,20 +1375,20 @@ TEST_P(SlotSamplingInputTest,
     ASSERT_EQ(aclrtSynchronizeDevice(), ACL_SUCCESS);
     auto guard = launch_->set_stream_guard();
     torch::Tensor old_logits = initial_logits.clone();
-    const torch::Tensor start_rng = rng_state();
+    const torch::Tensor start_rng = testutil::rng_state();
     const SampleOutput expected = sample(old_logits, legacy);
     ASSERT_EQ(aclrtSynchronizeStream(launch_->get_stream()->stream()),
               ACL_SUCCESS);
-    const torch::Tensor end_rng = rng_state();
-    set_rng_state(start_rng);
+    const torch::Tensor end_rng = testutil::rng_state();
+    testutil::set_rng_state(start_rng);
     ASSERT_TRUE(prepare_sampling(input, /*model_tokens=*/8, *prepare_).ok());
-    EXPECT_TRUE(torch::equal(start_rng, rng_state()));
+    EXPECT_TRUE(torch::equal(start_rng, testutil::rng_state()));
     handoff();
     torch::Tensor new_logits = initial_logits.clone();
     const SampleOutput actual = sample(new_logits, binding_->sampling_params());
     ASSERT_EQ(aclrtSynchronizeStream(launch_->get_stream()->stream()),
               ACL_SUCCESS);
-    EXPECT_TRUE(torch::equal(end_rng, rng_state()));
+    EXPECT_TRUE(torch::equal(end_rng, testutil::rng_state()));
     expect_equal(old_logits, new_logits);
     expect_equal(expected.next_tokens, actual.next_tokens);
     expect_equal(expected.draft_logits, actual.draft_logits);
@@ -1410,7 +1396,7 @@ TEST_P(SlotSamplingInputTest,
     expect_equal(expected.top_logprobs, actual.top_logprobs);
     expect_equal(expected.top_tokens, actual.top_tokens);
   }
-  set_rng_state(original_rng);
+  testutil::set_rng_state(original_rng);
 }
 
 INSTANTIATE_TEST_SUITE_P(ParameterTypes,

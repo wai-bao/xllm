@@ -130,6 +130,7 @@ struct TaskExecutionPipeline::SpeculativeSlot {
     // pinned source borrows retired feedback until the next result D2H starts.
     torch::Tensor control;
     torch::Tensor host_control;
+    torch::Tensor proposal;
     torch::Tensor consensus;
     torch::Tensor confidence;
     torch::Tensor widths;
@@ -221,7 +222,6 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   torch::Tensor proposal_storage;
   torch::Tensor accepted_mask_storage;
   torch::Tensor host_hidden_storage;
-  torch::Tensor proposal;
   torch::Tensor accepted_mask;
   torch::Tensor context_slots_storage;
   torch::Tensor context_slots;

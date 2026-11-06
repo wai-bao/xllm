@@ -340,7 +340,7 @@ TEST(PyCausalLMContextKVBridgeTest, PassesSwaCacheAsSixthPythonSlot) {
 }
 
 // End-to-end guard for the model-type classification the Python executor
-// performs: the truth table of (is_deepseek_v4_model, is_block_draft_model,
+// performs: the truth table of (is_deepseek_v4_model,
 // is_dspark_draft_model) must match the naming predicates the Python side
 // mirrors in model_platform_support. The cases below are sampled points, not
 // the full sets: when adding a new DSpark or DFlash family member, add a case
@@ -351,28 +351,24 @@ TEST(ModelTypeClassificationTest, ClassificationMatchesPredicates) {
   struct Expected {
     const char* model_type;
     bool is_deepseek_v4_model;
-    bool is_block_draft_model;
     bool is_dspark_draft_model;
   };
   const Expected cases[] = {
-      {"deepseek_v4", true, false, false},
+      {"deepseek_v4", true, false},
       // MTP marker branch: starts_with("deepseek_v4") && contains("mtp").
-      {"deepseek_v4_mtp", true, false, false},
-      {"deepseek_v4_dspark", true, true, true},
-      {"DFlashDraftModel", false, true, false},
-      {"DFlash2DraftModel", false, true, false},
-      {"DSparkDraftModel", false, true, true},
-      {"glm5_dspark", false, true, true},
-      {"glm_moe_dsa", false, false, false},
+      {"deepseek_v4_mtp", true, false},
+      {"deepseek_v4_dspark", true, true},
+      {"DFlashDraftModel", false, false},
+      {"DFlash2DraftModel", false, false},
+      {"DSparkDraftModel", false, true},
+      {"glm5_dspark", false, true},
+      {"glm_moe_dsa", false, false},
   };
 
   for (const Expected& expected : cases) {
     const std::string_view model_type = expected.model_type;
     EXPECT_EQ(util::is_deepseek_v4_model_type(model_type),
               expected.is_deepseek_v4_model)
-        << "model_type=" << expected.model_type;
-    EXPECT_EQ(is_block_draft_model_type(model_type),
-              expected.is_block_draft_model)
         << "model_type=" << expected.model_type;
     EXPECT_EQ(is_dspark_draft_model_type(model_type),
               expected.is_dspark_draft_model)

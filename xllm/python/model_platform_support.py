@@ -53,9 +53,9 @@ def is_deepseek_v4_model(config: dict) -> bool:
     )
 
 
-# Block-diffusion draft model types (mirrors
-# is_block_draft_model_type / is_dspark_draft_model_type in
-# xllm/core/framework/model/model_args.h).
+# Block-diffusion draft model types (mirrors is_dspark_draft_model_type in
+# xllm/core/framework/model/model_args.h; C++ kind-based callers use
+# is_block_draft(SpeculativeTaskKind)).
 _DSPARK_DRAFT_MODEL_TYPES = ("DSparkDraftModel", "glm5_dspark", "deepseek_v4_dspark")
 _BLOCK_DRAFT_MODEL_TYPES = (
     "DFlashDraftModel",

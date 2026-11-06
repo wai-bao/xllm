@@ -409,7 +409,7 @@ DFlashWorkerImpl::~DFlashWorkerImpl() {
   }
   if (draft_args.hidden_size() != capacity.common.hidden_size ||
       (draft_args.vocab_size() != capacity.common.vocab_size &&
-       !draft_vocab_.draft_to_target_ids_.defined()) ||
+       draft_vocab_.is_identity()) ||
       expected_context_hidden_size_ <= 0 ||
       expected_context_hidden_size_ > std::numeric_limits<int32_t>::max()) {
     return ::xllm::Status(StatusCode::INVALID_ARGUMENT,
@@ -504,6 +504,17 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
 
   if (draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
     const ModelArgs& draft_args = draft_impl_->context_.get_model_args();
+    // Greedy DFlash2 drafts share the target vocabulary; every other mode
+    // needs the d2t mapping for a reduced draft vocabulary.
+    const bool greedy_dflash2 = SpeculativeConfig::is_dflash2_algorithm(
+                                    options_.speculative_algorithm()) &&
+                                !is_probabilistic_draft_;
+    if (!greedy_dflash2) {
+      CHECK(draft_args.effective_draft_vocab_size() ==
+                impl_->context_.get_model_args().vocab_size() ||
+            !draft_vocab_.is_identity())
+          << "A reduced draft vocabulary requires a d2t mapping.";
+    }
     // DeepSeek-V4 DSpark checkpoints carry trained mtp.0.embed /
     // mtp.<last>.head tensors (with the draft-side QuaRot transform); replacing
     // them after load destroys proposal quality.
@@ -566,9 +577,7 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
         << "Block-diffusion draft config requires mask_token_id, "
            "dflash_config.mask_token_id, or dspark_noise_token_id.";
 
-    const int64_t draft_vocab_size = draft_args.draft_vocab_size() > 0
-                                         ? draft_args.draft_vocab_size()
-                                         : draft_args.vocab_size();
+    const int64_t draft_vocab_size = draft_args.effective_draft_vocab_size();
     const ModelArgs& target_args = impl_->context_.get_model_args();
     CHECK_GT(draft_vocab_size, 0)
         << "Block-diffusion draft vocab_size must be set.";

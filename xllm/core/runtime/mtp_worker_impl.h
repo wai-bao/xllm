@@ -123,19 +123,12 @@ class MTPWorkerImpl : public DraftModelSpecWorkerImpl<TargetInput> {
   virtual SampleOutput validate(SamplingParameters sampling_params,
                                 const std::vector<ForwardOutput>& draft_outputs,
                                 const ForwardOutput& target_output,
-                                int32_t num_speculative_tokens,
-                                const std::vector<uint8_t>& invalid_draft);
+                                int32_t num_speculative_tokens);
 
   virtual void check_draft_input_embedding(const torch::Tensor& /*embedding*/,
                                            const std::string& /*phase*/) const {
   }
   virtual bool share_target_lm_head_with_draft() const { return true; }
-
-  SampleOutput validate(SamplingParameters sampling_params,
-                        const DraftProposal& draft_proposal,
-                        const ForwardOutput& target_output,
-                        int32_t num_speculative_tokens,
-                        const std::vector<uint8_t>& invalid_draft = {});
 
   // PD separation: placeholder size for empty embedding slot. Default: 1x
   // hidden_size. Eagle3 overrides to 3 * target_hidden_size.
