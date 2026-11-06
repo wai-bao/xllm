@@ -16,6 +16,7 @@ limitations under the License.
 #include "core/runtime/speculative_worker_impl.h"
 
 #include <type_traits>
+#include <vector>
 
 #include "common/global_flags.h"
 #include "core/framework/config/speculative_config.h"
@@ -273,10 +274,29 @@ bool SpeculativeWorkerImpl<TargetInput>::prepare_model_decode_continuation(
 ForwardOutput finalize_verify_output(
     ForwardOutput target_output,
     SampleOutput val_output,
-    const std::vector<JsonObjectGrammarState>& json_object_states) {
-  // Verify kernels have completed by every entry to this tail.
-  const std::vector<int32_t> num_accepted_tokens =
-      tensor_to_vector<int32_t>(val_output.num_accepted_tokens);
+    const std::vector<JsonObjectGrammarState>& json_object_states,
+    const std::vector<int32_t>& staged_num_accepted_tokens) {
+  // Verify kernels have completed by every entry to this tail. The committed
+  // rows are -1-padded past each rejection, so the accepted count is the
+  // non-negative entry count minus the bonus token. Overlap callers derive
+  // the counts from their existing host token snapshot and pass them in; the
+  // fallbacks below cover callers without one.
+  std::vector<int32_t> num_accepted_tokens;
+  if (!staged_num_accepted_tokens.empty()) {
+    num_accepted_tokens = staged_num_accepted_tokens;
+  } else if (val_output.next_tokens.defined() &&
+             val_output.next_tokens.device().is_cpu()) {
+    const torch::Tensor committed = val_output.next_tokens;
+    const torch::Tensor accepted_per_row =
+        committed.ge(0).sum(/*dim=*/1, /*keepdim=*/false);
+    num_accepted_tokens = tensor_to_vector<int32_t>(accepted_per_row);
+    for (int32_t& accepted : num_accepted_tokens) {
+      --accepted;
+    }
+  } else {
+    num_accepted_tokens =
+        tensor_to_vector<int32_t>(val_output.num_accepted_tokens);
+  }
   target_output.spec_verify_stats =
       make_verify_stats(val_output.next_tokens,
                         /*per_seq_draft_counts=*/nullptr,

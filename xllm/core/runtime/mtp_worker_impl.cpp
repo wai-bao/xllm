@@ -2214,6 +2214,22 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
   if (enable_schedule_overlap()) {
     target_output.next_tokens_host = accepted_tokens_host;
   }
+  // The staged token snapshot carries the acceptance counts: committed rows
+  // are -1-padded past each rejection, so counting non-negative entries needs
+  // no second D2H. Derive them before the snapshot moves into the pending
+  // context; every earlier consumer of the copy event (JSON replay, the
+  // non-overlap flush) has already synchronized it on the paths below.
+  std::vector<int32_t> staged_accepted_counts;
+  if (enable_schedule_overlap() && target_context_ready_event != nullptr) {
+    CHECK(target_context_ready_event->synchronize())
+        << "failed to wait for staged MTP accepted tokens";
+    const torch::Tensor accepted_per_row =
+        accepted_tokens_host.ge(0).sum(/*dim=*/1, /*keepdim=*/false);
+    staged_accepted_counts = tensor_to_vector<int32_t>(accepted_per_row);
+    for (int32_t& accepted : staged_accepted_counts) {
+      --accepted;
+    }
+  }
   stage_target_context_write(input,
                              val_output,
                              base_positions,
@@ -2254,7 +2270,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
   }
   return finalize_verify_output(std::move(target_output),
                                 std::move(val_output),
-                                input.json_object_states);
+                                input.json_object_states,
+                                staged_accepted_counts);
 }
 
 template <typename TargetInput>

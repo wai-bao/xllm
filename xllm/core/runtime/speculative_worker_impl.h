@@ -49,7 +49,8 @@ void scale_speculative_parallel_token_counts(VlmModelParams& params,
 ForwardOutput finalize_verify_output(
     ForwardOutput target_output,
     SampleOutput val_output,
-    const std::vector<JsonObjectGrammarState>& json_object_states);
+    const std::vector<JsonObjectGrammarState>& json_object_states,
+    const std::vector<int32_t>& num_accepted_tokens = {});
 
 // Base class for all speculative decoding workers.
 // Provides common logic: target model management, step dispatch, and
