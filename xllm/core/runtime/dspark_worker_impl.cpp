@@ -49,14 +49,6 @@ bool DSparkWorkerImpl::init_model(const std::string& model_weights_path,
   }
 
   const ModelArgs& draft_args = draft_impl_->context_.get_model_args();
-  const ModelArgs& target_args = impl_->context_.get_model_args();
-  const int64_t draft_vocab_size = draft_args.draft_vocab_size() > 0
-                                       ? draft_args.draft_vocab_size()
-                                       : draft_args.vocab_size();
-  CHECK(draft_vocab_size == target_args.vocab_size() ||
-        draft_vocab_.draft_to_target_ids_.defined())
-      << "A reduced draft vocabulary requires a DSpark d2t mapping.";
-
   if (util::is_deepseek_v4_dspark_model_type(draft_args.model_type())) {
     draft_row_layout_ = draft_args.dspark_use_native_sas()
                             ? dflash_detail::DraftRowLayout::SPARSE_INDICES
@@ -105,14 +97,13 @@ DraftProposal DSparkWorkerImpl::run_decode_draft(
       << "DSpark draft logits batch must match the decode batch.";
   torch::Tensor base_logits = draft_output->logits.view(
       {batch_size, num_speculative_tokens, draft_output->logits.size(-1)});
-  DraftProposal draft_proposal;
-  {
+  DraftProposal draft_proposal = [&] {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     SamplingParameters sampling_params_on_device = input.sampling_params;
     prepare_draft_sampling(is_probabilistic_draft_, sampling_params_on_device);
     sampling_params_on_device = sampling_params_on_device.to(
         base_logits.device(), base_logits.scalar_type());
-    draft_proposal = sample_dspark_markov_block(
+    return sample_dspark_markov_block(
         [this](const torch::Tensor& tokens) {
           return draft_impl_->dspark_markov_bias(tokens);
         },
@@ -125,7 +116,7 @@ DraftProposal DSparkWorkerImpl::run_decode_draft(
         is_probabilistic_draft_,
         /*token_ids_out=*/torch::Tensor(),
         draft_vocab_);
-  }
+  }();
 
   draft_proposal.keep_alive() = take_retained_inputs(*draft_output);
 
@@ -151,23 +142,23 @@ DraftProposal sample_dspark_markov_block(
   // kernel error; enforce the contract here.
   CHECK_EQ(anchors.scalar_type(), torch::kInt64);
   CHECK_EQ(anchors.device(), base_logits.device());
-  const bool has_vocab_mapping = vocab_mapping.draft_to_target_ids_.defined();
-  const int64_t draft_vocab =
-      has_vocab_mapping ? vocab_mapping.target_vocab_size_ : draft_model_vocab;
-  DraftProposal proposal =
-      token_ids_out.defined()
-          ? DraftProposal::from_token_buffer(
-                std::move(token_ids_out),
-                draft_vocab,
-                is_probabilistic_draft,
-                base_logits.options().dtype(torch::kFloat32))
-          : DraftProposal::preallocate(
-                rows,
-                steps,
-                draft_vocab,
-                is_probabilistic_draft,
-                anchors.options(),
-                base_logits.options().dtype(torch::kFloat32));
+  const bool reduced_vocab = !vocab_mapping.is_identity();
+  torch::Tensor token_ids = std::move(token_ids_out);
+  if (!token_ids.defined()) {
+    token_ids = torch::empty({rows, steps}, anchors.options());
+  } else {
+    CHECK_EQ(token_ids.sizes(), torch::IntArrayRef({rows, steps}));
+  }
+  torch::Tensor draft_logits;
+  if (is_probabilistic_draft) {
+    // The saved q is target-vocab indexed; a shared vocabulary writes the
+    // pages in place, a reduced one expands through the d2t table below.
+    draft_logits = torch::empty(
+        {rows,
+         steps,
+         reduced_vocab ? vocab_mapping.target_vocab_size() : draft_model_vocab},
+        base_logits.options().dtype(torch::kFloat32));
+  }
   auto previous = anchors;
   torch::Tensor scratch;
   const bool needs_sync = sampling.sampling_mode() != SamplingMode::GREEDY;
@@ -176,41 +167,43 @@ DraftProposal sample_dspark_markov_block(
     CHECK_EQ(bias.sizes(), torch::IntArrayRef({rows, draft_model_vocab}))
         << "DSpark markov bias must be [rows, draft_model_vocab].";
     torch::Tensor step_logits;
-    if (!has_vocab_mapping && proposal.logits().has_value()) {
-      // add_out into the logits page lets the sampler mutate it in place;
-      // draft_logits aliases the page directly.
-      torch::Tensor page = proposal.logits_at(step);
-      torch::add_out(page, base_logits.select(1, step), bias);
-      step_logits = page;
-    } else {
+    if (reduced_vocab || !draft_logits.defined()) {
       if (!scratch.defined()) {
-        const bool float32_scratch =
-            has_vocab_mapping && proposal.logits().has_value();
+        // The d2t expansion consumes fp32; the sampler then mutates the
+        // scratch in place either way.
         scratch = torch::empty(
             base_logits.select(1, step).sizes(),
-            base_logits.options().dtype(
-                float32_scratch ? torch::kFloat32 : base_logits.scalar_type()));
+            base_logits.options().dtype(reduced_vocab && draft_logits.defined()
+                                            ? torch::kFloat32
+                                            : base_logits.scalar_type()));
       }
       torch::add_out(scratch, base_logits.select(1, step), bias);
       step_logits = scratch;
+    } else {
+      // add_out into the logits page lets the sampler mutate it in place;
+      // draft_logits aliases the page directly.
+      torch::Tensor page = draft_logits.select(/*dim=*/1, step);
+      torch::add_out(page, base_logits.select(1, step), bias);
+      step_logits = page;
     }
     auto sampled = sample(step_logits, sampling);
+    if (reduced_vocab) {
+      // Sampling ran in the compact draft domain; the d2t table is
+      // injective, so remapping just the winning id preserves the argmax.
+      sampled.next_tokens = vocab_mapping.remap_ids(sampled.next_tokens);
+      if (draft_logits.defined()) {
+        // The saved q must be target-vocab indexed.
+        torch::Tensor target_logits = draft_logits.select(/*dim=*/1, step);
+        vocab_mapping.expand_to_target(step_logits, target_logits);
+      }
+    }
     if (needs_sync) {
       sync_tokens(sampled.next_tokens);
     }
-    if (has_vocab_mapping) {
-      if (proposal.logits().has_value()) {
-        sampled.draft_logits = step_logits;
-        vocab_mapping.remap(sampled, proposal.logits_at(step));
-      } else {
-        sampled.draft_logits = torch::Tensor();
-        vocab_mapping.remap(sampled);
-      }
-    }
-    proposal.tokens_at(step).copy_(sampled.next_tokens);
+    token_ids.select(/*dim=*/1, step).copy_(sampled.next_tokens);
     previous = sampled.next_tokens;
   }
-  return proposal;
+  return DraftProposal(std::move(token_ids), std::move(draft_logits));
 }
 
 }  // namespace xllm

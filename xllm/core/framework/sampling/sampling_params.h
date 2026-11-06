@@ -433,24 +433,28 @@ inline constexpr std::array<SamplingFieldDesc, 21> kSamplingFields = {
      {.member = SamplingTensorAccessor{&SamplingParameters::prefix_tokens,
                                        &SamplingParameters::prefix_tokens}}}};
 
+// Shared role scan for the has_* queries below.
+inline bool any_field_role(const SamplingParameters& params,
+                           bool SamplingFieldDesc::* role,
+                           bool require_role = true) {
+  return std::any_of(kSamplingFields.begin(),
+                     kSamplingFields.end(),
+                     [&params, role, require_role](const SamplingFieldDesc& f) {
+                       return (f.*role == require_role) &&
+                              f.member(params).defined();
+                     });
+}
+
 // Out-of-line because it derives from kSamplingFields (below the class).
 inline bool SamplingParameters::has_post_penalty_transforms() const {
-  for (const auto& field : kSamplingFields) {
-    if (field.post_penalty_transform && field.member(*this).defined()) {
-      return true;
-    }
-  }
-  return false;
+  return any_field_role(*this, &SamplingFieldDesc::post_penalty_transform);
 }
 
 // Out-of-line because it derives from kSamplingFields (below the class).
 inline bool SamplingParameters::has_sampling_fields() const {
-  return std::any_of(kSamplingFields.begin(),
-                     kSamplingFields.end(),
-                     [this](const SamplingFieldDesc& field) {
-                       return !field.per_request &&
-                              field.member(*this).defined();
-                     });
+  return any_field_role(*this,
+                        &SamplingFieldDesc::per_request,
+                        /*require_role=*/false);
 }
 
 // Clears the per-token transform and seed fields that are dead on a greedy

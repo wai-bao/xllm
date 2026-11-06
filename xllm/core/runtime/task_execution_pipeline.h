@@ -204,6 +204,9 @@ class TaskExecutionPipeline final {
  private:
   friend struct TaskPipelineTestPeer;
   friend class SlotBuffer;
+  struct SpeculativeSlot;
+  // Draft tokens [rows, draft_steps]; adaptive verify views the arena segment.
+  static torch::Tensor draft_tokens(const SpeculativeSlot& slot);
   static Status context_create(MtpContextStorage& pool,
                                uint32_t capacity,
                                std::unique_ptr<MtpContextView>& output);
@@ -268,7 +271,6 @@ class TaskExecutionPipeline final {
     uint32_t sample_rows = 0;
   };
 
-  struct SpeculativeSlot;
   struct Sampling {
     SamplingParameters params;
     SampleOutput output;
@@ -369,10 +371,10 @@ class TaskExecutionPipeline final {
   void launch_prefill(SpeculativeSlot& slot);
   void launch_decode(SpeculativeSlot& slot);
   bool launch_unified_block(SpeculativeSlot& slot);
-  void launch_block_draft(SpeculativeSlot& slot);
-  void finish_fixed_verify(SpeculativeSlot& slot);
+  DraftProposal launch_block_draft(SpeculativeSlot& slot);
   void generate_adaptive_dspark_proposals(SpeculativeSlot& slot,
                                           const torch::Tensor& anchors);
+  void finish_fixed_verify(SpeculativeSlot& slot, DraftProposal proposal);
   void launch_packed_verify(SpeculativeSlot& slot);
   Status plan_adaptive_verify(SpeculativeSlot& slot,
                               const LlmForwardInput& input);

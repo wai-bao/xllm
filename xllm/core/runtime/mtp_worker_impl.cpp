@@ -1637,9 +1637,6 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
     json_invalid_suffix.assign(current_draft_input.json_object_states.size(),
                                static_cast<uint8_t>(0));
     json_scratch.states_after.reserve(num_speculative_tokens);
-    json_scratch.invalid_draft_step_major.reserve(
-        current_draft_input.json_object_states.size() *
-        static_cast<size_t>(num_speculative_tokens));
   }
   draft_outputs.reserve(num_speculative_tokens);
   const bool reuse_mtp_topk_state = layer::is_mtp_dsa_topk_reuse_enabled(
@@ -1762,7 +1759,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
     }
     bool halt_json_draft = false;
     if (has_json_object_states) {
-      const torch::Tensor& next_tokens =
+      torch::Tensor& next_tokens =
           draft_outputs.back().sample_output.next_tokens;
       CHECK(next_tokens.defined())
           << "draft next_tokens must be defined for JSON grammar handling";
@@ -1789,11 +1786,26 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
             draft_tokens[token_idx].template item<int64_t>()));
       }
 #endif
-      halt_json_draft =
+      const std::vector<uint8_t> invalid_draft =
           detail::append_json_draft_step(current_draft_input.json_object_states,
                                          json_invalid_suffix,
                                          draft_token_ids,
-                                         json_scratch);
+                                         json_scratch,
+                                         halt_json_draft);
+      if (std::find(invalid_draft.begin(), invalid_draft.end(), 1) !=
+          invalid_draft.end()) {
+        // Invalid drafts carry the -1 sentinel in place; the verifier
+        // force-rejects negative ids.
+        c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+        next_tokens.masked_fill_(
+            torch::from_blob(const_cast<uint8_t*>(invalid_draft.data()),
+                             {static_cast<int64_t>(invalid_draft.size())},
+                             torch::dtype(torch::kUInt8))
+                .to(next_tokens.device())
+                .to(torch::kBool),
+            /*value=*/-1);
+      }
+      json_invalid_suffix = invalid_draft;
     }
     if (draft_idx == num_speculative_tokens - 1) {
       continue;
@@ -1827,12 +1839,14 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
           rejected_output.sample_output.next_tokens = torch::full_like(
               rejected_output.sample_output.next_tokens, /*fill_value=*/-1);
           draft_outputs.push_back(std::move(rejected_output));
-          detail::append_json_draft_step(
+          bool pad_halt = false;
+          json_invalid_suffix = detail::append_json_draft_step(
               current_draft_input.json_object_states,
               json_invalid_suffix,
               std::vector<int32_t>(
                   current_draft_input.json_object_states.size(), -1),
-              json_scratch);
+              json_scratch,
+              pad_halt);
         }
         break;
       }
@@ -1889,9 +1903,7 @@ void MTPWorkerImpl<TargetInput>::fill_validate_input_from_draft_outputs(
     CHECK_EQ(json_scratch->states_after.size(),
              static_cast<size_t>(num_speculative_tokens));
     validate_input.json_object_states = detail::build_json_validation_states(
-        input.json_object_states,
-        *json_scratch,
-        validate_input.json_object_invalid_draft);
+        input.json_object_states, *json_scratch);
     validate_input.sampling_params.filter_bitmask() =
         build_json_object_filter_bitmask(validate_input.json_object_states,
                                          device_,
@@ -2060,8 +2072,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
     val_output = validate(std::move(verify_params),
                           draft_outputs,
                           target_output,
-                          num_speculative_tokens,
-                          validate_input.json_object_invalid_draft);
+                          num_speculative_tokens);
   }
 
   if (uses_embedded_eagle3_draft()) {
@@ -3929,54 +3940,33 @@ SampleOutput MTPWorkerImpl<TargetInput>::validate(
     SamplingParameters sampling_params,
     const std::vector<ForwardOutput>& draft_outputs,
     const ForwardOutput& target_output,
-    int32_t num_speculative_tokens,
-    const std::vector<uint8_t>& invalid_draft) {
+    int32_t num_speculative_tokens) {
   CHECK(!draft_outputs.empty())
       << "MTP validate requires at least one draft step";
   // An all-greedy batch under probabilistic mode carries no draft logits.
-  // The draft logits carry the DRAFT model's own vocabulary; size the buffer
-  // from their last dim, never from the target logits.
-  const torch::Tensor& first_step_logits =
-      draft_outputs.front().sample_output.draft_logits;
+  const bool is_probabilistic_draft =
+      draft_outputs.front().sample_output.draft_logits.defined();
   const torch::Tensor& first_tokens =
       draft_outputs.front().sample_output.next_tokens;
-  const bool is_probabilistic_draft = first_step_logits.defined();
-  DraftProposal proposal = DraftProposal::preallocate(
-      first_tokens.size(0),
-      static_cast<int64_t>(num_speculative_tokens),
-      is_probabilistic_draft ? first_step_logits.size(-1) : 0,
-      /*is_probabilistic_draft=*/is_probabilistic_draft,
-      first_tokens.options(),
-      is_probabilistic_draft ? first_step_logits.options()
-                             : first_tokens.options());
+  torch::Tensor token_ids = torch::empty(
+      {first_tokens.size(0), num_speculative_tokens}, first_tokens.options());
+  std::vector<torch::Tensor> pages;
+  pages.reserve(draft_outputs.size());
   int64_t step = 0;
   for (const auto& draft_output : draft_outputs) {
-    proposal.tokens_at(step).copy_(draft_output.sample_output.next_tokens);
+    token_ids.select(/*dim=*/1, step)
+        .copy_(draft_output.sample_output.next_tokens);
     if (is_probabilistic_draft) {
-      proposal.logits_at(step).copy_(draft_output.sample_output.draft_logits);
+      pages.push_back(draft_output.sample_output.draft_logits);
     }
     ++step;
   }
+  const DraftProposal proposal =
+      DraftProposal::from_step_logits(std::move(token_ids), std::move(pages));
 
-  return validate(std::move(sampling_params),
-                  proposal,
-                  target_output,
-                  num_speculative_tokens,
-                  invalid_draft);
-}
-
-template <typename TargetInput>
-SampleOutput MTPWorkerImpl<TargetInput>::validate(
-    SamplingParameters sampling_params,
-    const DraftProposal& draft_proposal,
-    const ForwardOutput& target_output,
-    int32_t num_speculative_tokens,
-    const std::vector<uint8_t>& invalid_draft) {
   const int32_t num_val_tokens = num_speculative_tokens + 1;
-  const int32_t batch_size =
-      static_cast<int32_t>(draft_proposal.token_ids().size(0));
+  const int32_t batch_size = static_cast<int32_t>(proposal.token_ids().size(0));
   const int32_t vocab_size = target_output.logits.size(/*dim=*/-1);
-
   const bool step_major_validate_layout = uses_step_major_validate_layout();
   // Last target hidden states for the committed verify rows; step-major
   // graphs emit them transposed, so permute into [batch, val_tokens, hidden].
@@ -3994,30 +3984,10 @@ SampleOutput MTPWorkerImpl<TargetInput>::validate(
       target_hidden_states = to_batch_major(target_hidden_states);
     }
   }
-
-  // Grammar-invalid draft positions carry the -1 sentinel directly in the
-  // proposal token ids; the rejection sampler rejects negative ids.
-  torch::Tensor validation_token_ids;
-  if (!invalid_draft.empty()) {
-    CHECK_EQ(invalid_draft.size(),
-             static_cast<size_t>(batch_size * (num_val_tokens - 1)))
-        << "MTP invalid draft mask shape mismatch";
-    torch::Tensor invalid_mask =
-        async_h2d_tensor(invalid_draft, draft_proposal.token_ids().device())
-            .view({batch_size, num_val_tokens - 1})
-            .to(torch::kBool);
-    validation_token_ids =
-        draft_proposal.token_ids().masked_fill(invalid_mask, /*sentinel=*/-1);
-  }
-  SampleOutput sample_output = spec_verify::run_rejection_sampling(
-      std::move(sampling_params),
-      DraftProposal(validation_token_ids.defined() ? validation_token_ids
-                                                   : draft_proposal.token_ids(),
-                    draft_proposal.logits()),
-      target_logits,
-      target_hidden_states);
-
-  return sample_output;
+  return spec_verify::run_rejection_sampling(std::move(sampling_params),
+                                             proposal,
+                                             target_logits,
+                                             target_hidden_states);
 }
 
 template class MTPWorkerImpl<LlmForwardInput>;

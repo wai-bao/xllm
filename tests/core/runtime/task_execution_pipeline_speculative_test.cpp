@@ -49,15 +49,19 @@ limitations under the License.
 #include "core/framework/speculative/adaptive/spec_cost_profile_store.h"
 #include "core/framework/speculative/metrics.h"
 #include "core/framework/speculative/mtp_async_input_builder.h"
+#include "core/framework/speculative/rejection_sampler.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/layers/common/attention_metadata.h"
+#include "core/platform/platform.h"
 #include "core/runtime/dflash2_worker_impl.h"
 #include "core/runtime/dflash_worker_impl.h"
+#include "core/runtime/dspark_worker_impl.h"
 #include "core/runtime/executor_impl_factory.h"
 #include "core/runtime/task_execution_pipeline.h"
 #include "core/runtime/unified_mtp_worker_impl.h"
 #include "core/runtime/worker_impl.h"
 #include "core/util/scope_guard.h"
+#include "tests/core/framework/sampling/sampling_test_utils.h"
 #include "tests/core/runtime/task_pipeline_test_peer.h"
 #include "worker.pb.h"
 
@@ -6834,6 +6838,225 @@ TEST_F(SpeculativePipelineTest, PrefixRefreshKeepsEmptyDpPeersInBodyOrder) {
   EXPECT_TRUE(torch::equal(draft_->forward_embeddings.back().cpu(),
                            torch::zeros({1, 1})));
 }
+
+class ValidationWorker final : public MTPWorkerImpl<LlmForwardInput> {
+ public:
+  using MTPWorkerImpl<LlmForwardInput>::MTPWorkerImpl;
+  using MTPWorkerImpl<LlmForwardInput>::validate;
+};
+
+ValidationWorker make_worker(const torch::Device& device) {
+  const ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, /*process_group=*/nullptr);
+  runtime::Options options;
+  options.model_id("test_target")
+      .block_size(4)
+      .num_speculative_tokens(2)
+      .world_size(1)
+      .dp_size(1)
+      .cp_size(1);
+  return ValidationWorker(parallel_args, device, options, WorkerType::LLM);
+}
+
+class MtpValidationTest
+    : public ::testing::TestWithParam<std::tuple<SamplingMode, bool>> {};
+
+TEST_P(MtpValidationTest, MarksOnlyLocalVerificationTokens) {
+  const auto [mode, probabilistic] = GetParam();
+  const torch::Device device(Platform::type_torch(), /*index=*/0);
+  ValidationWorker worker = make_worker(device);
+  const auto tensor_options =
+      torch::TensorOptions().device(device).dtype(torch::kInt64);
+  std::vector<ForwardOutput> drafts(2);
+  for (int64_t step = 0; step < 2; ++step) {
+    drafts[step].sample_output.next_tokens =
+        torch::full({2}, step + 1, tensor_options);
+    if (probabilistic) {
+      drafts[step].sample_output.draft_logits =
+          torch::full({2, 4}, -INFINITY, tensor_options);
+      drafts[step].sample_output.draft_logits.select(1, step + 1).fill_(0);
+    }
+  }
+  ForwardOutput target;
+  target.logits =
+      torch::full({6, 4}, -INFINITY, tensor_options)
+          .scatter_(1,
+                    torch::tensor({{1}, {2}, {3}, {1}, {2}, {3}},
+                                  tensor_options.dtype(torch::kInt64)),
+                    0.0F);
+  SamplingParameters sampling;
+  sampling.sampling_mode() = mode;
+  if (mode == SamplingMode::MIXED) {
+    sampling.do_sample() =
+        torch::tensor({false, true}, tensor_options.dtype(torch::kBool));
+  }
+
+  // Invalid drafts carry the -1 sentinel in place; the verifier force-rejects
+  // negative ids.
+  const torch::Tensor saved_step0 = drafts[0].sample_output.next_tokens.clone();
+  drafts[0].sample_output.next_tokens.select(0, 1).fill_(-1);
+  drafts[1].sample_output.next_tokens.select(0, 1).fill_(-1);
+  const SampleOutput constrained =
+      worker.validate(sampling, drafts, target, /*num_speculative_tokens=*/2);
+  EXPECT_TRUE(
+      torch::equal(constrained.next_tokens.cpu(),
+                   torch::tensor({{1, -1, -1}, {1, 2, -1}}, torch::kInt64)));
+  EXPECT_TRUE(torch::equal(constrained.num_accepted_tokens.cpu(),
+                           torch::tensor({{0}, {1}}, torch::kInt32)));
+
+  // Reusing the original draft outputs must still accept the entire prefix.
+  drafts[0].sample_output.next_tokens.copy_(saved_step0);
+  drafts[1].sample_output.next_tokens.select(0, 1).fill_(2);
+  const SampleOutput unconstrained =
+      worker.validate(sampling, drafts, target, /*num_speculative_tokens=*/2);
+  EXPECT_TRUE(
+      torch::equal(unconstrained.next_tokens.cpu(),
+                   torch::tensor({{1, 2, 3}, {1, 2, 3}}, torch::kInt64)));
+  for (int64_t step = 0; step < 2; ++step) {
+    EXPECT_TRUE(torch::equal(drafts[step].sample_output.next_tokens.cpu(),
+                             torch::full({2}, step + 1, torch::kInt64)));
+  }
+}
+
+TEST(MtpValidationDistributionTest, PreservesNonPointMassDraftAcceptance) {
+  constexpr int64_t kBatchSize = 32;
+  const torch::Device device(Platform::type_torch(), /*index=*/0);
+  ValidationWorker worker = make_worker(device);
+  const auto tensor_options =
+      torch::TensorOptions().device(device).dtype(torch::kFloat32);
+  std::vector<ForwardOutput> drafts(2);
+  for (int64_t step = 0; step < 2; ++step) {
+    drafts[step].sample_output.next_tokens = torch::full(
+        {kBatchSize}, step + 1, tensor_options.dtype(torch::kInt64));
+    drafts[step].sample_output.draft_logits =
+        torch::zeros({kBatchSize, 4}, tensor_options);
+  }
+  // q(token) = 1/4 and p(token) = 1/2 at both draft positions: Dense accepts
+  // every proposal, PointMass can reject.
+  torch::Tensor target_logits =
+      torch::full({kBatchSize, 3, 4}, -INFINITY, tensor_options);
+  target_logits.narrow(1, 0, 2).select(2, 0).fill_(0);
+  target_logits.select(1, 0).select(1, 1).fill_(0);
+  target_logits.select(1, 1).select(1, 2).fill_(0);
+  target_logits.select(1, 2).select(1, 3).fill_(0);
+  ForwardOutput target;
+  target.logits = target_logits.view({kBatchSize * 3, 4});
+  SamplingParameters sampling;
+  sampling.sampling_mode() = SamplingMode::RANDOM;
+
+  // Seed the device RNG, not the request: request seeds bypass p/q rejection.
+  const torch::Tensor saved_rng_state = testutil::rng_state();
+  testutil::seed_sampling_rng(device, 42);
+  ScopeGuard restore_rng([&] { testutil::set_rng_state(saved_rng_state); });
+
+  const SampleOutput dense =
+      worker.validate(sampling, drafts, target, /*num_speculative_tokens=*/2);
+  EXPECT_TRUE(torch::equal(dense.num_accepted_tokens.cpu(),
+                           torch::full({kBatchSize, 1}, 2, torch::kInt32)));
+  EXPECT_TRUE(torch::equal(
+      dense.next_tokens.narrow(1, 0, 2).cpu(),
+      torch::tensor({{1, 2}}, torch::kInt64).expand({kBatchSize, 2})));
+
+  // The same draw must distinguish absent logits from the Dense proposal.
+  for (auto& draft : drafts) {
+    draft.sample_output.draft_logits = torch::Tensor();
+  }
+  testutil::seed_sampling_rng(device, 42);
+  const SampleOutput point_mass =
+      worker.validate(sampling, drafts, target, /*num_speculative_tokens=*/2);
+  EXPECT_LT(point_mass.num_accepted_tokens.min().item<int32_t>(), 2);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    DraftRepresentations,
+    MtpValidationTest,
+    ::testing::Combine(::testing::Values(SamplingMode::GREEDY,
+                                         SamplingMode::RANDOM,
+                                         SamplingMode::MIXED),
+                       ::testing::Bool()));
+
+class SparseDraftProposalTest : public ::testing::TestWithParam<torch::Device> {
+ protected:
+  const torch::Device device_ = GetParam();
+};
+
+TEST_P(SparseDraftProposalTest, MatchesDenseWideVocabularyVerification) {
+  const auto options =
+      torch::TensorOptions().device(device_).dtype(torch::kFloat32);
+  const auto ids_options = options.dtype(torch::kInt64);
+  constexpr int64_t kVocab = 248320;
+  const torch::Tensor ids =
+      torch::arange(16, ids_options).view({1, 1, 16}).expand({8, 7, 16});
+  const torch::Tensor small_logits = torch::zeros({8, 7, 16}, options);
+  const torch::Tensor tokens = torch::full({8, 7}, 7, ids_options);
+  // token 7 sits at candidate column 7 in every step of the arange layout.
+  const torch::Tensor positions = torch::full({8, 7}, 7, ids_options);
+  const torch::Tensor dense_logits =
+      torch::full(
+          {8, 7, kVocab}, -std::numeric_limits<float>::infinity(), options)
+          .scatter_(2, ids, small_logits);
+  torch::Tensor target = torch::full(
+      {64, kVocab}, -std::numeric_limits<float>::infinity(), options);
+  target.narrow(1, 0, 16).copy_(torch::arange(16, options).mul(0.125));
+  target.select(1, 7).fill_(-std::numeric_limits<float>::infinity());
+  SamplingParameters params;
+  params.sampling_mode() = SamplingMode::RANDOM;
+  params.logprobs() = true;
+  testutil::seed_sampling_rng(target.device(), 42);
+  torch::Tensor dense_target = target.clone();
+  const SampleOutput expected = rejection_sample(
+      params, DraftProposal(tokens, dense_logits), dense_target);
+  testutil::seed_sampling_rng(target.device(), 42);
+  const SampleOutput actual = rejection_sample(
+      params,
+      DraftProposal(tokens, ids.clone(), positions, small_logits.clone()),
+      target);
+  EXPECT_TRUE(torch::equal(actual.next_tokens, expected.next_tokens));
+  EXPECT_TRUE(torch::allclose(actual.logprobs, expected.logprobs, 1e-5, 5e-6));
+}
+
+TEST_P(SparseDraftProposalTest, MatchesDenseSupportAndSentinelRecovery) {
+  const auto options =
+      torch::TensorOptions().device(device_).dtype(torch::kFloat32);
+  const auto ids_options = options.dtype(torch::kInt64);
+  const torch::Tensor tokens = torch::tensor({{1, 3}, {-1, 2}}, ids_options);
+  const torch::Tensor candidates =
+      torch::tensor({{{1, 2}, {3, 4}}, {{1, 2}, {2, 3}}}, ids_options);
+  // Column of each drafted token: row 0 drafts 1 then 3 (columns 0 and 0);
+  // the sentinel row's column is garbage — the verifier rejects the token.
+  const torch::Tensor positions = torch::tensor({{0, 0}, {1, 0}}, ids_options);
+  const torch::Tensor sparse_logits =
+      torch::tensor(
+          {{{1.0F, 0.0F}, {1.0F, 0.0F}}, {{0.25F, 0.75F}, {0.5F, 0.5F}}},
+          options)
+          .log();
+  const torch::Tensor dense_logits =
+      torch::full({2, 2, 5}, -std::numeric_limits<float>::infinity(), options)
+          .scatter_(2, candidates, sparse_logits);
+  // Accept the first draft, then recover outside q's support; the sentinel
+  // row must recover directly from p, without subtracting its stored q.
+  const torch::Tensor target_probs = torch::tensor(
+      {{{0.0F, 1.0F, 0.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F, 0.0F, 0.0F}},
+       {{0.0F, 0.0F, 0.0F, 0.0F, 1.0F}, {0.0F, 0.0F, 1.0F, 0.0F, 0.0F}}},
+      options);
+  const DraftProposal sparse = DraftProposal(
+      tokens, candidates.clone(), positions, sparse_logits.clone());
+  const torch::Tensor sparse_result =
+      testutil::random_sample_from_probs(sparse, target_probs, 123);
+  const torch::Tensor dense_result = testutil::random_sample_from_probs(
+      DraftProposal(tokens, dense_logits), target_probs, 123);
+  EXPECT_TRUE(torch::equal(sparse_result, dense_result));
+  EXPECT_TRUE(torch::equal(
+      sparse_result, torch::tensor({{1, 0, -1}, {4, -1, -1}}, ids_options)));
+}
+
+// The device generator is the NPU default (this suite runs with the NPU
+// runtime); CPU-only fallbacks collapse to running each case once.
+INSTANTIATE_TEST_SUITE_P(Devices,
+                         SparseDraftProposalTest,
+                         ::testing::Values(torch::Device(torch::kCPU),
+                                           torch::Device(Platform::type_torch(),
+                                                         0)));
 
 }  // namespace
 }  // namespace xllm

@@ -50,35 +50,36 @@ DraftVocabMapping::DraftVocabMapping(torch::Tensor draft_token_id_offsets,
       << target_vocab_size << ").";
   if (draft_vocab_size == target_vocab_size &&
       draft_token_id_offsets.eq(0).all().item<bool>()) {
+    // An all-zero offsets table with matching vocab sizes is the identity;
+    // keep it undefined so hot paths skip the mapping entirely.
     return;
   }
   draft_to_target_ids_ = mapped_ids.to(device);
 }
 
-void DraftVocabMapping::remap(SampleOutput& sample_output,
-                              torch::Tensor target_logits) const {
+void DraftVocabMapping::expand_to_target(const torch::Tensor& draft_logits,
+                                         torch::Tensor& target_logits) const {
+  target_logits.fill_(-std::numeric_limits<float>::infinity());
+  target_logits.scatter_(
+      /*dim=*/1,
+      draft_to_target_ids_.view({1, -1}).expand(
+          {draft_logits.size(0), draft_to_target_ids_.size(0)}),
+      draft_logits);
+}
+
+void DraftVocabMapping::remap(SampleOutput& sample_output) const {
   if (!draft_to_target_ids_.defined() || !sample_output.next_tokens.defined() ||
       sample_output.next_tokens.numel() == 0) {
     return;
   }
   if (sample_output.draft_logits.defined()) {
-    const int64_t rows = sample_output.draft_logits.size(0);
-    if (target_logits.defined()) {
-      target_logits.fill_(-std::numeric_limits<float>::infinity());
-    } else {
-      target_logits = torch::full({rows, target_vocab_size_},
-                                  -std::numeric_limits<float>::infinity(),
-                                  sample_output.draft_logits.options());
-    }
-    target_logits.scatter_(
-        /*dim=*/1,
-        draft_to_target_ids_.view({1, -1}).expand(
-            {rows, draft_to_target_ids_.size(0)}),
-        sample_output.draft_logits);
+    torch::Tensor target_logits =
+        torch::empty({sample_output.draft_logits.size(0), target_vocab_size_},
+                     sample_output.draft_logits.options());
+    expand_to_target(sample_output.draft_logits, target_logits);
     sample_output.draft_logits = std::move(target_logits);
   }
-  sample_output.next_tokens = draft_to_target_ids_.index_select(
-      0, sample_output.next_tokens.to(torch::kInt64));
+  sample_output.next_tokens = remap_ids(sample_output.next_tokens);
 }
 
 }  // namespace xllm

@@ -122,14 +122,16 @@ struct TaskExecutionPipeline::SpeculativeSlot {
     // Complete raw-B/G bindings are captured at drained startup for this Slot.
     // Admission checks this set before mutating persistent request context.
     std::unordered_set<uint64_t> unified_graph_bindings;
-    // Proposal IDs, confidence and widths share an owned arena. Proposal +
-    // confidence consensus is one broadcast; confidence + width feedback is
-    // one tiny D2H copy covered by the ordinary result-ready fence.
+    // Proposal IDs, confidence and widths share an owned arena. Confidence +
+    // width feedback is one tiny D2H copy covered by the ordinary
+    // result-ready fence.
     torch::Tensor arena_storage;
     // Control aliases otherwise-unused adaptive rejection-mask storage. The
     // pinned source borrows retired feedback until the next result D2H starts.
     torch::Tensor control;
     torch::Tensor host_control;
+    torch::Tensor proposal;
+    // Proposal + confidence broadcast payload for TP consensus.
     torch::Tensor consensus;
     torch::Tensor confidence;
     torch::Tensor widths;
@@ -138,6 +140,7 @@ struct TaskExecutionPipeline::SpeculativeSlot {
     torch::Tensor host_feedback;
     torch::Tensor host_confidence;
     torch::Tensor host_widths;
+    // ConfidenceHead input anchors + drafted prefix for the non-unified path.
     torch::Tensor previous_storage;
     torch::Tensor previous_tokens;
     torch::Tensor offsets_storage;
@@ -221,7 +224,6 @@ struct TaskExecutionPipeline::SpeculativeSlot {
   torch::Tensor proposal_storage;
   torch::Tensor accepted_mask_storage;
   torch::Tensor host_hidden_storage;
-  torch::Tensor proposal;
   torch::Tensor accepted_mask;
   torch::Tensor context_slots_storage;
   torch::Tensor context_slots;

@@ -33,11 +33,33 @@ class DraftVocabMapping final {
                     const torch::Device& device);
   DraftVocabMapping() = default;
 
+  // When true the mapping is the identity; remap_ids returns its input
+  // unchanged and the other methods are no-ops.
+  bool is_identity() const { return !draft_to_target_ids_.defined(); }
+
+  int64_t target_vocab_size() const { return target_vocab_size_; }
+
+  // Maps draft-domain token ids (any shape) into the target domain; the
+  // identity mapping returns its input unchanged.
+  torch::Tensor remap_ids(const torch::Tensor& ids) const {
+    if (!draft_to_target_ids_.defined()) {
+      return ids;
+    }
+    return draft_to_target_ids_
+        .index_select(0, ids.view(-1).to(draft_to_target_ids_.scalar_type()))
+        .view(ids.sizes())
+        .to(ids.scalar_type());
+  }
+
+  // Fills target_logits [rows, target_vocab_size()] with -inf and scatters
+  // the draft logits at their mapped positions.
+  void expand_to_target(const torch::Tensor& draft_logits,
+                        torch::Tensor& target_logits) const;
+
+  void remap(SampleOutput& sample_output) const;
+
   torch::Tensor draft_to_target_ids_;
   int64_t target_vocab_size_ = 0;
-
-  void remap(SampleOutput& sample_output,
-             torch::Tensor target_logits = torch::Tensor()) const;
 };
 
 }  // namespace xllm

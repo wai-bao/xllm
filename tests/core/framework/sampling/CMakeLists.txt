@@ -1,10 +1,5 @@
 include(cc_test)
 
-set(SAMPLER_DEVICE_TEST_SRCS)
-if(USE_NPU)
-  list(APPEND SAMPLER_DEVICE_TEST_SRCS seeded_sampler_test.cpp)
-endif()
-
 cc_test(
   NAME
     sampler_test
@@ -12,7 +7,6 @@ cc_test(
     gumbel_sampling_test.cpp
     rejection_sampler_test.cpp
     sampling_params_test.cpp
-    ${SAMPLER_DEVICE_TEST_SRCS}
   DEPS
     absl::strings
     GTest::gtest_main

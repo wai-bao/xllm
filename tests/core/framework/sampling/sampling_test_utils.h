@@ -18,7 +18,14 @@ limitations under the License.
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/rejection_sampler.h"
 #include "core/util/tensor_helper.h"
+#include "platform/device.h"
 #include "platform/platform.h"
+
+#if defined(USE_NPU)
+#include <torch_npu/csrc/aten/NPUGeneratorImpl.h>
+
+#include <mutex>
+#endif
 
 namespace xllm {
 namespace testutil {
@@ -98,6 +105,32 @@ inline torch::TensorOptions get_test_options(
   return torch::dtype(dtype).device(get_test_device());
 }
 
+// Seeds both the CPU default generator and the device generator (which
+// torch::manual_seed alone does not reach on NPU/MLU).
+inline void seed_sampling_rng(const torch::Device& device, int64_t seed) {
+  if (device.type() == torch::kCPU || !device.has_index()) {
+    torch::manual_seed(seed);
+    return;
+  }
+  Device(device).set_seed(static_cast<uint64_t>(seed));
+}
+
+// Snapshot / restore of the NPU device-generator state around tests that
+// must not perturb it.
+#if defined(USE_NPU)
+inline torch::Tensor rng_state() {
+  auto generator = at_npu::detail::getDefaultNPUGenerator(/*device_index=*/0);
+  std::lock_guard<std::mutex> lock(generator.mutex());
+  return generator.get_state();
+}
+
+inline void set_rng_state(const torch::Tensor& state) {
+  auto generator = at_npu::detail::getDefaultNPUGenerator(/*device_index=*/0);
+  std::lock_guard<std::mutex> lock(generator.mutex());
+  generator.set_state(state);
+}
+#endif
+
 // Drives random rejection_sample() over normalized
 // per-position probs. Without an explicit bonus_row, the bonus row repeats
 // the last target row's distribution. The seed is for reproducibility only —
@@ -118,7 +151,7 @@ inline torch::Tensor random_sample_from_probs(
       torch::cat({target_probs.log(), bonus}, /*dim=*/1);
   const SamplingParameters params =
       make_rejection_params(torch::ones({batch_size}, torch::kBool));
-  torch::manual_seed(uniform_seed);
+  seed_sampling_rng(target_probs.device(), uniform_seed);
   SampleOutput output =
       rejection_sample(params, proposal, flatten_rows(target_logits));
   return output.next_tokens;

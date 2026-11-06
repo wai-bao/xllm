@@ -46,13 +46,6 @@ inline constexpr bool is_dspark_draft_model_type(std::string_view model_type) {
          model_type == kDeepseekV4DSparkModelType;
 }
 
-// All block-diffusion draft model families (DFlash/DFlash2/DSpark).
-inline constexpr bool is_block_draft_model_type(std::string_view model_type) {
-  return model_type == "DFlashDraftModel" ||
-         is_dflash2_draft_model_type(model_type) ||
-         is_dspark_draft_model_type(model_type);
-}
-
 class TokenEmbeddingArgs final {
  public:
   REFLECT_PROPERTIES(TokenEmbeddingArgs);
@@ -747,6 +740,11 @@ struct ModelArgs {
   PROPERTY(SpeculativeArgs, speculative_args);
 
   FORWARD_PROPERTY(int64_t, draft_vocab_size, speculative_args);
+
+  // The draft model's output width; falls back to the shared vocabulary.
+  int64_t effective_draft_vocab_size() const {
+    return draft_vocab_size() > 0 ? draft_vocab_size() : vocab_size();
+  }
 
   PROPERTY(DSparkArgs, dspark_args);
 

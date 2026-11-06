@@ -22,6 +22,7 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <limits>
 #include <utility>
 
 #include "common/metrics.h"
@@ -35,30 +36,12 @@ limitations under the License.
 
 namespace xllm {
 
-bool DFlash2WorkerImpl::init_model(const std::string& model_weights_path,
-                                   int32_t random_seed,
-                                   MasterStatus master_status) {
-  const bool result = DFlashWorkerImpl::init_model(
-      model_weights_path, random_seed, master_status);
-  if (result && draft_impl_->get_status() == WorkerImpl::Status::LOADED &&
-      is_probabilistic_draft_) {
-    const ModelArgs& draft_args = draft_impl_->context_.get_model_args();
-    const ModelArgs& target_args = impl_->context_.get_model_args();
-    CHECK_EQ(draft_args.draft_vocab_size() > 0 ? draft_args.draft_vocab_size()
-                                               : draft_args.vocab_size(),
-             target_args.vocab_size())
-        << "DFlash2 probabilistic drafts require draft and target vocabulary "
-           "sizes to match.";
-  }
-  return result;
-}
-
 // The selector takes only temperature — truncation, penalties, and grammar
 // constraints belong to verification.
-DraftProposal sample_dflash2_path(const DFlash2CandidateOutput& candidates,
+DraftProposal sample_dflash2_path(DFlash2CandidateOutput candidates,
                                   const SamplingParameters& sampling_params,
                                   torch::Tensor gumbel_noise,
-                                  int64_t vocab_size,
+                                  const DraftVocabMapping& vocab_mapping,
                                   torch::Tensor token_ids_out) {
   CHECK_EQ(candidates.candidate_ids.dim(), 3);
   CHECK_EQ(candidates.edge_logits.dim(), 4);
@@ -93,12 +76,15 @@ DraftProposal sample_dflash2_path(const DFlash2CandidateOutput& candidates,
   } else {
     CHECK_EQ(token_ids.sizes(), torch::IntArrayRef({batch_size, num_steps}));
   }
-  torch::Tensor draft_logits;
-  if (is_probabilistic_draft) {
-    draft_logits = torch::full({batch_size, num_steps, vocab_size},
-                               -std::numeric_limits<float>::infinity(),
-                               float_options);
-  }
+  // q is published sparsely: per-step [batch, top_k] candidate logits keyed
+  // by candidate_ids, never a dense vocabulary buffer. positions records the
+  // candidate column sampled at each step so verification never searches.
+  torch::Tensor draft_logits =
+      is_probabilistic_draft
+          ? torch::empty({batch_size, num_steps, top_k}, float_options)
+          : torch::Tensor();
+  torch::Tensor positions =
+      torch::empty({batch_size, num_steps}, candidates.candidate_ids.options());
   torch::Tensor previous_indices =
       torch::zeros({batch_size}, candidates.candidate_ids.options());
 
@@ -141,14 +127,32 @@ DraftProposal sample_dflash2_path(const DFlash2CandidateOutput& candidates,
             /*dim=*/1, sampled_indices.view({batch_size, 1}), zero_log_probs);
         step_log_probs = torch::where(greedy_rows, one_hot, step_log_probs);
       }
-      draft_logits.select(/*dim=*/1, step)
-          .scatter_(/*dim=*/1, step_candidates, step_log_probs);
+      draft_logits.select(/*dim=*/1, step).copy_(step_log_probs);
     }
+    positions.select(/*dim=*/1, step).copy_(sampled_indices);
+    // The caller's token buffer (the arena view) feeds the verify input, so
+    // translate at the write: the arena and the proposal stay aliased and
+    // target-domain. Tokens stay in the draft domain inside the loop; the
+    // single remap below covers both the buffer and the proposal ids.
     token_ids.select(/*dim=*/1, step).copy_(sampled_tokens);
     previous_indices = sampled_indices;
   }
 
-  return DraftProposal(std::move(token_ids), std::move(draft_logits));
+  if (!vocab_mapping.is_identity()) {
+    // remap reads the full tensor before writing, so in-place is safe.
+    token_ids = vocab_mapping.remap_ids(token_ids);
+  }
+  if (!is_probabilistic_draft) {
+    return DraftProposal(std::move(token_ids));
+  }
+  torch::Tensor candidate_ids = std::move(candidates.candidate_ids);
+  if (!vocab_mapping.is_identity()) {
+    candidate_ids = vocab_mapping.remap_ids(candidate_ids);
+  }
+  return DraftProposal(std::move(token_ids),
+                       std::move(candidate_ids),
+                       std::move(positions),
+                       std::move(draft_logits));
 }
 
 torch::Tensor broadcast_gumbel_noise(int64_t batch_size,
@@ -227,16 +231,15 @@ DraftProposal DFlash2WorkerImpl::run_decode_draft(
        num_speculative_tokens,
        draft_output->selected_hidden.size(-1)});
 
-  DraftProposal draft_proposal;
-  {
+  DraftProposal draft_proposal = [&] {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     DFlash2CandidateOutput candidates =
         draft_impl_->dflash2_candidates(hidden_states, unary_logits, anchors);
-    draft_proposal = sample_dflash2_path(candidates,
-                                         draft_sampling_params,
-                                         selector_noise,
-                                         unary_logits.size(/*dim=*/-1));
-  }
+    return sample_dflash2_path(std::move(candidates),
+                               draft_sampling_params,
+                               selector_noise,
+                               draft_vocab_);
+  }();
   draft_proposal.keep_alive() = take_retained_inputs(*draft_output);
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               draft_timer.elapsed_seconds());

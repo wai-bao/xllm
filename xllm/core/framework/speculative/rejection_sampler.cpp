@@ -20,7 +20,6 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <limits>
-#include <optional>
 #include <tuple>
 #include <utility>
 
@@ -166,9 +165,12 @@ SampleOutput rejection_sample(const SamplingParameters& params,
   if (params.seeds().defined() && !params.is_all_greedy()) {
     // Sampling the target at each logical token offset makes seeded requests
     // independent of batch position and the number of accepted MTP drafts.
-    const torch::Tensor sampled = gumbel_argmax(
-        grouped_logits,
-        gumbel_noise(params, grouped_logits.sizes(), grouped_logits.device()));
+    // One 3-D gumbel_noise seeds each column at offsets[row] + column.
+    torch::Tensor sampled = gumbel_argmax(grouped_logits,
+                                          gumbel_noise(params,
+                                                       grouped_logits.sizes(),
+                                                       grouped_logits.device()))
+                                .to(draft_token_ids.scalar_type());
     SampleOutput output;
     if (num_draft_tokens == 0) {
       output.next_tokens = sampled;
@@ -223,7 +225,7 @@ SampleOutput rejection_sample(const SamplingParameters& params,
   }
   // Only the random/mixed verification legs read the lse; greedy batches
   // (the default draft mode) skip the [B, K, V] fp32 reduction entirely.
-  const torch::Tensor target_lse =
+  const torch::Tensor target_log_sum =
       params.sampling_mode() == SamplingMode::GREEDY
           ? torch::Tensor()
           : torch::logsumexp(
@@ -233,9 +235,6 @@ SampleOutput rejection_sample(const SamplingParameters& params,
                     .to(torch::kFloat32),
                 /*dim=*/-1,
                 /*keepdim=*/false);
-  draft_proposal.validate(
-      /*expected_batch_size=*/grouped_logits.size(0),
-      /*expected_num_speculative_tokens=*/num_draft_tokens);
   const torch::Tensor greedy_target_token_ids =
       full_greedy_token_ids.defined()
           ? full_greedy_token_ids.narrow(
@@ -261,24 +260,16 @@ SampleOutput rejection_sample(const SamplingParameters& params,
 
   auto random_sample_dispatch =
       [&]() -> std::pair<torch::Tensor, torch::Tensor> {
-    const std::optional<torch::Tensor>& draft_logits = draft_proposal.logits();
-
     // Accept p/q > u in log space. −1 sentinel drafts clamp to column 0
     // and are re-masked by the acceptance term.
     const torch::Tensor draft_index =
         draft_token_ids.clamp_min(0).to(torch::kLong);
-    const auto gathered_logit = [&](const torch::Tensor& logits) {
-      return index_select_2d(logits, /*dim=*/-1, draft_index)
-          .to(torch::kFloat32);
-    };
     torch::Tensor target_log_prob =
-        gathered_logit(grouped_logits).sub(target_lse);
-    torch::Tensor draft_lse;
-    if (draft_logits.has_value()) {
-      draft_lse = torch::logsumexp(
-          draft_logits->to(torch::kFloat32), /*dim=*/-1, /*keepdim=*/false);
-      target_log_prob.sub_(gathered_logit(*draft_logits).sub(draft_lse));
-    }
+        index_select_2d(grouped_logits, /*dim=*/-1, draft_index)
+            .to(torch::kFloat32);
+    target_log_prob.sub_(target_log_sum);
+    const torch::Tensor draft_lse = draft_proposal.logsumexp();
+    draft_proposal.apply_acceptance(target_log_prob, draft_index, draft_lse);
     torch::Tensor uniform_rand =
         torch::rand(draft_token_ids.sizes(),
                     grouped_logits.options().dtype(torch::kFloat32));
@@ -290,48 +281,18 @@ SampleOutput rejection_sample(const SamplingParameters& params,
         first_reject.clamp_max(num_draft_tokens - 1).to(torch::kLong);
     const torch::Tensor rejected_tokens =
         draft_token_ids.gather(/*dim=*/1, gather_reject);
-    // Row first_reject[i] of each [B, K, V] tensor as [B, V], kept as
-    // log-probs (row logsumexp subtracted) — the residual recovery works in
-    // log space.
-    const auto row_log_probs = [&](const torch::Tensor& logits,
-                                   const torch::Tensor& lse) {
-      torch::Tensor gathered_logits =
-          index_select_2d(logits,
-                          /*dim=*/1,
-                          gather_reject.expand({grouped_logits.size(0),
-                                                grouped_logits.size(-1)}))
-              .to(torch::kFloat32);
-      return gathered_logits.sub_(lse.gather(/*dim=*/1, gather_reject));
-    };
     // Recovered token from the residual (p - q)+ at the first rejected step;
     // sentinel (-1) drafts carry log q = -inf.
-    torch::Tensor recovered_tokens;
-    {
-      torch::Tensor target_log_probs =
-          row_log_probs(grouped_logits, target_lse);
-      torch::Tensor draft_log_probs =
-          draft_logits.has_value() ? row_log_probs(*draft_logits, draft_lse)
-                                   : torch::Tensor();
-      if (draft_log_probs.defined()) {
-        draft_log_probs.masked_fill_(rejected_tokens.lt(0),
-                                     -std::numeric_limits<float>::infinity());
-        draft_log_probs.sub_(target_log_probs)
-            .nan_to_num_(/*nan=*/0.0)
-            .clamp_max_(0)
-            .exp_()
-            .neg_()
-            .log1p_();
-        target_log_probs.add_(draft_log_probs);
-      } else {
-        const torch::Tensor clamped_rejected = rejected_tokens.clamp_min(0);
-        const torch::Tensor values =
-            target_log_probs.gather(/*dim=*/-1, clamped_rejected);
-        values.masked_fill_(rejected_tokens.ge(0),
-                            -std::numeric_limits<float>::infinity());
-        target_log_probs.scatter_(/*dim=*/-1, clamped_rejected, values);
-      }
-      recovered_tokens = gumbel_sample(target_log_probs);
-    }
+    torch::Tensor target_log_probs =
+        index_select_2d(grouped_logits,
+                        /*dim=*/1,
+                        gather_reject.expand(
+                            {grouped_logits.size(0), grouped_logits.size(-1)}))
+            .to(torch::kFloat32)
+            .sub_(target_log_sum.gather(/*dim=*/1, gather_reject));
+    draft_proposal.apply_residual(
+        target_log_probs, gather_reject, rejected_tokens, draft_lse);
+    const torch::Tensor recovered_tokens = gumbel_sample(target_log_probs);
     auto recovered_token_ids = recovered_tokens.unsqueeze(/*dim=*/-1);
     return {commit_prefix(accepted, recovered_token_ids), first_reject};
   };

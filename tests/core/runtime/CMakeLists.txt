@@ -490,3 +490,4 @@ target_link_options(dspark_sampler_test PRIVATE
   "-Wl,--whole-archive"
   "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
   "-Wl,--no-whole-archive")
+

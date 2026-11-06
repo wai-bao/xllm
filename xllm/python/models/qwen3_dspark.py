@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar
 
 import torch
 import torch.nn as nn
@@ -37,8 +36,6 @@ from xllm.python.models.qwen3_dflash import (
 
 @dataclass
 class Qwen3DSparkConfig(DFlashQwen3Config):
-    supports_reduced_draft_vocab: ClassVar[bool] = True
-
     markov_rank: int = 0
     enable_confidence_head: bool = False
     confidence_head_with_markov: bool = False
