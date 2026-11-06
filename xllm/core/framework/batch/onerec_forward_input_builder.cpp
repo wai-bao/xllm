@@ -32,7 +32,6 @@ limitations under the License.
 #include "core/framework/sampling/sampling_params.h"
 #include "core/kv_cache/layout/seq_lens_layout.h"
 #include "core/util/tensor_helper.h"
-#include "core/util/utils.h"
 #include "core/util/threadpool.h"
 
 namespace xllm {
@@ -531,22 +530,12 @@ RecForwardInput OneRecForwardInputBuilder::build_rec_forward_input(
 
   auto build_block_tables = [&input_params, num_sequences]() {
     std::vector<std::vector<int32_t>> empty_block_tables(num_sequences);
-    util::pad_2d_vector(empty_block_tables, 0);
-    input_params.attention.device.block_tables =
-        create_2d_tensor(empty_block_tables, torch::kInt);
-    input_params.attention.host.block_tables =
-        input_params.attention.device.block_tables;
+    AttentionInputView(input_params.attention)
+        .set_block_tables_from(empty_block_tables, /*pad_value=*/0);
 
     std::vector<int32_t> paged_kv_indptr(num_sequences + 1, 0);
     input_params.attention.device.new_cache_slots =
-        torch::empty({static_cast<int64_t>(paged_kv_indptr.size())},
-                     torch::TensorOptions()
-                         .dtype(torch::kInt)
-                         .device(torch::kCPU)
-                         .pinned_memory(true));
-    std::memcpy(input_params.attention.device.new_cache_slots.data_ptr<int>(),
-                paged_kv_indptr.data(),
-                paged_kv_indptr.size() * sizeof(int));
+        make_pinned_cpu_tensor(paged_kv_indptr);
   };
 
   if (thread_pool_ && num_sequences >= kSequenceParallelGrain) {

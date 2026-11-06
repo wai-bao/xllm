@@ -40,7 +40,6 @@ limitations under the License.
 #include "core/util/rec_model_utils.h"
 #include "core/util/slice.h"
 #include "core/util/tensor_helper.h"
-#include "core/util/utils.h"
 #include "core/util/threadpool.h"
 
 namespace xllm {
@@ -312,11 +311,8 @@ RecForwardInput RecMultiRoundForwardInputBuilder::state_to_forward_input() {
   input_params.features.mm_data.batch(mm_data_vec_);
 
   // Setup block tables
-  util::pad_2d_vector(state.block_tables_vec, /*pad_value=*/0);
-  input_params.attention.device.block_tables =
-      create_2d_tensor(state.block_tables_vec, torch::kInt);
-  input_params.attention.host.block_tables =
-      input_params.attention.device.block_tables;
+  AttentionInputView(input_params.attention)
+      .set_block_tables_from(state.block_tables_vec, /*pad_value=*/0);
 
   if (input_embeddings_vec_.size() != 0) {
     input_params.embedding.input_embedding = torch::cat(input_embeddings_vec_);

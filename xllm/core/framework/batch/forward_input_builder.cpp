@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/framework/config/model_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/framework/model/domain_attention_input.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_params_view.h"
 #include "core/framework/multimodal/mm_visitor.h"
@@ -1232,20 +1233,13 @@ Input ForwardInputBuilder::state_to_forward_input() {
   }
 
   // Setup block tables
-  util::pad_2d_vector(state_.block_tables_vec, /*pad_value=*/0);
-  input_params.attention.device.block_tables =
-      create_2d_tensor(state_.block_tables_vec, torch::kInt);
-  input_params.attention.host.block_tables =
-      input_params.attention.device.block_tables;
+  AttentionInputView(input_params.attention)
+      .set_block_tables_from(state_.block_tables_vec, /*pad_value=*/0);
 
   // Setup grouped cache block tables.
   if constexpr (!std::is_same_v<Input, RecForwardInput>) {
-    input_params.multi_block_tables.reserve(state_.multi_block_tables.size());
-    for (auto& mgr_tables : state_.multi_block_tables) {
-      util::pad_2d_vector(mgr_tables, /*pad_value=*/-1);
-      input_params.multi_block_tables.emplace_back(
-          create_2d_tensor(mgr_tables, torch::kInt));
-    }
+    input_params.multi_block_tables =
+        pad_and_stack_grouped_tables(state_.multi_block_tables);
   }
 
   if (input_embeddings_vec_.size() != 0) {

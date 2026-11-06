@@ -20,6 +20,7 @@ limitations under the License.
 #include <utility>
 
 #include "core/framework/model/model_input_types.h"
+#include "core/util/tensor_helper.h"
 
 namespace xllm {
 
@@ -295,6 +296,15 @@ class AttentionInputView final {
   void reserve_device_buffer_capacity(uint64_t capacity,
                                       const torch::Device& target_device) {
     ensure_attention_buffer_capacity(capacity, target_device);
+  }
+
+  // Materializes a rectangular block-id table and mirrors it onto the host
+  // view, so every builder publishes the same device/host pair.
+  void set_block_tables_from(std::vector<std::vector<int32_t>>& tables,
+                             int32_t pad_value) {
+    util::pad_2d_vector(tables, pad_value);
+    device.block_tables = create_2d_tensor(tables, torch::kInt);
+    host.block_tables = device.block_tables;
   }
 
   AttentionHostInputView host;
