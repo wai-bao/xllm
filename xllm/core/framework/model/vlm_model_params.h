@@ -92,16 +92,7 @@ class VlmModelParams final {
   }
 
   int32_t get_q_seq_len(int32_t seq_idx) const {
-    CHECK_GE(seq_idx, 0);
-#if defined(USE_NPU)
-    CHECK_LT(seq_idx, static_cast<int32_t>(attention.host.q_seq_lens.size()));
-    return attention.host.q_seq_lens[seq_idx];
-#else
-    CHECK_LT(seq_idx + 1,
-             static_cast<int32_t>(attention.host.q_seq_lens.size()));
-    return attention.host.q_seq_lens[seq_idx + 1] -
-           attention.host.q_seq_lens[seq_idx];
-#endif
+    return attention.host.q_seq_lens[static_cast<size_t>(seq_idx)];
   }
 
   bool synchronize_layer(int64_t layer_idx) const {

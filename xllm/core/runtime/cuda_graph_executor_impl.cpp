@@ -32,6 +32,7 @@ limitations under the License.
 #include "core/common/metrics.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/rec_config.h"
+#include "core/kv_cache/layout/paged_kv_layout.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/layers/cuda/flashinfer_planinfo.h"
@@ -42,7 +43,10 @@ limitations under the License.
 #include "core/platform/stream.h"
 #include "core/platform/vmm_torch_allocator.h"
 #include "core/runtime/graph_input_snapshot.h"
+#include "core/runtime/graph_seq_lens_sync.h"
 #include "core/util/rec_model_utils.h"
+#include "core/util/seq_lens.h"
+#include "core/util/tensor_helper.h"
 #include "core/util/utils.h"
 #include "kernels/cuda/global_capture_instance.h"
 #include "kernels/cuda/utils.h"
@@ -256,13 +260,14 @@ void CudaGraphPersistentParam::update_llm_decode_metadata_fast_path(
   CHECK_GE(actual_num_tokens, 0) << "actual_num_tokens must be >= 0";
   const int64_t actual_indices_size =
       params.attention.device.paged_kv_indices.size(0);
+  seq_lens::fill_query_start_loc(
+      params.attention.device.kv_seq_lens, actual_batch_size, kv_seq_lens_);
   xllm::kernel::cuda::LlmDecodeMetadataUpdateParams update_params{
       .src_tokens = tokens.template data_ptr<int32_t>(),
       .src_positions = positions.template data_ptr<int32_t>(),
       .src_new_cache_slots =
           params.attention.device.new_cache_slots.template data_ptr<int32_t>(),
-      .src_kv_seq_lens =
-          params.attention.device.kv_seq_lens.template data_ptr<int32_t>(),
+      .src_kv_seq_lens = kv_seq_lens_.template data_ptr<int32_t>(),
       .src_paged_kv_indptr =
           params.attention.device.paged_kv_indptr.template data_ptr<int32_t>(),
       .src_paged_kv_indices =
@@ -436,30 +441,12 @@ std::optional<Params> CudaGraphPersistentParam::update(
   }
 
   if (!is_rec_multi_round_graph_input(params) && !use_llm_decode_fast_path) {
-    // q_seq_lens is q_cu_seq_lens in GPU Model.
-    // kv_seq_lens is kv_cu_seq_lens in GPU Model.
-    VLOG(kGraphExecutorLogVerboseLevel)
-        << "copy_ q_seq_lens: src shape="
-        << params.attention.device.q_seq_lens.sizes() << ", dst slice shape=["
-        << actual_batch_size + 1 << "]";
-    q_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/actual_batch_size + 1)
-        .copy_(params.attention.device.q_seq_lens, /*non_blocking=*/true);
-
-    VLOG(kGraphExecutorLogVerboseLevel)
-        << "copy_ kv_seq_lens: src shape="
-        << params.attention.device.kv_seq_lens.sizes() << ", dst slice shape=["
-        << actual_batch_size + 1 << "]";
-    kv_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/actual_batch_size + 1)
-        .copy_(params.attention.device.kv_seq_lens, /*non_blocking=*/true);
-    if (params.meta.batch_forward_type.is_decode() &&
-        padded_num_tokens > actual_num_tokens) {
-      kv_seq_lens_
-          .slice(/*dim=*/0,
-                 /*start=*/actual_batch_size + 1,
-                 /*end=*/padded_num_tokens + 1)
-          .fill_(
-              params.attention.device.kv_seq_lens[-1].template item<int32_t>());
-    }
+    sync_graph_seq_lens(params,
+                        actual_batch_size,
+                        actual_num_tokens,
+                        padded_num_tokens,
+                        q_seq_lens_,
+                        kv_seq_lens_);
 
     VLOG(kGraphExecutorLogVerboseLevel)
         << "copy_ new_cache_slots: src shape="
@@ -473,7 +460,7 @@ std::optional<Params> CudaGraphPersistentParam::update(
           .slice(/*dim=*/0,
                  /*start=*/actual_num_tokens,
                  /*end=*/padded_num_tokens)
-          .fill_(-1);
+          .fill_(kPadSlotId);
     }
 
     // Keep metadata tensors pointing to persistent buffers used by graph
@@ -594,23 +581,20 @@ std::optional<Params> CudaGraphPersistentParam::update(
       if (params.attention.device.q_seq_lens.defined() &&
           params.attention.device.q_seq_lens.numel() > 0) {
         const int64_t q_numel = params.attention.device.q_seq_lens.numel();
-        q_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/q_numel)
-            .copy_(params.attention.device.q_seq_lens, /*non_blocking=*/true);
+        seq_lens::fill_query_start_loc(
+            params.attention.device.q_seq_lens, q_numel, q_seq_lens_);
         attn_metadata->q_cu_seq_lens =
-            q_seq_lens(/*actual_batch_size=*/q_numel);
+            q_seq_lens(/*actual_batch_size=*/q_numel + 1);
       }
 
       if (params.attention.device.kv_seq_lens.defined() &&
           params.attention.device.kv_seq_lens.numel() > 0) {
         const int64_t kv_numel = params.attention.device.kv_seq_lens.numel();
-        kv_seq_lens_.slice(/*dim=*/0, /*start=*/0, /*end=*/kv_numel)
-            .copy_(params.attention.device.kv_seq_lens, /*non_blocking=*/true);
+        seq_lens::fill_query_start_loc(
+            params.attention.device.kv_seq_lens, kv_numel, kv_seq_lens_);
         attn_metadata->kv_cu_seq_lens =
-            kv_seq_lens(/*actual_batch_size=*/kv_numel);
-        if (kv_numel > 1) {
-          attn_metadata->kv_seq_lens =
-              torch::diff(attn_metadata->kv_cu_seq_lens);
-        }
+            kv_seq_lens(/*actual_batch_size=*/kv_numel + 1);
+        attn_metadata->kv_seq_lens = params.attention.device.kv_seq_lens;
       }
 
       attn_metadata->paged_kv_indptr = torch::Tensor();

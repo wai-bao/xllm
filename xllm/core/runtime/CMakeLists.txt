@@ -26,6 +26,7 @@ cc_library(
     rec_executor_backend.h
     rec_executor_impl_factory.h
     graph_input_snapshot.h
+    graph_seq_lens_sync.h
     rec_graph_input.h
     dit_executor.h
     $<$<BOOL:${USE_NPU}>:acl_graph_bucket_policy.h>
