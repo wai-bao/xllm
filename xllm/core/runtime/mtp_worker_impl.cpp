@@ -1836,12 +1836,11 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
         }
         break;
       }
-      current_draft_input.sampling_params.filter_bitmask() =
+      current_draft_input.sampling_params.set_filter_bitmask(
           build_json_object_filter_bitmask(
               current_draft_input.json_object_states,
               device_,
-              JsonObjectMaskBuildPhase::DRAFT);
-      current_draft_input.sampling_params.filter_mask() = torch::Tensor();
+              JsonObjectMaskBuildPhase::DRAFT));
     }
     CHECK(compute_stream_->wait_event(
         current_draft_input.runtime.metadata_ready_event))
@@ -1892,11 +1891,10 @@ void MTPWorkerImpl<TargetInput>::fill_validate_input_from_draft_outputs(
         input.json_object_states,
         *json_scratch,
         validate_input.json_object_invalid_draft);
-    validate_input.sampling_params.filter_bitmask() =
+    validate_input.sampling_params.set_filter_bitmask(
         build_json_object_filter_bitmask(validate_input.json_object_states,
                                          device_,
-                                         JsonObjectMaskBuildPhase::TARGET);
-    validate_input.sampling_params.filter_mask() = torch::Tensor();
+                                         JsonObjectMaskBuildPhase::TARGET));
   }
 
   validate_input.runtime.device_tensors_ready = false;
@@ -2053,9 +2051,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
           verify_params.min_token_positions() - first_positions;
     }
     if (validate_input.sampling_params.filter_bitmask().defined()) {
-      verify_params.filter_bitmask() =
-          validate_input.sampling_params.filter_bitmask();
-      verify_params.filter_mask() = torch::Tensor();
+      verify_params.set_filter_bitmask(
+          validate_input.sampling_params.filter_bitmask());
     }
     val_output = validate(std::move(verify_params),
                           draft_outputs,
@@ -2150,7 +2147,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
 
     const torch::Tensor accepted_tokens =
         to_cpu_contiguous(accepted_tokens_host, torch::kInt64);
-    const std::vector<detail::JsonAcceptedTokenMismatch> mismatches =
+    const std::vector<JsonAcceptedTokenMismatch> mismatches =
         detail::find_json_accepted_token_mismatches(
             input.json_object_states,
             accepted_tokens.const_data_ptr<int64_t>(),
@@ -2171,7 +2168,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
           << "MTP JSON output error requires a sampled sequence id";
       failed_sequence_ids.emplace(error.sample_sequence_id);
     }
-    for (const detail::JsonAcceptedTokenMismatch& mismatch : mismatches) {
+    for (const JsonAcceptedTokenMismatch& mismatch : mismatches) {
       const std::string& sample_sequence_id =
           input.sample_sequence_ids[mismatch.sequence_index];
       CHECK(!sample_sequence_id.empty())

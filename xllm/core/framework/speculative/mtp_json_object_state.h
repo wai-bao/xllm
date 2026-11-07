@@ -20,7 +20,6 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <utility>
 #include <vector>
 
@@ -33,14 +32,6 @@ struct JsonDraftValidationScratch final {
   std::vector<std::vector<JsonObjectGrammarState>> states_after;
   // Invalid suffix flags in [draft_step][sequence] order.
   std::vector<uint8_t> invalid_draft_step_major;
-};
-
-struct JsonAcceptedTokenMismatch final {
-  size_t sequence_index = 0;
-  size_t token_offset = 0;
-  int32_t token_id = -1;
-  size_t committed_tokens = 0;
-  uint64_t state_fingerprint = 0;
 };
 
 inline std::vector<int32_t> copy_json_draft_token_ids(const int64_t* token_ids,
@@ -70,13 +61,10 @@ inline bool append_json_draft_step(
   std::vector<JsonObjectGrammarState> next_states = current_states;
   bool halt_json_draft = false;
   for (size_t state_idx = 0; state_idx < next_states.size(); ++state_idx) {
-    const JsonObjectGrammarState& state = current_states[state_idx];
     bool invalid = invalid_suffix[state_idx] != 0;
-    if (!invalid && state.initialized()) {
-      invalid = !state.can_accept_token(token_ids[state_idx]);
-      if (!invalid) {
-        CHECK(next_states[state_idx].accept_token(token_ids[state_idx]));
-      } else {
+    if (!invalid && next_states[state_idx].initialized()) {
+      invalid = !next_states[state_idx].accept_token(token_ids[state_idx]);
+      if (invalid) {
         halt_json_draft = true;
       }
     }
@@ -136,32 +124,18 @@ find_json_accepted_token_mismatches(
   std::vector<JsonAcceptedTokenMismatch> mismatches;
   mismatches.reserve(num_rows);
   for (size_t sequence_index = 0; sequence_index < num_rows; ++sequence_index) {
-    JsonObjectGrammarState state = initial_states[sequence_index];
-    if (!state.initialized()) {
+    if (!initial_states[sequence_index].initialized()) {
       continue;
     }
-
-    const size_t row_offset = sequence_index * row_width;
-    for (size_t token_offset = 0; token_offset < row_width; ++token_offset) {
-      const int64_t raw_token_id = accepted_tokens[row_offset + token_offset];
-      if (raw_token_id < 0) {
-        break;
-      }
-      CHECK_LE(raw_token_id,
-               static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
-          << "JSON accepted output token id exceeds int32 range";
-      const int32_t token_id = static_cast<int32_t>(raw_token_id);
-      if (!state.can_accept_token(token_id)) {
-        const JsonObjectGrammarSnapshot snapshot = state.snapshot();
-        mismatches.push_back({sequence_index,
-                              token_offset,
-                              token_id,
-                              snapshot.token_ids.size(),
-                              state.fingerprint()});
-        break;
-      }
-      CHECK(state.accept_token(token_id));
-    }
+    JsonObjectGrammarState state = initial_states[sequence_index].trial_state();
+    scan_json_accepted_tokens(
+        state,
+        initial_states[sequence_index].committed_token_count(),
+        sequence_index,
+        row_width,
+        accepted_tokens + sequence_index * row_width,
+        /*token_stride=*/1,
+        mismatches);
   }
   return mismatches;
 }

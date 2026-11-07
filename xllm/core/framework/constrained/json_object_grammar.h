@@ -50,6 +50,7 @@ class JsonObjectGrammarState final {
   JsonObjectGrammarState() = default;
 
   bool can_accept_token(int32_t token_id) const;
+  // All-or-nothing: a rejected token leaves the state exactly as it was.
   bool accept_token(int32_t token_id);
 
   bool can_accept_piece(std::string_view piece) const;
@@ -62,6 +63,10 @@ class JsonObjectGrammarState final {
   bool initialized() const { return grammar_ != nullptr; }
   const JsonObjectGrammar* grammar() const { return grammar_; }
   JsonObjectGrammarSnapshot snapshot() const;
+  // committed_token_ids_.size() without cloning the history.
+  size_t committed_token_count() const { return committed_token_ids_.size(); }
+  // Matcher-only copy without the committed-token history.
+  JsonObjectGrammarState trial_state() const;
   // Fingerprint of the matcher FSM only (not committed token history). Used for
   // mask caching and debug; identical FSMs share the same mask.
   uint64_t fingerprint() const;
@@ -263,9 +268,38 @@ torch::Tensor build_json_object_filter_bitmask(
     const torch::Device& device = torch::kCPU,
     JsonObjectMaskBuildPhase phase = JsonObjectMaskBuildPhase::NORMAL);
 
-// Advances each initialized state with its corresponding accepted token.
-std::vector<JsonObjectGrammarState> advance_json_object_states(
-    const std::vector<JsonObjectGrammarState>& states,
-    const std::vector<int32_t>& token_ids);
+// One rejected token during accepted-token scanning.
+struct JsonAcceptedTokenMismatch final {
+  size_t sequence_index = 0;
+  size_t token_offset = 0;
+  int32_t token_id = -1;
+  size_t committed_tokens = 0;
+  uint64_t state_fingerprint = 0;
+};
+
+// Scans one grammar state against a row of accepted tokens, advancing the
+// state in place, until the row ends (negative token), the state rejects a
+// token, or the row is exhausted. A rejection is recorded as a mismatch
+// (committed_tokens = base + token_offset) and true is returned; resetting
+// the state afterwards is the caller's policy.
+bool scan_json_accepted_tokens(
+    JsonObjectGrammarState& state,
+    size_t base_committed_tokens,
+    size_t sequence_index,
+    size_t row_width,
+    const int64_t* row_tokens,
+    int64_t token_stride,
+    std::vector<JsonAcceptedTokenMismatch>& mismatches);
+
+// Advances the borrowed grammar states in place with their accepted tokens.
+// Tokens must already be ready on CPU, int64, and 1-D or 2-D. Each state maps
+// to one token row, or -1 when it has no newly accepted tokens. Uninitialized
+// states are skipped. An undefined tensor is allowed only when every
+// initialized state maps to -1. A negative token ends its row. A state whose
+// token violates the grammar is recorded and reset to uninitialized.
+std::vector<JsonAcceptedTokenMismatch> advance_json_object_constraints(
+    std::vector<JsonObjectGrammarState>& states,
+    const torch::Tensor& accepted_tokens,
+    const std::vector<int32_t>& token_rows);
 
 }  // namespace xllm

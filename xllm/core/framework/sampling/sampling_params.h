@@ -175,6 +175,13 @@ class SamplingConstraints final {
   // defined, sample() prefers this over filter_mask (smaller H2D).
   PROPERTY(torch::Tensor, filter_bitmask);
 
+  // Installs the bitmask, keeping it mutually exclusive with the dense
+  // filter_mask (no duplicate H2D copy).
+  void set_filter_bitmask(torch::Tensor bitmask) {
+    filter_bitmask() = std::move(bitmask);
+    filter_mask() = torch::Tensor();
+  }
+
   // Per-selected-row additive logits bias.
   PROPERTY(torch::Tensor, logits_bias);
 
@@ -264,6 +271,10 @@ class SamplingParameters final {
   PROPERTY(SamplingConstraints, constraints);
   FORWARD_PROPERTY(torch::Tensor, filter_mask, constraints);
   FORWARD_PROPERTY(torch::Tensor, filter_bitmask, constraints);
+  void set_filter_bitmask(torch::Tensor bitmask) {
+    constraints().set_filter_bitmask(std::move(bitmask));
+  }
+
   FORWARD_PROPERTY(torch::Tensor, logits_bias, constraints);
   FORWARD_PROPERTY(torch::Tensor, min_token_positions, constraints);
   FORWARD_PROPERTY(torch::Tensor, min_tokens_remaining, constraints);

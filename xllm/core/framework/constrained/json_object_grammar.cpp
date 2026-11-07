@@ -183,7 +183,9 @@ bool JsonObjectGrammarState::accept_token(int32_t token_id) {
   if (piece.empty()) {
     return false;
   }
+  const JsonObjectGrammarState checkpoint = trial_state();
   if (!accept_piece(piece)) {
+    copy_trial_state_from(checkpoint);
     return false;
   }
   committed_token_ids_.push_back(token_id);
@@ -196,6 +198,12 @@ JsonObjectGrammarSnapshot JsonObjectGrammarState::snapshot() const {
   snapshot.reasoning_enabled = reasoning_enabled_;
   snapshot.token_ids = committed_token_ids_;
   return snapshot;
+}
+
+JsonObjectGrammarState JsonObjectGrammarState::trial_state() const {
+  JsonObjectGrammarState state;
+  state.copy_trial_state_from(*this);
+  return state;
 }
 
 uint64_t JsonObjectGrammarState::fingerprint() const {
@@ -1024,32 +1032,101 @@ torch::Tensor build_json_object_filter_bitmask(
   return mask;
 }
 
-std::vector<JsonObjectGrammarState> advance_json_object_states(
-    const std::vector<JsonObjectGrammarState>& states,
-    const std::vector<int32_t>& token_ids) {
-  CHECK_EQ(states.size(), token_ids.size())
-      << "JSON grammar state/token count mismatch";
-  std::vector<JsonObjectGrammarState> next_states = states;
-  for (size_t state_idx = 0; state_idx < next_states.size(); ++state_idx) {
-    if (!next_states[state_idx].initialized()) {
-      continue;
-    }
-    if (!next_states[state_idx].can_accept_token(token_ids[state_idx])) {
-      // Leave the state frozen at the last valid prefix. Callers that drive
-      // MTP draft loops should stop further drafting once this happens.
-      continue;
-    }
-    CHECK(next_states[state_idx].accept_token(token_ids[state_idx]))
-        << "JSON grammar state transition failed, token_id="
-        << token_ids[state_idx];
-  }
-  return next_states;
-}
-
 const std::string& JsonObjectGrammar::token_piece(int32_t token_id) const {
   CHECK_GE(token_id, 0);
   CHECK_LT(static_cast<size_t>(token_id), token_pieces_.size());
   return token_pieces_[token_id];
+}
+
+bool scan_json_accepted_tokens(
+    JsonObjectGrammarState& state,
+    size_t base_committed_tokens,
+    size_t sequence_index,
+    size_t row_width,
+    const int64_t* row_tokens,
+    int64_t token_stride,
+    std::vector<JsonAcceptedTokenMismatch>& mismatches) {
+  for (size_t token_offset = 0; token_offset < row_width; ++token_offset) {
+    const int64_t raw_token_id =
+        row_tokens[static_cast<int64_t>(token_offset) * token_stride];
+    if (raw_token_id < 0) {
+      break;
+    }
+    const int32_t token_id = static_cast<int32_t>(raw_token_id);
+    if (!state.accept_token(token_id)) {
+      mismatches.push_back({sequence_index,
+                            token_offset,
+                            token_id,
+                            base_committed_tokens + token_offset,
+                            state.fingerprint()});
+      return true;
+    }
+  }
+  return false;
+}
+
+std::vector<JsonAcceptedTokenMismatch> advance_json_object_constraints(
+    std::vector<JsonObjectGrammarState>& states,
+    const torch::Tensor& accepted_tokens,
+    const std::vector<int32_t>& token_rows) {
+  CHECK_EQ(token_rows.size(), states.size())
+      << "JSON constraint states must align with accepted-token rows";
+  for (const int32_t token_row : token_rows) {
+    CHECK_GE(token_row, -1)
+        << "JSON constraint token rows must be nonnegative or -1";
+  }
+  if (!accepted_tokens.defined()) {
+    for (size_t state_index = 0; state_index < states.size(); ++state_index) {
+      if (!states[state_index].initialized()) {
+        continue;
+      }
+      CHECK_EQ(token_rows[state_index], -1)
+          << "JSON constraint advancement requires accepted tokens";
+    }
+    return {};
+  }
+
+  CHECK(accepted_tokens.device().is_cpu())
+      << "JSON constraint tokens must already be ready on CPU";
+  CHECK(accepted_tokens.dim() == 1 || accepted_tokens.dim() == 2)
+      << "JSON constraint tokens must be 1-D or 2-D";
+  for (size_t state_index = 0; state_index < states.size(); ++state_index) {
+    if (!states[state_index].initialized()) {
+      continue;
+    }
+    CHECK_LT(token_rows[state_index], accepted_tokens.size(0))
+        << "JSON constraint token row is outside the accepted-token tensor";
+  }
+
+  const int64_t* token_data = accepted_tokens.const_data_ptr<int64_t>();
+  const int64_t row_stride = accepted_tokens.stride(0);
+  const bool has_multiple_tokens = accepted_tokens.dim() == 2;
+  const int64_t tokens_per_row =
+      has_multiple_tokens ? accepted_tokens.size(1) : 1;
+  const int64_t token_stride =
+      has_multiple_tokens ? accepted_tokens.stride(1) : 0;
+  std::vector<JsonAcceptedTokenMismatch> violations;
+  violations.reserve(states.size());
+  for (size_t state_index = 0; state_index < states.size(); ++state_index) {
+    JsonObjectGrammarState& state = states[state_index];
+    const int32_t token_row = token_rows[state_index];
+    if (!state.initialized() || token_row == -1) {
+      continue;
+    }
+    const int64_t row_offset = static_cast<int64_t>(token_row) * row_stride;
+    const bool mismatched =
+        scan_json_accepted_tokens(state,
+                                  state.committed_token_count(),
+                                  state_index,
+                                  static_cast<size_t>(tokens_per_row),
+                                  token_data + row_offset,
+                                  token_stride,
+                                  violations);
+    if (mismatched) {
+      state = JsonObjectGrammarState();
+    }
+  }
+  return violations;
 }
 
 }  // namespace xllm

@@ -142,23 +142,6 @@ TEST(JsonObjectGrammarTest, TemporaryAdvanceDoesNotCommitState) {
   EXPECT_TRUE(state.is_complete());
 }
 
-TEST(JsonObjectGrammarTest, MtpDraftStatesAccumulateAcceptedTokens) {
-  JsonObjectGrammar grammar = make_grammar();
-  std::vector<JsonObjectGrammarState> original_states = {
-      grammar.initial_state()};
-
-  // The second draft row must be built from S+d0, not from the original S.
-  const std::vector<JsonObjectGrammarState> after_d0 =
-      advance_json_object_states(original_states, {0});
-  const std::vector<JsonObjectGrammarState> cumulative_states =
-      advance_json_object_states(after_d0, {2});
-  const std::vector<JsonObjectGrammarState> reset_states =
-      advance_json_object_states(original_states, {2});
-
-  EXPECT_TRUE(cumulative_states[0].can_accept_token(/*d2=*/3));
-  EXPECT_FALSE(reset_states[0].can_accept_token(/*d2=*/3));
-}
-
 TEST(JsonObjectGrammarTest, SnapshotRestoresCommittedState) {
   JsonObjectGrammar grammar = make_grammar();
   JsonObjectGrammarState state = grammar.initial_state();

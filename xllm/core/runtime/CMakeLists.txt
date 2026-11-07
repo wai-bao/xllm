@@ -140,7 +140,7 @@ cc_library(
     :models
     :sampler
     :rec_constrained_decoding
-    :json_object_constraint_batch
+    :json_object_grammar
     :tokenizer
     :model_loader
     :util

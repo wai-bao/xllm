@@ -18,18 +18,6 @@ cc_library(
 
 cc_library(
   NAME
-    json_object_constraint_batch
-  HDRS
-    json_object_constraint_batch.h
-  SRCS
-    json_object_constraint_batch.cpp
-  DEPS
-    :json_object_grammar
-    glog::glog
-    torch)
-
-cc_library(
-  NAME
     rec_constrained_decoding
   HDRS
     rec_constrained_decoding.h

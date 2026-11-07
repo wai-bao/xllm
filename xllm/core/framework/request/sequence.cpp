@@ -256,12 +256,10 @@ bool Sequence::try_commit_json_object_token(int32_t token_id,
   if (!json_object_state_.has_value() || token_id < 0) {
     return true;
   }
-  if (json_object_state_->can_accept_token(token_id)) {
-    CHECK(json_object_state_->accept_token(token_id));
+  if (json_object_state_->accept_token(token_id)) {
     return true;
   }
 
-  const JsonObjectGrammarSnapshot snapshot = json_object_state_->snapshot();
   const bool is_overlap_commit = token_offset >= 0;
   if (is_overlap_commit) {
     const JsonObjectGrammar* grammar = json_object_state_->grammar();
@@ -270,7 +268,7 @@ bool Sequence::try_commit_json_object_token(int32_t token_id,
         << ", request_id=" << request_id() << ", sequence_index=" << index_
         << ", output_row=-1"
         << ", token_id=" << token_id
-        << ", committed_tokens=" << snapshot.token_ids.size()
+        << ", committed_tokens=" << json_object_state_->committed_token_count()
         << ", state_fingerprint=" << json_object_state_->fingerprint()
         << ", allowed_tokens="
         << (grammar == nullptr
@@ -280,8 +278,8 @@ bool Sequence::try_commit_json_object_token(int32_t token_id,
     LOG(ERROR) << "JSON grammar commit mismatch: request_id=" << request_id()
                << ", sequence_index=" << index_
                << ", output_row=-1, token_offset=-1"
-               << ", token_id=" << token_id
-               << ", committed_tokens=" << snapshot.token_ids.size()
+               << ", token_id=" << token_id << ", committed_tokens="
+               << json_object_state_->committed_token_count()
                << ", state_fingerprint=" << json_object_state_->fingerprint();
   }
   const std::string token_source =
