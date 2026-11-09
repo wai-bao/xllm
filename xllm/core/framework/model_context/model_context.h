@@ -15,11 +15,7 @@ limitations under the License.
 
 #pragma once
 
-#if defined(USE_NPU)
-namespace atb {
-class Context;
-}  // namespace atb
-#endif
+#include <glog/logging.h>
 
 #include <memory>
 #include <string>
@@ -29,6 +25,9 @@ class Context;
 #include "core/framework/model/model_args.h"
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/quantization/quant_args.h"
+#if defined(USE_NPU)
+#include "atb/atb_infer.h"
+#endif
 
 namespace xllm {
 
@@ -36,6 +35,18 @@ class ModelStreamRegistry;
 
 #if defined(USE_NPU)
 class AtbWorkspace;
+
+// Creates an ATB context and wraps it for shared ownership through one
+// failure-checked path.
+inline std::shared_ptr<atb::Context> create_owned_atb_context(
+    const char* what) {
+  atb::Context* context = nullptr;
+  const atb::Status status = atb::CreateContext(&context);
+  CHECK_EQ(status, atb::NO_ERROR) << "Failed to create " << what;
+  CHECK(context != nullptr);
+  return std::shared_ptr<atb::Context>(
+      context, [](atb::Context* owned) { atb::DestroyContext(owned); });
+}
 #endif
 
 // Internal optimization configuration.
@@ -70,7 +81,7 @@ class ModelContext {
                const ModelArgs& model_args,
                const QuantArgs& quant_args,
                const torch::TensorOptions& tensor_options,
-               atb::Context* context);
+               std::shared_ptr<atb::Context> context);
 #endif
 
   const ModelArgs& get_model_args() const { return model_args_; }
@@ -104,7 +115,7 @@ class ModelContext {
   ModelContext with_quant_args(const QuantArgs& quant_args) const;
 
 #if defined(USE_NPU)
-  const atb::Context* get_atb_context() const { return context_; }
+  const atb::Context* get_atb_context() const { return context_owner_.get(); }
   std::shared_ptr<AtbWorkspace> get_atb_workspace() const {
     return atb_workspace_;
   }
@@ -145,8 +156,9 @@ class ModelContext {
   std::shared_ptr<ModelStreamRegistry> stream_registry_;
 
 #if defined(USE_NPU)
-  // used for npu atb
-  atb::Context* context_;
+  // used for npu atb; owns the context for the lifetime of every derived
+  // ModelContext sharing it.
+  std::shared_ptr<atb::Context> context_owner_;
   std::shared_ptr<AtbWorkspace> atb_workspace_;
 #endif
 };

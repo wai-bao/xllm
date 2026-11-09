@@ -634,12 +634,17 @@ void HierarchyKVCacheTransfer::set_layer_synchronizer(ModelParamsView& params) {
         << "Invalid Host draft restore event at batch_id="
         << params.meta.batch_id;
   }
-  params.parallel.layer_wise_load_synchronizer = handle->synchronizer;
-  params.parallel.layers_per_event = handle->layers_per_event;
-  params.parallel.draft_load_event_index = handle->draft_event_index;
+  bind_load_handle(params, std::move(*handle));
   // Derived target/draft inputs retain the synchronizer, not a second request
   // to consume the same batch's handle.
   params.meta.requires_host_restore = false;
+}
+
+void HierarchyKVCacheTransfer::bind_load_handle(ModelParamsView& params,
+                                                HostKVLoadHandle handle) {
+  params.parallel.layer_wise_load_synchronizer = std::move(handle.synchronizer);
+  params.parallel.layers_per_event = handle.layers_per_event;
+  params.parallel.draft_load_event_index = handle.draft_event_index;
 }
 
 std::optional<HostKVLoadHandle> HierarchyKVCacheTransfer::take_load_handle(

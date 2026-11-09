@@ -26,6 +26,8 @@ limitations under the License.
 
 #include "core/framework/sampling/logits_processor.h"
 #include "core/framework/sampling/sampler.h"
+#include "core/framework/sampling/sampling_params.h"
+#include "core/framework/speculative/draft_input.h"
 #if defined(USE_NPU)
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #endif
@@ -75,10 +77,10 @@ void compute_logprobs(SampleOutput& output,
   }
   auto target_logprobs =
       torch::log_softmax(grouped_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
+  // log p(token); gather_from_logits maps -1 sentinels to column 0 and the
+  // mask below zeroes them.
   auto selected_logprobs =
-      index_select_2d(target_logprobs,
-                      /*dim=*/-1,
-                      output.next_tokens.clamp_min(0).to(torch::kLong));
+      gather_from_logits(target_logprobs, output.next_tokens);
   selected_logprobs.masked_fill_(output.next_tokens.lt(0), 0);
   output.logprobs = std::move(selected_logprobs);
   if (params.max_top_logprobs() > 0) {
@@ -91,7 +93,7 @@ void compute_logprobs(SampleOutput& output,
 
 }  // namespace
 
-SampleOutput rejection_sample(const SamplingParameters& params,
+SampleOutput rejection_sample(SamplingParameters params,
                               const DraftProposal& draft_proposal,
                               torch::Tensor target_logits) {
   const torch::Tensor& draft_token_ids = draft_proposal.token_ids();
@@ -102,8 +104,8 @@ SampleOutput rejection_sample(const SamplingParameters& params,
       << "target logits rows must be divisible by the validation width";
   const int64_t batch_size = target_logits.size(0) / (num_draft_tokens + 1);
   const int64_t num_val_tokens = num_draft_tokens + 1;
-  // Verify transforms: the penalty stages broadcast per-sequence inputs on
-  // the grouped view; the grammar bitmask stays on the flat rows.
+  // Per-sequence members stay [B]-scoped; only top_k/top_p and the grammar
+  // bitmask act on the flat [rows, vocab] layout.
   const int64_t vocab_size = target_logits.size(1);
   torch::Tensor grouped_logits =
       target_logits.view({batch_size, num_val_tokens, vocab_size});
@@ -258,20 +260,18 @@ SampleOutput rejection_sample(const SamplingParameters& params,
     const std::optional<torch::Tensor>& draft_logits = draft_proposal.logits();
 
     // Accept p/q > u in log space. −1 sentinel drafts clamp to column 0
-    // and are re-masked by the acceptance term.
+    // and are re-masked by the acceptance term. One clamped index feeds
+    // both gathers.
     const torch::Tensor draft_index =
         draft_token_ids.clamp_min(0).to(torch::kLong);
-    const auto gathered_logit = [&](const torch::Tensor& logits) {
-      return index_select_2d(logits, /*dim=*/-1, draft_index)
-          .to(torch::kFloat32);
-    };
     torch::Tensor target_log_prob =
-        gathered_logit(grouped_logits).sub(target_lse);
+        gather_log_probs_from_index(grouped_logits, target_lse, draft_index);
     torch::Tensor draft_lse;
     if (draft_logits.has_value()) {
       draft_lse = torch::logsumexp(
           draft_logits->to(torch::kFloat32), /*dim=*/-1, /*keepdim=*/false);
-      target_log_prob.sub_(gathered_logit(*draft_logits).sub(draft_lse));
+      target_log_prob.sub_(
+          gather_log_probs_from_index(*draft_logits, draft_lse, draft_index));
     }
     torch::Tensor uniform_rand =
         torch::rand(draft_token_ids.sizes(),

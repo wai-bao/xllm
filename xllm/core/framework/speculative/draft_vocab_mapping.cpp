@@ -17,11 +17,11 @@ limitations under the License.
 
 #include <glog/logging.h>
 
-#include <limits>
 #include <tuple>
 #include <utility>
 
 #include "core/framework/sampling/sampling_params.h"
+#include "core/framework/speculative/draft_input.h"
 
 namespace xllm {
 
@@ -63,18 +63,14 @@ void DraftVocabMapping::remap(SampleOutput& sample_output,
   }
   if (sample_output.draft_logits.defined()) {
     const int64_t rows = sample_output.draft_logits.size(0);
-    if (target_logits.defined()) {
-      target_logits.fill_(-std::numeric_limits<float>::infinity());
-    } else {
-      target_logits = torch::full({rows, target_vocab_size_},
-                                  -std::numeric_limits<float>::infinity(),
-                                  sample_output.draft_logits.options());
+    if (!target_logits.defined()) {
+      target_logits = torch::empty({rows, target_vocab_size_},
+                                   sample_output.draft_logits.options());
     }
-    target_logits.scatter_(
-        /*dim=*/1,
-        draft_to_target_ids_.view({1, -1}).expand(
-            {rows, draft_to_target_ids_.size(0)}),
-        sample_output.draft_logits);
+    embed_sparse_logits_inplace(target_logits,
+                                draft_to_target_ids_.view({1, -1}).expand(
+                                    {rows, draft_to_target_ids_.size(0)}),
+                                sample_output.draft_logits);
     sample_output.draft_logits = std::move(target_logits);
   }
   sample_output.next_tokens = draft_to_target_ids_.index_select(

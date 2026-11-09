@@ -76,6 +76,8 @@ class CausalLM : public torch::nn::Module, public Model {
                               std::vector<KVCache>& kv_caches,
                               const ModelParamsView& parameters) = 0;
 
+  // True only when aux_hidden_states carries a model-specific speculative
+  // feedback tensor rather than a configured intermediate-layer capture.
   virtual bool requires_graph_forward_metadata() { return false; }
 
   virtual bool is_hybrid_linear_attention() { return false; }
@@ -132,6 +134,10 @@ class CausalLM : public torch::nn::Module, public Model {
 
   virtual bool share_weights_from(CausalLM& /*source*/) { return false; }
 
+  // A self-contained MTP draft checkpoint supplies its own token embedding
+  // and LM head. Other draft models borrow those weights from the target.
+  virtual bool owns_mtp_draft_weights() const { return false; }
+
   virtual void prepare_expert_weight(
       int32_t layer_id,
       const std::vector<int32_t>& expert_ids) = 0;
@@ -179,6 +185,12 @@ class CausalLM : public torch::nn::Module, public Model {
     return {};
   }
 };
+
+// Marker for MTP draft wrappers whose checkpoint is self-contained (own
+// embedding + LM head). CausalLMImpl's trait detection turns this into
+// owns_mtp_draft_weights() == true; inheriting one empty tag beats pasting
+// the flag into every per-model draft header.
+struct MtpSelfContainedDraft {};
 
 template <typename ModelType>
 class CausalLMImpl : public CausalLM {
@@ -467,6 +479,16 @@ class CausalLMImpl : public CausalLM {
     } else {
       CausalLM::set_word_embedding(embedding);
     }
+  }
+
+  bool owns_mtp_draft_weights() const override {
+    if constexpr (detail::has_contained_type<ModelType>::value) {
+      if constexpr (std::is_base_of_v<MtpSelfContainedDraft,
+                                      typename ModelType::ContainedType>) {
+        return true;
+      }
+    }
+    return CausalLM::owns_mtp_draft_weights();
   }
 
   torch::Device device() const override { return options_.device(); }

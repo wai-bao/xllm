@@ -68,6 +68,7 @@ TORCH_MODULE(DeepseekMtpForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(deepseek_v3_mtp, DeepseekMtpForCausalLM);
+REGISTER_MTP_MODEL_PAIR(deepseek_v3, deepseek_v3_mtp);
 
 // example config:
 // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json

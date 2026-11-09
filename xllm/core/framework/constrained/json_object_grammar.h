@@ -17,11 +17,11 @@ limitations under the License.
 
 #include <torch/types.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <list>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -29,17 +29,16 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/tokenizer/tokenizer.h"
+#include "util/utils.h"
 
 namespace xllm {
 
 class JsonObjectGrammar;
 
-struct JsonTokenMismatch final {
-  size_t token_offset = 0;
-  int32_t token_id = -1;
-  size_t committed_tokens = 0;
-  uint64_t state_fingerprint = 0;
-  size_t sequence_index = 0;
+enum class JsonObjectMaskBuildPhase : uint8_t {
+  NORMAL = 0,
+  DRAFT = 1,
+  TARGET = 2,
 };
 
 struct JsonObjectGrammarSnapshot final {
@@ -52,8 +51,16 @@ class JsonObjectGrammarState final {
  public:
   JsonObjectGrammarState() = default;
 
+  bool can_accept_token(int32_t token_id) const;
   bool accept_token(int32_t token_id);
 
+  // Trial-then-commit accept that never partially mutates this state: the
+  // transition runs on a matcher-only fork, and only a full success is written
+  // back (matcher fields + the appended token). Equivalent to
+  // can_accept_token+accept_token in one FSM pass instead of two.
+  bool try_accept_token(int32_t token_id);
+
+  bool can_accept_piece(std::string_view piece) const;
   bool accept_piece(std::string_view piece);
 
   bool is_valid() const { return valid_; }
@@ -63,19 +70,13 @@ class JsonObjectGrammarState final {
   bool initialized() const { return grammar_ != nullptr; }
   const JsonObjectGrammar* grammar() const { return grammar_; }
   JsonObjectGrammarSnapshot snapshot() const;
-  size_t num_accepted_tokens() const { return committed_token_ids_.size(); }
+  size_t committed_token_count() const { return committed_token_ids_.size(); }
+  // Replay matcher transitions without copying the accumulated token history.
+  // The caller must account for the original committed prefix separately.
+  JsonObjectGrammarState fork_matcher_only() const;
   // Fingerprint of the matcher FSM only (not committed token history). Used for
   // mask caching and debug; identical FSMs share the same mask.
   uint64_t fingerprint() const;
-  // base_committed_tokens is the history length before this row; callers pass
-  // it from the pre-clone state so a matcher-only clone can still report it.
-  std::optional<JsonTokenMismatch> advance_tokens(size_t base_committed_tokens,
-                                                  size_t row_width,
-                                                  const int64_t* row_tokens,
-                                                  int64_t token_stride = 1);
-  // Matcher-only clone; drops committed_token_ids_ so derived states do not
-  // inherit O(generated) token history.
-  JsonObjectGrammarState clone_state() const;
 
  private:
   friend class JsonObjectGrammar;
@@ -133,13 +134,9 @@ class JsonObjectGrammarState final {
   void invalidate() { valid_ = false; }
   bool has_complete_number() const;
   // Copy matcher fields for trial accepts without cloning committed_token_ids_.
-  void copy_state_from(const JsonObjectGrammarState& other);
+  void copy_trial_state_from(const JsonObjectGrammarState& other);
   std::string transition_cache_key() const;
-  void advance_reasoning(int32_t token_id);
-  bool advance(int32_t token_id);
-  void commit_token(int32_t token_id) {
-    committed_token_ids_.push_back(token_id);
-  }
+
   const JsonObjectGrammar* grammar_ = nullptr;
   std::vector<ContainerFrame> containers_;
   ParseMode parse_mode_ = ParseMode::NONE;
@@ -192,19 +189,41 @@ class JsonObjectGrammar final {
   std::vector<uint32_t> allowed_token_bitmask(
       const JsonObjectGrammarState& state) const;
 
+  torch::Tensor build_filter_mask(
+      const JsonObjectGrammarState& state,
+      const torch::Device& device = torch::kCPU,
+      torch::ScalarType dtype = torch::kFloat32) const;
+
+  // Int32 bitmask row: shape [ceil(vocab/32)]. Preferred compact transfer form.
+  torch::Tensor build_filter_bitmask(
+      const JsonObjectGrammarState& state,
+      const torch::Device& device = torch::kCPU) const;
+
   size_t vocab_size() const { return token_pieces_.size(); }
   size_t bitmask_num_words() const {
-    return (token_pieces_.size() + 31U) / 32U;
+    return static_cast<size_t>(
+        util::bitmask_word_count(static_cast<int64_t>(token_pieces_.size())));
   }
+  const std::string& token_piece(int32_t token_id) const;
 
  private:
   friend class JsonObjectGrammarState;
+  friend torch::Tensor build_json_object_filter_mask(
+      const std::vector<JsonObjectGrammarState>& states,
+      const torch::Device& device,
+      torch::ScalarType dtype);
   friend torch::Tensor build_json_object_filter_bitmask(
       const std::vector<JsonObjectGrammarState>& states,
-      const torch::Device& device);
+      const torch::Device& device,
+      JsonObjectMaskBuildPhase phase);
+
+  struct CachedMask final {
+    std::vector<uint32_t> bitmask;
+    torch::Tensor float_mask_cpu;
+  };
 
   struct FilterMaskCacheEntry final {
-    std::shared_ptr<const std::vector<uint32_t>> mask;
+    std::shared_ptr<const CachedMask> mask;
     std::list<std::string>::iterator recency_iterator;
   };
 
@@ -214,28 +233,34 @@ class JsonObjectGrammar final {
     std::unordered_map<std::string, FilterMaskCacheEntry> entries;
   };
 
+  torch::Tensor get_cpu_filter_mask(const JsonObjectGrammarState& state) const;
   std::vector<uint32_t> compute_allowed_bitmask(
       const JsonObjectGrammarState& state) const;
-  std::shared_ptr<const std::vector<uint32_t>> cached_mask_for_state(
+  std::shared_ptr<const CachedMask> cached_mask_for_state(
       const JsonObjectGrammarState& state) const;
+  static torch::Tensor float_mask_from_bitmask(
+      const std::vector<uint32_t>& bitmask,
+      size_t vocab_size);
+
   std::vector<std::string> token_pieces_;
   std::unordered_set<int32_t> stop_token_ids_;
   std::vector<int32_t> reasoning_end_token_ids_;
+  // Precomputed additive mask for reasoning: allow all tokens except stops.
+  torch::Tensor reasoning_filter_mask_cpu_;
   std::vector<uint32_t> reasoning_bitmask_;
-  std::shared_ptr<const std::vector<uint32_t>> reasoning_cached_mask_;
+  std::shared_ptr<const CachedMask> reasoning_cached_mask_;
 
   std::shared_ptr<FilterMaskCache> filter_mask_cache_;
 };
 
+torch::Tensor build_json_object_filter_mask(
+    const std::vector<JsonObjectGrammarState>& states,
+    const torch::Device& device = torch::kCPU,
+    torch::ScalarType dtype = torch::kFloat32);
+
 torch::Tensor build_json_object_filter_bitmask(
     const std::vector<JsonObjectGrammarState>& states,
-    const torch::Device& device = torch::kCPU);
-
-// token_rows maps each state to its accepted-token row, or -1 when the state
-// has no newly accepted tokens.
-std::vector<JsonTokenMismatch> apply_json_constraints(
-    std::vector<JsonObjectGrammarState>& states,
-    const torch::Tensor& accepted_tokens,
-    const std::vector<int32_t>& token_rows);
+    const torch::Device& device = torch::kCPU,
+    JsonObjectMaskBuildPhase phase = JsonObjectMaskBuildPhase::NORMAL);
 
 }  // namespace xllm

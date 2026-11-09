@@ -46,7 +46,7 @@ class DiTEngine : public Engine {
   std::vector<int64_t> get_active_activation_memory() const;
 
   std::shared_ptr<DistributedWorkerManager> get_distributed_worker_manager()
-      const {
+      const override {
     return distributed_worker_manager_;
   }
 

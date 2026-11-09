@@ -45,8 +45,7 @@ class SuffixWorkerImpl : public SpeculativeWorkerImpl<LlmForwardInput> {
       const LlmForwardInput& inputs) override;
 
  private:
-  SampleOutput validate(SamplingParameters sampling_params,
-                        const DraftProposal& draft_proposal,
+  SampleOutput validate(const DraftProposal& draft_proposal,
                         const ForwardOutput& target_output);
 
   std::unique_ptr<SuffixDecodingCache> suffix_cache_;

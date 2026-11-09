@@ -167,7 +167,12 @@ class SamplingPenalties final {
 
 class SamplingConstraints final {
  public:
-  // Compact allowed-token bitmask [num_tokens, ceil(vocab/32)] int32.
+  // Dense additive mask for token-level structured output constraints. Zero
+  // entries are allowed and negative entries are forbidden.
+  PROPERTY(torch::Tensor, filter_mask);
+
+  // Compact allowed-token bitmask [num_tokens, ceil(vocab/32)] int32. When
+  // defined, sample() prefers this over filter_mask (smaller H2D).
   PROPERTY(torch::Tensor, filter_bitmask);
 
   // Per-selected-row additive logits bias.
@@ -256,6 +261,7 @@ class SamplingParameters final {
   FORWARD_PROPERTY(torch::Tensor, unique_token_ids_lens, penalties);
 
   PROPERTY(SamplingConstraints, constraints);
+  FORWARD_PROPERTY(torch::Tensor, filter_mask, constraints);
   FORWARD_PROPERTY(torch::Tensor, filter_bitmask, constraints);
 
   FORWARD_PROPERTY(torch::Tensor, logits_bias, constraints);
@@ -303,7 +309,6 @@ class SamplingParameters final {
            !return_logits();
   }
 
-  // Fails fast unless the batch is mixed (see do_sample()).
   const torch::Tensor& require_do_sample() const {
     CHECK(do_sample().defined())
         << "mixed sampling requires do_sample to be defined";
@@ -383,17 +388,23 @@ inline constexpr std::array<SamplingFieldDesc, 20> kSamplingFields = {
       .post_penalty_transform = true},
      {.member = SamplingTensorAccessor{&SamplingParameters::logits_bias,
                                        &SamplingParameters::logits_bias}},
-     {.member =
-          SamplingTensorAccessor{&SamplingParameters::min_token_positions,
-                                 &SamplingParameters::min_token_positions},
-      .is_greedy = true},
-     {.member =
-          SamplingTensorAccessor{&SamplingParameters::min_tokens_remaining,
-                                 &SamplingParameters::min_tokens_remaining},
-      .is_greedy = true},
-     {.member = SamplingTensorAccessor{&SamplingParameters::min_token_ids,
-                                       &SamplingParameters::min_token_ids},
-      .is_greedy = true},
+     {
+         .member =
+             SamplingTensorAccessor{&SamplingParameters::min_token_positions,
+                                    &SamplingParameters::min_token_positions},
+         .is_greedy = true,
+     },
+     {
+         .member =
+             SamplingTensorAccessor{&SamplingParameters::min_tokens_remaining,
+                                    &SamplingParameters::min_tokens_remaining},
+         .is_greedy = true,
+     },
+     {
+         .member = SamplingTensorAccessor{&SamplingParameters::min_token_ids,
+                                          &SamplingParameters::min_token_ids},
+         .is_greedy = true,
+     },
      {.member = SamplingTensorAccessor{&SamplingParameters::top_k,
                                        &SamplingParameters::top_k},
       .is_greedy = true,
@@ -409,14 +420,18 @@ inline constexpr std::array<SamplingFieldDesc, 20> kSamplingFields = {
      {.member = SamplingTensorAccessor{&SamplingParameters::filter_bitmask,
                                        &SamplingParameters::filter_bitmask},
       .post_penalty_transform = true},
-     {.member = SamplingTensorAccessor{&SamplingParameters::seeds,
-                                       &SamplingParameters::seeds},
-      .per_request = true,
-      .is_greedy = true},
-     {.member = SamplingTensorAccessor{&SamplingParameters::seed_offsets,
-                                       &SamplingParameters::seed_offsets},
-      .per_request = true,
-      .is_greedy = true},
+     {
+         .member = SamplingTensorAccessor{&SamplingParameters::seeds,
+                                          &SamplingParameters::seeds},
+         .per_request = true,
+         .is_greedy = true,
+     },
+     {
+         .member = SamplingTensorAccessor{&SamplingParameters::seed_offsets,
+                                          &SamplingParameters::seed_offsets},
+         .per_request = true,
+         .is_greedy = true,
+     },
      {.member = SamplingTensorAccessor{&SamplingParameters::bad_words,
                                        &SamplingParameters::bad_words}},
      {.member = SamplingTensorAccessor{&SamplingParameters::bad_word_suffix,
@@ -444,8 +459,6 @@ inline bool SamplingParameters::has_sampling_fields() const {
                      });
 }
 
-// Clears the per-token transform and seed fields that are dead on a greedy
-// draft leg (see is_greedy above).
 inline void clear_sampling_transforms(SamplingParameters& sampling_params) {
   for (const auto& field : kSamplingFields) {
     if (field.is_greedy) {
@@ -493,13 +506,43 @@ inline void expand_sampling_params_for_verify(
     SamplingParameters& sampling_params,
     int64_t repeats,
     int64_t total_num_val_tokens,
-    const torch::Device& device,
-    torch::Tensor cached_indices = torch::Tensor()) {
+    const torch::Device& device) {
   clear_all_sampling_fields(sampling_params);
   sampling_params.selected_token_idxes() =
-      cached_indices.defined() ? std::move(cached_indices)
-                               : arange_indices(total_num_val_tokens, device);
+      arange_indices(total_num_val_tokens, device);
   repeat_interleave_if_defined(sampling_params.do_sample(), repeats);
+}
+
+inline bool has_penalty_params(const SamplingParameters& params) {
+  return params.frequency_penalties().defined() ||
+         params.presence_penalties().defined() ||
+         params.repetition_penalties().defined();
+}
+
+// A new penalty member must be added here, not at the call sites.
+inline void clear_penalty_history_fields(SamplingParameters& params) {
+  params.frequency_penalties() = torch::Tensor();
+  params.presence_penalties() = torch::Tensor();
+  params.repetition_penalties() = torch::Tensor();
+  params.unique_token_ids() = torch::Tensor();
+  params.unique_token_counts() = torch::Tensor();
+  params.unique_token_ids_lens() = torch::Tensor();
+}
+
+// The draft proposal never applies penalties, the penalty history, or the
+// grammar filter masks; the rejection sampler enforces all of them on the
+// target's verify logits. clear_* is the shared seam; the full wrapper also
+// runs the draft-sampling field drops.
+inline void clear_verify_only_sampling_fields(SamplingParameters& params) {
+  clear_penalty_history_fields(params);
+  params.filter_bitmask() = torch::Tensor();
+  params.filter_mask() = torch::Tensor();
+}
+
+inline void prepare_draft_proposal_sampling(bool is_probabilistic_draft,
+                                            SamplingParameters& params) {
+  clear_verify_only_sampling_fields(params);
+  prepare_draft_sampling(is_probabilistic_draft, params);
 }
 
 // Advance the compact generated suffix with a padded accepted-token prefix.

@@ -311,6 +311,7 @@ cc_test(
   SRCS pd_http_response_test.cpp
   DEPS
     distributed_runtime
+    GTest::gmock
     disaggregation
     api_service
     GTest::gtest_main

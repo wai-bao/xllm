@@ -16,6 +16,7 @@ limitations under the License.
 #include "core/framework/speculative/verify_layout.h"
 
 #include <glog/logging.h>
+#include <torch/torch.h>
 
 #include <algorithm>
 #include <cstddef>

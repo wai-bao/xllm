@@ -434,6 +434,11 @@ ForwardOutput VLMEngine::step(BatchGroup& batch) {
   return {};
 }
 
+void VLMEngine::flush_released_requests() {
+  flush_released_request_state(
+      *kv_cache_manager_, worker_clients_, dp_local_tp_size_);
+}
+
 std::vector<RawForwardOutput> VLMEngine::collect_step_outputs(
     const BatchGroup& batch) {
   CHECK_EQ(batch.size(), dp_size_);

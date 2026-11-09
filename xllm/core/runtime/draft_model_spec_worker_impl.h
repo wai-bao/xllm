@@ -21,13 +21,13 @@ limitations under the License.
 #include <string>
 #include <tuple>
 
-#include "core/framework/speculative/draft_proposal.h"
 #include "core/framework/speculative/draft_vocab_mapping.h"
+#include "core/framework/speculative/target_decode_state_store.h"
+#include "runtime/speculative_input_builder.h"
 #include "runtime/speculative_worker_impl.h"
 
 namespace xllm {
 
-class EmbeddingCache;
 class LLMWorkerImpl;
 
 // Base for draft-model speculative workers (MTP, DFlash/DSpark); Suffix has no
@@ -55,6 +55,33 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl<TargetInput> {
   bool prepare_model_decode_continuation(
       TargetInput& inputs,
       const ForwardOutput& prior_output) override;
+  std::unique_ptr<TargetDecodeStateStore> target_state_store_;
+
+  // Shared chunked-prefill spec-verify tail: flags the input as spec-verify
+  // and resolves accepted prefix lengths from the target decode state store.
+  // q_cu_seq_lens stays owned by the validate-input layout builder that ran
+  // just before this tail; rebuilding it here would double-write the field.
+  template <typename Params>
+  std::vector<int32_t> apply_chunked_prefill_spec_verify_tail(
+      const TargetInput& input,
+      Params& input_params,
+      int32_t num_sequences,
+      const torch::TensorOptions& token_options,
+      bool publish_device_tensor) {
+    input_params.embedding.input_embedding = torch::Tensor();
+    input_params.is_spec_verify = true;
+    // on_kv_pools_allocated constructs the store before any spec verify.
+    CHECK(target_state_store_ != nullptr)
+        << "chunked spec verify requires the target decode state store";
+    std::vector<int32_t> accepted_prefix_lengths =
+        target_state_store_->resolve_accepted_prefix_lengths(
+            input.input_params.embedding.batch_rows(), num_sequences);
+    specBuilder::publish_accepted_prefix_lengths(input_params,
+                                                 accepted_prefix_lengths,
+                                                 token_options,
+                                                 publish_device_tensor);
+    return accepted_prefix_lengths;
+  }
 
   using TargetModelParams =
       typename SpeculativeWorkerImpl<TargetInput>::TargetModelParams;
@@ -85,16 +112,28 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl<TargetInput> {
       const KVCacheShape& target_kv_cache_shape,
       int64_t draft_world_size = -1) const;
 
-  // MTP-family drafts reserve a pre-head hidden-state placeholder per row.
-  virtual int64_t get_embedding_placeholder_size() const { return 0; }
+  // Called once per successful allocate_kv_cache* with the target pool's
+  // block count, after both target and draft pools are allocated. Creates
+  // the shared target decode state store; derived workers override, call
+  // the base, and create algorithm-specific stores.
+  virtual void on_kv_pools_allocated(int64_t num_blocks);
 
-  // Some drafts replay every verified KV position, so retain the full
-  // accepted span when allocating their embedding cache.
-  virtual bool requires_full_target_replay() const { return false; }
+  void release_request_state(
+      const std::vector<int32_t>& embedding_ids) override;
+
+  // Model contract of the seed this drafter carries across rounds. Only
+  // meaningful for draft-input-carrying drafters (see SpeculativeConfig::
+  // requires_bootstrap_hidden).
+  DraftInputModelSpec draft_input_spec() const;
+
+  // Algorithm-owned per-request state. Runs before the shared target decode
+  // state store is cleared: a pending-context flush may re-populate the store,
+  // so the shared clear must come after it (see release_request_state).
+  virtual void release_algorithm_state(
+      const std::vector<int32_t>& /*embedding_ids*/) {}
 
   void prepare_hierarchy_kv_cache_transfers();
   void finalize_hierarchy_kv_cache_transfers();
-  void init_embedding_cache(int64_t num_blocks);
   using AllocateFn = std::function<bool(WorkerImpl&, const KVCacheShape&)>;
   bool allocate_pools(const KVCacheShape& kv_cache_shape,
                       const AllocateFn& allocate);
@@ -105,10 +144,37 @@ class DraftModelSpecWorkerImpl : public SpeculativeWorkerImpl<TargetInput> {
       const runtime::Options& target_options,
       const runtime::Options& draft_options);
 
-  void prepare_draft_input(const TargetInput& input);
+  // Per-algorithm policy for rewrite_decode_rows_from_target_state.
+  struct DecodeRowPolicy {
+    // Positions track kv_len instead of position+1 (MTP decoupled targets).
+    bool positions_decoupled_from_kv_len = false;
+    // Chunked-prefill verify: clamp the position to block-table capacity and
+    // resolve the scheduler's KV-length lag/lead against it.
+    bool chunked_prefill_verify = false;
+    int32_t logical_block_size = 0;
+    int32_t validate_width = 0;
+    // Without schedule overlap a fake token is a contract violation; with
+    // overlap but no cached state, MTP still substitutes the recorded state
+    // token while DFlash keeps the raw input id.
+    bool fake_context_falls_back_to_state_token = false;
+  };
 
+  // Rewrites the decode rows from the target's committed per-request state:
+  // fake-token correction under schedule overlap, position offsets, and the
+  // position/kv_len invariant check. Single shared implementation so the
+  // MTP and DFlash/DSpark decode legs cannot drift apart.
+  void rewrite_decode_rows_from_target_state(
+      TargetInput& input,
+      const std::vector<TargetDecodeStateStore::DecodeRow>& last_states,
+      const DecodeRowPolicy& policy) const;
+
+  // Draft model worker created by the ctor's factory.
   std::unique_ptr<LLMWorkerImpl> draft_impl_;
-  std::unique_ptr<EmbeddingCache> embedding_cache_;
+
+  // Resolved once after the draft model loads; the spec is invariant for the
+  // worker's lifetime, so the per-draft-step lookup must not re-resolve it.
+  mutable DraftInputModelSpec draft_input_spec_{};
+  mutable bool draft_input_spec_valid_ = false;
 
   DraftVocabMapping draft_vocab_;
 

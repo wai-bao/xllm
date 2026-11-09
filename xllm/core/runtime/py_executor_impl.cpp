@@ -33,11 +33,12 @@ limitations under the License.
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_visitor.h"
-#include "core/framework/speculative/spec_verify.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
 #include "core/platform/platform.h"
 #include "core/runtime/py_attention_metadata.h"
+#include "core/runtime/spec_verify.h"
 #include "core/util/pybind_helper.h"
 #include "models/llm/py_causal_lm.h"
 #include "models/py_model_helper.h"
@@ -189,7 +190,6 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   executor_config["task_type"] = options_.task_type();
   executor_config["max_encoder_cache_size"] = options_.max_encoder_cache_size();
   executor_config["num_speculative_tokens"] = options_.num_speculative_tokens();
-  executor_config["mtp_draft_prefix_width"] = options_.mtp_draft_prefix_width();
   executor_config["engine_type"] = SpeculativeConfig::uses_ssm_engine(
                                        options_.draft_model_path().value_or(""),
                                        options_.speculative_algorithm(),

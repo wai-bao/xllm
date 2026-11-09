@@ -21,6 +21,7 @@ cc_library(
   NAME 
     common
   HDRS
+    batch_rows.h
     constants.h
     etcd_client.h
     global_flags.h

@@ -182,6 +182,19 @@ struct ParallelArgs {
                          : dp_local_rank / (dp_local_size / kv);
   }
 
+  // Orthogonal CP x TP publishes distinct tp_group_ and cp_group_; operations
+  // that need cross-replica consensus must cover both axes.
+  [[nodiscard]] bool has_orthogonal_cp_consensus() const noexcept {
+    return cp_size() > 1 && tp_group_ != nullptr && cp_group_ != nullptr &&
+           cp_group_ != tp_group_;
+  }
+
+  // Group used to keep speculative tokens consistent across replicas: the TP
+  // group when present, otherwise the full process group.
+  [[nodiscard]] ProcessGroup* spec_broadcast_group() const noexcept {
+    return tp_group_ != nullptr ? tp_group_ : process_group_;
+  }
+
   // atb hccl mapping json data
   PROPERTY(nlohmann::json, mapping_data);
 

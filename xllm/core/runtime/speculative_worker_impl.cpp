@@ -18,20 +18,45 @@ limitations under the License.
 #include <type_traits>
 
 #include "common/global_flags.h"
-#include "core/common/types.h"
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/eplb/eplb_utils.h"
-#include "core/framework/speculative/spec_input_builder.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "core/framework/speculative/verify_layout.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
+#include "core/runtime/spec_verify_input_layout.h"
+#include "core/runtime/speculative_input_builder.h"
 #include "core/util/tensor_helper.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/vlm_worker_impl.h"
 #include "util/slice.h"
 #include "util/timer.h"
 #include "util/utils.h"
-
 namespace xllm {
+
+runtime::Options speculative_target_options(const runtime::Options& options) {
+  auto opts = options;
+  opts.enable_schedule_overlap(false)
+      .is_draft_engine(false)
+      .enable_graph_aux_hidden_states(true);
+  return opts;
+}
+
+// Draft-model options shared by the speculative algorithms: single-token
+// decoding, no speculative width on the drafter itself, aux hidden states
+// captured for the next proposal.
+runtime::Options speculative_draft_options(const runtime::Options& options) {
+  auto opts = options;
+  // The colocated drafter is always a text LLM; a VLM target must not drag
+  // its vision backend into the draft worker.
+  opts.backend("llm")
+      .enable_schedule_overlap(false)
+      .is_draft_engine(true)
+      .mtp_draft_prefix_width(options.num_speculative_tokens() + 1)
+      .num_decoding_tokens(1)
+      .num_speculative_tokens(0)
+      .enable_graph_aux_hidden_states(true);
+  return opts;
+}
 
 namespace {
 template <typename Params>
@@ -49,13 +74,9 @@ bool should_run_speculative_decode_impl(const Params& params) {
     return false;
   }
 
-  // Idle DP ranks (no scheduled tokens this step) must not veto speculative
-  // decode for the active ranks. Under enable_graph=False these idle ranks keep
-  // dp_is_decode=0 (the backfill in llm_engine only fires when enable_graph=
-  // True), which made an all-of-ones check fail for any bs<dp_size batch and
-  // silently fell back to the non-speculative path (validate never ran). Only
-  // ranks that actually carry tokens gate the decision; require every such rank
-  // to be in decode.
+  // Idle DP ranks keep dp_is_decode=0 under enable_graph=False, so an
+  // all-of-ones check would silently fall back to the non-speculative path
+  // for any bs<dp_size batch. Only ranks that actually carry tokens vote.
   bool any_active = false;
   for (size_t i = 0; i < dp_is_decode.size(); ++i) {
     if (dp_token_nums[i] == 0) {
@@ -129,6 +150,32 @@ SpeculativeWorkerImpl<TargetInput>::~SpeculativeWorkerImpl() {
 }
 
 template <typename TargetInput>
+void SpeculativeWorkerImpl<TargetInput>::broadcast_spec_tokens(
+    torch::Tensor& tokens) const {
+  if (!parallel_args_.has_orthogonal_cp_consensus()) {
+    sync_sampling_tensor(tokens, parallel_args_.spec_broadcast_group());
+    return;
+  }
+  // Both axes need a broadcast to reach the same sampled token.
+  sync_sampling_tensor(tokens, parallel_args_.tp_group_);
+  sync_sampling_tensor(tokens, parallel_args_.cp_group_);
+}
+
+template <typename TargetInput>
+void SpeculativeWorkerImpl<TargetInput>::maybe_broadcast_spec_tokens(
+    torch::Tensor& tokens,
+    bool all_greedy_sample) const {
+  if (parallel_args_.has_orthogonal_cp_consensus()) {
+    broadcast_spec_tokens(tokens);
+    return;
+  }
+  if (get_optimization_config().enable_spec_token_broadcast &&
+      !all_greedy_sample) {
+    broadcast_spec_tokens(tokens);
+  }
+}
+
+template <typename TargetInput>
 void SpeculativeWorkerImpl<TargetInput>::drain_pending_execution() {
   WorkerImpl::drain_pending_execution();
   if (impl_ != nullptr) {
@@ -170,22 +217,47 @@ bool SpeculativeWorkerImpl<TargetInput>::allocate_kv_cache_with_transfer(
 
 template <typename TargetInput>
 std::optional<ForwardOutput> SpeculativeWorkerImpl<TargetInput>::step(
-    const TargetInput& input) {
+    const TargetInput& raw_input) {
   if constexpr (std::is_same_v<TargetInput, VlmForwardInput>) {
-    if (input.runtime.input_host_buffer_has_layout) {
+    if (raw_input.runtime.input_host_buffer_has_layout) {
       // Rebuild host views before speculative code derives text draft inputs.
       // Each leaf worker still owns device preparation on its ordered stream.
       TargetInput unpacked_input;
-      if (input.runtime.device_tensors_ready) {
-        unpacked_input = input.clone();
+      if (raw_input.runtime.device_tensors_ready) {
+        unpacked_input = raw_input.clone();
         unpacked_input.runtime.input_host_buffer_has_layout = false;
       } else {
         CHECK(detail::unpack_from_input_host_buffer(
-            input, torch::Device(torch::kCPU), unpacked_input));
+            raw_input, torch::Device(torch::kCPU), unpacked_input));
       }
       return step(unpacked_input);
     }
   }
+  // released_embedding_ids is consumed exactly here; every downstream worker
+  // treats it as opaque transport data, so releasing the state never requires
+  // cloning the whole input just to clear the field afterwards.
+  if constexpr (std::is_same_v<TargetInput, LlmForwardInput>) {
+    const auto& released = raw_input.request_state.released_embedding_ids;
+    if (!released.empty()) {
+      release_request_state(released);
+    }
+  }
+  // input_params is mutable on both input types precisely so a Host-KV load
+  // handle can be bound in place from a const input (the upstream pattern);
+  // no clone is needed and set_hierarchy_layer_synchronizer below then sees
+  // the bound synchronizer. bind_load_handle does not clear
+  // requires_host_restore, matching this path's semantics.
+  if (hierarchy_kv_cache_transfer_ != nullptr) {
+    std::optional<HostKVLoadHandle> load_handle =
+        hierarchy_kv_cache_transfer_->take_load_handle(
+            raw_input.input_params.meta.batch_id);
+    if (load_handle.has_value()) {
+      ModelParamsView bound_params(raw_input.input_params);
+      HierarchyKVCacheTransfer::bind_load_handle(bound_params,
+                                                 std::move(*load_handle));
+    }
+  }
+  const TargetInput& input = raw_input;
   auto& mutable_params = input.input_params;
   set_hierarchy_layer_synchronizer(mutable_params);
   const bool run_speculative_decode =
@@ -299,31 +371,20 @@ template <typename TargetInput>
 void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
     const TargetInput& input,
     TargetInput& validate_input) {
-  // Clear the transform fields on the host copy first so .to() skips them;
-  // expand_sampling_params_for_verify later installs the validate-row idxes.
-  // The JSON grammar states are not consumed by the logits-only validate
-  // forward (the verify layouts are built from the original input), so they
-  // are moved aside instead of deep-copied through clone() and .to().
+  // Clear the transform fields on the host copy first so .to() skips their
+  // blocking H2D uploads; the rejection sampler applies its own transforms
+  // from the per-sequence source.
   TargetInput host_input = input.clone();
-  std::vector<JsonObjectGrammarState> json_states =
-      std::move(host_input.json_object_states);
-  std::vector<JsonObjectGrammarSnapshot> json_snapshots =
-      std::move(host_input.json_object_state_snapshots);
   clear_all_sampling_fields(host_input.sampling_params);
   validate_input = host_input.to(device_, dtype_);
-  validate_input.json_object_states = std::move(json_states);
-  validate_input.json_object_state_snapshots = std::move(json_snapshots);
   validate_input.skip_sampling_for_logits_only = true;
   validate_input.runtime.device_tensors_ready = false;
   auto& input_params = validate_input.input_params;
-  torch::TensorOptions token_options = validate_input.token_ids.options();
-  torch::TensorOptions position_options = validate_input.positions.options();
 
   const int32_t num_speculative_tokens = options_.num_speculative_tokens();
   const int32_t num_sequences = input_params.meta.num_sequences;
   const int32_t num_val_tokens = num_speculative_tokens + 1;
   const int32_t total_num_val_tokens = num_sequences * num_val_tokens;
-  const int32_t block_size = options_.block_size();
   // Hybrid targets (for example Qwen3.8 GDN) mark validation as spec-verify
   // before entering this generic builder.  They must keep one sequence row
   // with an N+1-token query so recurrent state is checkpointed and committed
@@ -332,94 +393,23 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
   const bool use_chunked_spec_verify =
       ::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel() ||
       input.input_params.is_spec_verify;
-  specBuilder::DecodeRowContext row_ctx =
-      specBuilder::make_decode_row_context(input);
+  // Row geometry comes from the shared mtp_verify layout builder so the
+  // uniform, per-seq, and MTP validate paths cannot drift apart. This base
+  // path's callers (DFlash/DFlash2/DSpark/Suffix) never serve mrope targets,
+  // so the position/kv_len coupling invariant holds.
+  spec_verify_layout::ValidateInputPlan plan;
+  plan.uniform_width = num_val_tokens;
+  plan.logical_block_size = options_.block_size();
+  plan.attention_mode =
+      use_chunked_spec_verify
+          ? spec_verify_layout::ValidateAttentionMode::CHUNKED_PREFILL
+          : spec_verify_layout::ValidateAttentionMode::DECODE;
+  spec_verify_layout::ValidateInputLayout layout =
+      spec_verify_layout::build_validate_input_layout(input, plan);
+  spec_verify_layout::apply_validate_input_layout(validate_input, plan, layout);
 
-  Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
-  Slice<int32_t> kv_seq_lens = input.input_params.attention.host.kv_seq_lens;
-  specBuilder::DecodeBuildBuffers buf;
-  buf.out_token_ids.reserve(total_num_val_tokens);
-  buf.out_positions.reserve(total_num_val_tokens);
-  buf.out_new_cache_slots.reserve(total_num_val_tokens);
-  if (!use_chunked_spec_verify) {
-    buf.out_kv_seq_lens.reserve(total_num_val_tokens);
-    buf.out_q_seq_lens.reserve(total_num_val_tokens);
-    buf.out_q_cu_seq_lens.reserve(total_num_val_tokens);
-    buf.reserve_row_buffers(static_cast<size_t>(total_num_val_tokens),
-                            row_ctx.block_table_stride);
-  }
-
-  std::vector<int32_t> atb_kv_seq_lens_vec = {};
-  std::vector<int32_t> atb_q_seq_lens_vec = {};
-  std::vector<int32_t> atb_q_cu_seq_lens_vec = {};
-  int32_t atb_kv_max_seq_len = 0;
-  for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
-    int32_t kv_len =
-        specBuilder::calc_kv_len(kv_seq_lens, seq_id, /*offset=*/0);
-    for (int32_t val_idx = 0; val_idx < num_val_tokens; ++val_idx) {
-      specBuilder::RowSpec row;
-      row.seq_id = seq_id;
-      if (val_idx == 0) {
-        row.token_id = token_ids[seq_id];
-      } else {
-        row.token_id = -val_idx;
-      }
-      row.position_offset = val_idx;
-      row.append_kv_len = !use_chunked_spec_verify;
-      row.append_q_len_one = !use_chunked_spec_verify;
-      row.append_block_table = !use_chunked_spec_verify;
-      specBuilder::append_decode_row(row_ctx, row, block_size, buf);
-    }
-
-    if (use_chunked_spec_verify) {
-      const int32_t kv_len_after_validation = kv_len + num_speculative_tokens;
-      specBuilder::update_kv_seq_lens_and_max(
-          atb_kv_seq_lens_vec, kv_len_after_validation, atb_kv_max_seq_len);
-      specBuilder::append_q_seq_len(
-          atb_q_seq_lens_vec, atb_q_cu_seq_lens_vec, num_val_tokens);
-    }
-  }
-
-  CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_token_ids.size())
-      << "validate kv slots/tokens mismatch";
-  CHECK_EQ(buf.out_positions.size(), buf.out_token_ids.size())
-      << "validate positions/tokens mismatch";
-
-  specBuilder::set_token_position_tensors(validate_input,
-                                          buf.out_token_ids,
-                                          buf.out_positions,
-                                          token_options,
-                                          position_options);
-  // update the input_params
-  if (!use_chunked_spec_verify) {
-    input_params.meta.num_sequences = total_num_val_tokens;
-    input_params.meta.q_max_seq_len = 1;
-    input_params.meta.batch_forward_type = BatchForwardType::DECODE;
-  } else {
-    input_params.meta.q_max_seq_len = num_val_tokens;
-    input_params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
-  }
-  if (use_chunked_spec_verify) {
-    specBuilder::update_input_params(input_params,
-                                     buf,
-                                     num_val_tokens,
-                                     std::move(atb_q_seq_lens_vec),
-                                     std::move(atb_q_cu_seq_lens_vec),
-                                     atb_kv_max_seq_len,
-                                     std::move(atb_kv_seq_lens_vec));
-  } else {
-    specBuilder::update_input_params(input_params,
-                                     buf,
-                                     1,
-                                     std::move(buf.out_q_seq_lens),
-                                     std::move(buf.out_q_cu_seq_lens),
-                                     buf.meta.kv_max_seq_len,
-                                     std::move(buf.out_kv_seq_lens),
-                                     /*update_block_tables=*/true);
-  }
   input_params.attention.rebuild_device_buffer(device_);
 
-  // Clearing here drops the ~15 dead per-token tensors the clone carried in.
   expand_sampling_params_for_verify(validate_input.sampling_params,
                                     num_val_tokens,
                                     total_num_val_tokens,
@@ -427,6 +417,20 @@ void SpeculativeWorkerImpl<TargetInput>::prepare_validate_inputs(
 
   scale_speculative_parallel_token_counts(input_params, num_val_tokens);
   validate_input.runtime.device_tensors_ready = true;
+}
+
+template <typename TargetInput>
+void SpeculativeWorkerImpl<TargetInput>::prepare_work_before_execute(
+    const TargetInput& input,
+    TargetInput& processed_input) {
+  // The composite owns no KV cache. Preserve linear-state metadata for the
+  // target leaf, which prepares and restores its own recurrent cache before
+  // execution.
+  prepare_work_before_execute_on_stream(input,
+                                        processed_input,
+                                        *prepare_stream_,
+                                        /*record_ready_event=*/true,
+                                        /*restore_linear_state=*/false);
 }
 
 template <typename TargetInput>

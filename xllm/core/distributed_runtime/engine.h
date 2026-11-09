@@ -18,8 +18,10 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <memory>
+#include <vector>
 
 #include "common/types.h"
+#include "core/distributed_runtime/distributed_worker_manager.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
@@ -31,6 +33,17 @@ namespace xllm {
 class Engine {
  public:
   virtual ~Engine() = default;
+
+  // Called after all scheduled outputs have been consumed and no batch
+  // remains; flushes request-state releases without a model forward.
+  virtual void flush_released_requests() {}
+
+  // Idle-only reclaim on every TP/CP worker. Coexists deliberately with the
+  // piggyback-on-next-forward channel; collapsing them is a behavior change.
+  void flush_released_request_state(
+      KVCacheManager& manager,
+      const std::vector<std::shared_ptr<WorkerClient>>& workers,
+      int32_t workers_per_dp);
 
   virtual bool init() { return true; };
 
@@ -54,6 +67,13 @@ class Engine {
   // return the tokenizer args
   virtual const TokenizerArgs& tokenizer_args() const {
     return tokenizer_args_;
+  }
+
+  // The worker-connection manager for engines that drive remote workers;
+  // local-only modes return nullptr.
+  virtual std::shared_ptr<DistributedWorkerManager>
+  get_distributed_worker_manager() const {
+    return nullptr;
   }
 
   // Start/stop online timeline profiling on all workers. CUDA only for now.

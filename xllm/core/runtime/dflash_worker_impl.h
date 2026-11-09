@@ -23,7 +23,6 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/speculative/draft_proposal.h"
-#include "core/framework/speculative/embedding_cache.h"
 #include "core/kv_cache/transfer/kv_cache_transfer.h"
 #include "framework/model/model_args.h"
 #include "runtime/draft_model_spec_worker_impl.h"
@@ -109,12 +108,10 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
                                             LlmForwardInput& validate_input);
 
   // Mirrors sampled tokens to rank 0 under schedule-overlap so every rank
-  // commits the same prefix. No-op for a single rank.
-  void maybe_broadcast_spec_tokens(torch::Tensor& tokens);
-
-  void update_decode_step_input(
-      LlmForwardInput& input,
-      const std::vector<EmbeddingCache::DecodeState>& last_states) const;
+  // commits the same prefix. No-op for a single rank. Distinct from the
+  // base's two-argument maybe_broadcast_spec_tokens, which additionally
+  // covers orthogonal CP consensus.
+  void broadcast_committed_tokens(torch::Tensor& tokens);
 
   void write_context_kv(const LlmForwardInput& input,
                         const torch::Tensor& context_hidden,

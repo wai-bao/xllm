@@ -15,15 +15,16 @@ limitations under the License.
 
 #pragma once
 
-#include "core/framework/parallel_state/parallel_args.h"
-#include "core/framework/speculative/embedding_cache.h"
-#include "core/platform/stream.h"
-#include "core/runtime/forward_params.h"
+#include "models/model_registry.h"
 
-namespace xllm::mtp_detail {
-void check_mtp_decode_states(
-    const std::vector<EmbeddingCache::DecodeState>& states,
-    const std::vector<std::string>& request_ids,
-    const torch::Tensor& token_ids_host,
-    bool allow_overlap_fake_token);
-}  // namespace xllm::mtp_detail
+// Platform-agnostic registry entries for the deepseek_v32 family. Every
+// platform's deepseek_v32 headers include this file once; the registrations
+// carry no platform-specific information, so they live here instead of being
+// pasted into every platform copy.
+// Include at global scope only: the REGISTER_* variables must not land
+// inside another namespace.
+namespace xllm::deepseek_v32_registry {
+
+REGISTER_TARGET_SPEC_VERIFY_MODE(deepseek_v32, PYTHON_EXPANDED_VERIFY);
+
+}  // namespace xllm::deepseek_v32_registry

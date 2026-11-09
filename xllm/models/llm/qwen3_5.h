@@ -200,6 +200,8 @@ REGISTER_MODEL_BACKEND(qwen3_5_text, "llm");
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_MUSA) || \
     defined(USE_DCU)
 REGISTER_CAUSAL_MODEL(qwen3_5_text, Qwen3_5ForCausalLM);
+REGISTER_TARGET_SPEC_VERIFY_MODE(qwen3_5_text, UNIFORM_EXPANDED_VERIFY);
+REGISTER_QWEN3_5_LINEAR_STATE_LAYOUT(qwen3_5_text);
 #endif
 REGISTER_MODEL_ARGS(qwen3_5_text, [&] {
   LOAD_QWEN3_5_TEXT_TYPE_AND_DTYPE("qwen3_5_text");
@@ -213,6 +215,8 @@ REGISTER_MODEL_BACKEND(qwen3_5_moe_text, "llm");
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_MUSA) || \
     defined(USE_DCU)
 REGISTER_CAUSAL_MODEL(qwen3_5_moe_text, Qwen3_5ForCausalLM);
+REGISTER_TARGET_SPEC_VERIFY_MODE(qwen3_5_moe_text, UNIFORM_EXPANDED_VERIFY);
+REGISTER_QWEN3_5_LINEAR_STATE_LAYOUT(qwen3_5_moe_text);
 #endif
 REGISTER_MODEL_ARGS(qwen3_5_moe_text, [&] {
   LOAD_QWEN3_5_TEXT_TYPE_AND_DTYPE("qwen3_5_moe_text");
@@ -223,38 +227,6 @@ REGISTER_MODEL_ARGS(qwen3_5_moe_text, [&] {
 });
 
 #if defined(USE_NPU)
-namespace qwen3_5_args {
-
-inline void configure_mtp_args(ModelArgs& args,
-                               [[maybe_unused]] bool is_python_model) {
-  const int32_t mtp_layers = args.num_nextn_predict_layers();
-  if (mtp_layers <= 0) {
-    return;
-  }
-
-  const bool is_moe = args.model_type() == "qwen3_5_moe" ||
-                      args.model_type() == "qwen3_5_moe_text";
-  args.model_type(is_moe ? "qwen3_5_moe_mtp" : "qwen3_5_mtp");
-  args.n_layers(mtp_layers);
-  args.layer_types(std::vector<std::string>(static_cast<size_t>(mtp_layers),
-                                            "full_attention"));
-  args.full_attention_interval(1);
-}
-
-}  // namespace qwen3_5_args
-
-const bool qwen3_5_mtp_adapter_registered = []() {
-  ModelRegistry::register_mtp_args_adapter("qwen3_5",
-                                           &qwen3_5_args::configure_mtp_args);
-  ModelRegistry::register_mtp_args_adapter("qwen3_5_moe",
-                                           &qwen3_5_args::configure_mtp_args);
-  ModelRegistry::register_mtp_args_adapter("qwen3_5_text",
-                                           &qwen3_5_args::configure_mtp_args);
-  ModelRegistry::register_mtp_args_adapter("qwen3_5_moe_text",
-                                           &qwen3_5_args::configure_mtp_args);
-  return true;
-}();
-
 const bool qwen3_5_dcp_registered = []() {
   ModelRegistry::register_dcp_capability("qwen3_5_text");
   ModelRegistry::register_dcp_capability("qwen3_5_moe_text");

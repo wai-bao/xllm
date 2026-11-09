@@ -80,7 +80,6 @@ limitations under the License.
 #include "core/framework/allocator/virtual_memory/physical_page_pool.h"
 #include "core/framework/model_loader/model_loader.h"
 #include "core/framework/speculative/draft_config.h"
-#include "core/framework/speculative/mtp_utils.h"
 #include "core/kv_cache/layout/layerwise_split_layout.h"
 #include "core/kv_cache/storage/kv_cache.h"
 #include "core/kv_cache/storage/linear_state_restore.h"
@@ -1770,8 +1769,8 @@ void WorkerImpl::observe_execution_memory(bool is_warmup) {
       !cache_config.vmm_elastic()) {
     return;
   }
+  CHECK(compute_stream_ != nullptr);
   if (is_warmup) {
-    CHECK(compute_stream_ != nullptr);
     CHECK_EQ(compute_stream_->synchronize(), 0)
         << "Failed to finish elastic VMM execution warmup";
   }
@@ -1802,6 +1801,27 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async_impl(
       output->is_graph_warmup = input.input_params.meta.is_graph_warmup;
     }
     promise.setValue(std::move(output));
+  });
+  return future;
+}
+
+folly::SemiFuture<bool> WorkerImpl::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        ids = std::move(embedding_ids),
+                        promise = std::move(promise)]() mutable {
+    // The schedule-overlap coordinator owns prior-output lifetime; this idle
+    // path only retires device work and per-request state.
+    CHECK(compute_stream_ != nullptr);
+    c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+    release_request_state(ids);
+    CHECK_EQ(compute_stream_->synchronize(), 0)
+        << "Failed to retire idle worker device work";
+    VLOG(1) << "Released idle request state for " << ids.size()
+            << " embedding slots";
+    promise.setValue(true);
   });
   return future;
 }
@@ -2090,12 +2110,32 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
   model_weights_path_ = model_weights_path;
 
   auto args = model_loader->model_args();
-  ModelRegistry::configure_mtp_args(
-      args,
-      options_.speculative_algorithm(),
-      options_.is_draft_engine(),
-      ModelConfig::is_python_model_impl(context_.get_model_impl()));
+#if defined(USE_MLU)
+  const bool native_glm5_next =
+      !ModelConfig::is_python_model_impl(context_.get_model_impl()) &&
+      (is_glm5_next_target_model_type(args.model_type()) ||
+       args.model_type() == "glm5_next_mtp");
+  CHECK(!(native_glm5_next && options_.enable_speculative_decode()))
+      << "Native MLU GLM5-Next speculative decoding is not supported yet: "
+         "Dense Validate Span and accepted-span state replay are not wired "
+         "into the MTP worker. Disable speculative decoding.";
+#endif
+  const std::string& speculative_algorithm = options_.speculative_algorithm();
+  const SpeculativeConfig::MtpDraftConversion mtp_draft_conversion =
+      maybe_load_mtp_pair_draft(options_.is_draft_engine(),
+                                speculative_algorithm,
+                                options_.num_speculative_tokens(),
+                                args);
   validate_shared_kv_cache_support(args, options_, parallel_args_);
+  const bool is_block_diffusion =
+      SpeculativeConfig::is_block_diffusion_algorithm(speculative_algorithm);
+#if defined(USE_NPU)
+  if (mtp_draft_conversion ==
+      SpeculativeConfig::MtpDraftConversion::DRAFT_ENGINE_PAIR) {
+    LOG(INFO) << "Loading MTP draft directly from " << model_weights_path
+              << ", appended layer " << args.mtp_start_layer_idx();
+  }
+#endif
   auto quant_args = model_loader->quant_args();
   const bool embedding_mode = options_.task_type() == "embed";
   args.embedding_mode(embedding_mode);
@@ -2129,16 +2169,12 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
   }
   tokenizer_ = std::move(tokenizer);
 
-  const std::string& speculative_algorithm = options_.speculative_algorithm();
-  const bool is_block_diffusion =
-      SpeculativeConfig::is_block_diffusion_algorithm(speculative_algorithm);
-
 #if defined(USE_NPU)
-  if (options_.enable_speculative_decode() &&
-      SpeculativeConfig::is_mtp_algorithm(speculative_algorithm) &&
-      uses_mtp_target_spec_width(args.model_type())) {
-    args.num_speculative_tokens(options_.num_speculative_tokens());
-  }
+  SpeculativeConfig::apply_mtp_target_spec_width(
+      args,
+      speculative_algorithm,
+      options_.enable_speculative_decode(),
+      options_.num_speculative_tokens());
   if (is_block_diffusion) {
     if (options_.is_draft_engine()) {
       args.layers_to_capture({});
@@ -2179,6 +2215,10 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
              ::xllm::SpeculativeConfig::get_instance()
                  .enable_atb_spec_kernel()) {
     args.num_speculative_tokens(options_.num_speculative_tokens());
+  } else if (options_.enable_speculative_decode() &&
+             mtp_draft_conversion ==
+                 SpeculativeConfig::MtpDraftConversion::EMBEDDED_LAYER) {
+    maybe_override_mtp_draft_model_type(args);
   }
   if (options_.enable_speculative_decode() && !options_.is_draft_engine() &&
       SpeculativeConfig::requires_aux_hidden_capture(speculative_algorithm) &&
@@ -2215,25 +2255,11 @@ bool WorkerImpl::init_model_impl(const std::string& model_weights_path,
     // When running speculative decoding, the draft worker reuses the same
     // checkpoint as the target model. The draft worker needs to instantiate
     // the MTP variant, so override the model_type here without mutating the
-    // original config.
-    if (!is_block_diffusion && options_.num_speculative_tokens() == 0 &&
-        args.num_nextn_predict_layers() != 0) {
-      static const std::unordered_map<std::string, std::string>
-          kModelTypeToMtpType = {
-              {"deepseek_v3", "deepseek_v3_mtp"},
-              {"deepseek_v32", "deepseek_v32_mtp"},
-              {"deepseek_v4", "deepseek_v4_mtp"},
-              {"glm_moe_dsa", "glm_moe_dsa_mtp"},
-              {"joyai_llm_flash", "joyai_llm_flash_mtp"},
-              {"mimo", "mimo_mtp"},
-          };
-      const std::string& current_type = args.model_type();
-      auto it = kModelTypeToMtpType.find(current_type);
-      if (it != kModelTypeToMtpType.end()) {
-        LOG(INFO) << "Overriding draft model_type from " << current_type
-                  << " to " << it->second << " for speculative decoding";
-        args.model_type(it->second);
-      }
+    // original config. Non-NPU platforms convert through the embedded-layer
+    // mode for draft engines and plain workers alike.
+    if (mtp_draft_conversion ==
+        SpeculativeConfig::MtpDraftConversion::EMBEDDED_LAYER) {
+      maybe_override_mtp_draft_model_type(args);
     }
   }
 #endif

@@ -13,12 +13,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/spec_input_builder.h"
+#include "core/runtime/speculative_input_builder.h"
 
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <array>
 #include <limits>
+#include <memory>
 #include <utility>
 
 #include "core/framework/model/seq_lens.h"
@@ -28,11 +30,92 @@ limitations under the License.
 #include "framework/sampling/sampling_params.h"
 #include "layers/common/expanded_decode_metadata_builder.h"
 #include "runtime/vlm_forward_params.h"
+#include "util/utils.h"
 
 namespace xllm::specBuilder {
 
 namespace {
 
+template <size_t N>
+void clone_packed_metadata(const torch::Tensor& buffer,
+                           uint64_t active_bytes,
+                           std::array<torch::Tensor*, N>& tensors) {
+  if (!buffer.defined() || buffer.scalar_type() != torch::kUInt8 ||
+      buffer.dim() != 1 || !buffer.is_contiguous() || active_bytes == 0 ||
+      active_bytes > static_cast<uint64_t>(buffer.numel())) {
+    return;
+  }
+  const uintptr_t base = reinterpret_cast<uintptr_t>(buffer.const_data_ptr());
+  std::array<bool, N> packed{};
+  std::array<uint64_t, N> offsets{};
+  std::array<uint64_t, N> ends{};
+  uint64_t begin = active_bytes;
+  uint64_t end = 0;
+  uint64_t alignment = 1;
+  size_t count = 0;
+  for (size_t i = 0; i < N; ++i) {
+    const torch::Tensor& tensor = *tensors[i];
+    if (!tensor.defined() || tensor.numel() == 0 ||
+        tensor.device() != buffer.device() || !tensor.is_contiguous() ||
+        tensor.is_quantized()) {
+      continue;
+    }
+    const uintptr_t address =
+        reinterpret_cast<uintptr_t>(tensor.const_data_ptr());
+    if (address < base) {
+      continue;
+    }
+    const uint64_t offset = address - base;
+    const uint64_t bytes = tensor.nbytes();
+    if (offset > active_bytes || bytes > active_bytes - offset ||
+        offset % tensor.element_size() != 0) {
+      continue;
+    }
+    bool overlaps = false;
+    for (size_t j = 0; j < i; ++j) {
+      if (packed[j] && offset < ends[j] && offsets[j] < offset + bytes) {
+        overlaps = true;
+        break;
+      }
+    }
+    if (overlaps) {
+      continue;
+    }
+    packed[i] = true;
+    offsets[i] = offset;
+    ends[i] = offset + bytes;
+    begin = std::min(begin, offset);
+    end = std::max(end, offset + bytes);
+    alignment =
+        std::max(alignment, static_cast<uint64_t>(tensor.element_size()));
+    ++count;
+  }
+  if (count < 2) {
+    return;
+  }
+  // Keep dtype views aligned while excluding unused prefix/capacity. Each
+  // resulting view owns the new storage even after the packed owner is reset.
+  begin -= begin % alignment;
+  const torch::Tensor snapshot =
+      buffer
+          .narrow(
+              0, static_cast<int64_t>(begin), static_cast<int64_t>(end - begin))
+          .detach()
+          .clone();
+  for (size_t i = 0; i < N; ++i) {
+    if (!packed[i]) {
+      continue;
+    }
+    torch::Tensor& tensor = *tensors[i];
+    tensor = snapshot
+                 .narrow(0,
+                         static_cast<int64_t>(offsets[i] - begin),
+                         static_cast<int64_t>(ends[i] - offsets[i]))
+                 .view(tensor.scalar_type())
+                 .view(tensor.sizes());
+    tensors[i] = nullptr;
+  }
+}
 template <typename Input>
 Slice<int32_t> get_token_ids(const Input& input) {
   return tensor_slice(input.token_ids_host);
@@ -78,18 +161,6 @@ Slice<int32_t> get_block_table_slice(const DecodeRowContext& ctx,
           static_cast<size_t>(ctx.block_table_stride)};
 }
 
-template <typename T>
-void pad_2d_vector(std::vector<std::vector<T>>& vec, T pad_value) {
-  size_t max_col_size = 0;
-  for (const std::vector<T>& row : vec) {
-    max_col_size = std::max(max_col_size, row.size());
-  }
-
-  for (std::vector<T>& row : vec) {
-    row.resize(max_col_size, pad_value);
-  }
-}
-
 torch::Tensor create_flat_2d_tensor(const std::vector<int32_t>& values,
                                     int32_t rows,
                                     int32_t stride) {
@@ -101,11 +172,7 @@ torch::Tensor create_flat_2d_tensor(const std::vector<int32_t>& values,
   CHECK_EQ(values.size(), static_cast<size_t>(rows) * stride)
       << "flat 2D tensor size mismatch, rows=" << rows << ", stride=" << stride
       << ", values_size=" << values.size();
-  auto tensor = torch::empty({rows, stride},
-                             torch::TensorOptions()
-                                 .dtype(torch::kInt)
-                                 .device(torch::kCPU)
-                                 .pinned_memory(true));
+  auto tensor = torch::empty({rows, stride}, pinned_cpu_options(torch::kInt));
   std::copy(values.begin(), values.end(), tensor.data_ptr<int32_t>());
   return tensor;
 }
@@ -124,11 +191,17 @@ void fill_multi_block_table_slices(DecodeRowContext& ctx) {
         << "num_sequences exceeds multi_block_tables[" << m
         << "] rows, num_sequences=" << ctx.num_sequences
         << ", rows=" << manager_table.size(0);
+    // A Slice borrows contiguous row storage, so each row must be unit-strided.
+    // Indexing per row would build a throwaway TensorImpl per sequence.
+    CHECK_EQ(manager_table.stride(1), 1)
+        << "multi_block_tables[" << m << "] rows must be contiguous";
+    const int64_t row_stride = manager_table.stride(0);
+    const size_t row_length = static_cast<size_t>(manager_table.size(1));
+    int32_t* base = manager_table.data_ptr<int32_t>();
     ctx.multi_block_tables[m].reserve(static_cast<size_t>(ctx.num_sequences));
     for (int32_t seq_id = 0; seq_id < ctx.num_sequences; ++seq_id) {
-      torch::Tensor row = manager_table[seq_id];
-      ctx.multi_block_tables[m].emplace_back(row.data_ptr<int32_t>(),
-                                             static_cast<size_t>(row.numel()));
+      ctx.multi_block_tables[m].emplace_back(base + seq_id * row_stride,
+                                             row_length);
     }
   }
 }
@@ -154,6 +227,162 @@ MtpTopkStatePtr select_mtp_topk_state_for_next_step(
       selected_idxes.to(torch::dtype(torch::kLong).device(state->device()))
           .contiguous();
   return state->index_select_rows(index);
+}
+
+template <typename Params>
+void fill_mtp_prefill_token_ids(const torch::Tensor& token_ids_host,
+                                const Params& params,
+                                const std::vector<int32_t>& extra_token_ids,
+                                torch::Tensor& output) {
+  const Slice<int32_t> tokens = tensor_slice(token_ids_host);
+  const Slice<int32_t> result = tensor_slice(output);
+  CHECK_EQ(result.size(), tokens.size());
+  const int32_t num_sequences = params.meta.num_sequences;
+  CHECK_GE(num_sequences, 0);
+  CHECK_EQ(extra_token_ids.size(), static_cast<size_t>(num_sequences));
+  int32_t* destination = output.data_ptr<int32_t>();
+  size_t offset = 0;
+  for (int32_t sequence = 0; sequence < num_sequences; ++sequence) {
+    const int32_t query_length =
+        params.attention.host.q_seq_lens[static_cast<size_t>(sequence)];
+    CHECK_GT(query_length, 0);
+    CHECK_LE(static_cast<size_t>(query_length), tokens.size() - offset);
+    const size_t length = static_cast<size_t>(query_length);
+    std::copy(tokens.data() + offset + 1,
+              tokens.data() + offset + length,
+              destination + offset);
+    destination[offset + length - 1] = extra_token_ids[sequence];
+    offset += length;
+  }
+  CHECK_EQ(offset, tokens.size());
+}
+
+MtpDraftExtendRows build_mtp_draft_extend_rows(
+    const torch::Tensor& accepted_tokens,
+    const torch::Tensor& target_hidden_states,
+    bool step_major_layout) {
+  CHECK(accepted_tokens.defined());
+  CHECK(target_hidden_states.defined());
+  CHECK_EQ(accepted_tokens.dim(), 2);
+  CHECK_EQ(target_hidden_states.dim(), 3);
+  const int64_t batch_size = accepted_tokens.size(0);
+  const int64_t width = accepted_tokens.size(1);
+  CHECK_EQ(target_hidden_states.size(0), batch_size);
+  CHECK_EQ(target_hidden_states.size(1), width);
+  CHECK_GT(batch_size, 0);
+  CHECK_GT(width, 0);
+
+  torch::Tensor last_rows =
+      accepted_tokens.ge(0).sum(/*dim=*/1).to(torch::kLong);
+  last_rows.sub_(1).clamp_min_(0);
+  const torch::Tensor safe_tokens = accepted_tokens.clamp_min(0);
+  const torch::Tensor sequence_idxes =
+      torch::arange(batch_size, accepted_tokens.options().dtype(torch::kLong));
+  MtpDraftExtendRows rows;
+  if (step_major_layout) {
+    rows.token_ids = safe_tokens.transpose(0, 1).contiguous().flatten();
+    rows.hidden_states =
+        target_hidden_states.transpose(0, 1).contiguous().flatten(0, 1);
+    rows.selected_token_idxes = last_rows * batch_size + sequence_idxes;
+    return rows;
+  }
+  rows.token_ids = safe_tokens.flatten();
+  rows.hidden_states = target_hidden_states.flatten(0, 1);
+  rows.selected_token_idxes = sequence_idxes * width + last_rows;
+  return rows;
+}
+
+template <typename TargetInput>
+TargetInput build_mtp_draft_extend_input(const TargetInput& validate_input,
+                                         const MtpDraftExtendRows& rows,
+                                         SamplingParameters sampling_params) {
+  TargetInput input;
+  input.positions = validate_input.positions;
+  input.positions_host = validate_input.positions_host;
+  input.runtime.kv_slot_layout = validate_input.runtime.kv_slot_layout;
+  input.sample_sequence_ids = validate_input.sample_sequence_ids;
+  // LlmModelParams/VlmModelParams delete copy-assignment by design, so the
+  // carried field set is written as this explicit whitelist; the draft
+  // worker rebuilds MLA prefix-cache workspace for its own cache.
+  auto& params = input.input_params;
+  params.meta = validate_input.input_params.meta;
+  params.attention = validate_input.input_params.attention;
+  params.parallel = validate_input.input_params.parallel;
+  params.multi_block_tables = validate_input.input_params.multi_block_tables;
+  input.input_params.embedding.embedding_ids =
+      validate_input.input_params.embedding.embedding_ids;
+  input.input_params.embedding.request_ids =
+      validate_input.input_params.embedding.request_ids;
+  params.attention.device.history_compressed_kv = torch::Tensor();
+  params.attention.device.history_k_rope = torch::Tensor();
+  clone_mtp_draft_metadata(input);
+
+  input.token_ids = safe_to(rows.token_ids, validate_input.token_ids.options());
+  params.embedding.input_embedding = rows.hidden_states;
+  input.sampling_params = std::move(sampling_params);
+  input.sampling_params.selected_token_idxes() =
+      rows.selected_token_idxes.to(input.token_ids.device());
+  input.runtime.device_tensors_ready = true;
+  return input;
+}
+
+template <typename TargetInput>
+void clone_mtp_draft_metadata(TargetInput& input) {
+  const auto clone_tensor = [](torch::Tensor& tensor) {
+    if (tensor.defined()) {
+      tensor = clone_contiguous_detached_tensor(tensor);
+    }
+  };
+  clone_tensor(input.positions);
+  clone_tensor(input.positions_host);
+  auto& attention = input.input_params.attention;
+  // Block tables are the largest host snapshot per decode round; the memcpy
+  // clone avoids launching an ATen parallel copy team on every TP rank.
+  if (attention.host.block_tables.defined()) {
+    attention.host.block_tables =
+        clone_host_block_tables(attention.host.block_tables);
+  }
+  for (torch::Tensor& block_table : input.input_params.multi_block_tables) {
+    if (block_table.defined()) {
+      block_table = clone_host_block_tables(block_table);
+    }
+  }
+  std::array tensors = {
+      &attention.device.q_seq_lens,
+      &attention.device.kv_seq_lens,
+      &attention.device.q_cu_seq_lens,
+      &attention.device.new_cache_slots,
+      &attention.device.block_tables,
+      &attention.device.paged_kv_indptr,
+      &attention.device.paged_kv_indices,
+      &attention.device.paged_kv_last_page_len,
+      &attention.device.new_cache_slot_offsets,
+      &attention.device.kv_cache_start_offsets,
+      &attention.device.kv_cache_tokens_nums,
+      &attention.device.history_compressed_kv,
+      &attention.device.history_k_rope,
+      &attention.device.ring_cur_seqlen,
+      &attention.device.ring_cache_seqlen,
+      &attention.device.in_prefix_slots,
+  };
+  clone_packed_metadata(attention.attention_device_buffer,
+                        attention.attention_buffer_bytes,
+                        tensors);
+  for (torch::Tensor* tensor : tensors) {
+    if (tensor != nullptr) {
+      clone_tensor(*tensor);
+    }
+  }
+
+  // Every view holds storage independent from the target, so neither its
+  // reusable buffers nor borrowed pointers are exposed.
+  attention.host.graph_q_seq_lens_data = nullptr;
+  attention.host.graph_kv_seq_lens_data = nullptr;
+  attention.attention_host_buffer = torch::Tensor();
+  attention.attention_device_buffer = torch::Tensor();
+  attention.attention_buffer_bytes = 0;
+  attention.attention_buffer_capacity = 0;
+  attention.attention_buffer_owner = std::make_shared<int>(0);
 }
 
 int32_t calc_slot_id(int32_t position,
@@ -231,6 +460,104 @@ void append_q_seq_len(std::vector<int32_t>& q_seq_lens,
       (q_cu_seq_lens.empty() ? 0 : q_cu_seq_lens.back()) + len);
 }
 
+template <typename Params>
+void publish_accepted_prefix_lengths(
+    Params& input_params,
+    const std::vector<int32_t>& accepted_prefix_lengths,
+    const torch::TensorOptions& token_options,
+    bool publish_device_tensor) {
+  // num_accepted_tokens is a logical checkpoint index, not the physical
+  // conv-state capacity. Clamping it commits a stale checkpoint (issue #2247).
+  input_params.num_accepted_tokens_host.assign(accepted_prefix_lengths.begin(),
+                                               accepted_prefix_lengths.end());
+  if (publish_device_tensor) {
+    input_params.num_accepted_tokens =
+        async_h2d_tensor(accepted_prefix_lengths, token_options);
+  }
+}
+
+#if defined(USE_NPU)
+template <typename Params>
+bool prepare_expanded_spec_verify_graph_host_input(Params& input_params) {
+  input_params.graph.use_expanded_decode_for_spec_verify_attention = false;
+  input_params.graph.expanded_kv_seq_lens = torch::Tensor();
+  input_params.graph.expanded_block_tables = torch::Tensor();
+  input_params.graph.expanded_paged_kv_indptr = torch::Tensor();
+  input_params.graph.expanded_paged_kv_indices = torch::Tensor();
+  input_params.graph.expanded_paged_kv_last_page_len = torch::Tensor();
+  input_params.graph.expanded_tiling_data = torch::Tensor();
+  input_params.graph.expanded_kv_seq_lens_vec.clear();
+  if (!input_params.is_spec_verify ||
+      !input_params.meta.batch_forward_type.is_chunked_prefill()) {
+    return false;
+  }
+
+  const std::vector<int32_t>& q_seq_lens =
+      input_params.attention.host.q_seq_lens;
+  const std::vector<int32_t>& kv_seq_lens =
+      input_params.attention.host.kv_seq_lens;
+  if (q_seq_lens.empty() || kv_seq_lens.empty()) {
+    return false;
+  }
+  input_params.graph.expanded_kv_seq_lens_vec =
+      layer::ExpandedDecodeMetadataBuilder::build_tokenwise_kv_seq_lens(
+          q_seq_lens, kv_seq_lens);
+  if (input_params.graph.expanded_kv_seq_lens_vec.empty()) {
+    return false;
+  }
+  input_params.graph.use_expanded_decode_for_spec_verify_attention = true;
+  return true;
+}
+
+namespace {
+template <typename Params>
+void bind_expanded_spec_verify_graph_input(Params& input_params,
+                                           const torch::Device& device,
+                                           int32_t block_size) {
+  if (!input_params.graph.use_expanded_decode_for_spec_verify_attention) {
+    return;
+  }
+  CHECK(input_params.attention.device.block_tables.defined())
+      << "spec verify block tables must be rebuilt before graph input";
+  const std::vector<int32_t>& q_seq_lens =
+      input_params.attention.host.q_seq_lens;
+  CHECK_GE(input_params.attention.device.block_tables.size(0),
+           static_cast<int64_t>(q_seq_lens.size()))
+      << "spec verify block table rows are fewer than sequences";
+
+  if (!input_params.graph.expanded_kv_seq_lens.defined()) {
+    input_params.graph.expanded_kv_seq_lens =
+        async_h2d_tensor(input_params.graph.expanded_kv_seq_lens_vec, device);
+  }
+  // One repeat_interleave replaces per-token select + stack: a single kernel
+  // with no intermediate row-view TensorImpls.
+  torch::Tensor expanded_block_tables =
+      input_params.attention.device.block_tables.repeat_interleave(
+          async_h2d_tensor(
+              q_seq_lens,
+              torch::TensorOptions()
+                  .dtype(torch::kInt64)
+                  .device(input_params.attention.device.block_tables.device())),
+          /*dim=*/0);
+  layer::ExpandedDecodeMetadataBuilder::populate_expanded_layout(
+      ModelParamsView(input_params),
+      input_params.graph.expanded_kv_seq_lens,
+      expanded_block_tables,
+      input_params.graph.expanded_kv_seq_lens_vec,
+      block_size);
+}
+}  // namespace
+
+template <typename Params>
+void build_expanded_spec_verify_graph_input(Params& input_params,
+                                            const torch::Device& device,
+                                            int32_t block_size) {
+  CHECK(prepare_expanded_spec_verify_graph_host_input(input_params))
+      << "spec-verify chunked prefill requires q/kv seq lens";
+  bind_expanded_spec_verify_graph_input(input_params, device, block_size);
+}
+#endif
+
 void update_kv_seq_lens_and_max(std::vector<int32_t>& kv_seq_lens_vec,
                                 int32_t kv_len,
                                 int32_t& kv_max_seq_len) {
@@ -263,10 +590,7 @@ DecodeRowContext make_decode_row_context(const Input& input) {
         input.input_params.multi_block_tables.size());
     for (const torch::Tensor& block_table :
          input.input_params.multi_block_tables) {
-      torch::Tensor cpu_block_table = block_table.device().is_cpu()
-                                          ? block_table
-                                          : block_table.to(torch::kCPU);
-      ctx.multi_block_tables_owner.emplace_back(cpu_block_table.contiguous());
+      ctx.multi_block_tables_owner.emplace_back(to_cpu_contiguous(block_table));
     }
     fill_multi_block_table_slices(ctx);
     return ctx;
@@ -491,7 +815,7 @@ void update_input_params(Params& input_params,
           buf.out_multi_block_tables.size());
       for (std::vector<std::vector<int32_t>>& manager_tables :
            buf.out_multi_block_tables) {
-        pad_2d_vector(manager_tables, /*pad_value=*/-1);
+        util::pad_2d_vector(manager_tables, /*pad_value=*/-1);
         input_params.multi_block_tables.emplace_back(
             create_2d_tensor(manager_tables, torch::kInt));
       }
@@ -510,11 +834,11 @@ void update_input_params(Params& input_params,
         CHECK_EQ(buf.out_paged_kv_indptr.back(),
                  static_cast<int32_t>(buf.out_paged_kv_indices.size()));
         input_params.attention.device.paged_kv_indptr =
-            make_cpu_int_tensor(buf.out_paged_kv_indptr);
+            make_pinned_cpu_tensor(buf.out_paged_kv_indptr);
         input_params.attention.device.paged_kv_indices =
-            make_cpu_int_tensor(buf.out_paged_kv_indices);
+            make_pinned_cpu_tensor(buf.out_paged_kv_indices);
         input_params.attention.device.paged_kv_last_page_len =
-            make_cpu_int_tensor(buf.out_paged_kv_last_page_len);
+            make_pinned_cpu_tensor(buf.out_paged_kv_last_page_len);
       } else {
         input_params.attention.device.paged_kv_indptr = torch::Tensor();
         input_params.attention.device.paged_kv_indices = torch::Tensor();
@@ -524,57 +848,6 @@ void update_input_params(Params& input_params,
   }
 }
 
-torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values) {
-  return make_pinned_cpu_tensor(values);
-}
-
-void materialize_empty_block_draft_rows(LlmForwardInput& input,
-                                        int32_t query_width,
-                                        int32_t mask_token_id) {
-  CHECK_GT(query_width, 0);
-  auto& params = input.input_params;
-  for (int32_t& count : params.parallel.dp_global_token_nums) {
-    if (count == 0) {
-      count = query_width;
-    }
-  }
-  if (params.meta.num_sequences != 0) {
-    return;
-  }
-  const torch::TensorOptions options =
-      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
-  input.token_ids_host = torch::full({query_width}, mask_token_id, options);
-  input.positions_host = torch::arange(query_width, options);
-  input.token_ids = input.token_ids_host;
-  input.positions = input.positions_host;
-  input.runtime.device_tensors_ready = false;
-  input.runtime.input_host_buffer_has_layout = false;
-  params.meta.num_sequences = 1;
-  params.meta.actual_num_sequences = 0;
-  if (ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl())) {
-    auto& execution_batch = params.meta.execution_batch;
-    execution_batch.num_reqs = 0;
-    execution_batch.num_tokens = query_width;
-    execution_batch.num_scheduled_tokens.clear();
-    execution_batch.num_computed_tokens.clear();
-    execution_batch.query_start_loc = {0};
-    execution_batch.is_prefilling.clear();
-  }
-  params.meta.q_max_seq_len = query_width;
-  params.meta.kv_max_seq_len = 1;
-  params.attention.host.q_seq_lens.clear();
-  params.attention.host.q_seq_lens.emplace_back(query_width);
-  params.attention.host.q_cu_seq_lens = {0, query_width};
-  params.attention.host.kv_seq_lens.clear();
-  params.attention.host.kv_seq_lens.emplace_back(/*value=*/1);
-  params.attention.host.new_cache_slots.assign(query_width, util::kPadSlotId);
-  params.attention.host.block_tables = torch::zeros({1, 1}, options);
-  params.attention.device.paged_kv_indptr = torch::tensor({0, 1}, options);
-  params.attention.device.paged_kv_indices = torch::tensor({0}, options);
-  params.attention.device.paged_kv_last_page_len = torch::tensor({1}, options);
-}
-
 template <typename Input>
 void set_token_position_tensors(Input& input,
                                 const std::vector<int32_t>& token_ids,
@@ -582,8 +855,8 @@ void set_token_position_tensors(Input& input,
                                 const torch::TensorOptions& token_options,
                                 const torch::TensorOptions& position_options) {
   input.runtime.device_tensors_ready = false;
-  input.token_ids_host = make_cpu_int_tensor(token_ids);
-  input.positions_host = make_cpu_int_tensor(positions);
+  input.token_ids_host = make_pinned_cpu_tensor(token_ids);
+  input.positions_host = make_pinned_cpu_tensor(positions);
   input.token_ids =
       safe_to(input.token_ids_host, token_options, /*non_blocking=*/true);
   input.positions =
@@ -633,5 +906,86 @@ template void update_input_params(VlmModelParams&,
                                   int32_t,
                                   std::vector<int32_t>,
                                   bool);
+
+// Explicit instantiations for the parameter-view templates shared by the
+// LLM/VLM MTP workers and DFlash.
+template void publish_accepted_prefix_lengths(LlmModelParams&,
+                                              const std::vector<int32_t>&,
+                                              const torch::TensorOptions&,
+                                              bool);
+template void publish_accepted_prefix_lengths(VlmModelParams&,
+                                              const std::vector<int32_t>&,
+                                              const torch::TensorOptions&,
+                                              bool);
+template void build_expanded_spec_verify_graph_input(LlmModelParams&,
+                                                     const torch::Device&,
+                                                     int32_t);
+template void build_expanded_spec_verify_graph_input(VlmModelParams&,
+                                                     const torch::Device&,
+                                                     int32_t);
+template bool prepare_expanded_spec_verify_graph_host_input(LlmModelParams&);
+template bool prepare_expanded_spec_verify_graph_host_input(VlmModelParams&);
+template LlmForwardInput build_mtp_draft_extend_input(const LlmForwardInput&,
+                                                      const MtpDraftExtendRows&,
+                                                      SamplingParameters);
+template VlmForwardInput build_mtp_draft_extend_input(const VlmForwardInput&,
+                                                      const MtpDraftExtendRows&,
+                                                      SamplingParameters);
+
+template void fill_mtp_prefill_token_ids(const torch::Tensor&,
+                                         const LlmModelParams&,
+                                         const std::vector<int32_t>&,
+                                         torch::Tensor&);
+template void fill_mtp_prefill_token_ids(const torch::Tensor&,
+                                         const VlmModelParams&,
+                                         const std::vector<int32_t>&,
+                                         torch::Tensor&);
+
+void materialize_empty_block_draft_rows(LlmForwardInput& input,
+                                        int32_t query_width,
+                                        int32_t mask_token_id) {
+  CHECK_GT(query_width, 0);
+  auto& params = input.input_params;
+  for (int32_t& count : params.parallel.dp_global_token_nums) {
+    if (count == 0) {
+      count = query_width;
+    }
+  }
+  if (params.meta.num_sequences != 0) {
+    return;
+  }
+  const torch::TensorOptions options =
+      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+  input.token_ids_host = torch::full({query_width}, mask_token_id, options);
+  input.positions_host = torch::arange(query_width, options);
+  input.token_ids = input.token_ids_host;
+  input.positions = input.positions_host;
+  input.runtime.device_tensors_ready = false;
+  input.runtime.input_host_buffer_has_layout = false;
+  params.meta.num_sequences = 1;
+  params.meta.actual_num_sequences = 0;
+  if (ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl())) {
+    auto& execution_batch = params.meta.execution_batch;
+    execution_batch.num_reqs = 0;
+    execution_batch.num_tokens = query_width;
+    execution_batch.num_scheduled_tokens.clear();
+    execution_batch.num_computed_tokens.clear();
+    execution_batch.query_start_loc = {0};
+    execution_batch.is_prefilling.clear();
+  }
+  params.meta.q_max_seq_len = query_width;
+  params.meta.kv_max_seq_len = 1;
+  params.attention.host.q_seq_lens.clear();
+  params.attention.host.q_seq_lens.emplace_back(query_width);
+  params.attention.host.q_cu_seq_lens = {0, query_width};
+  params.attention.host.kv_seq_lens.clear();
+  params.attention.host.kv_seq_lens.emplace_back(1);
+  params.attention.host.new_cache_slots.assign(query_width, util::kPadSlotId);
+  params.attention.host.block_tables = torch::zeros({1, 1}, options);
+  params.attention.device.paged_kv_indptr = torch::tensor({0, 1}, options);
+  params.attention.device.paged_kv_indices = torch::tensor({0}, options);
+  params.attention.device.paged_kv_last_page_len = torch::tensor({1}, options);
+}
 
 }  // namespace xllm::specBuilder

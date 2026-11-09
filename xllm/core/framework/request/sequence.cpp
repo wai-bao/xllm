@@ -185,7 +185,6 @@ Sequence::Sequence(const Sequence& other, size_t index)
       mrope_position_delta_(other.mrope_position_delta_),
       mrope_positions_(other.mrope_positions_),
       output_embedding_(other.output_embedding_),
-      mtp_bootstrap_embedding_(other.mtp_bootstrap_embedding_),
       num_tokens_(other.num_tokens_),
       token_to_count_map_(other.token_to_count_map_),
       num_prompt_tokens_(other.num_prompt_tokens_),
@@ -201,6 +200,8 @@ Sequence::Sequence(const Sequence& other, size_t index)
       finish_reason_(other.finish_reason_),
       stop_reason_(other.stop_reason_),
       matched_stop_token_count_(other.matched_stop_token_count_),
+      target_decode_bootstrap_pending_(other.target_decode_bootstrap_pending_),
+      draft_input_(other.draft_input_),
       closed_(other.closed_),
       dp_rank_(other.dp_rank_),
       cur_generated_token_idx_(other.cur_generated_token_idx_),
@@ -267,7 +268,7 @@ bool Sequence::try_commit_json_object_token(int32_t token_id,
         << ", request_id=" << request_id() << ", sequence_index=" << index_
         << ", output_row=-1"
         << ", token_id=" << token_id
-        << ", committed_tokens=" << json_object_state_->num_accepted_tokens()
+        << ", committed_tokens=" << json_object_state_->committed_token_count()
         << ", state_fingerprint=" << json_object_state_->fingerprint()
         << ", allowed_tokens="
         << (grammar == nullptr
@@ -278,7 +279,7 @@ bool Sequence::try_commit_json_object_token(int32_t token_id,
                << ", sequence_index=" << index_
                << ", output_row=-1, token_offset=-1, token_id=" << token_id
                << ", committed_tokens="
-               << json_object_state_->num_accepted_tokens()
+               << json_object_state_->committed_token_count()
                << ", state_fingerprint=" << json_object_state_->fingerprint();
   }
   const std::string token_source =
@@ -481,12 +482,6 @@ void Sequence::update_embeddings(const torch::Tensor& embeddings) {
     if (output_embedding_.dim() == 1) {
       output_embedding_ = output_embedding_.unsqueeze(0);
     }
-  }
-}
-
-void Sequence::update_mtp_bootstrap_embedding(const torch::Tensor& embedding) {
-  if (embedding.defined()) {
-    mtp_bootstrap_embedding_ = embedding.detach().clone();
   }
 }
 
@@ -797,6 +792,10 @@ void Sequence::reset() {
   host_kv_state_.reset();
   pending_host_restore_.reset();
   clear_host_cache_match();
+  // The KV lifetime has ended: after a recompute, the stale target bootstrap
+  // and draft input must not be imported again.
+  clear_target_decode_bootstrap();
+  draft_input_.reset();
   volatile_num_prompt_tokens_ = num_tokens_;
 }
 
@@ -1025,4 +1024,11 @@ void Sequence::reset_finish_state_for_beam_search() {
   finished();
 }
 
+void Sequence::update_draft_input(const DraftInput& seed) {
+  check_draft_input(seed);
+  CHECK_EQ(seed.token_ids.size(0), 1);
+  // Slicing a batch-level seed per request must not copy each [1, vocab]
+  // payload; detached views keep the producer's storage alive instead.
+  draft_input_ = detach_draft_input(seed);
+}
 }  // namespace xllm

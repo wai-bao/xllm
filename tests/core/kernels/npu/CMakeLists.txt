@@ -50,25 +50,6 @@ cc_test(
 #     glog::glog
 # )
 
-cc_test(
-  NAME
-    mtp_prepare_next_draft_test
-  SRCS
-    mtp_prepare_next_draft_test.cpp
-  DEPS
-    :tilelang_kernels
-    ascendcl
-    nnopbase
-    torch
-    torch_npu
-    GTest::gtest_main
-    glog::glog
-)
-if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
-  target_link_options(mtp_prepare_next_draft_test PRIVATE
-    "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
-endif()
-
 # build_cp_context is CompositeExplicitAutograd pure host index math, so this
 # runs on CPU with no NPU; it only needs the xllm_ops registrations linked in.
 cc_test(

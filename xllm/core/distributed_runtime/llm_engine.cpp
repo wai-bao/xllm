@@ -59,7 +59,6 @@ limitations under the License.
 #include "core/util/tensor_options.h"
 #include "framework/block/kv_cache_manager_factory.h"
 #include "framework/model/model_args.h"
-#include "framework/speculative/mtp_utils.h"
 #include "models/model_registry.h"
 #include "runtime/decode_graph_bucket.h"
 #include "runtime/llm_worker_impl.h"
@@ -196,12 +195,10 @@ bool LLMEngine::init_model(MasterStatus master_status,
   LOG(INFO) << "Initializing model from: " << model_path;
 
   args_ = model_loader->model_args();
-  ModelRegistry::configure_mtp_args(
-      args_,
-      options_.speculative_algorithm(),
-      options_.is_draft_engine(),
-      ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl()));
+  maybe_load_mtp_pair_draft(options_.is_draft_engine(),
+                            options_.speculative_algorithm(),
+                            options_.num_speculative_tokens(),
+                            args_);
   if (!options_.is_draft_engine() &&
       SpeculativeConfig::is_block_diffusion_algorithm(
           options_.speculative_algorithm())) {
@@ -212,13 +209,11 @@ bool LLMEngine::init_model(MasterStatus master_status,
         read_capture_layer_ids(options_.draft_model_path().value()));
   }
 
-#if defined(USE_NPU)
-  if (options_.enable_speculative_decode() &&
-      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm()) &&
-      uses_mtp_target_spec_width(args_.model_type())) {
-    args_.num_speculative_tokens(options_.num_speculative_tokens());
-  }
-#endif
+  SpeculativeConfig::apply_mtp_target_spec_width(
+      args_,
+      options_.speculative_algorithm(),
+      options_.enable_speculative_decode(),
+      options_.num_speculative_tokens());
 
   // A draft engine is fed token ids and detokenized by the target, so it
   // shares the target vocabulary and loads no tokenizer of its own.
@@ -576,6 +571,14 @@ ForwardOutput LLMEngine::step(BatchGroup& batch) {
   bool is_graph_warmup = false;
   forward_input_factory_->create_inputs(
       batch, args_, forward_inputs, is_graph_warmup);
+  // Released embedding ids ride the next forward input to the worker, which
+  // clears the per-request speculative state on arrival. The pool already
+  // drops ids it reused at the release-queue choke point, so every consumer
+  // only sees genuinely departed slots.
+  for (uint32_t dp_rank = 0; dp_rank < forward_inputs.size(); ++dp_rank) {
+    forward_inputs[dp_rank].request_state.released_embedding_ids =
+        kv_cache_manager_->take_released_embedding_ids(dp_rank);
+  }
   if (eplb_controller_ != nullptr) {
     eplb_controller_->on_step_dispatched(forward_inputs, is_graph_warmup);
   }
@@ -626,6 +629,11 @@ ForwardOutput LLMEngine::step(BatchGroup& batch) {
 
   COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
   return {};
+}
+
+void LLMEngine::flush_released_requests() {
+  flush_released_request_state(
+      *kv_cache_manager_, worker_clients_, dp_local_size_);
 }
 
 std::vector<RawForwardOutput> LLMEngine::collect_step_outputs(

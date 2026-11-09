@@ -13,38 +13,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "eagle3_worker_impl.h"
+#include "core/runtime/eagle3_worker_impl.h"
 
 #include <glog/logging.h>
 
 #include "core/framework/model/aux_hidden_capture.h"
-#include "core/framework/sampling/logits_processor.h"
-#include "core/util/tensor_helper.h"
 #include "runtime/llm_worker_impl.h"
 
 namespace xllm {
 
 namespace {
 
-runtime::Options eagle3_main_options(const runtime::Options& options) {
-  auto opts = options;
-  opts.enable_schedule_overlap(false)
-      .is_draft_engine(false)
-      .enable_graph_aux_hidden_states(true);
-  return opts;
-}
-
 runtime::Options eagle3_draft_options(const runtime::Options& options) {
-  auto opts = options;
-  opts.enable_schedule_overlap(false)
-      .is_draft_engine(true)
-      .num_decoding_tokens(1)
-      .num_speculative_tokens(0)
-      .enable_graph(false)
+  auto opts = speculative_draft_options(options);
+  opts.enable_graph(false)
       .enable_graph_mode_decode_no_padding(false)
-      .enable_prefill_piecewise_graph(false)
-      .enable_graph_aux_hidden_states(true)
-      .backend("llm");
+      .enable_prefill_piecewise_graph(false);
   return opts;
 }
 
@@ -59,7 +43,7 @@ Eagle3WorkerImpl<TargetInput>::Eagle3WorkerImpl(
     : MTPWorkerImpl<TargetInput>(parallel_args,
                                  device,
                                  options,
-                                 eagle3_main_options(options),
+                                 speculative_target_options(options),
                                  eagle3_draft_options(options),
                                  worker_type) {
   // Context parallelism does not expose the auxiliary hidden states.
@@ -74,8 +58,52 @@ Eagle3WorkerImpl<TargetInput>::~Eagle3WorkerImpl() {
 }
 
 template <typename TargetInput>
-int64_t Eagle3WorkerImpl<TargetInput>::get_embedding_placeholder_size() const {
-  return AuxHiddenCapture::aux_hidden_dim(context_.get_model_args());
+bool Eagle3WorkerImpl<TargetInput>::init_model(
+    const std::string& model_weights_path,
+    int32_t random_seed,
+    MasterStatus master_status) {
+  bool result = MTPWorkerImpl<TargetInput>::init_model(
+      model_weights_path, random_seed, master_status);
+
+  // The base init already extracted the d2t offsets from the same state
+  // dict and normalized them (draft_id + arange) into draft_vocab_.
+  if (draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
+    if (uses_embedded_eagle3_draft()) {
+      vocab_map_ = VocabMap();
+    } else if (draft_vocab_.draft_to_target_ids_.defined()) {
+      vocab_map_ = VocabMap(draft_vocab_.draft_to_target_ids_,
+                            context_.get_model_args().vocab_size());
+    }
+  }
+
+  return result;
+}
+
+template <typename TargetInput>
+void Eagle3WorkerImpl<TargetInput>::release_algorithm_state(
+    const std::vector<int32_t>& embedding_ids) {
+  MTPWorkerImpl<TargetInput>::release_algorithm_state(embedding_ids);
+  if (!embedding_ids.empty()) {
+    draft_history_batch_.reclaim_unused_projection();
+  }
+}
+
+template <typename TargetInput>
+std::vector<uint8_t>
+Eagle3WorkerImpl<TargetInput>::prepare_draft_vocabulary_sampling(
+    SamplingParameters& sampling_params,
+    const DraftTokenHistories& histories) {
+  if (!draft_token_mapping_active()) {
+    return {};
+  }
+  return vocab_map_.remap(sampling_params, draft_history_batch_, histories);
+}
+
+template <typename TargetInput>
+void Eagle3WorkerImpl<TargetInput>::remap_draft_sample_output(
+    SampleOutput& sample_output) {
+  // Same sparse-logits scatter and token remap as the DSpark proposal path.
+  draft_vocab_.remap(sample_output);
 }
 
 template <typename TargetInput>
@@ -89,7 +117,8 @@ void Eagle3WorkerImpl<TargetInput>::check_draft_input_embedding(
     return;
   }
 
-  const int64_t expected_hidden_size = get_embedding_placeholder_size();
+  const int64_t expected_hidden_size =
+      AuxHiddenCapture::aux_hidden_dim(context_.get_model_args());
   const int64_t draft_hidden_size =
       draft_impl_ == nullptr ? 0 : draft_impl_->hidden_size();
   CHECK_EQ(embedding.dim(), 2)

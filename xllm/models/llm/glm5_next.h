@@ -211,57 +211,44 @@ inline bool load_model_args(const JsonReader& json, ModelArgs* args) {
   return true;
 }
 
-inline void configure_mtp_args(ModelArgs& args,
-                               [[maybe_unused]] bool is_python_model) {
-#if defined(USE_MLU)
-  // Native MLU needs a fresh index layout on each draft iteration.
-  if (!is_python_model) {
-    args.index_share_for_mtp_iteration(false);
-  }
-#endif
-  if (!is_glm5_next_target_model_type(args.model_type())) {
-    return;
-  }
-  CHECK_EQ(args.num_nextn_predict_layers(), 1)
-      << "GLM MTP requires exactly one appended prediction layer.";
-  CHECK_GT(args.n_layers(), 0);
-  args.mtp_start_layer_idx(args.n_layers());
-  args.model_type("glm5_next_mtp");
-  args.n_layers(1);
-  args.first_k_dense_replace(0);
-  args.layer_types({"deepseek_sparse_attention"});
-  args.full_attn_layers({0});
-  args.mlp_layer_types({"sparse"});
-  args.indexer_types({"full"});
-  if (args.index_share_for_mtp_iteration()) {
-    args.index_topk_freq(std::max(args.index_topk_freq(), 2));
-    args.index_skip_topk_offset(0);
-    args.index_topk_pattern("S");
-  }
-}
-
 }  // namespace glm5_next_args
-
-const bool glm5_next_mtp_adapter_registered = []() {
-  ModelRegistry::register_mtp_args_adapter("glm5_next",
-                                           &glm5_next_args::configure_mtp_args);
-  ModelRegistry::register_mtp_args_adapter("glm5_next_mtp",
-                                           &glm5_next_args::configure_mtp_args);
-  return true;
-}();
 
 REGISTER_MODEL_BACKEND(glm5_next, "llm");
 REGISTER_MODEL_BACKEND(glm5_next_mtp, "llm");
 REGISTER_MODEL_ARGS_LOADER(glm5_next, &glm5_next_args::load_model_args);
 REGISTER_MODEL_ARGS_LOADER(glm5_next_mtp, &glm5_next_args::load_model_args);
 
-// Exported MTP checkpoints contain their own embedding and LM head weights.
-const bool glm5_next_mtp_capabilities_registered = []() {
-  MtpModelCapabilities capabilities;
-  capabilities.native_draft_requires_accepted_span_replay = true;
-  capabilities.python_draft_owns_embedding_and_lm_head = true;
-  ModelRegistry::register_mtp_capabilities("glm5_next_mtp", capabilities);
+REGISTER_TARGET_SPEC_VERIFY_MODE(glm5_next, CAUSAL_CHUNKED_PREFILL);
+// glm5_next_text shares the family's checkpoint layout and verify contract;
+// it reaches the registry under its own transformers model_type string.
+REGISTER_TARGET_SPEC_VERIFY_MODE(glm5_next_text, CAUSAL_CHUNKED_PREFILL);
+
+// The GLM MTP draft rewrites the target's args into the draft form.
+const bool glm5_next_mtp_pair_registered = []() {
+  ModelRegistry::register_mtp_model_pair(
+      "glm5_next", "glm5_next_mtp", [](ModelArgs& args) {
+        CHECK_EQ(args.num_nextn_predict_layers(), 1)
+            << "GLM MTP requires exactly one appended prediction layer.";
+        CHECK_GT(args.n_layers(), 0);
+        args.mtp_start_layer_idx(args.n_layers());
+        args.n_layers(1);
+        args.first_k_dense_replace(0);
+        args.layer_types({"deepseek_sparse_attention"});
+        args.full_attn_layers({0});
+        args.mlp_layer_types({"sparse"});
+        args.indexer_types({"full"});
+        if (args.index_share_for_mtp_iteration()) {
+          args.index_topk_freq(std::max(args.index_topk_freq(), 2));
+          args.index_skip_topk_offset(0);
+          args.index_topk_pattern("S");
+        }
+      });
   return true;
 }();
+
+// Exported MTP checkpoints contain their own embedding and LM head weights;
+// the Python draft model loads them (glm5_next_mtp.py load_weights), and
+// PyCausalLM::share_weights_from only borrows a target's weights when the
+// draft's lm_head/embed_tokens are None.
 
 }  // namespace xllm

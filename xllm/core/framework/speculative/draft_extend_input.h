@@ -21,9 +21,7 @@ namespace xllm {
 
 class SampleOutput;
 struct ModelOutput;
-class LlmForwardInput;
 class ForwardOutput;
-class EmbeddingCache;
 
 // Selects the drafter's feed from `get_hidden_states_for_drafter(model_output)`
 // and exposes it through `embeddings` (plus `selected_embeddings` on target
@@ -38,12 +36,8 @@ void output_spec_hidden_states(
 
 void clear_all_output_embeddings(ForwardOutput& output);
 
-// Writes the target prefill context to the embedding cache and exposes the
-// selected hidden as `embeddings` for the PD handoff to the first draft-extend
-// step.
-template <typename Input>
-void prepare_first_draft_inputs(EmbeddingCache& embedding_cache,
-                                const Input& input,
-                                ForwardOutput& output);
+// Exposes the target prefill's selected hidden as `embeddings` for the PD
+// handoff to the first draft-extend step.
+void prepare_first_draft_inputs(ForwardOutput& output);
 
 }  // namespace xllm

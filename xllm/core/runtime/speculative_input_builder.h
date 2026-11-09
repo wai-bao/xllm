@@ -23,8 +23,9 @@ limitations under the License.
 
 #include "core/framework/model/mtp_topk_state.h"
 #include "core/framework/model/seq_lens.h"
-#include "core/framework/speculative/draft_proposal.h"
 #include "util/slice.h"
+
+// Runtime input construction and metadata ownership for speculative execution.
 
 namespace xllm {
 
@@ -58,13 +59,6 @@ struct DecodeBuildBuffers {
   int32_t last_sequence_id = -1;
   int32_t out_block_table_rows = 0;
   int32_t out_block_table_stride = 0;
-
-  void reserve_row_buffers(size_t num_rows, size_t block_table_stride) {
-    out_block_tables.reserve(num_rows * block_table_stride);
-    out_paged_kv_indices.reserve(num_rows * block_table_stride);
-    out_paged_kv_indptr.reserve(num_rows + 1);
-    out_paged_kv_last_page_len.reserve(num_rows);
-  }
 };
 
 // CPU-side row context shared by decode row builders.
@@ -168,6 +162,29 @@ void append_q_seq_len(std::vector<int32_t>& q_seq_lens,
                       std::vector<int32_t>& q_cu_seq_lens,
                       int32_t len);
 
+// Keep the logical accepted count for recurrent checkpoint selection. The
+// device tensor is materialized only when replay does not supply it directly.
+template <typename Params>
+void publish_accepted_prefix_lengths(
+    Params& input_params,
+    const std::vector<int32_t>& accepted_prefix_lengths,
+    const torch::TensorOptions& token_options,
+    bool publish_device_tensor);
+
+#if defined(USE_NPU)
+// Build the host and device parts of expanded target-verification metadata.
+// The host layout may be prepared before the packed replay inputs are bound.
+template <typename Params>
+bool prepare_expanded_spec_verify_graph_host_input(Params& input_params);
+// Prepares the host layout (CHECKing that the required seq lens exist) and
+// binds the device graph inputs. Callers decide when expanded metadata is
+// needed: MTP also uses it in eager mode, while DFlash uses it in graph mode.
+template <typename Params>
+void build_expanded_spec_verify_graph_input(Params& input_params,
+                                            const torch::Device& device,
+                                            int32_t block_size);
+#endif
+
 // Appends kv_len into output vector and updates kv_max_seq_len.
 void update_kv_seq_lens_and_max(std::vector<int32_t>& kv_seq_lens_vec,
                                 int32_t kv_len,
@@ -183,9 +200,6 @@ void update_input_params(Params& input_params,
                          int32_t kv_max_seq_len,
                          std::vector<int32_t> kv_seq_lens_vec,
                          bool update_block_tables = false);
-
-// Packs a host int32 vector into a pinned CPU tensor for async H2D staging.
-torch::Tensor make_cpu_int_tensor(const std::vector<int32_t>& values);
 
 // Empty DP ranks participate in block-draft execution with a complete query
 // block. Fill their execution counts on every rank and materialize an idle
@@ -208,6 +222,41 @@ void set_token_position_tensors(Input& input,
 MtpTopkStatePtr select_mtp_topk_state_for_next_step(
     const MtpTopkStatePtr& state,
     const SamplingParameters& sampling_params);
+
+// Shift each prefill query left and append its target-sampled root token into
+// caller-owned CPU storage. The runtime supplies pinned storage for H2D.
+template <typename Params>
+void fill_mtp_prefill_token_ids(const torch::Tensor& token_ids_host,
+                                const Params& params,
+                                const std::vector<int32_t>& extra_token_ids,
+                                torch::Tensor& destination);
+
+struct MtpDraftExtendRows {
+  torch::Tensor token_ids;
+  torch::Tensor hidden_states;
+  torch::Tensor selected_token_idxes;
+};
+
+// Pair committed next tokens with their producing target rows. The returned
+// layout matches the verifier metadata; only the last accepted row is sampled.
+// Every sequence contributes the same fixed query length.
+MtpDraftExtendRows build_mtp_draft_extend_rows(
+    const torch::Tensor& accepted_tokens,
+    const torch::Tensor& target_hidden_states,
+    bool step_major_layout);
+
+// Construct a draft input from the verifier's row layout. Target execution,
+// graph, transfer and recurrent-state controls never cross this boundary.
+// The caller orders this snapshot after verification on the metadata stream.
+template <typename TargetInput>
+TargetInput build_mtp_draft_extend_input(const TargetInput& validate_input,
+                                         const MtpDraftExtendRows& rows,
+                                         SamplingParameters sampling_params);
+
+// Copies the refresh metadata independently on the current stream; the caller
+// is responsible for synchronizing with updates to the source buffers.
+template <typename TargetInput>
+void clone_mtp_draft_metadata(TargetInput& input);
 
 }  // namespace specBuilder
 

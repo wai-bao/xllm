@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include "core/framework/speculative/spec_input_builder.h"
+#include "core/runtime/speculative_input_builder.h"
 
 #include <gtest/gtest.h>
 
@@ -148,7 +148,9 @@ TEST(SpecDecodeInputBuilderTest, EmptyBlockDraftMaterializesWholeQuery) {
   input.input_params.parallel.raw_dp_global_token_nums = {0, 21};
   input.input_params.parallel.dp_global_sequence_nums = {0, 3};
   input.runtime.input_host_buffer_has_layout = true;
-  materialize_empty_block_draft_rows(input, 7, 42);
+  materialize_empty_block_draft_rows(input,
+                                     /*query_width=*/7,
+                                     /*mask_token_id=*/42);
 
   const auto& params = input.input_params;
   EXPECT_EQ(params.meta.num_sequences, 1);
@@ -160,7 +162,7 @@ TEST(SpecDecodeInputBuilderTest, EmptyBlockDraftMaterializesWholeQuery) {
   EXPECT_EQ(params.meta.q_max_seq_len, 7);
   EXPECT_EQ(params.meta.kv_max_seq_len, 1);
   EXPECT_EQ(tensor_to_vector<int32_t>(input.token_ids_host),
-            std::vector<int32_t>(7, 42));
+            std::vector<int32_t>(/*count=*/7, /*value=*/42));
   EXPECT_EQ(tensor_to_vector<int32_t>(input.positions_host),
             std::vector<int32_t>({0, 1, 2, 3, 4, 5, 6}));
   EXPECT_EQ(params.attention.host.q_seq_lens, std::vector<int32_t>({7}));
@@ -182,7 +184,9 @@ TEST(SpecDecodeInputBuilderTest, ActiveBlockDraftOnlyFillsIdlePeerCount) {
   input.input_params.meta.num_sequences = 3;
   input.input_params.parallel.dp_global_token_nums = {21, 0};
   input.token_ids = torch::tensor({11, 12}, torch::kInt32);
-  materialize_empty_block_draft_rows(input, 7, 42);
+  materialize_empty_block_draft_rows(input,
+                                     /*query_width=*/7,
+                                     /*mask_token_id=*/42);
 
   EXPECT_EQ(input.input_params.meta.num_sequences, 3);
   EXPECT_EQ(input.input_params.parallel.dp_global_token_nums,
@@ -394,9 +398,9 @@ TEST(SpecDecodeInputBuilderTest, ValidateRowsStartFromCorrectedCurrentView) {
 
 TEST(SpecDecodeInputBuilderTest, ValidateInputsAtbChunkedPrefillShape) {
   std::vector<int32_t> kv_seq_lens = {5, 9};
-  std::vector<int32_t> atb_kv_seq_lens;
-  std::vector<int32_t> atb_q_seq_lens;
-  int32_t atb_kv_max_seq_len = 0;
+  std::vector<int32_t> chunked_kv_seq_lens;
+  std::vector<int32_t> chunked_q_seq_lens;
+  int32_t chunked_kv_max_seq_len = 0;
   const int32_t num_val_tokens = 3;
 
   auto kv_slice = to_slice(kv_seq_lens);
@@ -404,13 +408,13 @@ TEST(SpecDecodeInputBuilderTest, ValidateInputsAtbChunkedPrefillShape) {
     int32_t kv_len = calc_kv_len(kv_slice, seq_id, /*offset=*/0);
     int32_t kv_len_after_validation = kv_len + num_val_tokens;
     update_kv_seq_lens_and_max(
-        atb_kv_seq_lens, kv_len_after_validation, atb_kv_max_seq_len);
-    atb_q_seq_lens.emplace_back(num_val_tokens);
+        chunked_kv_seq_lens, kv_len_after_validation, chunked_kv_max_seq_len);
+    chunked_q_seq_lens.emplace_back(num_val_tokens);
   }
 
-  EXPECT_EQ(atb_kv_seq_lens, std::vector<int32_t>({8, 12}));
-  EXPECT_EQ(atb_q_seq_lens, std::vector<int32_t>({3, 3}));
-  EXPECT_EQ(atb_kv_max_seq_len, 12);
+  EXPECT_EQ(chunked_kv_seq_lens, std::vector<int32_t>({8, 12}));
+  EXPECT_EQ(chunked_q_seq_lens, std::vector<int32_t>({3, 3}));
+  EXPECT_EQ(chunked_kv_max_seq_len, 12);
 }
 
 TEST(SpecDecodeInputBuilderTest, FirstDecodeInputsFixAndNonFixMix) {

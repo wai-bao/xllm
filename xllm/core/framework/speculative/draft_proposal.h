@@ -15,12 +15,15 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <torch/types.h>
 
 #include <cstdint>
 #include <optional>
 #include <utility>
 #include <vector>
+
+#include "core/framework/speculative/draft_input.h"
 
 namespace xllm {
 
@@ -91,6 +94,18 @@ class DraftProposal final {
   torch::Tensor logits_at(int64_t step) {
     CHECK(logits_.has_value()) << "greedy proposal carries no logits buffer";
     return logits_->select(/*dim=*/1, /*index=*/step);
+  }
+
+  // Fills one proposal column's q: dense rows copy their logits, rows with
+  // undefined logits embed the point-mass one-hot at their token.
+  void fill_column(int64_t step, const torch::Tensor& logits) {
+    torch::Tensor column_logits = logits_at(step);
+    if (logits.defined()) {
+      column_logits.copy_(logits);
+      return;
+    }
+    column_logits.copy_(point_mass_logits(
+        tokens_at(step), column_logits.size(-1), column_logits.options()));
   }
 
  private:

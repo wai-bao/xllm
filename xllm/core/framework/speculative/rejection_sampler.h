@@ -24,7 +24,7 @@ namespace xllm {
 
 // The single sampling owner for speculative verification; the
 // general-purpose sample() never runs for verify steps.
-SampleOutput rejection_sample(const SamplingParameters& params,
+SampleOutput rejection_sample(SamplingParameters params,
                               const DraftProposal& draft_proposal,
                               torch::Tensor target_logits);
 

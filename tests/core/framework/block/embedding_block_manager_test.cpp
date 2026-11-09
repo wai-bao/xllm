@@ -49,6 +49,22 @@ TEST(EmbeddingBlockManagerTest, AllocateAndFreeRoundTrip) {
   EXPECT_DOUBLE_EQ(manager.kv_cache_utilization(), 0.0);
 }
 
+TEST(EmbeddingBlockManagerTest, ReportsReleaseOnlyAfterTheLastAlias) {
+  std::vector<int32_t> released;
+  EmbeddingBlockManager manager(
+      3, "seed", "", [&released](int32_t id) { released.emplace_back(id); });
+  std::vector<Block> blocks = manager.allocate(1);
+  ASSERT_EQ(blocks.size(), 1u);
+  const int32_t id = blocks[0].id();
+  Block alias = blocks[0];
+  manager.deallocate(Slice<Block>(blocks));
+  EXPECT_TRUE(released.empty());
+  blocks.clear();
+  EXPECT_TRUE(released.empty());
+  alias = Block();
+  EXPECT_EQ(released, std::vector<int32_t>{id});
+}
+
 TEST(EmbeddingBlockManagerTest, AllocateReturnsEmptyWhenExhausted) {
   // id 0 is reserved internally, so 3 physical slots expose 2 usable blocks.
   EmbeddingBlockManager manager(3, "single");

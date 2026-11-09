@@ -11,5 +11,6 @@ cc_test(
     :profile
     :platform
     :request
+    models
     GTest::gtest_main
 )

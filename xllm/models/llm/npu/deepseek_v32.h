@@ -18,6 +18,7 @@ limitations under the License.
 #include "core/framework/model/model_output.h"
 #include "core/layers/npu/npu_deepseek_v32_decoder_layer_impl.h"
 #include "llm_model_base.h"
+#include "models/llm/deepseek_v32_registry.h"
 
 // DeepSeek v32 compatible with huggingface weights
 // ref to:

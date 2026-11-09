@@ -368,3 +368,50 @@ target_link_options(dspark_sampler_test PRIVATE
   "-Wl,--whole-archive"
   "${CMAKE_BINARY_DIR}/third_party/spdlog/libspdlog.a"
   "-Wl,--no-whole-archive")
+
+cc_test(
+  NAME
+    mtp_draft_input_carry_test
+  SRCS
+    mtp_draft_input_carry_test.cpp
+  DEPS
+    :runtime
+    :model_loader
+    :batch
+    :kv_cache
+    :platform
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME worker_request_state_test
+  NO_NPU_RUNTIME
+  SRCS worker_request_state_test.cpp
+  DEPS :runtime GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    speculative_input_builder_test
+  SRCS
+    speculative_input_builder_test.cpp
+  DEPS
+    :runtime
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    spec_verify_test
+  SRCS
+    spec_verify_test.cpp
+  DEPS
+    :runtime
+    GTest::gtest_main
+)
+target_link_libraries(spec_verify_test PRIVATE
+  Python::Python
+  $<$<BOOL:${USE_NPU}>:ascendcl>
+  $<$<BOOL:${USE_NPU}>:hccl>
+  $<$<BOOL:${USE_NPU}>:c_sec>
+  $<$<BOOL:${USE_NPU}>:nnopbase>)

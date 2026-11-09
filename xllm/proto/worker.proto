@@ -415,6 +415,7 @@ message SquenceOutput {
   repeated Token tokens = 1;
   TensorList mm_embeddings = 2;
   SpeculativeTokenStats speculative_token_stats = 3;
+  DraftInput draft_input = 4;
 }
 
 message JsonObjectOutputError {
@@ -454,6 +455,11 @@ service Collective {
 }
 
 // Worker receive action from master engine.
+// Idle cleanup only: no model execution or speculative collectives.
+message RequestStateRelease {
+  repeated int32 embedding_ids = 1;
+}
+
 service DistributeWorker {
   rpc Hello (Status) returns (Status);
   rpc InitModel (InitModelRequest) returns (Status);
@@ -480,4 +486,6 @@ service DistributeWorker {
   rpc Wakeup (WakeupRequest) returns (Status);
   rpc StartProfile (Empty) returns (Status);
   rpc StopProfile (Empty) returns (Status);
+  // Idle cleanup only: no model execution or speculative collectives.
+  rpc ReleaseIdleRequestState(RequestStateRelease) returns (Status);
 }

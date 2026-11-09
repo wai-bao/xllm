@@ -21,6 +21,7 @@ cc_library(
     :util
     :scheduler
     :distributed_runtime
+    :speculative_transport_adapter
 )
 target_link_libraries(disaggregation PRIVATE
   :xllm_server

@@ -37,6 +37,7 @@ class JoyAILLMFlashMtpForCausalLMImpl
 TORCH_MODULE(JoyAILLMFlashMtpForCausalLM);
 
 REGISTER_CAUSAL_MODEL(joyai_llm_flash_mtp, JoyAILLMFlashMtpForCausalLM);
+REGISTER_MTP_MODEL_PAIR(joyai_llm_flash, joyai_llm_flash_mtp);
 
 REGISTER_MODEL_ARGS(joyai_llm_flash_mtp, [&] {
   LOAD_ARG_OR(model_type, "model_type", "joyai_llm_flash_mtp");

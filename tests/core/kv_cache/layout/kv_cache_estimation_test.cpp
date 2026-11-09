@@ -1297,8 +1297,7 @@ TEST_F(VirtualMemoryPrefixEstimationTest, ReservesReusableLinearStateSlots) {
 
 #if defined(USE_NPU)
 TEST(KVCacheEstimationTest, Qwen35NativeMtpDraftUsesFullAttentionCacheBudget) {
-  for (const std::string& model_type :
-       {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}) {
+  for (const std::string& model_type : {"qwen3_5_text", "qwen3_5_moe_text"}) {
     for (const int64_t draft_layers : {1, 2}) {
       SCOPED_TRACE(model_type);
       SCOPED_TRACE(draft_layers);
@@ -1309,15 +1308,8 @@ TEST(KVCacheEstimationTest, Qwen35NativeMtpDraftUsesFullAttentionCacheBudget) {
                         "full_attention",
                         "linear_attention",
                         "full_attention"});
-      ModelRegistry::configure_mtp_args(target_args,
-                                        /*speculative_algorithm=*/"MTP",
-                                        /*is_draft_engine=*/false,
-                                        /*is_python_model=*/false);
       ModelArgs draft_args = target_args;
-      ModelRegistry::configure_mtp_args(draft_args,
-                                        /*speculative_algorithm=*/"MTP",
-                                        /*is_draft_engine=*/true,
-                                        /*is_python_model=*/false);
+      ASSERT_TRUE(ModelRegistry::convert_to_mtp_draft(draft_args));
 
       KVCacheEstimateOptions target_options = make_linear_attention_options();
       target_options.num_speculative_tokens = 3;

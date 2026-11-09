@@ -1076,7 +1076,8 @@ class DeepseekV4MtpModelImpl final : public torch::nn::Module {
 TORCH_MODULE(DeepseekV4MtpModel);
 
 class DeepseekV4MtpForCausalLMImpl final
-    : public LlmForCausalLMImplBase<DeepseekV4MtpModel> {
+    : public LlmForCausalLMImplBase<DeepseekV4MtpModel>,
+      public MtpSelfContainedDraft {
  public:
   explicit DeepseekV4MtpForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<DeepseekV4MtpModel>(context) {}
@@ -1127,11 +1128,5 @@ REGISTER_MODEL_ARGS(deepseek_v4_mtp, [&] {
   validate_deepseek_v4_args(*args, args_policy);
   normalize_deepseek_v4_args(args);
 });
-
-// The draft checkpoint owns its embedding and LM head weights.
-const bool deepseek_v4_mtp_shared_weight_owner_registered = []() {
-  ModelRegistry::register_mtp_shared_weight_owner("deepseek_v4_mtp");
-  return true;
-}();
 
 }  // namespace xllm

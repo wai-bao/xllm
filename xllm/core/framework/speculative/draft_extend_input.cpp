@@ -20,8 +20,7 @@ limitations under the License.
 #include "common/macros.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/sampling/sampling_params.h"
-#include "core/framework/speculative/embedding_cache.h"
-#include "runtime/vlm_forward_params.h"
+#include "core/runtime/forward_params.h"
 
 namespace xllm {
 
@@ -76,30 +75,15 @@ void clear_all_output_embeddings(ForwardOutput& output) {
   output.sample_output.embeddings = torch::Tensor();
   clear_selected_embeddings(output);
 }
-template <typename Input>
-void prepare_first_draft_inputs(EmbeddingCache& embedding_cache,
-                                const Input& input,
-                                ForwardOutput& output) {
+void prepare_first_draft_inputs(ForwardOutput& output) {
   const torch::Tensor& sample_hidden_states =
       output.sample_output.selected_embeddings;
   CHECK(sample_hidden_states.defined())
       << "target worker must populate "
          "selected_embeddings on the speculative "
          "prefill path";
-  embedding_cache.write_prefill_target_context(
-      input.input_params.embedding.embedding_ids,
-      input.input_params.embedding.request_ids,
-      output.sample_output.next_tokens,
-      sample_hidden_states);
   output.sample_output.embeddings = sample_hidden_states.detach();
   clear_selected_embeddings(output);
 }
-
-template void prepare_first_draft_inputs(EmbeddingCache&,
-                                         const LlmForwardInput&,
-                                         ForwardOutput&);
-template void prepare_first_draft_inputs(EmbeddingCache&,
-                                         const VlmForwardInput&,
-                                         ForwardOutput&);
 
 }  // namespace xllm

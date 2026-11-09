@@ -38,7 +38,6 @@ cc_library(
     worker_server.h
     comm_channel.h
     shm_channel.h
-    heartbeat_callback_registry.h
     http_callback_channel_cache.h
     kv_transfer_topology.h
     kv_transfer_coordinator.h
@@ -46,6 +45,7 @@ cc_library(
     model_residency_coordinator.h
     kv_capacity_planner.h
   SRCS
+    engine.cpp
     dit_engine.cpp
     llm_engine.cpp
     vlm_engine.cpp
@@ -74,6 +74,7 @@ cc_library(
     :runtime
     :kv_cache_manager_factory
     :xllm_server
+    :speculative_transport_adapter
     :util
     glog::glog
     nlohmann_json::nlohmann_json

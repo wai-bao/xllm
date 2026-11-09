@@ -34,7 +34,7 @@ limitations under the License.
 #include "core/kv_cache/layout/kv_cache_estimation.h"
 #include "core/kv_cache/layout/vmm_kv_cache_layout.h"
 #include "core/util/tensor_options.h"
-#include "framework/speculative/mtp_utils.h"
+#include "framework/speculative/draft_input_model_spec.h"
 #include "llm_engine.h"
 #include "util/utils.h"
 #include "vlm_engine.h"
@@ -60,14 +60,14 @@ SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
   runtime::Options dist_options = options;
   dist_options.num_decoding_tokens(options.num_speculative_tokens() + 1);
   dist_options.enable_speculative_decode(true);
-  distributed_worker_manager_ =
+  const std::shared_ptr<DistributedWorkerManager> distributed_worker_manager =
       std::make_shared<DistributedWorkerManager>(dist_options);
 
   runtime::Options target_engine_options = options_;
   target_engine_options.num_decoding_tokens(options.num_speculative_tokens() +
                                             1);
   engine_ = std::make_unique<TargetEngine>(target_engine_options,
-                                           distributed_worker_manager_);
+                                           distributed_worker_manager);
 
   if (use_draft_engine_) {
     // draft engine
@@ -86,7 +86,7 @@ SpeculativeEngineBase<TargetEngine>::SpeculativeEngineBase(
       draft_engine_options.model_id(options_.model_id() + "::mtp_draft");
     }
     draft_engine_ = std::make_unique<LLMEngine>(draft_engine_options,
-                                                distributed_worker_manager_);
+                                                distributed_worker_manager);
   }
 }
 
@@ -159,6 +159,11 @@ bool SpeculativeEngineBase<TargetEngine>::init_model(
 
     // check if the max context length are the same
     const auto& draft_model_args = draft_engine_->model_args();
+    if (SpeculativeConfig::requires_bootstrap_hidden(
+            options_.speculative_algorithm())) {
+      draft_input_spec_ =
+          make_draft_input_spec(draft_model_args, draft_engine_->dtype_);
+    }
     if (model_args_.max_position_embeddings() !=
         draft_model_args.max_position_embeddings()) {
       LOG(WARNING) << "draft and target models have different max context "

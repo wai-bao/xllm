@@ -74,10 +74,12 @@ class LLMEngine : public Engine {
             std::shared_ptr<KVCacheTransferCoordinatorBase>
                 transfer_coordinator = nullptr);
 
+  void flush_released_requests() override;
+
   std::vector<RawForwardOutput> collect_step_outputs(const BatchGroup& batch);
 
   std::shared_ptr<DistributedWorkerManager> get_distributed_worker_manager()
-      const {
+      const override {
     return distributed_worker_manager_;
   }
 
@@ -123,7 +125,6 @@ class LLMEngine : public Engine {
   // Effective TP width (MLU=dp_local; NPU=dp_local/cp).
   uint32_t dp_local_tp_size_;
   uint32_t dp_local_size_;
-  std::unique_ptr<ForwardInputFactory> forward_input_factory_;
 
   // For multi-node serving
   // engine brpc server, all workers connect to engine_server_,
@@ -135,6 +136,7 @@ class LLMEngine : public Engine {
       nullptr;
 
   std::unique_ptr<EplbController> eplb_controller_;
+  std::unique_ptr<ForwardInputFactory> forward_input_factory_;
 };
 
 }  // namespace xllm

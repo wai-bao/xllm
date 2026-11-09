@@ -23,6 +23,8 @@ limitations under the License.
 
 #include "core/common/macros.h"
 #include "core/framework/config/option_category.h"
+#include "core/framework/model/model_args.h"
+#include "core/platform/platform.h"
 
 namespace xllm {
 
@@ -66,9 +68,56 @@ class SpeculativeConfig final {
     return boost::iequals(algorithm, "MTP");
   }
 
-  // Whether the PD handoff must carry the bootstrap hidden state.
-  static bool requires_bootstrap_hidden(std::string_view algorithm) {
-    return is_mtp_algorithm(algorithm) || is_eagle3_algorithm(algorithm);
+  // NPU MTP targets whose num_speculative_tokens flows from engine Options
+  // into ModelArgs; other targets keep the checkpoint default.
+  static bool uses_mtp_target_spec_width(std::string_view model_type) {
+    return is_glm5_next_target_model_type(model_type) ||
+           util::is_deepseek_v4_model_type(model_type);
+  }
+
+  // NPU only: targets in the uses_mtp_target_spec_width family take their
+  // speculative width from the engine options instead of the checkpoint.
+  static void apply_mtp_target_spec_width(ModelArgs& args,
+                                          std::string_view algorithm,
+                                          bool speculative_decode_enabled,
+                                          int64_t options_width) {
+    if (Platform::is_npu() && speculative_decode_enabled &&
+        is_mtp_algorithm(algorithm) &&
+        uses_mtp_target_spec_width(args.model_type())) {
+      args.num_speculative_tokens(options_width);
+    }
+  }
+
+  // Which MTP draft-variant conversion applies to this model load; the single
+  // gate behind every convert_to_mtp_draft call site.
+  enum class MtpDraftConversion {
+    NONE,
+    // NPU draft engine running MTP with no fixed speculative width: load the
+    // registered MTP pair variant.
+    DRAFT_ENGINE_PAIR,
+    // A checkpoint carrying an embedded MTP layer and no fixed speculative
+    // width: on NPU only non-draft-engine workers, elsewhere any worker.
+    EMBEDDED_LAYER,
+  };
+
+  static MtpDraftConversion resolve_mtp_draft_conversion(
+      bool is_draft_engine,
+      std::string_view algorithm,
+      int32_t num_speculative_tokens,
+      int32_t num_nextn_predict_layers,
+      bool is_block_diffusion) {
+    if (num_speculative_tokens != 0 || is_block_diffusion) {
+      return MtpDraftConversion::NONE;
+    }
+    const bool is_npu_build = Platform::is_npu();
+    if (is_draft_engine && is_mtp_algorithm(algorithm)) {
+      return is_npu_build ? MtpDraftConversion::DRAFT_ENGINE_PAIR
+                          : MtpDraftConversion::NONE;
+    }
+    if (num_nextn_predict_layers != 0 && (!is_npu_build || !is_draft_engine)) {
+      return MtpDraftConversion::EMBEDDED_LAYER;
+    }
+    return MtpDraftConversion::NONE;
   }
 
   // Drafts that generate a block of speculative tokens in one forward.
@@ -86,6 +135,12 @@ class SpeculativeConfig final {
   static bool supports_host_kv_cache(std::string_view algorithm) {
     return is_mtp_algorithm(algorithm) || is_eagle3_algorithm(algorithm) ||
            is_block_diffusion_algorithm(algorithm);
+  }
+
+  // Whether the PD handoff must carry the bootstrap hidden state (MTP and
+  // Eagle3).
+  static bool requires_bootstrap_hidden(std::string_view algorithm) {
+    return is_mtp_algorithm(algorithm) || is_eagle3_algorithm(algorithm);
   }
 
   // DFlash2 carries the dense proposal only when probabilistic rejection
@@ -144,5 +199,13 @@ class SpeculativeConfig final {
 
   PROPERTY(bool, enable_atb_spec_kernel) = false;
 };
+
+// The embedded-draft flag lives on ModelArgs; the algorithm classification
+// lives here.
+inline bool uses_embedded_eagle3_draft(std::string_view algorithm,
+                                       const ModelArgs& target_model_args) {
+  return SpeculativeConfig::is_eagle3_algorithm(algorithm) &&
+         target_model_args.enable_embedded_eagle3_draft();
+}
 
 }  // namespace xllm

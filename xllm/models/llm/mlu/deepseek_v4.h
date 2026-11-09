@@ -46,6 +46,7 @@ limitations under the License.
 #include "core/layers/mlu/deepseek_v4/dsa_empty_dp_input.h"
 #include "core/layers/mlu/deepseek_v4/dsa_metadata_builder_mlu.h"
 #include "core/layers/mlu/hyper_connection.h"
+#include "models/llm/deepseek_v4_registry.h"
 #include "models/llm/llm_model_base.h"
 #include "models/llm/mlu/deepseek_v4_base.h"
 

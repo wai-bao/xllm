@@ -68,6 +68,24 @@ inline std::enable_if_t<std::is_integral_v<T>, T> ceil_div(T value, T divisor) {
   return value / divisor + static_cast<T>(value % divisor != 0);
 }
 
+// Token-bitmask wire layout shared by the grammar generator, the vocab
+// remapper, and the token-bitmask consumers.
+constexpr int32_t kBitmaskBitsPerWord = 32;
+
+constexpr int32_t bitmask_word_index(int64_t token_id) {
+  return static_cast<int32_t>(token_id / kBitmaskBitsPerWord);
+}
+
+constexpr uint32_t bitmask_bit_mask(int64_t token_id) {
+  return uint32_t{1} << (static_cast<uint32_t>(token_id) %
+                         static_cast<uint32_t>(kBitmaskBitsPerWord));
+}
+
+constexpr int32_t bitmask_word_count(int64_t vocab_size) {
+  return static_cast<int32_t>(vocab_size / kBitmaskBitsPerWord +
+                              (vocab_size % kBitmaskBitsPerWord != 0));
+}
+
 static inline int64_t align_up(int64_t value, int64_t alignment) {
   if (alignment == 0) {
     return value;

@@ -21,6 +21,7 @@ limitations under the License.
 
 #include "core/layers/npu/npu_deepseek_v32_decoder_layer_impl.h"
 #include "deepseek_v32.h"
+#include "models/llm/glm_moe_dsa_registry.h"
 #include "models/llm/npu/glm_shared_expert_stream.h"
 
 namespace xllm::npu::model {

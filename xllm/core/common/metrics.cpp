@@ -138,6 +138,8 @@ DEFINE_COUNTER(json_object_mask_cache_misses_total,
                "JSON object mask cache miss count");
 DEFINE_HISTOGRAM(json_object_mask_vocab_scan_latency_microseconds,
                  "JSON object mask vocabulary scan latency in microseconds");
+DEFINE_HISTOGRAM(json_object_mask_row_build_latency_microseconds,
+                 "JSON object CPU mask row build latency in microseconds");
 DEFINE_HISTOGRAM(json_object_mask_batch_build_latency_microseconds,
                  "JSON object CPU mask batch build latency in microseconds");
 DEFINE_HISTOGRAM(json_object_mask_device_copy_latency_microseconds,
@@ -145,6 +147,24 @@ DEFINE_HISTOGRAM(json_object_mask_device_copy_latency_microseconds,
 DEFINE_HISTOGRAM(
     json_object_mask_transfer_submission_latency_microseconds,
     "JSON object non-blocking device copy submission latency in microseconds");
+DEFINE_COUNTER(json_object_mask_build_calls_normal_total,
+               "JSON object normal mask build calls");
+DEFINE_COUNTER(json_object_mask_build_calls_draft_total,
+               "JSON object draft mask build calls");
+DEFINE_COUNTER(json_object_mask_build_calls_target_total,
+               "JSON object target mask build calls");
+DEFINE_COUNTER(json_object_mask_build_rows_normal_total,
+               "JSON object normal mask build rows");
+DEFINE_COUNTER(json_object_mask_build_rows_draft_total,
+               "JSON object draft mask build rows");
+DEFINE_COUNTER(json_object_mask_build_rows_target_total,
+               "JSON object target mask build rows");
+DEFINE_COUNTER(json_object_mask_build_constrained_rows_normal_total,
+               "JSON object constrained rows in normal mask builds");
+DEFINE_COUNTER(json_object_mask_build_constrained_rows_draft_total,
+               "JSON object constrained rows in draft mask builds");
+DEFINE_COUNTER(json_object_mask_build_constrained_rows_target_total,
+               "JSON object constrained rows in target mask builds");
 // scheduler metrics
 DEFINE_GAUGE(num_pending_requests, "Number of pending requests in scheduler");
 DEFINE_GAUGE(num_running_requests, "Number of running requests in scheduler");

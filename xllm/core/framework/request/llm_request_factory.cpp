@@ -413,6 +413,14 @@ std::shared_ptr<Request> LLMRequestFactory::create(
                         sp.source_xservice_addr);
     return nullptr;
   }
+  const std::string& speculative_algorithm = options_->speculative_algorithm();
+  if (options_->num_speculative_tokens() > 0 && sampling_param.beam_width > 1 &&
+      SpeculativeConfig::requires_bootstrap_hidden(speculative_algorithm)) {
+    CALLBACK_WITH_ERROR(StatusCode::INVALID_ARGUMENT,
+                        "Beam search (beam_width > 1) is not supported with " +
+                            speculative_algorithm + " speculative decoding");
+    return nullptr;
+  }
   // Model-aware complement to verify_params' 2000 cap: an oversized top-k
   // would throw inside the sampler and take the whole batch down with it.
   if (const auto error =

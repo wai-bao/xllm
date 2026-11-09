@@ -25,10 +25,11 @@ limitations under the License.
 
 #include "core/framework/model/model_type.h"
 #include "core/framework/model/mtp_topk_state.h"
-#include "core/framework/speculative/mtp_utils.h"
+#include "core/framework/speculative/draft_input_model_spec.h"
 #include "core/framework/state_dict/utils.h"
 #include "core/util/utils.h"
 #include "llm_model_base.h"
+#include "models/model_registry.h"
 
 namespace xllm {
 
@@ -173,7 +174,7 @@ class MtpDecoderLayerImplBase : public torch::nn::Module {
     torch::Tensor embedding_data = input_params.embedding.input_embedding;
     // for dummy data parallel run, we set a empty embedding
     if (attn_metadata.is_dummy) {
-      const int64_t embed_cols = mtp_hidden_state_width(model_args_);
+      const int64_t embed_cols = draft_input_hidden_width(model_args_);
       embedding_data =
           torch::zeros({embed.size(0), embed_cols}, embed.options());
     }

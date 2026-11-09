@@ -92,6 +92,7 @@ TORCH_MODULE(DeepseekV32MtpForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(deepseek_v32_mtp, DeepseekV32MtpForCausalLM);
+REGISTER_MTP_MODEL_PAIR(deepseek_v32, deepseek_v32_mtp);
 
 REGISTER_MODEL_ARGS(deepseek_v32_mtp, [&] {
   LOAD_ARG_OR(model_type, "model_type", "deepseek_v32_mtp");

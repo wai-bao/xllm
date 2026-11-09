@@ -27,7 +27,8 @@ limitations under the License.
 #include <vector>
 
 namespace xllm::util {
-torch::ScalarType datatype_proto_to_torch(const std::string& proto_datatype) {
+std::optional<torch::ScalarType> try_datatype_proto_to_torch(
+    const std::string& proto_datatype) {
   static const std::unordered_map<std::string, torch::ScalarType> kDatatypeMap =
       {{"BOOL", torch::kBool},
        {"INT32", torch::kInt},
@@ -42,11 +43,20 @@ torch::ScalarType datatype_proto_to_torch(const std::string& proto_datatype) {
 
   auto iter = kDatatypeMap.find(proto_datatype);
   if (iter == kDatatypeMap.end()) {
+    return std::nullopt;
+  }
+  return iter->second;
+}
+
+torch::ScalarType datatype_proto_to_torch(const std::string& proto_datatype) {
+  const std::optional<torch::ScalarType> dtype =
+      try_datatype_proto_to_torch(proto_datatype);
+  if (!dtype.has_value()) {
     LOG(FATAL)
         << "Unsupported proto datatype: " << proto_datatype
         << " (supported types: BOOL/INT32/INT64/UINT32/UINT64/FP32/FP64/BYTES)";
   }
-  return iter->second;
+  return *dtype;
 }
 
 namespace {
@@ -309,7 +319,13 @@ torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor,
       });
 }
 
+std::optional<torch::Tensor> try_proto_to_torch(
+    const proto::Tensor& proto_tensor);
+
 torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor) {
+  // Single parse path: try_proto_to_torch owns the dispatch; the trusted
+  // variant only adds per-reason logging. A successful parse is always
+  // defined (shape non-empty, dims > 0).
   if (proto_tensor.datatype().empty()) {
     LOG(ERROR) << "Proto Tensor missing required field: datatype (e.g., "
                   "\"FP32\", \"INT64\")";
@@ -324,79 +340,13 @@ torch::Tensor proto_to_torch(const proto::Tensor& proto_tensor) {
         << "Proto Tensor missing required field: contents (TensorContents)";
     return torch::Tensor();
   }
-  const auto& proto_contents = proto_tensor.contents();
-
-  const std::string& proto_datatype = proto_tensor.datatype();
-  const torch::ScalarType torch_dtype = datatype_proto_to_torch(proto_datatype);
-  const size_t element_size = torch::elementSize(torch_dtype);
-
-  std::vector<int64_t> torch_shape;
-  int64_t total_elements = 1;
-  for (const int64_t dim : proto_tensor.shape()) {
-    if (dim <= 0) {
-      LOG(ERROR) << "Proto Tensor has invalid dimension: " << dim
-                 << " (must be positive, datatype=" << proto_datatype << ")";
-      return torch::Tensor();
-    }
-    torch_shape.emplace_back(dim);
-    total_elements *= dim;
-  }
-  torch::IntArrayRef tensor_shape(torch_shape);
-
-  const void* data_ptr = nullptr;
-  size_t data_count = 0;
-  if (proto_datatype == "BOOL") {
-    data_ptr = get_data_from_contents<bool>(proto_contents, proto_datatype);
-    data_count = proto_contents.bool_contents_size();
-  } else if (proto_datatype == "INT32") {
-    data_ptr = get_data_from_contents<int32_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.int_contents_size();
-  } else if (proto_datatype == "INT64") {
-    data_ptr = get_data_from_contents<int64_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.int64_contents_size();
-  } else if (proto_datatype == "UINT32") {
-    data_ptr = get_data_from_contents<uint32_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.uint_contents_size();
-  } else if (proto_datatype == "UINT64") {
-    data_ptr = get_data_from_contents<uint64_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.uint64_contents_size();
-  } else if (proto_datatype == "FP32") {
-    data_ptr = get_data_from_contents<float>(proto_contents, proto_datatype);
-    data_count = proto_contents.fp32_contents_size();
-  } else if (proto_datatype == "FP64") {
-    data_ptr = get_data_from_contents<double>(proto_contents, proto_datatype);
-    data_count = proto_contents.fp64_contents_size();
-  } else if (proto_datatype == "BF16") {
-    data_ptr = get_data_from_contents<uint8_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.bytes_contents().size() /
-                 static_cast<size_t>(sizeof(torch::BFloat16));
-  } else if (proto_datatype == "FP16") {
-    data_ptr = get_data_from_contents<uint8_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.bytes_contents().size() /
-                 static_cast<size_t>(sizeof(torch::Half));
-  } else if (proto_datatype == "BYTES") {
-    data_ptr = get_data_from_contents<uint8_t>(proto_contents, proto_datatype);
-    data_count = proto_contents.bytes_contents().size();
-  }
-
-  if (data_ptr == nullptr) {
-    LOG(ERROR) << "Failed to get data from TensorContents (datatype="
-               << proto_datatype << ")";
+  const std::optional<torch::Tensor> tensor = try_proto_to_torch(proto_tensor);
+  if (!tensor.has_value()) {
+    LOG(ERROR) << "Proto Tensor data does not match datatype="
+               << proto_tensor.datatype() << " and shape";
     return torch::Tensor();
   }
-  if (data_count != static_cast<size_t>(total_elements)) {
-    LOG(ERROR) << "Proto Tensor data count mismatch (datatype="
-               << proto_datatype << "): "
-               << "expected " << total_elements
-               << " elements (shape=" << tensor_shape << "), "
-               << "got " << data_count << " elements";
-    return torch::Tensor();
-  }
-
-  torch::Tensor tensor =
-      torch::from_blob(const_cast<void*>(data_ptr), tensor_shape, torch_dtype)
-          .clone();
-  return tensor;
+  return *tensor;
 }
 
 bool torch_to_proto(const torch::Tensor& torch_tensor,
@@ -583,6 +533,81 @@ bool torch_to_proto(const torch::Tensor& torch_tensor,
   }
 
   return true;
+}
+
+// Rejective variant of the scalar proto_to_torch above: mirrors its
+// validation and construction, returning std::nullopt on malformed
+// metadata instead of logging. Used for untrusted (RPC-received) tensors.
+std::optional<torch::Tensor> try_proto_to_torch(
+    const proto::Tensor& proto_tensor) {
+  const std::string& proto_datatype = proto_tensor.datatype();
+  const std::optional<torch::ScalarType> dtype =
+      try_datatype_proto_to_torch(proto_datatype);
+  if (!dtype.has_value() || proto_tensor.shape().empty() ||
+      !proto_tensor.has_contents()) {
+    return std::nullopt;
+  }
+  const auto& proto_contents = proto_tensor.contents();
+  int64_t total_elements = 1;
+  std::vector<int64_t> torch_shape;
+  for (const int64_t dim : proto_tensor.shape()) {
+    if (dim <= 0) {
+      return std::nullopt;
+    }
+    torch_shape.emplace_back(dim);
+    total_elements *= dim;
+  }
+  torch::IntArrayRef tensor_shape(torch_shape);
+
+  const void* data_ptr = nullptr;
+  size_t data_count = 0;
+  if (proto_datatype == "BOOL") {
+    data_ptr = get_data_from_contents<bool>(proto_contents, proto_datatype);
+    data_count = proto_contents.bool_contents_size();
+  } else if (proto_datatype == "INT32") {
+    data_ptr = get_data_from_contents<int32_t>(proto_contents, proto_datatype);
+    data_count = proto_contents.int_contents_size();
+  } else if (proto_datatype == "INT64") {
+    data_ptr = get_data_from_contents<int64_t>(proto_contents, proto_datatype);
+    data_count = proto_contents.int64_contents_size();
+  } else if (proto_datatype == "UINT32") {
+    data_ptr = get_data_from_contents<uint32_t>(proto_contents, proto_datatype);
+    data_count = proto_contents.uint_contents_size();
+  } else if (proto_datatype == "UINT64") {
+    data_ptr = get_data_from_contents<uint64_t>(proto_contents, proto_datatype);
+    data_count = proto_contents.uint64_contents_size();
+  } else if (proto_datatype == "FP32") {
+    data_ptr = get_data_from_contents<float>(proto_contents, proto_datatype);
+    data_count = proto_contents.fp32_contents_size();
+  } else if (proto_datatype == "FP64") {
+    data_ptr = get_data_from_contents<double>(proto_contents, proto_datatype);
+    data_count = proto_contents.fp64_contents_size();
+  } else if (proto_datatype == "BF16" || proto_datatype == "FP16") {
+    // A partial trailing byte must not be accepted by the floor division:
+    // the byte payload has to cover the element type exactly.
+    const size_t bytes_size = proto_contents.bytes_contents().size();
+    const size_t element_size = proto_datatype == "BF16"
+                                    ? sizeof(torch::BFloat16)
+                                    : sizeof(torch::Half);
+    if (bytes_size % element_size != 0) {
+      return std::nullopt;
+    }
+    data_ptr = get_data_from_contents<uint8_t>(proto_contents, proto_datatype);
+    data_count = bytes_size / element_size;
+  } else if (proto_datatype == "BYTES") {
+    data_ptr = get_data_from_contents<uint8_t>(proto_contents, proto_datatype);
+    data_count = proto_contents.bytes_contents().size();
+  }
+  if (data_ptr == nullptr ||
+      data_count != static_cast<size_t>(total_elements)) {
+    return std::nullopt;
+  }
+  try {
+    return torch::from_blob(const_cast<void*>(data_ptr), tensor_shape, *dtype)
+        .clone();
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
 }
 
 }  // namespace xllm::util

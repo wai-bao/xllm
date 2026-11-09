@@ -32,6 +32,14 @@ namespace xllm {
 
 class JsonObjectGrammarState;
 
+// Target-model options shared by the speculative algorithms: decode-order
+// schedule overlap stays off, the target is not a draft engine, and aux
+// hidden states are captured for the drafter.
+runtime::Options speculative_target_options(const runtime::Options& options);
+runtime::Options speculative_draft_options(const runtime::Options& options);
+
+class LLMWorkerImpl;
+
 // Returns whether this rank may execute the multi-step speculative decode
 // plan for the current global DP batch.
 bool should_run_speculative_decode(const LlmModelParams& params);
@@ -141,54 +149,23 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   virtual std::optional<ForwardOutput> step_empty(
       const TargetInput& inputs) = 0;
 
+  // Broadcasts the sampled token across all model ranks within one DP
+  // replica; with orthogonal CP x TP both axes are covered, without crossing
+  // into another DP replica.
+  void broadcast_spec_tokens(torch::Tensor& tokens) const;
+
+  // Orthogonal CP needs the broadcast unconditionally; otherwise the spec
+  // broadcast config decides, and only for probabilistic sampling (never
+  // all-greedy, where every rank deterministically picks argmax).
+  void maybe_broadcast_spec_tokens(torch::Tensor& tokens,
+                                   bool all_greedy_sample) const;
+
+  void prepare_work_before_execute(const TargetInput& inputs,
+                                   TargetInput& processed_inputs) override;
+
   // prepare inputs for target model at Decode phase (validation).
   void prepare_validate_inputs(const TargetInput& inputs,
                                TargetInput& validate_inputs);
-
-  bool should_broadcast_spec_tokens(bool enable_spec_token_broadcast,
-                                    bool all_greedy_sample) const {
-    const bool use_orthogonal_cp_consensus =
-        parallel_args_.cp_size() > 1 && parallel_args_.tp_group_ != nullptr &&
-        parallel_args_.cp_group_ != nullptr &&
-        parallel_args_.cp_group_ != parallel_args_.tp_group_;
-    return use_orthogonal_cp_consensus ||
-           (enable_spec_token_broadcast && !all_greedy_sample);
-  }
-
-  // Speculative state is replicated across every model rank within one DP
-  // replica. With orthogonal CP x TP, tp_group_ covers only one CP shard,
-  // while cp_group_ connects the same TP rank across CP shards. Broadcast
-  // along both axes so every replica caches and consumes the same sampled
-  // token, without crossing into another DP replica through the world group.
-  void broadcast_spec_tokens(torch::Tensor& tokens) const {
-    ProcessGroup* tp_group = parallel_args_.tp_group_ != nullptr
-                                 ? parallel_args_.tp_group_
-                                 : parallel_args_.process_group_;
-    const bool use_orthogonal_cp_consensus =
-        parallel_args_.cp_size() > 1 && parallel_args_.tp_group_ != nullptr &&
-        parallel_args_.cp_group_ != nullptr &&
-        parallel_args_.cp_group_ != parallel_args_.tp_group_;
-    if (!use_orthogonal_cp_consensus) {
-      sync_sampling_tensor(tokens, tp_group);
-      return;
-    }
-
-    sync_sampling_tensor(tokens, parallel_args_.tp_group_);
-    sync_sampling_tensor(tokens, parallel_args_.cp_group_);
-  }
-
-  void finalize_output_on_stream(ForwardOutput& output,
-                                 Stream& stream,
-                                 bool allow_async) const {
-    if (allow_async) {
-      output.ready_event = stream.record_event_or_sync();
-      return;
-    }
-    const int32_t ret = stream.synchronize();
-    CHECK_EQ(ret, 0) << "failed to synchronize speculative compute stream, ret="
-                     << ret;
-    output.retained_inputs.clear();
-  }
 
  protected:
   // Target model worker

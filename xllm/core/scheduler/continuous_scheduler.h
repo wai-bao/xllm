@@ -140,7 +140,6 @@ class ContinuousSchedulerBase : public Scheduler {
       std::shared_ptr<DistributedWorkerManager> distributed_worker_manager =
           nullptr);
 
-  void clear_mtp_bootstrap(Request* request);
   virtual void drain_request_releases() {}
   void populate_heartbeat_request(
       xllm_service::proto::HeartbeatRequest& request,

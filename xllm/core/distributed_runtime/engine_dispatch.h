@@ -33,9 +33,9 @@ decltype(auto) invoke_first_engine(Function&& function,
   }
   if constexpr (sizeof...(rest) > 0) {
     return invoke_first_engine(std::forward<Function>(function), rest...);
-  } else {
-    LOG(FATAL) << "dispatch_engine requires a non-null engine";
   }
+  LOG(FATAL) << "dispatch_engine requires a non-null engine";
+  __builtin_unreachable();
 }
 
 }  // namespace detail

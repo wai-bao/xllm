@@ -43,6 +43,7 @@ limitations under the License.
 #include "core/framework/sampling/sampling_params.h"
 #include "core/kv_cache/block/block_manager.h"
 #include "core/kv_cache/block/static_kv_cache_block_pool.h"
+#include "util/utils.h"
 #if defined(USE_MUSA)
 #include "layers/common/attention_metadata.h"
 #endif
@@ -258,8 +259,8 @@ ForwardInputBuilder::ForwardInputBuilder(
       std::all_of(sequences_.begin(), sequences_.end(), [](Sequence* sequence) {
         return sequence != nullptr && sequence->is_graph_warmup();
       });
-  state_.mtp_bootstrap_embeddings.reserve(sequences.size());
-  state_.mtp_bootstrap_row_idxes.reserve(sequences.size());
+  state_.target_decode_bootstrap_rows.reserve(sequences.size());
+  state_.draft_input_rows.reserve(sequences.size());
   if (args_ != nullptr) {
     use_mrope_ = (args_->rope_scaling_rope_type() == "mrope");
   }
@@ -703,13 +704,16 @@ void ForwardInputBuilder::process_sequences_multithreaded() {
     state_.eplb_decode_token_mask.insert(state_.eplb_decode_token_mask.end(),
                                          state.eplb_decode_token_mask.begin(),
                                          state.eplb_decode_token_mask.end());
-    for (int32_t row_idx : state.mtp_bootstrap_row_idxes) {
-      state_.mtp_bootstrap_row_idxes.emplace_back(row_offset + row_idx);
+    for (auto& row : state.draft_input_rows) {
+      row.row += row_offset;
     }
-    state_.mtp_bootstrap_embeddings.insert(
-        state_.mtp_bootstrap_embeddings.end(),
-        state.mtp_bootstrap_embeddings.begin(),
-        state.mtp_bootstrap_embeddings.end());
+    state_.target_decode_bootstrap_rows.insert(
+        state_.target_decode_bootstrap_rows.end(),
+        state.target_decode_bootstrap_rows.begin(),
+        state.target_decode_bootstrap_rows.end());
+    state_.draft_input_rows.insert(state_.draft_input_rows.end(),
+                                   state.draft_input_rows.begin(),
+                                   state.draft_input_rows.end());
     state_.transfer_kv_infos.insert(state_.transfer_kv_infos.end(),
                                     state.transfer_kv_infos.begin(),
                                     state.transfer_kv_infos.end());
@@ -885,28 +889,29 @@ void ForwardInputBuilder::extract_tokens_and_positions(
     state.extra_token_ids.emplace_back(-1);
     state.embedding_ids.emplace_back(sequence->get_embedding_block_id());
     state.request_ids.emplace_back(sequence->request_id());
-    torch::Tensor mtp_bootstrap = sequence->get_mtp_bootstrap_embedding();
-    if (state.batch_forward_type.is_decode() && mtp_bootstrap.defined()) {
+    if (state.batch_forward_type.is_decode() &&
+        (sequence->get_draft_input().has_value() ||
+         sequence->has_target_decode_bootstrap())) {
       CHECK_LT(n_kv_cache_tokens, seq_len)
-          << "MTP bootstrap decode input must contain current token";
+          << "Target decode bootstrap input must contain current token";
       const int32_t token_id = token_ids[n_kv_cache_tokens];
-      const bool is_fake_token = token_id < 0;
-      const bool allow_fake_token =
-          ::xllm::SchedulerConfig::get_instance().enable_schedule_overlap();
-      if (is_fake_token) {
-        CHECK(allow_fake_token)
-            << "MTP bootstrap fake token is only allowed with schedule "
-            << "overlap";
-      } else {
-        state.mtp_bootstrap_row_idxes.emplace_back(
-            static_cast<int32_t>(state.embedding_ids.size() - 1));
-        if (mtp_bootstrap.dim() == 1) {
-          state.mtp_bootstrap_embeddings.emplace_back(
-              mtp_bootstrap.unsqueeze(0));
+      if (sequence->get_draft_input().has_value()) {
+        CHECK_GE(token_id, 0)
+            << "MTP draft input requires the resolved target root token";
+        state.draft_input_rows.push_back(
+            {static_cast<int32_t>(state.embedding_ids.size() - 1), sequence});
+      }
+      if (sequence->has_target_decode_bootstrap()) {
+        const bool is_fake_token = token_id < 0;
+        const bool allow_fake_token =
+            ::xllm::SchedulerConfig::get_instance().enable_schedule_overlap();
+        if (is_fake_token) {
+          CHECK(allow_fake_token)
+              << "Target decode bootstrap fake token is only "
+                 "allowed with schedule "
+              << "overlap";
         } else {
-          CHECK(mtp_bootstrap.dim() == 2 && mtp_bootstrap.size(0) == 1)
-              << "MTP bootstrap embedding should be [hidden] or [1, hidden]";
-          state.mtp_bootstrap_embeddings.emplace_back(mtp_bootstrap);
+          state.target_decode_bootstrap_rows.emplace_back(sequence);
         }
       }
     }
@@ -1312,15 +1317,29 @@ Input ForwardInputBuilder::state_to_forward_input() {
     input_params.embedding.mtp_shifted_token_ids = mtp_tensor;
     input_params.mtp_shifted_token_ids = mtp_tensor;
   }
-  if (!state_.mtp_bootstrap_embeddings.empty()) {
-    CHECK_EQ(state_.mtp_bootstrap_row_idxes.size(),
-             state_.mtp_bootstrap_embeddings.size());
-    input_params.embedding.mtp_bootstrap_row_idxes =
-        std::move(state_.mtp_bootstrap_row_idxes);
-    input_params.embedding.mtp_bootstrap_embeddings =
-        torch::cat(state_.mtp_bootstrap_embeddings, /*dim=*/0);
-    for (Sequence* sequence : sequences_) {
-      sequence->clear_mtp_bootstrap_embedding();
+  if constexpr (std::is_same_v<Input, LlmForwardInput>) {
+    if (!state_.target_decode_bootstrap_rows.empty()) {
+      // The bootstrap rows themselves are consumed inline here; the sequence
+      // flag is one-shot and must not survive into the next round's build.
+      for (Sequence* bootstrap_sequence : state_.target_decode_bootstrap_rows) {
+        bootstrap_sequence->clear_target_decode_bootstrap();
+      }
+    }
+    if (!state_.draft_input_rows.empty()) {
+      forward_input.request_state.draft_input_row_idxes.reserve(
+          state_.draft_input_rows.size());
+      std::vector<DraftInput> draft_inputs;
+      draft_inputs.reserve(state_.draft_input_rows.size());
+      for (auto& input_row : state_.draft_input_rows) {
+        std::optional<DraftInput> seed = input_row.sequence->take_draft_input();
+        CHECK(seed.has_value())
+            << "draft input row lost its seed before attach, row="
+            << input_row.row;
+        forward_input.request_state.draft_input_row_idxes.emplace_back(
+            input_row.row);
+        draft_inputs.emplace_back(std::move(*seed));
+      }
+      forward_input.request_state.draft_input = cat_draft_inputs(draft_inputs);
     }
   }
   input_params.meta.batch_id = batch_id_;

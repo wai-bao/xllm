@@ -19,7 +19,7 @@ limitations under the License.
 #include "core/framework/sampling/logits_processor.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/framework/speculative/rejection_sampler.h"
-#include "core/framework/speculative/spec_verify.h"
+#include "core/runtime/spec_verify.h"
 #include "tests/core/framework/sampling/sampling_test_utils.h"
 
 namespace xllm {

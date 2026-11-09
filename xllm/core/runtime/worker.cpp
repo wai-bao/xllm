@@ -294,6 +294,11 @@ folly::SemiFuture<bool> Worker::wakeup_async(const WakeupOptions& options) {
   return future;
 }
 
+folly::SemiFuture<bool> Worker::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  return impl_->release_idle_request_state_async(std::move(embedding_ids));
+}
+
 bool Worker::start_profile() { return impl_->start_profile(); }
 
 bool Worker::stop_profile() { return impl_->stop_profile(); }
