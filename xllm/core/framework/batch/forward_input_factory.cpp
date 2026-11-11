@@ -44,9 +44,6 @@ ForwardInputFactory::ForwardInputFactory(ForwardInputFactoryOptions options)
           std::make_unique<SharedKVCacheMappingTracker>());
     }
   }
-  dp_batch_embedding_ids_.resize(options_.dp_size);
-  dp_batch_request_ids_.resize(options_.dp_size);
-  dp_batch_generations_.resize(options_.dp_size, 0);
   threadpool_ = std::make_unique<ThreadPool>(
       /*num_threads=*/16,
       /*cpu_binding=*/false,
@@ -158,14 +155,6 @@ void ForwardInputFactory::prepare_rank_inputs(BatchGroup& batches,
     state.is_graph_warmup = state.is_graph_warmup || meta.is_graph_warmup;
     state.dp_is_decode[dp_rank] =
         current_forward_type.is_decode() && meta.q_max_seq_len == 1;
-
-    const auto& embedding = input.input_params.embedding;
-    if (dp_batch_embedding_ids_[dp_rank] != embedding.embedding_ids ||
-        dp_batch_request_ids_[dp_rank] != embedding.request_ids) {
-      dp_batch_embedding_ids_[dp_rank] = embedding.embedding_ids;
-      dp_batch_request_ids_[dp_rank] = embedding.request_ids;
-      ++dp_batch_generations_[dp_rank];
-    }
   }
 }
 
@@ -188,7 +177,6 @@ void ForwardInputFactory::finalize_inputs(PreparationState& state) {
     input.input_params.meta.is_graph_warmup = state.is_graph_warmup;
     auto& parallel = input.input_params.parallel;
     parallel.dp_global_token_nums = state.dp_token_counts;
-    parallel.dp_global_batch_generations = dp_batch_generations_;
     if (input.input_params.meta.batch_forward_type.is_empty()) {
       input.input_params.meta.batch_forward_type = state.batch_forward_type;
     }

@@ -24,6 +24,7 @@ limitations under the License.
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/metrics.h"
@@ -35,6 +36,7 @@ limitations under the License.
 #include "core/framework/model/model_output.h"
 #include "core/framework/model_context/model_context.h"
 #include "core/framework/model_loader/model_loader.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/stopping_checker.h"
 #include "core/framework/sampling/sampling_params.h"
@@ -44,6 +46,7 @@ limitations under the License.
 #include "core/kv_cache/storage/kv_cache.h"
 #include "core/kv_cache/storage/kv_cache_utils.h"
 #include "core/layers/common/attention_metadata.h"
+#include "core/layers/npu_torch/deepseek_v4_cp_context.h"
 #include "core/layers/npu_torch/qwen3_next_attention.h"
 #include "core/layers/npu_torch/tests_utils.h"
 #include "core/runtime/acl_graph_executor_impl.h"
@@ -149,30 +152,6 @@ TEST(AclGraphStaticGraphTaskSignatureTest,
 
   params.parallel.query_start_loc.push_back(6);
   EXPECT_FALSE(npu::make_static_graph_task_signature(params).has_value());
-}
-
-TEST(Qwen35FiaRoutingTest, UsesExactModelTypeWhitelist) {
-  const std::vector<std::string> supported_model_types = {
-      "qwen3_5",
-      "qwen3_5_text",
-      "qwen3_5_moe",
-      "qwen3_5_moe_text",
-      "qwen3_5_mtp",
-      "qwen3_5_moe_mtp",
-  };
-  for (const std::string& model_type : supported_model_types) {
-    EXPECT_TRUE(layer::is_qwen3_5_model_type(model_type)) << model_type;
-  }
-
-  const std::vector<std::string> unsupported_model_types = {
-      "",
-      "qwen3_next",
-      "qwen3_5_future",
-      "qwen3_50",
-  };
-  for (const std::string& model_type : unsupported_model_types) {
-    EXPECT_FALSE(layer::is_qwen3_5_model_type(model_type)) << model_type;
-  }
 }
 
 TEST(Qwen35FiaRoutingTest, RequiresExplicitEnableFlag) {
@@ -1424,6 +1403,91 @@ TEST(AuxHiddenCaptureTest, PreservesConfiguredLayerOrderAndResidual) {
                            torch::full({3, 2}, 20.0f)));
 }
 
+TEST(AuxHiddenCaptureTest, ExposesOnlyWrittenLocalRowsBeforeCpRestore) {
+  ModelArgs args;
+  args.hidden_size(2).layers_to_capture({0});
+  AuxHiddenCapture capture(
+      args, torch::TensorOptions().dtype(torch::kFloat32), 4);
+  const torch::Tensor local_hidden =
+      torch::tensor({{1.0F, 2.0F}, {3.0F, 4.0F}});
+  capture.capture_layer(/*layer_idx=*/0, local_hidden, std::nullopt);
+
+  const torch::Tensor local_aux = capture.sharded_aux_hidden_states(2);
+  EXPECT_EQ(local_aux.size(0), 2);
+  EXPECT_TRUE(torch::equal(local_aux, local_hidden));
+}
+
+namespace {
+
+class FixedCpGatherGroup final : public ProcessGroup {
+ public:
+  explicit FixedCpGatherGroup(torch::Tensor remote_rows)
+      : ProcessGroup(/*rank=*/0,
+                     /*world_size=*/2,
+                     torch::Device(torch::kCPU)),
+        remote_rows_(std::move(remote_rows)) {}
+
+  torch::Tensor allgather_base_sync(const torch::Tensor& local_rows) override {
+    return torch::stack({local_rows, remote_rows_});
+  }
+
+  c10::intrusive_ptr<c10d::Work> allgather_base_async(
+      const torch::Tensor& padded_local_rows,
+      torch::Tensor& output) override {
+    output[0].copy_(padded_local_rows);
+    output[1].copy_(remote_rows_);
+    return {};
+  }
+
+ private:
+  torch::Tensor remote_rows_;
+};
+
+}  // namespace
+
+TEST(AuxHiddenCaptureTest, RestoresCapturedCpRowsBeforeSpeculativeSelection) {
+  ModelArgs args;
+  args.hidden_size(2).layers_to_capture({0});
+  AuxHiddenCapture capture(
+      args, torch::TensorOptions().dtype(torch::kFloat32), 4);
+  capture.capture_layer(
+      /*layer_idx=*/0,
+      torch::tensor({{1.0F, 2.0F}, {3.0F, 4.0F}}),
+      std::nullopt);
+
+  FixedCpGatherGroup cp_group(torch::tensor({{5.0F, 6.0F}, {7.0F, 8.0F}}));
+  layer::v4_cp::DeepseekV4CpContext cp_context;
+  cp_context.cp_size = 2;
+  cp_context.cp_group = &cp_group;
+  cp_context.tokens_per_rank = {2, 2};
+  cp_context.restore_indices = torch::tensor({0, 2, 1, 3}, torch::kLong);
+  const torch::Tensor restored_aux =
+      cp_context
+          .gather_restore(capture.sharded_aux_hidden_states(/*num_tokens=*/2))
+          .first;
+  EXPECT_TRUE(torch::equal(
+      restored_aux,
+      torch::tensor({{1.0F, 2.0F}, {5.0F, 6.0F}, {3.0F, 4.0F}, {7.0F, 8.0F}})));
+
+  cp_context.tokens_per_rank = {1, 2};
+  cp_context.restore_indices = torch::tensor({0, 1, 2}, torch::kLong);
+  const torch::Tensor uneven_aux =
+      cp_context
+          .gather_restore(capture.sharded_aux_hidden_states(/*num_tokens=*/1))
+          .first;
+  EXPECT_TRUE(torch::equal(
+      uneven_aux, torch::tensor({{1.0F, 2.0F}, {5.0F, 6.0F}, {7.0F, 8.0F}})));
+
+  cp_context.tokens_per_rank = {0, 2};
+  cp_context.restore_indices = torch::tensor({0, 1}, torch::kLong);
+  const torch::Tensor empty_local_aux =
+      cp_context
+          .gather_restore(capture.sharded_aux_hidden_states(/*num_tokens=*/0))
+          .first;
+  EXPECT_TRUE(torch::equal(empty_local_aux,
+                           torch::tensor({{5.0F, 6.0F}, {7.0F, 8.0F}})));
+}
+
 TEST(DSparkWorkerInputTest, InvalidatesTargetAttentionAndRecurrentMetadata) {
   LlmModelParams params;
   params.attn_metadata = std::make_shared<layer::AttentionMetadata>();
@@ -1649,8 +1713,8 @@ TEST(AclGraphExecutorHybridTest, KvCacheSupportsLinearOnlyLayers) {
       LinearAttentionKVCacheTensors{conv_cache, ssm_cache});
 
   EXPECT_FALSE(linear_only_cache.empty());
-  EXPECT_FALSE(linear_only_cache.get_conv_cache().defined() == false);
-  EXPECT_FALSE(linear_only_cache.get_ssm_cache().defined() == false);
+  EXPECT_TRUE(linear_only_cache.get_conv_cache().defined());
+  EXPECT_TRUE(linear_only_cache.get_ssm_cache().defined());
   EXPECT_FALSE(linear_only_cache.get_k_cache().defined());
   EXPECT_FALSE(linear_only_cache.get_v_cache().defined());
 }

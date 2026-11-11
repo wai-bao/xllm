@@ -34,6 +34,7 @@ limitations under the License.
 #include "common/types.h"
 #include "core/distributed_runtime/worker_model_codec.h"
 #include "core/framework/config/eplb_config.h"
+#include "core/framework/speculative/draft_input.h"
 #include "core/framework/speculative/metrics.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/transfer/kv_transport_codec.h"
@@ -90,14 +91,6 @@ int32_t get_decode_sequence_count(const Input& input) {
   return unpacked ? static_cast<int32_t>(
                         unpacked_input.sampling_params.num_sample_seqs())
                   : 0;
-}
-
-template <typename Input>
-void stabilize_host_views(Input& input) {
-  input.token_ids_host = materialize_cpu_tensor(input.token_ids_host);
-  input.positions_host = materialize_cpu_tensor(input.positions_host);
-  input.input_params.attention.host.block_tables =
-      materialize_cpu_tensor(input.input_params.attention.host.block_tables);
 }
 
 class WorkerPrefetchSession final
@@ -458,6 +451,8 @@ void WorkerService::collect_llm_output(
                                                   : sample.next_tokens,
                 torch::kCPU,
                 /*non_blocking=*/true);
+    cpu_output.draft_input =
+        draft_input_to(output.draft_input, torch::kCPU, /*non_blocking=*/true);
     if (cpu_output.sample_output.next_tokens.defined()) {
       cpu_output.sample_output.logprobs =
           safe_to(sample.logprobs, torch::kCPU, /*non_blocking=*/true);
@@ -1144,6 +1139,24 @@ void WorkerService::Wakeup(::google::protobuf::RpcController* controller,
   });
 
   return;
+}
+
+void WorkerService::ReleaseIdleRequestState(
+    ::google::protobuf::RpcController* controller,
+    const proto::RequestStateRelease* request,
+    proto::Status* response,
+    ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, request, response, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    if (!initialized_) {
+      controller->SetFailed("Worker is not initialized");
+      return;
+    }
+    std::vector<int32_t> ids(request->embedding_ids().begin(),
+                             request->embedding_ids().end());
+    auto future = worker_->release_idle_request_state_async(std::move(ids));
+    response->set_ok(std::move(future).get());
+  });
 }
 
 void WorkerService::StartProfile(::google::protobuf::RpcController* controller,

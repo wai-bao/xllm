@@ -71,6 +71,8 @@ class RemoteWorker : public WorkerClient {
       const std::string& model_weights_path,
       int32_t random_seed,
       MasterStatus master_status) override;
+  folly::SemiFuture<bool> release_idle_request_state_async(
+      std::vector<int32_t> embedding_ids) override;
 
   folly::SemiFuture<std::tuple<int64_t, int64_t>>
   estimate_kv_cache_capacity_async() override;

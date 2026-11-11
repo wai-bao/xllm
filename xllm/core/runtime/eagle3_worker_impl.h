@@ -15,7 +15,10 @@ limitations under the License.
 
 #pragma once
 
-#include "forward_params.h"
+#include <cstdint>
+#include <string>
+
+#include "core/runtime/forward_params.h"
 #include "runtime/mtp_worker_impl.h"
 
 namespace xllm {
@@ -30,14 +33,10 @@ class Eagle3WorkerImpl final : public MTPWorkerImpl<TargetInput> {
 
   ~Eagle3WorkerImpl() override;
 
-  // EAGLE-3 draft input_embedding is num_aux_layers * target_hidden_size
-  int64_t get_embedding_placeholder_size() const override;
-
  protected:
   using MTPWorkerImpl<TargetInput>::context_;
   using MTPWorkerImpl<TargetInput>::draft_impl_;
-
-  static runtime::Options draft_options(const runtime::Options& options);
+  using MTPWorkerImpl<TargetInput>::draft_vocab_;
 
   void check_draft_input_embedding(const torch::Tensor& embedding,
                                    const std::string& phase) const override;

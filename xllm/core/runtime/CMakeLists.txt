@@ -29,6 +29,8 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.h>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.h>
     py_executor_impl.h
+    spec_verify_input_layout.h
+    $<$<BOOL:${USE_NPU}>:mtp_npu_validate_input_state.h>
     py_attention_metadata.h
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.h>
     worker.h
@@ -50,6 +52,7 @@ cc_library(
     dflash2_worker_impl.h
     dspark_worker_impl.h
     forward_shared_memory_transport.h
+    target_context_handoff.h
     worker_rendezvous.h
   SRCS
     decode_graph_bucket.cpp
@@ -68,6 +71,8 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.cpp>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.cpp>
     py_executor_impl.cpp
+    spec_verify_input_layout.cpp
+    $<$<BOOL:${USE_NPU}>:mtp_npu_validate_input_state.cpp>
     py_attention_metadata.cpp
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.cpp>
     worker.cpp
@@ -83,6 +88,7 @@ cc_library(
     dit_forward_params.cpp
     draft_model_spec_worker_impl.cpp
     speculative_worker_impl.cpp
+    target_context_handoff.cpp
     mtp_worker_impl.cpp
     suffix_worker_impl.cpp
     eagle3_worker_impl.cpp
@@ -122,6 +128,7 @@ cc_library(
     :models
     :sampler
     :json_object_grammar
+    :json_object_constraint_batch
     :tokenizer
     :model_loader
     :util

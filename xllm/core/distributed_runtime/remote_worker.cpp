@@ -176,6 +176,18 @@ folly::SemiFuture<bool> RemoteWorker::init_model_async(
   return future;
 }
 
+folly::SemiFuture<bool> RemoteWorker::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        ids = std::move(embedding_ids),
+                        promise = std::move(promise)]() mutable {
+    promise.setValue(channel_->release_idle_request_state(ids));
+  });
+  return future;
+}
+
 folly::SemiFuture<bool> RemoteWorker::allocate_kv_cache_async(
     const KVCacheShape& kv_cache_shape) {
   folly::Promise<bool> promise;

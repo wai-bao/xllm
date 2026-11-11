@@ -39,6 +39,10 @@ inline bool has_contiguous_input_buffer_exclusions(
 }
 }  // namespace detail
 
+// Skipped draft-step fields are shared via
+// detail::copy_draft_step_skipped_fields in forward_params.h so a new skipped
+// field cannot drift between the Llm/Vlm copy paths.
+
 class VlmForwardInput final {
  public:
   VlmForwardInput() = default;
@@ -50,18 +54,13 @@ class VlmForwardInput final {
   bool to_packed_proto(proto::PackedForwardInput* packed_forward_input) const;
   bool from_packed_proto(const proto::PackedForwardInput& packed_forward_input);
 
-  VlmForwardInput clone() const {
-    VlmForwardInput inputs;
-    inputs.runtime = runtime;
-    copy_non_runtime_metadata_to(inputs);
-    inputs.token_ids = token_ids;
-    inputs.positions = positions;
-    inputs.token_ids_host = token_ids_host;
-    inputs.positions_host = positions_host;
-    inputs.input_params = input_params.clone();
-    inputs.sampling_params = sampling_params;
-    inputs.json_object_errors = json_object_errors;
-    return inputs;
+  VlmForwardInput clone() const { return clone_impl(/*for_draft_step=*/false); }
+
+  // clone() minus the fields a recursive MTP draft step never reads
+  // (grammar states are O(seq_len) to copy): json_object_states arrives from
+  // the previous draft output; the rest have no readers in a draft step.
+  VlmForwardInput clone_for_draft_step() const {
+    return clone_impl(/*for_draft_step=*/true);
   }
 
   VlmForwardInput to(const torch::Device& device,
@@ -173,15 +172,33 @@ class VlmForwardInput final {
     inputs.runtime.retained_device_tensors = runtime.retained_device_tensors;
   }
 
-  void copy_non_runtime_metadata_to(VlmForwardInput& inputs) const {
+  // for_draft_step skips the fields a recursive MTP draft step never reads
+  // (grammar states are O(seq_len) to copy) so the copy is never paid.
+  void copy_non_runtime_metadata_to(VlmForwardInput& inputs,
+                                    bool for_draft_step = false) const {
     inputs.transfer_kv_infos = transfer_kv_infos;
     inputs.input_host_sample_count = input_host_sample_count;
     inputs.skip_sampling_for_logits_only = skip_sampling_for_logits_only;
     inputs.return_selected_hidden = return_selected_hidden;
-    inputs.sample_sequence_ids = sample_sequence_ids;
     inputs.sample_prior_output_rows = sample_prior_output_rows;
-    inputs.json_object_states = json_object_states;
-    inputs.json_object_state_snapshots = json_object_state_snapshots;
+    if (!for_draft_step) {
+      detail::copy_draft_step_skipped_fields(*this, inputs);
+    }
+  }
+
+  VlmForwardInput clone_impl(bool for_draft_step) const {
+    VlmForwardInput inputs;
+    inputs.runtime = runtime;
+    copy_non_runtime_metadata_to(inputs, for_draft_step);
+    inputs.token_ids = token_ids;
+    inputs.positions = positions;
+    inputs.token_ids_host = token_ids_host;
+    inputs.positions_host = positions_host;
+    inputs.input_params = input_params.clone();
+    inputs.sampling_params = sampling_params;
+    inputs.json_object_invalid_draft = json_object_invalid_draft;
+    inputs.json_object_errors = json_object_errors;
+    return inputs;
   }
 
   void set_host_views(VlmForwardInput& inputs) const {
@@ -223,6 +240,9 @@ class VlmForwardInput final {
   std::vector<int32_t> sample_prior_output_rows;
   std::vector<JsonObjectGrammarState> json_object_states;
   std::vector<JsonObjectGrammarSnapshot> json_object_state_snapshots;
+  // Flattened [sequence][draft position] flags produced during MTP
+  // validation. This is execution-local metadata and is not transported.
+  std::vector<uint8_t> json_object_invalid_draft;
   // Errors detected while aligning prior overlap output with grammar rows.
   std::vector<JsonObjectOutputError> json_object_errors;
 
@@ -298,10 +318,6 @@ inline LlmForwardInput make_llm_draft_input(const VlmForwardInput& target,
   params.embedding.extra_token_ids = source.embedding.extra_token_ids;
   params.embedding.mtp_shifted_token_ids =
       source.embedding.mtp_shifted_token_ids;
-  params.embedding.mtp_bootstrap_row_idxes =
-      source.embedding.mtp_bootstrap_row_idxes;
-  params.embedding.mtp_bootstrap_embeddings =
-      source.embedding.mtp_bootstrap_embeddings;
   params.parallel = source.parallel;
   params.expert = source.expert;
   params.graph.attn_mask = source.graph.attn_mask;

@@ -75,6 +75,7 @@ class XServiceClient {
 
  private:
   friend class XServiceClientTestPeer;
+  friend class XServiceGenerationTestPeer;
 
   enum class DirectRegistrationResult {
     SUCCESS,

@@ -76,6 +76,7 @@ class ConcurrentBlockManagerImpl : public BlockManager {
   size_t num_used_blocks() const override;
   size_t num_total_blocks() const override;
   size_t admission_capacity() const override;
+  bool is_block_used(int32_t block_id) const override;
   double kv_cache_utilization() const override;
   void reserve_virtual_memory_padding_blocks() override;
 

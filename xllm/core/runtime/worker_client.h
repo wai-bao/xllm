@@ -51,6 +51,8 @@ class WorkerClient {
 
   virtual folly::SemiFuture<bool> stop_profile_async();
 
+  virtual folly::SemiFuture<bool> release_idle_request_state_async(
+      std::vector<int32_t> embedding_ids);
   virtual void get_cache_info(uint64_t& cluster_id,
                               std::string& addr,
                               uint16_t& port);

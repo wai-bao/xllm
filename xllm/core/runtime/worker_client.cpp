@@ -28,6 +28,11 @@ limitations under the License.
 
 namespace xllm {
 
+folly::SemiFuture<bool> WorkerClient::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  return worker_->release_idle_request_state_async(std::move(embedding_ids));
+}
+
 void WorkerClient::get_cache_info(uint64_t& cluster_id,
                                   std::string& addr,
                                   uint16_t& port) {

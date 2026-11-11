@@ -21,6 +21,7 @@ limitations under the License.
 #include "deepseek_v2.h"
 #include "layers/common/attention_metadata_builder.h"
 #include "layers/mlu/deepseek_v32_cp_context.h"
+#include "models/llm/deepseek_v32_registry.h"
 #include "platform/platform.h"
 
 namespace xllm {

@@ -5,38 +5,45 @@ cc_library(
     speculative
   HDRS
     draft_config.h
+    mtp_json_object_state.h
+    spec_verify.h
+    draft_input.h
+    draft_input_sampling.h
     draft_proposal.h
+    draft_sampling_history.h
     draft_vocab_mapping.h
     rejection_sampler.h
-    mtp_async_input_builder.h
-    mtp_async_state.h
-    mtp_json_object_state.h
     draft_extend_input.h
-    embedding_cache.h
+    draft_input_state_store.h
+    target_decode_state_store.h
+    pd_speculative_handoff.h
+    draft_input_spec_provider.h
+    padded_token_row_scan.h
     metrics.h
     verify_layout.h
-    spec_verify.h
   SRCS
     draft_config.cpp
+    spec_verify.cpp
+    draft_extend_input.cpp
+    draft_input_sampling.cpp
+    draft_sampling_history.cpp
+    draft_input_state_store.cpp
+    target_decode_state_store.cpp
+    pd_speculative_handoff.cpp
+    metrics.cpp
+    verify_layout.cpp
     draft_proposal.cpp
     draft_vocab_mapping.cpp
     rejection_sampler.cpp
-    mtp_async_input_builder.cpp
-    mtp_async_state.cpp
-    draft_extend_input.cpp
-    embedding_cache.cpp
-    metrics.cpp
-    verify_layout.cpp
-    spec_verify.cpp
   DEPS
     Threads::Threads
     torch
     $<$<BOOL:${USE_NPU}>:torch_npu>
     :common
+    :config
     :util
     :sampler
     :json_object_grammar
-    :common_layers
     $<$<BOOL:${USE_NPU}>:xllm_ops>
     glog::glog
     nlohmann_json::nlohmann_json

@@ -15,8 +15,6 @@ limitations under the License.
 
 #pragma once
 
-#include <absl/functional/function_ref.h>
-
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -24,13 +22,11 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
-#include "core/framework/batch/decode_input_builder.h"
 #include "core/framework/speculative/draft_proposal.h"
-#include "core/framework/speculative/embedding_cache.h"
 #include "core/kv_cache/transfer/kv_cache_transfer.h"
-#include "core/util/tensor_helper.h"
 #include "framework/model/model_args.h"
 #include "runtime/draft_model_spec_worker_impl.h"
+#include "runtime/llm_worker_impl.h"
 
 namespace xllm {
 
@@ -46,6 +42,12 @@ inline void invalidate_draft_model_geometry(LlmModelParams& input_params) {
   input_params.clear_linear_attention_state();
 }
 
+enum class DraftRowLayout : uint8_t {
+  SEQUENCE,
+  BLOCK_ROWS,
+  SPARSE_INDICES,
+};
+
 }  // namespace dflash_detail
 
 class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
@@ -60,16 +62,9 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
                   int32_t random_seed,
                   MasterStatus master_status) override;
 
- protected:
-  DFlashWorkerImpl(
-      const ParallelArgs& parallel_args,
-      const torch::Device& device,
-      const runtime::Options& options,
-      absl::FunctionRef<std::unique_ptr<LLMWorkerImpl>()> draft_factory,
-      int32_t (*configure_draft_config)(ModelArgs&, const runtime::Options&));
+  std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override;
 
-  static runtime::Options draft_options(const runtime::Options& options,
-                                        int32_t num_speculative_tokens = 0);
+ protected:
   std::optional<ForwardOutput> step_prefill(
       const LlmForwardInput& input) override;
 
@@ -97,25 +92,34 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   void prepare_validate_inputs(const LlmForwardInput& input,
                                LlmForwardInput& validate_input);
 
-  bool draft_input_per_request_ = true;
-  BatchForwardType draft_forward_type_ = BatchForwardType::CHUNKED_PREFILL;
-  bool draft_needs_dummy_tokens_ = false;
-  bool sample_from_anchor_ = false;
+  int32_t draft_query_width_;
+  dflash_detail::DraftRowLayout draft_row_layout_ =
+      dflash_detail::DraftRowLayout::SEQUENCE;
+  bool draft_needs_dummy_rows_ = false;
 
  private:
-  DecodeExpansionOptions prepare_for_draft() const;
-
-  bool prepare_parallel_draft_metadata(
-      LlmForwardInput& query_input,
-      const DecodeExpansionOptions& decode_options);
-
   void fill_validate_input_from_draft_outputs(
       const DraftProposal& draft_proposal,
       LlmForwardInput& validate_input,
       Stream& compute_stream);
+
   std::optional<ForwardOutput> run_validate(const LlmForwardInput& input,
                                             const DraftProposal& draft_proposal,
                                             LlmForwardInput& validate_input);
+
+  // Mirrors sampled tokens to rank 0 under schedule-overlap so every rank
+  // commits the same prefix. No-op for a single rank. Distinct from the
+  // base's two-argument maybe_broadcast_spec_tokens, which additionally
+  // covers orthogonal CP consensus.
+  void broadcast_committed_tokens(torch::Tensor& tokens);
+
+  // Per-row bases uploaded on prepare_stream_ for the device row builders.
+  struct RowBases {
+    torch::Tensor positions;
+    torch::Tensor kv_lens;
+    torch::Tensor block_tables;
+  };
+  RowBases upload_row_bases(const LlmForwardInput& input);
 
   std::vector<std::string> write_context_kv(
       const LlmForwardInput& input,
@@ -123,20 +127,59 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
       const torch::Tensor& positions_device,
       const torch::Tensor& new_cache_slots_device);
 
-  std::vector<std::string> write_target_context_to_cache(
+  // Device-side context-KV scatter behind rejection sampling; never waits on
+  // the host. The store-side bookkeeping rides the pinned handoff instead.
+  // Returns the request ids whose PD KV push failed (empty when no push).
+  // `bases`/`bases_ready` come from the caller's upload_row_bases so the
+  // scatter and the next-query launch share one upload per verify round.
+  std::vector<std::string> scatter_context_kv(
       const LlmForwardInput& input,
-      const SampleOutput& validate_output);
+      const SampleOutput& validate_output,
+      const RowBases& bases,
+      const StreamEventPtr& bases_ready);
 
  protected:
-  torch::Tensor anchor_token_ids(const LlmForwardInput& input) const;
+  // The query forward launched at the tail of the previous run_validate,
+  // consumed by the next step's run_decode_draft. Owned copies, at most one
+  // outstanding (same ownership rule as MTP's pending round).
+  struct PendingQueryRound {
+    std::vector<int32_t> embedding_ids;
+    std::vector<std::string> request_ids;
+    ForwardOutput output;
+    // Keeps the no-sync query input's tensors alive until the stream work
+    // that reads them completes (CALLER_MANAGED completion).
+    LlmForwardInput prepared_input;
+    torch::Tensor anchors;  // last accepted token per sequence, device
+  };
+  std::optional<PendingQueryRound> pending_query_;
 
+  // Launches the next round's draft query from the device-side accepted
+  // block (build_next_query_rows_device) behind the context-KV scatter.
+  // Only the SEQUENCE layout under schedule overlap qualifies.
+  // Per-head query forward flags: DFlash samples in the query pass, DSpark
+  // needs logits only, DFlash2 also returns selected hidden states.
+  virtual bool query_forward_logits_only() const { return false; }
+  virtual bool query_forward_returns_selected_hidden() const { return false; }
+
+  void launch_next_query(const LlmForwardInput& input,
+                         const SampleOutput& val_output,
+                         const RowBases& bases,
+                         const StreamEventPtr& bases_ready);
+  // Broadcast + sampled-output → proposal tail shared by both draft paths.
+  DraftProposal proposal_from_sampled_output(ForwardOutput& draft_output);
+  bool take_pending_query(const LlmForwardInput& input, PendingQueryRound& out);
+
+  // Shared by the DSpark/DFlash2 sampling sites.
+  ProcessGroup* sampling_process_group_ = nullptr;
+
+  // Block drafts (DFlash2/DSpark) condition their first step on the decode
+  // batch's first tokens.
+  torch::Tensor anchor_token_ids(const LlmForwardInput& input) const;
   int32_t mask_token_id_ = -1;
   int64_t expected_context_hidden_size_ = 0;
-  // Whether the target model owns recurrent (linear attention) layers.
+  // Whether the target model owns recurrent (linear attention) layers;
+  // fixed once the target finishes loading.
   bool target_is_hybrid_recurrent_ = false;
-
- private:
-  CachedDeviceIndices draft_logits_indices_;
 };
 
 }  // namespace xllm

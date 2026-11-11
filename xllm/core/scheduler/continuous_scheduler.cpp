@@ -298,18 +298,6 @@ void ContinuousSchedulerBase::create_queues(const Options& options) {
   }
 }
 
-void ContinuousSchedulerBase::clear_mtp_bootstrap(Request* request) {
-  if (!options_.enable_disagg_pd() || options_.num_speculative_tokens() <= 0 ||
-      request == nullptr || request->sequences().empty()) {
-    return;
-  }
-  Sequence* sequence = request->sequences()[0].get();
-  if (sequence == nullptr) {
-    return;
-  }
-  sequence->clear_mtp_bootstrap_embedding();
-}
-
 void ContinuousSchedulerBase::drain_decode_restore_waiting(
     std::vector<std::shared_ptr<Request>>& finished) {
   const absl::Time now = absl::Now();
@@ -319,7 +307,6 @@ void ContinuousSchedulerBase::drain_decode_restore_waiting(
     CHECK(request != nullptr);
     request->update_connection_status();
     if (request->finished() || request->cancelled()) {
-      clear_mtp_bootstrap(request.get());
       kv_cache_manager_->deallocate(request.get());
       finished.emplace_back(request);
       it = decode_restore_waiting_.erase(it);
@@ -330,7 +317,6 @@ void ContinuousSchedulerBase::drain_decode_restore_waiting(
       continue;
     }
 
-    clear_mtp_bootstrap(request.get());
     kv_cache_manager_->deallocate(request.get());
     output_dispatcher_->process_failed_request(
         request,
@@ -507,6 +493,7 @@ void ContinuousSchedulerBase::step(const absl::Duration& timeout) {
           return one_batch.empty();
         });
     if (all_empty) {
+      resource_engine_->flush_released_requests();
       return;
     }
 
@@ -528,6 +515,7 @@ void ContinuousSchedulerBase::step_with_schedule_overlap(
         return one_batch.empty();
       });
   if (cur_batch_all_empty && !pending_step_.has_value()) {
+    resource_engine_->flush_released_requests();
     return;
   }
 
@@ -583,6 +571,7 @@ void ContinuousSchedulerBase::generate() {
 
   // wait for all responses done
   output_dispatcher_->wait_completion();
+  resource_engine_->flush_released_requests();
 }
 
 void ContinuousSchedulerBase::process_batch_output(

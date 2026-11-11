@@ -15,12 +15,15 @@ limitations under the License.
 
 #pragma once
 
+#include <glog/logging.h>
 #include <torch/types.h>
 
 #include <cstdint>
 #include <optional>
 #include <utility>
 #include <vector>
+
+#include "core/framework/speculative/draft_input.h"
 
 namespace xllm {
 
@@ -58,10 +61,9 @@ class DraftProposal final {
     if (!logits_.has_value()) {
       return;
     }
-    // The logits' vocab is the DRAFT model's own (an EAGLE3-style small head
-    // differs from the target's), so it is intentionally NOT compared to the
-    // target vocab: the rejection sampler only gathers at draft_token_ids,
-    // which index the draft domain.
+    // The logits' vocab is the DRAFT model's own, intentionally NOT compared
+    // to the target vocab: the rejection sampler only gathers at
+    // draft_token_ids, which index the draft domain.
     CHECK_EQ(logits_->dim(), 3)
         << "proposal logits must be [batch, n_spec, draft_vocab]";
     CHECK_EQ(logits_->size(0), token_ids_.size(0))
@@ -91,6 +93,18 @@ class DraftProposal final {
   torch::Tensor logits_at(int64_t step) {
     CHECK(logits_.has_value()) << "greedy proposal carries no logits buffer";
     return logits_->select(/*dim=*/1, /*index=*/step);
+  }
+
+  // Fills one proposal column's q: dense rows copy their logits, rows with
+  // undefined logits embed the point-mass one-hot at their token.
+  void fill_column(int64_t step, const torch::Tensor& logits) {
+    torch::Tensor column_logits = logits_at(step);
+    if (logits.defined()) {
+      column_logits.copy_(logits);
+      return;
+    }
+    column_logits.copy_(point_mass_logits(
+        tokens_at(step), column_logits.size(-1), column_logits.options()));
   }
 
  private:

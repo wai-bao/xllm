@@ -17,6 +17,7 @@ limitations under the License.
 
 #include <torch/types.h>
 
+#include <optional>
 #include <string>
 
 #include "core/util/binary_payload.h"
@@ -41,6 +42,15 @@ bool torch_to_proto(const torch::Tensor& torch_tensor,
 bool torch_to_proto(const torch::Tensor& torch_tensor,
                     proto::Tensor* proto_tensor,
                     std::string& binary_payload);
+
+std::optional<torch::ScalarType> try_datatype_proto_to_torch(
+    const std::string& proto_datatype);
+
+// Rejective variant for untrusted (RPC-received) tensors: returns
+// std::nullopt on malformed metadata instead of logging and returning an
+// undefined tensor. Semantics otherwise identical to proto_to_torch.
+std::optional<torch::Tensor> try_proto_to_torch(
+    const proto::Tensor& proto_tensor);
 
 torch::ScalarType datatype_proto_to_torch(const std::string& proto_datatype);
 

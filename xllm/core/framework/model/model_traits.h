@@ -59,6 +59,15 @@ struct has_get_word_embedding<
     std::void_t<decltype(std::declval<T>()->get_word_embedding())>>
     : std::true_type {};
 
+// CausalLMImpl's owns_mtp_draft_weights checks the draft model's ContainedType
+// against MtpSelfContainedDraft; only wrappers that define it participate.
+template <typename T, typename = void>
+struct has_contained_type : std::false_type {};
+
+template <typename T>
+struct has_contained_type<T, std::void_t<typename T::ContainedType>>
+    : std::true_type {};
+
 template <typename T, typename = void>
 struct has_set_word_embedding : std::false_type {};
 

@@ -15,6 +15,8 @@ limitations under the License.
 ==============================================================================*/
 
 #pragma once
+#include <glog/logging.h>
+
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -23,6 +25,7 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/model/causal_lm.h"
 #include "core/framework/model/causal_vlm.h"
 #include "core/framework/model/dit_model.h"
@@ -34,6 +37,17 @@ limitations under the License.
 #include "processors/multimodal_processor.h"
 
 namespace xllm {
+
+// Target verification contract declared with each model registration; the
+// runtime separately checks the current batch and device can execute it.
+enum class TargetSpecVerifyMode : int8_t {
+  GENERIC,
+  CAUSAL_CHUNKED_PREFILL,
+  // The target's verify kernel requires the same width for every sequence.
+  UNIFORM_EXPANDED_VERIFY,
+  // The Python executor's expanded verify path owns the verify graph.
+  PYTHON_EXPANDED_VERIFY,
+};
 
 class Options;
 
@@ -81,11 +95,6 @@ struct CausalVLMRegistration {
   int32_t priority = 0;
 };
 
-// Rewrites a target model's args into the registered MTP draft form. The
-// registry owns dispatch so engines never name a concrete MTP model.
-using MtpArgsAdapter =
-    std::function<void(ModelArgs& args, bool is_python_model)>;
-
 using GraphKVCapacityAdapter = std::function<int64_t(const ModelArgs&)>;
 
 enum class MtpModelFamily : int8_t {
@@ -101,13 +110,7 @@ enum class GraphContextPolicy : int8_t {
 };
 
 struct MtpModelCapabilities {
-  bool native_draft_requires_accepted_span_replay = false;
-  bool native_draft_owns_embedding_and_lm_head = false;
-  bool python_draft_owns_embedding_and_lm_head = false;
-  bool allow_tail_fallback = false;
   MtpModelFamily model_family = MtpModelFamily::NONE;
-  bool supports_causal_replay = false;
-  bool supports_expanded_replay = false;
   bool supports_grouped_graph = false;
   GraphContextPolicy graph_context_policy = GraphContextPolicy::MAX_CONTEXT;
 };
@@ -123,8 +126,17 @@ struct ModelMeta {
   TokenizerArgsLoader tokenizer_args_loader;
   bool supports_dcp = false;
   MtpModelCapabilities mtp_capabilities;
-  MtpArgsAdapter mtp_args_adapter;
   GraphKVCapacityAdapter graph_kv_capacity_adapter;
+  TargetSpecVerifyMode target_spec_verify_mode = TargetSpecVerifyMode::GENERIC;
+  // Qwen3.5-family MegaGdn linear-state layout: the NPU linear-state cache
+  // sizes its blocks for this family (targets and drafts share the layout).
+  bool qwen3_5_linear_state_layout = false;
+  std::string mtp_draft_model_type;
+  std::string mtp_target_model_type;
+  std::function<void(ModelArgs&)> mtp_draft_args_adapter;
+  // Draft-input row hidden width for this target; null defaults to
+  // args.hidden_size().
+  std::function<int64_t(const ModelArgs&)> draft_hidden_width_fn;
 };
 
 // Model config names may be aliases, but registry lookups use one canonical
@@ -194,11 +206,6 @@ class ModelRegistry {
   static void register_dcp_capability(const std::string& name);
   static bool supports_dcp(const std::string& name);
 
-  static void register_mtp_shared_weight_owner(const std::string& name);
-
-  static void register_mtp_args_adapter(const std::string& name,
-                                        MtpArgsAdapter adapter);
-
   static void register_mtp_capabilities(const std::string& name,
                                         MtpModelCapabilities capabilities);
 
@@ -211,10 +218,28 @@ class ModelRegistry {
                                        const ModelArgs& args,
                                        int64_t default_capacity);
 
-  static void configure_mtp_args(ModelArgs& args,
-                                 std::string_view algorithm,
-                                 bool is_draft_engine,
-                                 bool is_python_model);
+  static void register_mtp_model_pair(
+      const std::string& target,
+      const std::string& draft,
+      std::function<void(ModelArgs&)> args_adapter = {});
+  static std::string get_mtp_target_model_type(const std::string& draft);
+  // Convert loaded target arguments using the paired model's own policy.
+  static bool convert_to_mtp_draft(ModelArgs& args);
+  static void register_draft_hidden_width(
+      const std::string& name,
+      std::function<int64_t(const ModelArgs&)> width_fn);
+  // Key contract: `name` is the target model_type. A draft-converted
+  // model_type resolves through its registered MTP pair first.
+  static int64_t get_draft_hidden_width(const std::string& name,
+                                        const ModelArgs& model_args);
+  // Registers one model (target or draft) as using the Qwen3.5 MegaGdn
+  // linear-state layout.
+  static void register_qwen3_5_linear_state_layout(const std::string& name);
+  static bool uses_qwen3_5_linear_state_layout(const std::string& name);
+  static void register_target_spec_verify_mode(const std::string& name,
+                                               TargetSpecVerifyMode mode);
+  static TargetSpecVerifyMode get_target_spec_verify_mode(
+      const std::string& name);
 
   static CausalLMFactory get_causallm_factory(const std::string& name);
 
@@ -244,6 +269,11 @@ class ModelRegistry {
   static std::string get_model_backend(const std::string& name);
 
  private:
+  // Metadata getters resolve aliases through the canonical key; the factory
+  // getters intentionally use the raw registration key because the load path
+  // canonicalizes the model type before calling them.
+  static const ModelMeta* find_model_meta(const std::string& name);
+
   std::unordered_map<std::string, ModelMeta> model_registry_;
   std::unordered_map<std::string, std::string> model_backend_;
 };
@@ -377,6 +407,26 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
       Implementation,                                                        \
       ModelClass __VA_OPT__(, ) __VA_ARGS__)
 
+#define REGISTER_TARGET_SPEC_VERIFY_MODE(ModelType, Mode) \
+  const bool ModelType##_spec_verify_registered = []() {  \
+    ModelRegistry::register_target_spec_verify_mode(      \
+        #ModelType, TargetSpecVerifyMode::Mode);          \
+    return true;                                          \
+  }()
+
+#define REGISTER_MTP_MODEL_PAIR(TargetType, DraftType, ...) \
+  const bool DraftType##_mtp_pair_registered = []() {       \
+    ModelRegistry::register_mtp_model_pair(                 \
+        #TargetType, #DraftType, ##__VA_ARGS__);            \
+    return true;                                            \
+  }()
+
+#define REGISTER_QWEN3_5_LINEAR_STATE_LAYOUT(ModelType)              \
+  const bool ModelType##_qwen35_layout_registered = []() {           \
+    ModelRegistry::register_qwen3_5_linear_state_layout(#ModelType); \
+    return true;                                                     \
+  }()
+
 #define REGISTER_DIT_MODEL_WITH_VARNAME(VarName, ModelType, ModelClass) \
   const bool VarName##_registered = []() {                              \
     ModelRegistry::register_dit_model_factory(                          \
@@ -506,5 +556,48 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
   }()
 
 #define SET_ARG(arg_name, value) [&] { args->arg_name() = value; }()
+
+// Rewrites args to the registered MTP draft model type when the checkpoint
+// carries one; shared by the worker and engine speculative-decode paths.
+inline void maybe_override_mtp_draft_model_type(ModelArgs& args) {
+  const std::string current_type = args.model_type();
+  if (ModelRegistry::convert_to_mtp_draft(args)) {
+    LOG(INFO) << "Overriding draft model_type from " << current_type << " to "
+              << args.model_type() << " for speculative decoding";
+  }
+}
+
+// Resolves the MTP draft conversion and, on NPU, rewrites args to the
+// registered pair-draft model type for a DRAFT_ENGINE_PAIR load. Returns the
+// conversion so callers can act on EMBEDDED_LAYER themselves.
+inline SpeculativeConfig::MtpDraftConversion maybe_load_mtp_pair_draft(
+    bool is_draft_engine,
+    std::string_view algorithm,
+    int32_t num_speculative_tokens,
+    ModelArgs& args) {
+  const SpeculativeConfig::MtpDraftConversion conversion =
+      SpeculativeConfig::resolve_mtp_draft_conversion(
+          is_draft_engine,
+          algorithm,
+          num_speculative_tokens,
+          args.num_nextn_predict_layers(),
+          SpeculativeConfig::is_block_diffusion_algorithm(algorithm));
+#if defined(USE_NPU)
+  if (conversion == SpeculativeConfig::MtpDraftConversion::DRAFT_ENGINE_PAIR) {
+    maybe_override_mtp_draft_model_type(args);
+  }
+#else
+  (void)conversion;
+#endif
+  return conversion;
+}
+
+// Hidden width a DraftInput row must carry for this target model; defaults
+// to hidden_size(), overridden per target when the draft embedding width
+// differs (e.g. DeepSeek-V4 hyper-connections).
+inline int64_t draft_input_hidden_width(const ModelArgs& model_args) {
+  return ModelRegistry::get_draft_hidden_width(model_args.model_type(),
+                                               model_args);
+}
 
 }  // namespace xllm

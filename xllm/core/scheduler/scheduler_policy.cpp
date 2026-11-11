@@ -201,7 +201,6 @@ bool SchedulerPolicy::collect_terminal(
     state.release_failed_request(request);
   }
   clear_kv_allocation_failures(request.get());
-  clear_mtp_bootstrap(request.get(), state);
   state.kv_cache_manager->deallocate(request.get());
   finished.emplace_back(std::move(request));
   return true;
@@ -395,7 +394,6 @@ SchedulerPolicy::schedule_one_prefill_request(
       state.release_failed_request(request);
     }
     clear_kv_allocation_failures(request.get());
-    clear_mtp_bootstrap(request.get(), state);
     state.kv_cache_manager->deallocate(request.get());
     state.output_dispatcher->process_failed_request(
         request,
@@ -940,9 +938,6 @@ void SchedulerPolicy::enqueue_decode_restore(
     const std::shared_ptr<Request>& request,
     SchedulerState& state) {
   const bool should_wait = should_wait_for_decode_restore(request, state);
-  if (should_wait) {
-    clear_mtp_bootstrap(request.get(), state);
-  }
   state.kv_cache_manager->deallocate(request.get());
   request->set_preempted();
   if (should_wait) {
@@ -1005,7 +1000,6 @@ void SchedulerPolicy::handle_abnormal_decode_request(
     // Reject only a permanent token-budget or static-capacity limit.
     queue->pop_top();
     clear_kv_allocation_failures(request.get());
-    clear_mtp_bootstrap(request.get(), state);
     state.kv_cache_manager->deallocate(request.get());
     if (budget_exhausted) {
       state.output_dispatcher->process_failed_request(
@@ -1038,7 +1032,6 @@ void SchedulerPolicy::handle_unschedulable_head(
       state.release_failed_request(request);
     }
     clear_kv_allocation_failures(request.get());
-    clear_mtp_bootstrap(request.get(), state);
     state.kv_cache_manager->deallocate(request.get());
     if (blocks_exhausted) {
       LOG(ERROR) << "Request prompt is too long, no enough memory to schedule "
@@ -1129,20 +1122,6 @@ void SchedulerPolicy::cache_in_batch_prefix(
         sequence->kv_state().kv_cache_tokens_num() + token_budgets[i];
     state.kv_cache_manager->publish_prefix(sequence, max_handle_num_tokens);
   }
-}
-
-void SchedulerPolicy::clear_mtp_bootstrap(Request* request,
-                                          const SchedulerState& state) {
-  if (!state.options.enable_disagg_pd() ||
-      state.options.num_speculative_tokens() <= 0 || request == nullptr ||
-      request->sequences().empty()) {
-    return;
-  }
-  Sequence* sequence = request->sequences()[0].get();
-  if (sequence == nullptr) {
-    return;
-  }
-  sequence->clear_mtp_bootstrap_embedding();
 }
 
 // =============================================================================

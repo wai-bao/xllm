@@ -74,7 +74,7 @@ class PDServiceImpl {
   PDScheduler* scheduler_;  // not owned
   Engine* engine_;          // not owned
   const PDServiceOptions response_options_;
-  XServiceClient* xservice_client_ = nullptr;
+  XServiceClient* xservice_client_ = nullptr;  // singleton, not owned
   std::mutex json_object_grammar_mutex_;
   std::shared_ptr<const JsonObjectGrammar> json_object_grammar_;
   std::shared_ptr<const JsonObjectGrammar> json_reasoning_grammar_;

@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "core/common/macros.h"
 #include "core/framework/config/option_category.h"
+#include "core/platform/platform.h"
 
 namespace xllm {
 
@@ -69,6 +70,38 @@ class SpeculativeConfig final {
   // Whether the PD handoff must carry the bootstrap hidden state.
   static bool requires_bootstrap_hidden(std::string_view algorithm) {
     return is_mtp_algorithm(algorithm) || is_eagle3_algorithm(algorithm);
+  }
+
+  // Which MTP draft-variant conversion applies to this model load; the single
+  // gate behind every convert_to_mtp_draft call site.
+  enum class MtpDraftConversion {
+    NONE,
+    // NPU draft engine running MTP with no fixed speculative width: load the
+    // registered MTP pair variant.
+    DRAFT_ENGINE_PAIR,
+    // Embedded MTP layer with no fixed width: on NPU only non-draft-engine
+    // workers, elsewhere any worker.
+    EMBEDDED_LAYER,
+  };
+
+  static MtpDraftConversion resolve_mtp_draft_conversion(
+      bool is_draft_engine,
+      std::string_view algorithm,
+      int32_t num_speculative_tokens,
+      int32_t num_nextn_predict_layers,
+      bool is_block_diffusion) {
+    if (num_speculative_tokens != 0 || is_block_diffusion) {
+      return MtpDraftConversion::NONE;
+    }
+    const bool is_npu_build = Platform::is_npu();
+    if (is_draft_engine && is_mtp_algorithm(algorithm)) {
+      return is_npu_build ? MtpDraftConversion::DRAFT_ENGINE_PAIR
+                          : MtpDraftConversion::NONE;
+    }
+    if (num_nextn_predict_layers != 0 && (!is_npu_build || !is_draft_engine)) {
+      return MtpDraftConversion::EMBEDDED_LAYER;
+    }
+    return MtpDraftConversion::NONE;
   }
 
   // Drafts that generate a block of speculative tokens in one forward.

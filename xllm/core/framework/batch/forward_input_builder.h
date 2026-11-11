@@ -51,6 +51,8 @@ class ForwardInputBuilder final {
   Input build_forward_input();
 
  private:
+  friend class ForwardInputBuilderTestPeer;
+
   // Core building methods
   void process_sequences();
   void process_sequences_multithreaded();
@@ -108,8 +110,14 @@ class ForwardInputBuilder final {
     std::vector<int32_t> extra_token_ids;
     std::vector<int32_t> mtp_shifted_token_ids;
     std::vector<int32_t> eplb_decode_token_mask;
-    std::vector<int32_t> mtp_bootstrap_row_idxes;
-    std::vector<torch::Tensor> mtp_bootstrap_embeddings;
+    // One-time carried rows (PD seed handoff / target decode bootstrap).
+    // Only the Llm domain's state_to_forward_input consumes them; the
+    // bootstrap leg ignores the row index, the draft-input leg needs it.
+    struct CarriedSequenceRow {
+      int32_t row = 0;
+      Sequence* sequence = nullptr;
+    };
+    std::vector<CarriedSequenceRow> carried_sequence_rows;
     std::vector<TransferKVInfo> transfer_kv_infos;
     std::vector<MMData> scheduled_mm_data_vec;
 

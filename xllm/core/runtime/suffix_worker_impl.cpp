@@ -18,9 +18,9 @@ limitations under the License.
 #include <algorithm>
 
 #include "common/metrics.h"
-#include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/util/tensor_helper.h"
+#include "framework/sampling/sampling_params.h"
 #include "util/slice.h"
 #include "util/timer.h"
 
@@ -221,7 +221,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   SampleOutput val_output;
   {
     AUTO_COUNTER(speculative_execution_latency_seconds_validation);
-    val_output = validate(input.sampling_params, draft_proposal, target_output);
+    val_output = validate(draft_proposal, target_output);
   }
 
   if (has_request_ids) {
@@ -266,8 +266,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
                                 input.json_object_states);
 }
 
-SampleOutput SuffixWorkerImpl::validate(SamplingParameters sampling_params,
-                                        const DraftProposal& draft_proposal,
+SampleOutput SuffixWorkerImpl::validate(const DraftProposal& draft_proposal,
                                         const ForwardOutput& target_output) {
   const int32_t num_val_tokens = options_.num_speculative_tokens() + 1;
   const int32_t batch_size =
@@ -276,10 +275,9 @@ SampleOutput SuffixWorkerImpl::validate(SamplingParameters sampling_params,
            static_cast<int64_t>(batch_size) * num_val_tokens)
       << "suffix validate logits shape mismatch";
 
-  // The suffix draft carries no model distribution (q = 1 deterministic
-  // suggestion), so the rejection sampler's no-logits path applies.
+  // All-greedy by default: the suffix proposal carries no sampling state.
   return spec_verify::run_rejection_sampling(
-      std::move(sampling_params),
+      SamplingParameters{},
       draft_proposal,
       target_output.logits,
       target_output.sample_output.embeddings);

@@ -17,13 +17,20 @@ limitations under the License.
 
 #include <torch/types.h>
 
+#include <vector>
+
+#include "core/framework/model/mtp_topk_state.h"
+#include "core/framework/speculative/draft_input.h"
+
 namespace xllm {
+
+struct SamplingParameters;
 
 class SampleOutput;
 struct ModelOutput;
 class LlmForwardInput;
+class VlmForwardInput;
 class ForwardOutput;
-class EmbeddingCache;
 
 // Selects the drafter's feed from `get_hidden_states_for_drafter(model_output)`
 // and exposes it through `embeddings` (plus `selected_embeddings` on target
@@ -38,12 +45,48 @@ void output_spec_hidden_states(
 
 void clear_all_output_embeddings(ForwardOutput& output);
 
-// Writes the target prefill context to the embedding cache and exposes the
-// selected hidden as `embeddings` for the PD handoff to the first draft-extend
-// step.
-template <typename Input>
-void prepare_first_draft_inputs(EmbeddingCache& embedding_cache,
-                                const Input& input,
-                                ForwardOutput& output);
+// Exposes the target prefill's selected hidden as `embeddings` for the PD
+// handoff to the first draft-extend step.
+void prepare_first_draft_inputs(ForwardOutput& output);
+
+// Reuses the NPU MTP draft-step row-selection flow for every backend. Backend
+// state implementations only interpret index_select_rows() for their payload.
+MtpTopkStatePtr select_mtp_topk_state_for_next_step(
+    const MtpTopkStatePtr& state,
+    const SamplingParameters& sampling_params);
+
+// Shift each prefill query left and append its target-sampled root token into
+// caller-owned CPU storage (pinned for H2D).
+template <typename Params>
+void fill_mtp_prefill_token_ids(const torch::Tensor& token_ids_host,
+                                const Params& params,
+                                const std::vector<int32_t>& extra_token_ids,
+                                torch::Tensor& destination);
+
+struct MtpDraftExtendRows {
+  torch::Tensor token_ids;
+  torch::Tensor hidden_states;
+  torch::Tensor logits_indices;
+};
+
+// Pair committed next tokens with their producing target rows; only the last
+// accepted row is sampled. Every sequence contributes the same fixed query
+// length.
+MtpDraftExtendRows build_mtp_draft_extend_rows(
+    const torch::Tensor& accepted_tokens,
+    const torch::Tensor& target_hidden_states);
+
+// Construct a draft input from the verifier's row layout. Target execution,
+// graph, transfer and recurrent-state controls never cross this boundary; the
+// caller orders this snapshot after verification on the metadata stream.
+template <typename TargetInput>
+TargetInput build_mtp_draft_extend_input(const TargetInput& validate_input,
+                                         const MtpDraftExtendRows& rows,
+                                         SamplingParameters sampling_params);
+
+// Copies the refresh metadata independently on the current stream; the caller
+// is responsible for synchronizing with updates to the source buffers.
+template <typename TargetInput>
+void clone_mtp_draft_metadata(TargetInput& input);
 
 }  // namespace xllm

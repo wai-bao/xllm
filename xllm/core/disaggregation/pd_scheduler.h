@@ -27,6 +27,7 @@ limitations under the License.
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -34,6 +35,9 @@ limitations under the License.
 
 #include "core/disaggregation/pd_service.h"
 #include "core/distributed_runtime/distributed_worker_manager.h"
+#include "core/framework/config/speculative_config.h"
+#include "core/framework/speculative/draft_input_spec_provider.h"
+#include "core/framework/speculative/pd_speculative_handoff.h"
 #include "disagg_pd.pb.h"
 #include "distributed_runtime/xservice_client.h"
 #include "framework/request/request.h"
@@ -141,8 +145,14 @@ class PDScheduler : public ContinuousScheduler<> {
       std::vector<KVTransferMapping> source_mappings,
       int32_t src_dp_size,
       int32_t src_dp_rank,
-      torch::Tensor mtp_bootstrap_embedding = torch::Tensor(),
-      int32_t num_cached_tokens = 0);
+      int32_t num_cached_tokens = 0,
+      std::optional<DraftInput> draft_input = std::nullopt);
+
+  // Reject a handoff before admission, including transport decoding failures.
+  // Idempotent for duplicate RPCs; a non-empty reservation_id must still match
+  // the waiting request so a stale duplicate cannot consume a newer request.
+  void reject_received_request(const std::string& request_id,
+                               const std::string& reservation_id = "");
 
   // Only consumes a matching waiting reservation, never a running request.
   bool release_reservation(const std::string& req_id,
@@ -210,6 +220,22 @@ class PDScheduler : public ContinuousScheduler<> {
     if (!options_.instance_role().has_value()) {
       LOG(FATAL) << "Instance type is not set in disagg pd mode.";
     }
+    if constexpr (std::is_base_of_v<DraftInputSpecProvider, TargetEngine>) {
+      draft_input_spec_provider_ = engine;
+    }
+    // The handoff shape is fixed for the scheduler's lifetime; resolve it once
+    // instead of per decoded first-generation.
+    const auto& speculative_config = SpeculativeConfig::get_instance();
+    handoff_kind_ =
+        pd_speculative_handoff_kind(speculative_config.speculative_algorithm(),
+                                    options_.num_speculative_tokens());
+    probabilistic_handoff_ = speculative_config.enable_probabilistic_draft();
+    handoff_vocab_size_ = engine->model_args().vocab_size();
+    if (handoff_kind_ == SpeculativeHandoffKind::DRAFT_INPUT) {
+      CHECK(draft_input_spec_provider_ != nullptr)
+          << "DRAFT_INPUT PD handoff requires an engine that provides a draft "
+             "input specification";
+    }
   }
 
   void release_failed_request(const std::shared_ptr<Request>& request) override;
@@ -221,6 +247,14 @@ class PDScheduler : public ContinuousScheduler<> {
 
   // Caller holds received_request_map_mutex_. Deallocation stays outside it.
   std::shared_ptr<Request> take_waiting_request(const std::string& req_id);
+
+  // Caller holds received_request_map_mutex_. A stale duplicate must not
+  // consume a newer waiting request that reuses the req_id; an empty
+  // reservation id (reject path) skips that guard.
+  std::shared_ptr<Request> take_received_request_locked(
+      const std::string& req_id,
+      const std::string& reservation_id,
+      bool allow_empty_reservation);
 
   void do_permanent_rejection(const std::shared_ptr<Request>& request,
                               int32_t status_code);
@@ -326,6 +360,12 @@ class PDScheduler : public ContinuousScheduler<> {
   std::unordered_set<std::string> linked_instance_;
 
   std::string server_name_;
+
+  const DraftInputSpecProvider* draft_input_spec_provider_ = nullptr;
+
+  SpeculativeHandoffKind handoff_kind_ = SpeculativeHandoffKind::NONE;
+  bool probabilistic_handoff_ = false;
+  int64_t handoff_vocab_size_ = 0;
 };
 
 }  // namespace xllm

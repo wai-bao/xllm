@@ -56,6 +56,7 @@ Worker::Worker(const ParallelArgs& parallel_args,
   CHECK(extension_impl.empty() ||
         ExtensionRegistry::get_instance().has_implementation(extension_impl))
       << "Unknown extension implementation: " << extension_impl;
+
   if (options.enable_speculative_decode()) {
     const std::string& algorithm = options.speculative_algorithm();
     LOG(INFO) << "Speculative decode is enabled, algorithm: " << algorithm;
@@ -279,6 +280,11 @@ folly::SemiFuture<bool> Worker::wakeup_async(const WakeupOptions& options) {
     promise.setValue(this->wakeup(options));
   });
   return future;
+}
+
+folly::SemiFuture<bool> Worker::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  return impl_->release_idle_request_state_async(std::move(embedding_ids));
 }
 
 bool Worker::start_profile() { return impl_->start_profile(); }

@@ -1105,6 +1105,7 @@ void WorkerImpl::prepare_work_before_execute_on_stream_impl(
     Input& processed_input,
     Stream& prepare_stream,
     bool record_ready_event,
+    bool restore_linear_state,
     bool wait_for_compute_stream,
     const std::function<void(Input&)>& prepare_input) {
   if (!input.json_object_state_snapshots.empty()) {
@@ -1114,6 +1115,7 @@ void WorkerImpl::prepare_work_before_execute_on_stream_impl(
                                                processed_input,
                                                prepare_stream,
                                                record_ready_event,
+                                               restore_linear_state,
                                                wait_for_compute_stream,
                                                prepare_input);
     return;
@@ -1199,7 +1201,7 @@ void WorkerImpl::prepare_work_before_execute_on_stream_impl(
       prepare_input_params_for_linear_attention(input_params);
       // Overlap restores in the worker thread on compute_stream_, after the
       // preceding chunk finishes writing its live slots.
-      if (!enable_schedule_overlap()) {
+      if (restore_linear_state && !enable_schedule_overlap()) {
         prepare_linear_state_cache(ModelParamsView(input_params));
       }
     }
@@ -1290,8 +1292,8 @@ void WorkerImpl::observe_execution_memory(bool is_warmup) {
       !cache_config.vmm_elastic()) {
     return;
   }
+  CHECK(compute_stream_ != nullptr);
   if (is_warmup) {
-    CHECK(compute_stream_ != nullptr);
     CHECK_EQ(compute_stream_->synchronize(), 0)
         << "Failed to finish elastic VMM execution warmup";
   }
@@ -1322,6 +1324,27 @@ folly::SemiFuture<std::optional<ForwardOutput>> WorkerImpl::step_async_impl(
       output->is_graph_warmup = input.input_params.meta.is_graph_warmup;
     }
     promise.setValue(std::move(output));
+  });
+  return future;
+}
+
+folly::SemiFuture<bool> WorkerImpl::release_idle_request_state_async(
+    std::vector<int32_t> embedding_ids) {
+  folly::Promise<bool> promise;
+  auto future = promise.getSemiFuture();
+  threadpool_.schedule([this,
+                        ids = std::move(embedding_ids),
+                        promise = std::move(promise)]() mutable {
+    // The schedule-overlap coordinator owns prior-output lifetime; this idle
+    // path only retires device work and per-request state.
+    CHECK(compute_stream_ != nullptr);
+    c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+    release_request_state(ids);
+    CHECK_EQ(compute_stream_->synchronize(), 0)
+        << "Failed to retire idle worker device work";
+    VLOG(1) << "Released idle request state for " << ids.size()
+            << " embedding slots";
+    promise.setValue(true);
   });
   return future;
 }
@@ -2051,11 +2074,13 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     const LlmForwardInput& input,
     LlmForwardInput& processed_input,
     Stream& prepare_stream,
-    bool record_ready_event) {
+    bool record_ready_event,
+    bool restore_linear_state) {
   prepare_work_before_execute_on_stream_impl(input,
                                              processed_input,
                                              prepare_stream,
                                              record_ready_event,
+                                             restore_linear_state,
                                              true,
                                              prepare_llm_input_);
 }
@@ -2064,11 +2089,13 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
     const VlmForwardInput& input,
     VlmForwardInput& processed_input,
     Stream& prepare_stream,
-    bool record_ready_event) {
+    bool record_ready_event,
+    bool restore_linear_state) {
   prepare_work_before_execute_on_stream_impl(input,
                                              processed_input,
                                              prepare_stream,
                                              record_ready_event,
+                                             restore_linear_state,
                                              true,
                                              prepare_vlm_input_);
 }

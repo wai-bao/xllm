@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/multimodal/embedding_output.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/sampling/sampling_params.h"
+#include "core/framework/speculative/draft_input.h"
 #include "core/framework/tokenizer/tokenizer.h"
 #include "core/kv_cache/block/block.h"
 #include "core/kv_cache/prefix/block_hasher.h"
@@ -238,14 +239,8 @@ class Sequence {
                             EmbeddingOutputMetadata metadata = {});
   // update embeddings to the sequence
   void update_embeddings(const torch::Tensor& embedding);
-  void update_mtp_bootstrap_embedding(const torch::Tensor& embedding);
+  const torch::Tensor& output_embedding() const { return output_embedding_; }
   void record_speculative_token_stats(const SpeculativeTokenStats& stats);
-  torch::Tensor get_mtp_bootstrap_embedding() const {
-    return mtp_bootstrap_embedding_;
-  }
-  void clear_mtp_bootstrap_embedding() {
-    mtp_bootstrap_embedding_ = torch::Tensor();
-  }
 
   int32_t get_embedding_block_id() const {
     return kv_state_.get_embedding_block_id();
@@ -489,12 +484,35 @@ class Sequence {
 
   // Read access for derived output paths.
   const SequenceParams& sequence_params() const { return sequence_params_; }
-  const torch::Tensor& output_embedding() const { return output_embedding_; }
   // Number of leading tokens that are real: trailing placeholder tokens (< 0,
   // appended under schedule overlap) are excluded.
   size_t num_valid_tokens() const;
 
+ public:
+  void mark_target_decode_bootstrap() {
+    target_decode_bootstrap_pending_ = true;
+  }
+  bool has_target_decode_bootstrap() const {
+    return target_decode_bootstrap_pending_;
+  }
+  void clear_target_decode_bootstrap() {
+    target_decode_bootstrap_pending_ = false;
+  }
+  void update_draft_input(const DraftInput& draft_input);
+  const std::optional<DraftInput>& get_draft_input() const {
+    return draft_input_;
+  }
+  // Consumes the carried PD draft input: swap disengages the member so it is
+  // encoded exactly once.
+  std::optional<DraftInput> take_draft_input() {
+    std::optional<DraftInput> seed;
+    seed.swap(draft_input_);
+    return seed;
+  }
+
  private:
+  bool target_decode_bootstrap_pending_ = false;
+  std::optional<DraftInput> draft_input_;
   void init_request_state();
   void init_logprob_state(bool force_token_logprobs);
 
@@ -584,9 +602,6 @@ class Sequence {
 
   // embeddings of the sequence
   torch::Tensor output_embedding_;
-
-  // temporary PD handoff bootstrap hidden state for first MTP decode.
-  torch::Tensor mtp_bootstrap_embedding_;
 
   // number of tokens in the sequence
   size_t num_tokens_ = 0;

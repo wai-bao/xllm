@@ -26,7 +26,6 @@ limitations under the License.
 #include "core/common/options.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/model_config.h"
-#include "core/framework/config/speculative_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model_loader/dit_model_discovery.h"
 #include "core/framework/model_loader/hf_model_config.h"
@@ -229,9 +228,10 @@ void resolve_npu_kernel_backend(Options* options,
 
 int64_t get_npu_linear_state_cache_block_limit(const std::string& model_type) {
 #if defined(USE_NPU)
-  // Native and Python Qwen3.5 use the same MegaGdn state-slot layout.
-  if (is_qwen3_5_target_model_type(model_type) || model_type == "qwen3_5_mtp" ||
-      model_type == "qwen3_5_moe_mtp") {
+  // Registered per model (targets and drafts) via
+  // REGISTER_QWEN3_5_LINEAR_STATE_LAYOUT; the family fact lives in the
+  // registry, not a parallel string list.
+  if (ModelRegistry::uses_qwen3_5_linear_state_layout(model_type)) {
     return 1024;
   }
 #endif
@@ -412,14 +412,95 @@ void ModelRegistry::register_tokenizer_args_loader(const std::string& name,
   }
 }
 
+const ModelMeta* ModelRegistry::find_model_meta(const std::string& name) {
+  const auto& registry = get_instance()->model_registry_;
+  const auto it = registry.find(canonical_model_registration_name(name));
+  return it == registry.end() ? nullptr : &it->second;
+}
+
 void ModelRegistry::register_dcp_capability(const std::string& name) {
   get_instance()->model_registry_[name].supports_dcp = true;
 }
 
 bool ModelRegistry::supports_dcp(const std::string& name) {
-  const ModelRegistry* instance = get_instance();
-  const auto it = instance->model_registry_.find(name);
-  return it != instance->model_registry_.end() && it->second.supports_dcp;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta != nullptr && meta->supports_dcp;
+}
+
+void ModelRegistry::register_mtp_model_pair(
+    const std::string& target,
+    const std::string& draft,
+    std::function<void(ModelArgs&)> args_adapter) {
+  CHECK(!target.empty() && !draft.empty() && target != draft);
+  auto& registry = get_instance()->model_registry_;
+  auto& target_meta = registry[target];
+  auto& draft_meta = registry[draft];
+  CHECK(target_meta.mtp_draft_model_type.empty() ||
+        target_meta.mtp_draft_model_type == draft);
+  CHECK(draft_meta.mtp_target_model_type.empty() ||
+        draft_meta.mtp_target_model_type == target);
+  target_meta.mtp_draft_model_type = draft;
+  target_meta.mtp_draft_args_adapter = std::move(args_adapter);
+  draft_meta.mtp_target_model_type = target;
+}
+
+std::string ModelRegistry::get_mtp_target_model_type(const std::string& draft) {
+  const ModelMeta* meta = find_model_meta(draft);
+  return meta == nullptr ? std::string() : meta->mtp_target_model_type;
+}
+
+void ModelRegistry::register_draft_hidden_width(
+    const std::string& name,
+    std::function<int64_t(const ModelArgs&)> width_fn) {
+  get_instance()->model_registry_[name].draft_hidden_width_fn =
+      std::move(width_fn);
+}
+
+int64_t ModelRegistry::get_draft_hidden_width(const std::string& name,
+                                              const ModelArgs& model_args) {
+  // A draft-converted model_type has a registry entry (the pair
+  // registration) but carries no width policy; resolve it to its target.
+  const std::string target = get_mtp_target_model_type(name);
+  const ModelMeta* meta = find_model_meta(target.empty() ? name : target);
+  if (meta != nullptr && meta->draft_hidden_width_fn != nullptr) {
+    return meta->draft_hidden_width_fn(model_args);
+  }
+  return model_args.hidden_size();
+}
+
+bool ModelRegistry::convert_to_mtp_draft(ModelArgs& args) {
+  const ModelMeta* meta = find_model_meta(args.model_type());
+  if (meta == nullptr || meta->mtp_draft_model_type.empty()) {
+    return false;
+  }
+  args.model_type(meta->mtp_draft_model_type);
+  if (meta->mtp_draft_args_adapter != nullptr) {
+    meta->mtp_draft_args_adapter(args);
+  }
+  return true;
+}
+
+void ModelRegistry::register_target_spec_verify_mode(
+    const std::string& name,
+    TargetSpecVerifyMode mode) {
+  get_instance()->model_registry_[name].target_spec_verify_mode = mode;
+}
+
+void ModelRegistry::register_qwen3_5_linear_state_layout(
+    const std::string& name) {
+  get_instance()->model_registry_[name].qwen3_5_linear_state_layout = true;
+}
+
+bool ModelRegistry::uses_qwen3_5_linear_state_layout(const std::string& name) {
+  const ModelMeta* meta = find_model_meta(name);
+  return meta != nullptr && meta->qwen3_5_linear_state_layout;
+}
+
+TargetSpecVerifyMode ModelRegistry::get_target_spec_verify_mode(
+    const std::string& name) {
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? TargetSpecVerifyMode::GENERIC
+                         : meta->target_spec_verify_mode;
 }
 
 CausalLMFactory ModelRegistry::get_causallm_factory(const std::string& name) {
@@ -463,14 +544,15 @@ CausalVLMFactory ModelRegistry::get_causalvlm_factory(
 }
 
 DiTModelFactory ModelRegistry::get_dit_model_factory(const std::string& name) {
-  ModelRegistry* instance = get_instance();
-  return instance->model_registry_[name].dit_model_factory;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? DiTModelFactory() : meta->dit_model_factory;
 }
 
 MultimodalProcessorFactory ModelRegistry::get_multimodal_processor_factory(
     const std::string& name) {
-  ModelRegistry* instance = get_instance();
-  return instance->model_registry_[name].multimodal_processor_factory;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? MultimodalProcessorFactory()
+                         : meta->multimodal_processor_factory;
 }
 
 void ModelRegistry::register_speech_model_factory(const std::string& name,
@@ -492,25 +574,19 @@ SpeechModelFactory ModelRegistry::get_speech_model_factory(
 }
 
 ModelArgsLoader ModelRegistry::get_model_args_loader(const std::string& name) {
-  ModelRegistry* instance = get_instance();
-
-  return instance->model_registry_[name].model_args_loader;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? ModelArgsLoader() : meta->model_args_loader;
 }
 
 TokenizerArgsLoader ModelRegistry::get_tokenizer_args_loader(
     const std::string& name) {
-  ModelRegistry* instance = get_instance();
-
-  return instance->model_registry_[name].tokenizer_args_loader;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta == nullptr ? TokenizerArgsLoader() : meta->tokenizer_args_loader;
 }
 
 bool ModelRegistry::has_dit_model_factory(const std::string& name) {
-  ModelRegistry* instance = get_instance();
-  const auto it = instance->model_registry_.find(name);
-  if (it == instance->model_registry_.end()) {
-    return false;
-  }
-  return it->second.dit_model_factory != nullptr;
+  const ModelMeta* meta = find_model_meta(name);
+  return meta != nullptr && meta->dit_model_factory != nullptr;
 }
 
 namespace util {
@@ -591,17 +667,6 @@ std::string resolve_dit_pipeline_type(
 
 }  // namespace util
 
-void ModelRegistry::register_mtp_shared_weight_owner(const std::string& name) {
-  auto& capabilities = get_instance()->model_registry_[name].mtp_capabilities;
-  capabilities.native_draft_owns_embedding_and_lm_head = true;
-  capabilities.python_draft_owns_embedding_and_lm_head = true;
-}
-
-void ModelRegistry::register_mtp_args_adapter(const std::string& name,
-                                              MtpArgsAdapter adapter) {
-  get_instance()->model_registry_[name].mtp_args_adapter = std::move(adapter);
-}
-
 void ModelRegistry::register_mtp_capabilities(
     const std::string& name,
     MtpModelCapabilities capabilities) {
@@ -635,30 +700,13 @@ int64_t ModelRegistry::get_graph_kv_capacity(const std::string& name,
   return it->second.graph_kv_capacity_adapter(args);
 }
 
-void ModelRegistry::configure_mtp_args(ModelArgs& args,
-                                       std::string_view algorithm,
-                                       bool is_draft_engine,
-                                       bool is_python_model) {
-  if (!is_draft_engine || !SpeculativeConfig::is_mtp_algorithm(algorithm)) {
-    return;
-  }
-  const auto& models = get_instance()->model_registry_;
-  const auto entry =
-      models.find(canonical_model_registration_name(args.model_type()));
-  if (entry == models.end() || !entry->second.mtp_args_adapter) {
-    return;
-  }
-  entry->second.mtp_args_adapter(args, is_python_model);
-}
-
 std::string ModelRegistry::get_model_backend(const std::string& name) {
   ModelRegistry* instance = get_instance();
   auto it = instance->model_backend_.find(name);
   if (it != instance->model_backend_.end()) {
     return it->second;
   }
-  const std::string canonical_name = canonical_model_registration_name(name);
-  it = instance->model_backend_.find(canonical_name);
+  it = instance->model_backend_.find(canonical_model_registration_name(name));
   return it == instance->model_backend_.end() ? "" : it->second;
 }
 

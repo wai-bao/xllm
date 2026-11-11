@@ -19,6 +19,7 @@ limitations under the License.
 #include <torch/types.h>
 
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <numeric>
@@ -38,6 +39,7 @@ limitations under the License.
 #include "core/framework/multimodal/mm_batch_data.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/sampling/sampling_params.h"
+#include "core/framework/speculative/draft_input.h"
 #include "core/framework/speculative/verify_layout.h"
 #include "core/util/tensor_helper.h"
 #include "platform/device.h"
@@ -53,6 +55,15 @@ class PackedForwardInput;
 
 class LlmForwardInput;
 constexpr int32_t kUnknownPackedSampleCount = -1;
+
+// Control data consumed by worker orchestration, never by model forward.
+// Identity lives in input_params.embedding on every domain; this struct only
+// carries the speculative draft-input/release channels.
+struct WorkerRequestState {
+  std::vector<int32_t> released_embedding_ids;
+  std::vector<int32_t> draft_input_row_idxes;
+  std::optional<DraftInput> draft_input;
+};
 
 namespace detail {
 
@@ -231,7 +242,6 @@ template <typename Params>
 inline void clear_contiguous_input_buffer_tensor_targets(Params& params) {
   params.embedding.input_embedding = torch::Tensor();
   params.embedding.linear_state_indices = torch::Tensor();
-  params.embedding.mtp_bootstrap_embeddings = torch::Tensor();
   params.graph.attn_mask = torch::Tensor();
   params.graph.tiling_data = torch::Tensor();
 }
@@ -280,10 +290,26 @@ inline bool add_model_tensors_to_plan(const Params& source,
                   &target.embedding.input_embedding) &&
          plan.add(source.embedding.linear_state_indices,
                   &target.embedding.linear_state_indices) &&
-         plan.add(source.embedding.mtp_bootstrap_embeddings,
-                  &target.embedding.mtp_bootstrap_embeddings) &&
          plan.add(source.graph.attn_mask, &target.graph.attn_mask) &&
          plan.add(source.graph.tiling_data, &target.graph.tiling_data);
+}
+
+inline bool add_request_state_to_plan(const WorkerRequestState& source,
+                                      WorkerRequestState& target,
+                                      ForwardInputBufferPlan& plan) {
+  target.draft_input.reset();
+  if (source.draft_input.has_value()) {
+    target.draft_input.emplace();
+    const DraftInput& input = *source.draft_input;
+    DraftInput& output = *target.draft_input;
+    output.point_mass_q = input.point_mass_q;
+    for (torch::Tensor DraftInput::* member : kDraftInputTensors) {
+      if (!plan.add(input.*member, &(output.*member))) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 }  // namespace detail
@@ -352,6 +378,20 @@ class WorkerType {
 };
 
 // Inputs for forward execution
+namespace detail {
+
+// Fields a recursive MTP draft step never reads (grammar states are
+// O(seq_len) to copy); shared by the Llm/Vlm copy paths so a new skipped
+// field cannot drift between the two.
+template <typename Src, typename Dst>
+void copy_draft_step_skipped_fields(const Src& src, Dst& dst) {
+  dst.sample_sequence_ids = src.sample_sequence_ids;
+  dst.json_object_states = src.json_object_states;
+  dst.json_object_state_snapshots = src.json_object_state_snapshots;
+}
+
+}  // namespace detail
+
 class LlmForwardInput final {
  public:
   LlmForwardInput() = default;
@@ -363,18 +403,13 @@ class LlmForwardInput final {
   bool to_packed_proto(proto::PackedForwardInput* packed_forward_input) const;
   bool from_packed_proto(const proto::PackedForwardInput& packed_forward_input);
 
-  LlmForwardInput clone() const {
-    LlmForwardInput inputs;
-    inputs.runtime = runtime;
-    copy_non_runtime_metadata_to(inputs);
-    inputs.token_ids = token_ids;
-    inputs.positions = positions;
-    inputs.token_ids_host = token_ids_host;
-    inputs.positions_host = positions_host;
-    inputs.input_params = input_params.clone();
-    inputs.sampling_params = sampling_params;
-    inputs.json_object_errors = json_object_errors;
-    return inputs;
+  LlmForwardInput clone() const { return clone_impl(/*for_draft_step=*/false); }
+
+  // clone() minus the fields a recursive MTP draft step never reads
+  // (grammar states are O(seq_len) to copy): json_object_states arrives from
+  // the previous draft output; the rest have no readers in a draft step.
+  LlmForwardInput clone_for_draft_step() const {
+    return clone_impl(/*for_draft_step=*/true);
   }
 
   LlmForwardInput to(const torch::Device& device,
@@ -424,6 +459,9 @@ class LlmForwardInput final {
         runtime.input_host_buffer_has_layout;
     inputs.runtime.device_tensors_ready = true;
     inputs.runtime.kv_slot_layout = runtime.kv_slot_layout;
+    inputs.request_state.draft_input = draft_input_to(request_state.draft_input,
+                                                      device,
+                                                      /*non_blocking=*/true);
     return inputs;
   }
 
@@ -454,7 +492,9 @@ class LlmForwardInput final {
     if (!detail::add_attention_to_plan(
             source_params.attention, inputs.input_params.attention, plan) ||
         !detail::add_model_tensors_to_plan(
-            source_params, inputs.input_params, plan)) {
+            source_params, inputs.input_params, plan) ||
+        !detail::add_request_state_to_plan(
+            request_state, inputs.request_state, plan)) {
       return false;
     }
 
@@ -485,15 +525,34 @@ class LlmForwardInput final {
     inputs.runtime.retained_device_tensors = runtime.retained_device_tensors;
   }
 
-  void copy_non_runtime_metadata_to(LlmForwardInput& inputs) const {
+  // for_draft_step skips the fields a recursive MTP draft step never reads
+  // (grammar states are O(seq_len) to copy) so the copy is never paid.
+  void copy_non_runtime_metadata_to(LlmForwardInput& inputs,
+                                    bool for_draft_step = false) const {
     inputs.transfer_kv_infos = transfer_kv_infos;
     inputs.input_host_sample_count = input_host_sample_count;
     inputs.skip_sampling_for_logits_only = skip_sampling_for_logits_only;
     inputs.return_selected_hidden = return_selected_hidden;
-    inputs.sample_sequence_ids = sample_sequence_ids;
     inputs.sample_prior_output_rows = sample_prior_output_rows;
-    inputs.json_object_states = json_object_states;
-    inputs.json_object_state_snapshots = json_object_state_snapshots;
+    if (!for_draft_step) {
+      detail::copy_draft_step_skipped_fields(*this, inputs);
+      inputs.request_state = request_state;
+    }
+  }
+
+  LlmForwardInput clone_impl(bool for_draft_step) const {
+    LlmForwardInput inputs;
+    inputs.runtime = runtime;
+    copy_non_runtime_metadata_to(inputs, for_draft_step);
+    inputs.token_ids = token_ids;
+    inputs.positions = positions;
+    inputs.token_ids_host = token_ids_host;
+    inputs.positions_host = positions_host;
+    inputs.input_params = input_params.clone();
+    inputs.sampling_params = sampling_params;
+    inputs.json_object_invalid_draft = json_object_invalid_draft;
+    inputs.json_object_errors = json_object_errors;
+    return inputs;
   }
 
   void set_host_views(LlmForwardInput& inputs) const {
@@ -538,11 +597,15 @@ class LlmForwardInput final {
   torch::Tensor token_ids_host;
   torch::Tensor positions_host;
   mutable LlmModelParams input_params;
+  WorkerRequestState request_state;
   SamplingParameters sampling_params;
   std::vector<std::string> sample_sequence_ids;
   std::vector<int32_t> sample_prior_output_rows;
   std::vector<JsonObjectGrammarState> json_object_states;
   std::vector<JsonObjectGrammarSnapshot> json_object_state_snapshots;
+  // Flattened [sequence][draft position] flags produced during MTP
+  // validation. This is execution-local metadata and is not transported.
+  std::vector<uint8_t> json_object_invalid_draft;
   // Errors detected while aligning prior overlap output with grammar rows.
   std::vector<JsonObjectOutputError> json_object_errors;
 
@@ -581,6 +644,10 @@ class ForwardOutput final {
   std::vector<char> constrained_mask;
   std::vector<JsonObjectOutputError> json_object_errors;
   std::vector<std::string> failed_request_ids;
+  // Carried seed for PD handoff and the recursive MTP draft loop: the sampled
+  // first proposal with its recurrent draft hidden. Set only by the
+  // speculative paths; ordinary decode leaves it empty.
+  std::optional<DraftInput> draft_input;
   // Keep no-sync input tensor handles alive until downstream consumers finish
   // using outputs on the same compute stream. Composite workers append child
   // outputs' retained inputs here. Local runtime handles; not in proto/shm.
@@ -593,8 +660,8 @@ class ForwardOutput final {
   // Selected hidden states matching `logits` layout: [num_selected,
   // hidden_dim]. Populated when a speculative worker requests the pre-lm_head
   // hidden (e.g. DSpark's ConfidenceHead), or on the context-parallel
-  // speculative-decode path, where output_spec_hidden_states reuses it instead
-  // of re-selecting the local shard.
+  // speculative-decode path, where output_spec_hidden_states reuses it
+  // instead of re-selecting the local shard.
   torch::Tensor selected_hidden;
   // Backend-neutral state for the next MTP draft step.
   MtpTopkStatePtr mtp_topk_state;
@@ -664,6 +731,7 @@ struct RawSampleOutput {
   std::vector<torch::Tensor> mm_embeddings;
   EmbeddingOutputMetadata mm_embeddings_metadata;
   SpeculativeTokenStats speculative_token_stats;
+  std::optional<DraftInput> draft_input;
 };
 
 class RawForwardOutput final {
@@ -676,5 +744,16 @@ class RawForwardOutput final {
   // dit output data
   DiTForwardOutput dit_forward_output;
 };
+
+// Replaces host-side views into transport buffers with independent,
+// contiguous, detached copies so later execution cannot race the buffer being
+// refilled. Caller-specific tensors are cloned by the caller.
+template <typename Input>
+inline void stabilize_host_views(Input& input) {
+  input.token_ids_host = materialize_cpu_tensor(input.token_ids_host);
+  input.positions_host = materialize_cpu_tensor(input.positions_host);
+  input.input_params.attention.host.block_tables =
+      clone_host_block_tables(input.input_params.attention.host.block_tables);
+}
 
 }  // namespace xllm

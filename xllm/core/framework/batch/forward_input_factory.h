@@ -87,9 +87,6 @@ class ForwardInputFactory final {
   ForwardInputFactoryOptions options_;
   std::vector<std::unique_ptr<SharedKVCacheMappingTracker>>
       dp_shared_kv_mapping_trackers_;
-  std::vector<std::vector<int32_t>> dp_batch_embedding_ids_;
-  std::vector<std::vector<std::string>> dp_batch_request_ids_;
-  std::vector<uint64_t> dp_batch_generations_;
   std::unique_ptr<ThreadPool> threadpool_;
   EplbController* eplb_controller_ = nullptr;  // Owned by LLMEngine.
 };

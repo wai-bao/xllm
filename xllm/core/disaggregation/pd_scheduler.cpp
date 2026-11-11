@@ -35,7 +35,9 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
 #include "core/framework/config/speculative_config.h"
+#include "core/framework/speculative/draft_input_spec_provider.h"
 #include "core/kv_cache/transfer/pd_topology_guard.h"
+#include "core/transport/draft_input_proto.h"
 #include "core/util/scope_guard.h"
 #include "core/util/tensor_codec.h"
 #include "disagg_pd.pb.h"
@@ -871,30 +873,15 @@ void PDScheduler::prefill_send_first_generation() {
         gen->set_dp_size(instance_info_.dp_size);
         gen->set_dp_rank(sequence->dp_rank());
       }
-      if (options_.num_speculative_tokens() > 0 &&
-          SpeculativeConfig::requires_bootstrap_hidden(
-              SpeculativeConfig::get_instance().speculative_algorithm())) {
-        torch::Tensor embedding =
-            request->sequences()[0]->get_mtp_bootstrap_embedding();
-        if (!embedding.defined()) {
-          LOG(ERROR) << "Missing MTP bootstrap embedding, request_id: "
-                     << request->request_id();
-          fail_request(
-              request,
-              {StatusCode::UNKNOWN, "Missing MTP bootstrap embedding"});
-          continue;
-        }
-        torch::Tensor embedding_cpu = safe_to(embedding, torch::kCPU);
-        if (!util::torch_to_proto(embedding_cpu,
-                                  gen->mutable_mtp_bootstrap_embedding())) {
-          LOG(ERROR) << "Failed to serialize MTP bootstrap embedding, "
-                     << "request_id: " << request->request_id();
-          fail_request(request,
-                       {StatusCode::UNKNOWN,
-                        "Failed to serialize MTP bootstrap embedding"});
-          continue;
-        }
-        request->sequences()[0]->clear_mtp_bootstrap_embedding();
+      Sequence* sequence = request->sequences()[0].get();
+      const std::optional<DraftInput> seed = sequence->take_draft_input();
+      const char* handoff_error = proto_adapter::encode_pd_speculative_handoff(
+          handoff_kind_, seed, gen);
+      if (handoff_error != nullptr) {
+        LOG(ERROR) << handoff_error
+                   << ", request_id: " << request->request_id();
+        fail_request(request, {StatusCode::UNKNOWN, handoff_error});
+        continue;
       }
       const double prepare_seconds = first_generation_timer.elapsed_seconds();
 
@@ -976,6 +963,36 @@ void PDScheduler::release_failed_request(
   });
 }
 
+void PDScheduler::reject_received_request(const std::string& request_id,
+                                          const std::string& reservation_id) {
+  std::shared_ptr<Request> request;
+  {
+    std::lock_guard<std::mutex> lock(received_request_map_mutex_);
+    request = take_received_request_locked(
+        request_id, reservation_id, /*allow_empty_reservation=*/true);
+  }
+  if (request != nullptr) {
+    release_request_blocks(std::move(request), /*cache_prefix=*/false);
+  }
+}
+
+std::shared_ptr<Request> PDScheduler::take_received_request_locked(
+    const std::string& req_id,
+    const std::string& reservation_id,
+    bool allow_empty_reservation) {
+  auto it = received_request_map_.find(req_id);
+  if (it == received_request_map_.end()) {
+    return nullptr;
+  }
+  if (allow_empty_reservation && reservation_id.empty()) {
+    return take_waiting_request(req_id);
+  }
+  if (it->second->state().pd_reservation_id != reservation_id) {
+    return nullptr;
+  }
+  return take_waiting_request(req_id);
+}
+
 std::shared_ptr<Request> PDScheduler::take_waiting_request(
     const std::string& req_id) {
   auto it = received_request_map_.find(req_id);
@@ -1050,12 +1067,11 @@ bool PDScheduler::release_reservation(const std::string& req_id,
     released_reservations_.insert_or_assign(
         ReservationIdentity{req_id, reservation_id},
         now + kReservationReleaseRetention);
-    auto it = received_request_map_.find(req_id);
-    if (it == received_request_map_.end() ||
-        it->second->state().pd_reservation_id != reservation_id) {
-      return false;
-    }
-    request = take_waiting_request(req_id);
+    request = take_received_request_locked(
+        req_id, reservation_id, /*allow_empty_reservation=*/false);
+  }
+  if (request == nullptr) {
+    return false;
   }
   release_request_blocks(std::move(request), /*cache_prefix=*/false);
   return true;
@@ -1114,8 +1130,8 @@ bool PDScheduler::decode_recv_first_generation(
     std::vector<KVTransferMapping> source_mappings,
     int32_t src_dp_size,
     int32_t src_dp_rank,
-    torch::Tensor mtp_bootstrap_embedding,
-    int32_t num_cached_tokens) {
+    int32_t num_cached_tokens,
+    std::optional<DraftInput> draft_input) {
   Timer receive_timer;
   // push to request_queue_, and will be executed by engine.
   std::shared_ptr<Request> request = nullptr;
@@ -1152,28 +1168,35 @@ bool PDScheduler::decode_recv_first_generation(
   }
   request->record_num_prefix_cache_tokens(
       static_cast<size_t>(num_cached_tokens));
-  const bool requires_bootstrap_hidden =
-      options_.num_speculative_tokens() > 0 &&
-      SpeculativeConfig::requires_bootstrap_hidden(
-          SpeculativeConfig::get_instance().speculative_algorithm());
-  if (requires_bootstrap_hidden) {
-    const int32_t slot_id = sequence->get_embedding_block_id();
-    if (slot_id < 0) {
-      LOG(ERROR) << "Invalid MTP bootstrap slot, request_id: " << req_id;
+  if (handoff_kind_ != SpeculativeHandoffKind::NONE) {
+    const std::optional<DraftInputModelSpec> handoff_spec =
+        draft_input_spec_provider_ == nullptr
+            ? std::nullopt
+            : draft_input_spec_provider_->draft_input_spec();
+    const char* handoff_reason =
+        validate_pd_handoff(handoff_kind_,
+                            sequence->get_embedding_block_id(),
+                            token_id,
+                            draft_input,
+                            probabilistic_handoff_,
+                            handoff_vocab_size_,
+                            handoff_spec ? &*handoff_spec : nullptr);
+    if (handoff_reason != nullptr) {
+      LOG(ERROR) << handoff_reason << ", request_id: " << req_id;
+      // The entry ScopeGuard already deallocates without cache on this early
+      // return.
       return false;
     }
-    if (token_id < 0 ||
-        token_id > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
-      LOG(ERROR) << "Invalid MTP bootstrap token, request_id: " << req_id
-                 << ", token_id: " << token_id;
-      return false;
+    switch (handoff_kind_) {
+      case SpeculativeHandoffKind::BOOTSTRAP_TOKEN:
+        sequence->mark_target_decode_bootstrap();
+        break;
+      case SpeculativeHandoffKind::DRAFT_INPUT:
+        sequence->update_draft_input(*draft_input);
+        break;
+      case SpeculativeHandoffKind::NONE:
+        break;
     }
-    if (!mtp_bootstrap_embedding.defined()) {
-      LOG(ERROR) << "Missing MTP bootstrap embedding, request_id: " << req_id;
-      return false;
-    }
-
-    sequence->update_mtp_bootstrap_embedding(mtp_bootstrap_embedding);
   }
 
   Token first_token(token_id);

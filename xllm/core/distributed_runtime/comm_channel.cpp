@@ -383,6 +383,23 @@ bool CommChannel::wakeup(const WakeupOptions& options) {
   return true;
 }
 
+bool CommChannel::release_idle_request_state(
+    const std::vector<int32_t>& embedding_ids) {
+  proto::RequestStateRelease request;
+  ADD_VECTOR_TO_PROTO(request.mutable_embedding_ids(), embedding_ids);
+  proto::Status status;
+  brpc::Controller controller;
+  // Slot IDs may be reused after success; a delayed original attempt must not
+  // race a successful retry and clear a newer request.
+  controller.set_max_retry(0);
+  stub_->ReleaseIdleRequestState(&controller, &request, &status, nullptr);
+  if (controller.Failed() || !status.ok()) {
+    LOG(ERROR) << "ReleaseIdleRequestState failed: " << controller.ErrorText();
+    return false;
+  }
+  return true;
+}
+
 bool CommChannel::start_profile() {
   proto::Empty req;
   proto::Status s;

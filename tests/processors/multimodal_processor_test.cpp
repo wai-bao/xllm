@@ -20,8 +20,8 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+#include "core/framework/multimodal/content_hash.h"
 #include "core/framework/tokenizer/tokenizer.h"
-#include "core/util/hash_util.h"
 #include "processors/cacheable_multimodal_processor.h"
 #include "processors/multimodal_processor_pipeline.h"
 #include "processors/qwen3_vl_prompt_processor.h"

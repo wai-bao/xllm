@@ -23,9 +23,11 @@ limitations under the License.
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <utility>
 
 #include "common/types.h"
 #include "core/framework/allocator/virtual_memory/mapped_virtual_memory_region.h"
+#include "core/framework/config/eplb_config.h"
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/transfer/hierarchy_kv_cache_transfer.h"
 #include "core/kv_cache/transfer/kv_cache_store.h"
@@ -39,6 +41,7 @@ limitations under the License.
 #include "framework/model_context/model_context.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
+#include "framework/sampling/sampler.h"
 #include "framework/state_dict/state_dict.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "options.h"
@@ -160,11 +163,13 @@ class WorkerImpl {
   void prepare_work_before_execute_on_stream(const LlmForwardInput& input,
                                              LlmForwardInput& processed_input,
                                              Stream& prepare_stream,
-                                             bool record_ready_event = true);
+                                             bool record_ready_event = true,
+                                             bool restore_linear_state = true);
   void prepare_work_before_execute_on_stream(const VlmForwardInput& input,
                                              VlmForwardInput& processed_input,
                                              Stream& prepare_stream,
-                                             bool record_ready_event = true);
+                                             bool record_ready_event = true,
+                                             bool restore_linear_state = true);
   // Prepare shared mappings and new block contents on the owning stream.
   void initialize_shared_full_blocks(
       const std::vector<int32_t>& full_block_rows,
@@ -207,6 +212,12 @@ class WorkerImpl {
     RECORD_EVENT,
   };
 
+  folly::SemiFuture<bool> release_idle_request_state_async(
+      std::vector<int32_t> embedding_ids);
+
+  virtual void release_request_state(
+      const std::vector<int32_t>& /*embedding_ids*/) {}
+
   // No-sync LLM/VLM outputs retain their inputs. Composite callers manage
   // completion after their final operation; overlap callers request an event.
   virtual std::optional<ForwardOutput> execute_no_sync_on_stream(
@@ -221,7 +232,6 @@ class WorkerImpl {
       const std::function<void()>& prepare_sampling = {});
 
   virtual void process_group_test();
-
   // Warmup waits for execution allocations; serving keeps stream overlap.
   void observe_execution_memory(bool is_warmup);
 
@@ -333,6 +343,11 @@ class WorkerImpl {
     return model_->share_weights_from(*source.model_);
   }
 
+  bool owns_mtp_draft_weights() const {
+    CHECK(model_ != nullptr);
+    return model_->owns_mtp_draft_weights();
+  }
+
   bool enable_schedule_overlap() const {
     return options_.enable_schedule_overlap_;
   }
@@ -340,6 +355,14 @@ class WorkerImpl {
   virtual ForwardOutput get_last_step_result();
 
   bool is_driver() const { return driver_ || dp_driver_; }
+
+  // Whether this rank publishes step outputs to the scheduler: any
+  // schedule-overlap rank, the DP driver, or an EPLB participant. Non-driving
+  // plain ranks under a non-overlap setup return nullopt instead.
+  bool publishes_step_output() const {
+    return enable_schedule_overlap() || is_driver() ||
+           ::xllm::EPLBConfig::get_instance().enable_eplb();
+  }
 
   Status get_status() const { return status_; }
 
@@ -480,6 +503,15 @@ class WorkerImpl {
   template <typename Input>
   void restore_json_object_states_impl(Input& input);
   template <typename Input>
+  void prepare_work_before_execute_on_stream_impl(
+      const Input& input,
+      Input& processed_input,
+      Stream& prepare_stream,
+      bool record_ready_event,
+      bool restore_linear_state,
+      bool wait_for_compute_stream = true,
+      const std::function<void(Input&)>& prepare_input = {});
+  template <typename Input>
   folly::SemiFuture<std::optional<ForwardOutput>> step_async_impl(
       const Input& input);
   template <typename Params>
@@ -489,14 +521,6 @@ class WorkerImpl {
   bool can_skip_npu_graph_decode_sync_impl(const Params& input_params) const;
   template <typename Input>
   void prepare_dummy_input(Input& input);
-  template <typename Input>
-  void prepare_work_before_execute_on_stream_impl(
-      const Input& input,
-      Input& processed_input,
-      Stream& prepare_stream,
-      bool record_ready_event,
-      bool wait_for_compute_stream = true,
-      const std::function<void(Input&)>& prepare_input = {});
   template <typename Params>
   void prepare_mla_prefixcache_inputs_impl(Params& input_params);
 #if defined(USE_NPU)
@@ -513,7 +537,6 @@ class WorkerImpl {
 
   // runtime options
   runtime::Options options_;
-
   // whether the worker is a driver, who takes care of the sampling
   bool driver_ = false;
   bool dp_driver_ = false;
@@ -585,5 +608,40 @@ class WorkerImpl {
 
   std::string model_weights_path_;
 };
+
+namespace detail {
+
+// Shared no-sync dispatch for the draft-model workers (MTP and block-diffusion
+// families): prepare on the worker's prepare stream, execute on the compute
+// stream, never synchronizing the host. The metadata-ready event is recorded
+// only when the two streams differ; a same-stream dispatch has no ordering
+// gap to publish. `processed_output` optionally receives the prepared input
+// for callers that reuse the prepared views.
+template <typename TargetInput>
+inline std::optional<ForwardOutput> run_worker_no_sync(
+    WorkerImpl& worker,
+    const TargetInput& input,
+    Stream& prepare_stream,
+    Stream& compute_stream,
+    TargetInput* processed_output = nullptr) {
+  TargetInput processed_input;
+  worker.prepare_work_before_execute_on_stream(
+      input,
+      processed_input,
+      prepare_stream,
+      /*record_ready_event=*/&prepare_stream != &compute_stream);
+  // No-op unless a hierarchy KV transfer is wired.
+  worker.set_hierarchy_layer_synchronizer(processed_input.input_params);
+  std::optional<ForwardOutput> output = worker.execute_no_sync_on_stream(
+      processed_input,
+      compute_stream,
+      WorkerImpl::ForwardCompletion::CALLER_MANAGED);
+  if (processed_output != nullptr) {
+    *processed_output = std::move(processed_input);
+  }
+  return output;
+}
+
+}  // namespace detail
 
 }  // namespace xllm

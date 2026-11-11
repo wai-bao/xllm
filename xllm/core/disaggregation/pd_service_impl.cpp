@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/constrained/json_object_grammar.h"
 #include "core/framework/request/request_output.h"
+#include "core/transport/draft_input_proto.h"
 #include "core/util/tensor_codec.h"
 #include "util/utils.h"
 
@@ -46,12 +47,7 @@ PDServiceImpl::PDServiceImpl(PDScheduler* scheduler,
       engine_(engine),
       response_options_(std::move(response_options)),
       xservice_client_(XServiceClient::get_instance()),
-      block_manager_(engine->block_manager_pool()) {
-  if (!xservice_client_->initialize_done()) {
-    LOG(FATAL) << "XServiceClient not init.";
-    return;
-  }
-}
+      block_manager_(engine->block_manager_pool()) {}
 
 std::shared_ptr<const JsonObjectGrammar> PDServiceImpl::get_json_object_grammar(
     bool reasoning_enabled,
@@ -100,7 +96,7 @@ std::shared_ptr<Request> PDServiceImpl::generate_request(
   OutputCallback output_callback =
       [client = xservice_client_](const RequestOutput& output) -> bool {
     // response to xllm service to avoid the redirect cost.
-    if (client == nullptr) {
+    if (!client->initialize_done()) {
       return false;
     }
     return client->generation(output);
@@ -109,7 +105,7 @@ std::shared_ptr<Request> PDServiceImpl::generate_request(
   OutputsFunc batch_output_callback =
       [client = xservice_client_](const std::vector<RequestOutput>& outputs) {
         // response to xllm service to avoid the redirect cost.
-        if (client == nullptr) {
+        if (!client->initialize_done()) {
           return std::vector<bool>(outputs.size(), false);
         }
         return client->generations(outputs);
@@ -306,11 +302,15 @@ void PDServiceImpl::decode_recv_first_generation(
     const proto::DisaggGenerationsRequests* request,
     proto::Status* response) {
   // TODO: we only support one request generation currently
+  bool all_ok = true;
   for (auto& gen : request->multi_gens()) {
-    // Process the first token from the tokens array
+    // Process the first token from the tokens array. A generation without a
+    // token is malformed: reject it so the prefill side's reservation and
+    // blocks are reclaimed.
     if (gen.tokens().empty()) {
-      response->set_ok(false);
-      return;
+      scheduler_->reject_received_request(gen.req_id(), gen.reservation_id());
+      all_ok = false;
+      continue;
     }
 
     const auto& first_token = gen.tokens(0);
@@ -330,10 +330,9 @@ void PDServiceImpl::decode_recv_first_generation(
                                 proto_group.ids().end());
       source_mappings.emplace_back(std::move(mapping));
     }
-    torch::Tensor mtp_bootstrap_embedding;
-    if (gen.has_mtp_bootstrap_embedding()) {
-      mtp_bootstrap_embedding =
-          util::proto_to_torch(gen.mtp_bootstrap_embedding());
+    std::optional<DraftInput> draft_input;
+    if (gen.has_draft_input()) {
+      draft_input = proto_adapter::draft_input_from_proto(gen.draft_input());
     }
 
     bool success = scheduler_->decode_recv_first_generation(
@@ -352,15 +351,14 @@ void PDServiceImpl::decode_recv_first_generation(
         std::move(source_mappings),
         gen.dp_size(),
         gen.dp_rank(),
-        std::move(mtp_bootstrap_embedding),
-        gen.num_cached_tokens());
+        gen.num_cached_tokens(),
+        std::move(draft_input));
     if (!success) {
-      response->set_ok(false);
-      return;
+      all_ok = false;
     }
   }
 
-  response->set_ok(true);
+  response->set_ok(all_ok);
 }
 
 void PDServiceImpl::link_instance(const proto::InstanceClusterInfo* request,

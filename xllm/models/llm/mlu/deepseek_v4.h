@@ -46,6 +46,7 @@ limitations under the License.
 #include "core/layers/mlu/deepseek_v4/dsa_empty_dp_input.h"
 #include "core/layers/mlu/deepseek_v4/dsa_metadata_builder_mlu.h"
 #include "core/layers/mlu/hyper_connection.h"
+#include "models/llm/deepseek_v4_registry.h"
 #include "models/llm/llm_model_base.h"
 #include "models/llm/mlu/deepseek_v4_base.h"
 
@@ -582,6 +583,9 @@ inline void validate_deepseek_v4_args(const ModelArgs& args,
 }
 
 REGISTER_CAUSAL_MODEL(deepseek_v4, DeepseekV4ForCausalLM);
+// Platform-agnostic registrations (verify mode, draft hidden width, MTP
+// model pair) live in deepseek_v4_registry.h; see the include at the top of
+// this file.
 
 REGISTER_MODEL_ARGS(deepseek_v4, [&] {
   const DeepseekV4ArgsPolicy args_policy = build_deepseek_v4_args_policy();

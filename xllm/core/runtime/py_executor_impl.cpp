@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_visitor.h"
 #include "core/framework/multimodal/multimodal_utils.h"
+#include "core/framework/parallel_state/process_group.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"

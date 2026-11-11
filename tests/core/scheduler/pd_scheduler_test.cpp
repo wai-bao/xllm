@@ -40,10 +40,16 @@ limitations under the License.
 #include "common/metrics.h"
 #include "core/disaggregation/pd_service_impl.h"
 #include "core/framework/batch/sampling_input_builder.h"
+#include "core/framework/config/disagg_pd_config.h"
 #include "core/framework/config/distributed_config.h"
+#include "core/framework/config/speculative_config.h"
+#include "core/framework/speculative/draft_input_spec_provider.h"
+#include "core/framework/speculative/pd_speculative_handoff.h"
 #include "core/kv_cache/block/block_manager_impl.h"
 #include "core/kv_cache/transfer/kv_transfer_completion.h"
 #include "core/platform/device.h"
+#include "core/runtime/worker_client.h"
+#include "core/transport/draft_input_proto.h"
 #include "core/util/scope_guard.h"
 #include "distributed_runtime/distributed_worker_manager.h"
 #include "distributed_runtime/engine.h"
@@ -79,7 +85,35 @@ class PDSchedulerTestPeer final {
   }
 };
 
+using proto_adapter::draft_input_to_proto;
 namespace {
+
+// Saves, overrides, and restores the process-wide SpeculativeConfig fields
+// the scheduler resolves its PD handoff shape from.
+class ScopedSpeculativeConfig final {
+ public:
+  ScopedSpeculativeConfig(const std::string& algorithm, bool probabilistic)
+      : old_algorithm_(
+            SpeculativeConfig::get_instance().speculative_algorithm()),
+        old_probabilistic_(
+            SpeculativeConfig::get_instance().enable_probabilistic_draft()) {
+    SpeculativeConfig::get_instance().speculative_algorithm(algorithm);
+    SpeculativeConfig::get_instance().enable_probabilistic_draft(probabilistic);
+  }
+
+  ~ScopedSpeculativeConfig() {
+    SpeculativeConfig::get_instance().speculative_algorithm(old_algorithm_);
+    SpeculativeConfig::get_instance().enable_probabilistic_draft(
+        old_probabilistic_);
+  }
+
+  ScopedSpeculativeConfig(const ScopedSpeculativeConfig&) = delete;
+  ScopedSpeculativeConfig& operator=(const ScopedSpeculativeConfig&) = delete;
+
+ private:
+  std::string old_algorithm_;
+  bool old_probabilistic_;
+};
 
 class RecordingPullWorkerClient final : public WorkerClient {
  public:
@@ -182,7 +216,7 @@ class PrefetchBlockManagerPool final : public BlockManagerPool {
   std::atomic<size_t> prefetch_pipeline_calls_{0};
 };
 
-class FakeEngine final : public Engine {
+class FakeEngine final : public Engine, public DraftInputSpecProvider {
  public:
   FakeEngine(int32_t num_blocks,
              int32_t block_size,
@@ -198,6 +232,7 @@ class FakeEngine final : public Engine {
         .num_embedding_blocks(embedding_blocks == 0 ? num_blocks
                                                     : embedding_blocks);
     tokenizer_ = std::make_unique<FakeTokenizer>();
+    model_args_.vocab_size(64).hidden_size(8);
     block_manager_ =
         std::make_unique<PrefetchBlockManagerPool>(options, dp_size);
   }
@@ -227,6 +262,14 @@ class FakeEngine final : public Engine {
 
   const ModelArgs& model_args() const override { return model_args_; }
 
+  std::optional<DraftInputModelSpec> draft_input_spec() const override {
+    return seed_spec_;
+  }
+
+  void set_seed_spec(std::optional<DraftInputModelSpec> spec) {
+    seed_spec_ = std::move(spec);
+  }
+
   const TokenizerArgs& tokenizer_args() const override { NOT_IMPLEMENTED(); }
 
   bool init() override { return true; }
@@ -251,6 +294,8 @@ class FakeEngine final : public Engine {
   std::unique_ptr<Tokenizer> tokenizer_;
   std::unique_ptr<PrefetchBlockManagerPool> block_manager_;
   ModelArgs model_args_;
+  std::optional<DraftInputModelSpec> seed_spec_ =
+      DraftInputModelSpec{2, torch::kFloat};
 };
 
 class TestPDServiceImpl final : public PDServiceImpl {
@@ -264,6 +309,7 @@ class TestPDScheduler final : public PDScheduler {
   using PDScheduler::drain_request_releases;
   using PDScheduler::enqueue_request_block_release;
   using PDScheduler::prepare_batch;
+  using PDScheduler::start_rpc_server;
 
   template <typename TargetEngine>
   TestPDScheduler(
@@ -345,8 +391,8 @@ class TestPDScheduler final : public PDScheduler {
       std::vector<KVTransferMapping> source_mappings,
       int32_t src_dp_size,
       int32_t src_dp_rank,
-      torch::Tensor mtp_bootstrap_embedding = torch::Tensor(),
-      int32_t num_cached_tokens = 0) {
+      int32_t num_cached_tokens = 0,
+      std::optional<DraftInput> draft_input = std::nullopt) {
     return run_with_releases([&] {
       return PDScheduler::decode_recv_first_generation(
           req_id,
@@ -364,8 +410,8 @@ class TestPDScheduler final : public PDScheduler {
           std::move(source_mappings),
           src_dp_size,
           src_dp_rank,
-          std::move(mtp_bootstrap_embedding),
-          num_cached_tokens);
+          num_cached_tokens,
+          std::move(draft_input));
     });
   }
 
@@ -445,6 +491,20 @@ class TestPDScheduler final : public PDScheduler {
   void cache_prefill_blocks_for_test(Request* request) {
     for (auto& sequence : request->sequences()) {
       kv_cache_manager_->publish_prefix(sequence.get());
+    }
+  }
+
+  void start_background_threads_for_test() {
+    server_name_ = "PDShutdownTest";
+    dispatch_thread_ =
+        std::make_unique<std::thread>([this] { dispatch_requests(); });
+    rpc_server_thread_ = std::make_unique<std::thread>(
+        [this] { start_rpc_server(PDServiceOptions{}); });
+    auto& registry = ServerRegistry::get_instance();
+    auto* server = registry.try_get_server(server_name_);
+    while (server == nullptr || !server->has_initialized()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      server = registry.try_get_server(server_name_);
     }
   }
 
@@ -716,12 +776,72 @@ void release_prefix_cache(BlockManagerPool* block_manager) {
   EXPECT_EQ(first_cache_size(*block_manager), 0u);
 }
 
-bool recv_first_generation(TestPDScheduler* scheduler,
-                           const torch::Tensor& mtp_embedding,
-                           int32_t num_cached_tokens = 0,
-                           double time_to_first_token_latency_seconds = 0.1,
-                           double upstream_elapsed_seconds = 0.0,
-                           const std::string& reservation_id = "") {
+DraftInput make_pd_draft_input() {
+  DraftInput draft_input;
+  draft_input.token_ids = torch::tensor({43}, torch::kLong);
+  draft_input.hidden_states = torch::tensor({{4.0f, 5.0f}});
+  draft_input.selected_probs = torch::tensor({0.9f});
+  return draft_input;
+}
+
+TEST(PDSchedulerTest, EncodedDraftInputSatisfiesDomainHandoffContract) {
+  const DraftInput draft_input = make_pd_draft_input();
+  proto::DisaggGenerationsRequest generation;
+  EXPECT_EQ(proto_adapter::encode_pd_speculative_handoff(
+                SpeculativeHandoffKind::DRAFT_INPUT, draft_input, &generation),
+            nullptr);
+  EXPECT_TRUE(generation.has_draft_input());
+
+  const DraftInputModelSpec spec{2, torch::kFloat};
+  EXPECT_EQ(draft_input_import_reason(draft_input,
+                                      /*probabilistic=*/false,
+                                      /*vocab_size=*/64,
+                                      spec),
+            nullptr);
+  EXPECT_STREQ(
+      draft_input_import_reason(draft_input,
+                                /*probabilistic=*/true,
+                                /*vocab_size=*/64,
+                                spec),
+      "probabilistic draft input requires point-mass q or draft logits");
+  DraftInput point_mass = draft_input;
+  point_mass.point_mass_q = true;
+  EXPECT_EQ(draft_input_import_reason(point_mass,
+                                      /*probabilistic=*/true,
+                                      /*vocab_size=*/64,
+                                      spec),
+            nullptr);
+  DraftInput two_rows = draft_input;
+  two_rows.token_ids = torch::tensor({43, 44}, torch::kLong);
+  two_rows.hidden_states =
+      torch::tensor({{4.0f, 5.0f}, {4.0f, 5.0f}}, torch::kFloat);
+  two_rows.selected_probs = torch::tensor({0.9f, 0.9f}, torch::kFloat);
+  EXPECT_STREQ(draft_input_import_reason(two_rows,
+                                         /*probabilistic=*/false,
+                                         /*vocab_size=*/64,
+                                         spec),
+               "imported draft_input must carry exactly one row");
+}
+
+TEST(PDSchedulerTest, BootstrapHandoffNeedsOnlyValidSlotAndToken) {
+  proto::DisaggGenerationsRequest generation;
+  EXPECT_EQ(
+      proto_adapter::encode_pd_speculative_handoff(
+          SpeculativeHandoffKind::BOOTSTRAP_TOKEN, std::nullopt, &generation),
+      nullptr);
+  // Field 14 is reserved in the proto, so no descriptor entry exists and the
+  // encoder never writes it; old senders stay wire-compatible because unknown
+  // fields are dropped by the parser.
+  EXPECT_EQ(generation.GetDescriptor()->FindFieldByNumber(14), nullptr);
+}
+
+bool recv_first_generation(
+    TestPDScheduler* scheduler,
+    int32_t num_cached_tokens = 0,
+    double time_to_first_token_latency_seconds = 0.1,
+    double upstream_elapsed_seconds = 0.0,
+    const std::string& reservation_id = "",
+    std::optional<DraftInput> draft_input = make_pd_draft_input()) {
   return scheduler->decode_recv_first_generation(
       "req",
       reservation_id,
@@ -738,8 +858,8 @@ bool recv_first_generation(TestPDScheduler* scheduler,
       /*source_mappings=*/{},
       /*src_dp_size=*/1,
       /*src_dp_rank=*/0,
-      mtp_embedding,
-      num_cached_tokens);
+      num_cached_tokens,
+      std::move(draft_input));
 }
 
 }  // namespace
@@ -989,6 +1109,25 @@ TEST(PDSchedulerTest, CachesPrefillBlocksBeforeRelease) {
   release_prefix_cache(block_manager);
 }
 
+TEST(PDSchedulerDeathTest, DestructionStopsRpcAndIdleDispatchThreads) {
+  EXPECT_EXIT(
+      {
+        alarm(15);
+        DisaggPDConfig::get_instance().disagg_pd_port(0);
+        FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
+        auto scheduler =
+            std::make_unique<TestPDScheduler>(&engine, make_options());
+        scheduler->start_background_threads_for_test();
+        scheduler.reset();
+        CHECK_EQ(
+            ServerRegistry::get_instance().try_get_server("PDShutdownTest"),
+            nullptr);
+        _exit(0);
+      },
+      ::testing::ExitedWithCode(0),
+      "");
+}
+
 TEST(PDSchedulerTest, CacheSkipsExistingSharedBlocks) {
   FakeEngine engine(/*num_blocks=*/10, /*block_size=*/2);
   TestPDScheduler scheduler(&engine, make_options());
@@ -1018,21 +1157,6 @@ TEST(PDSchedulerTest, CacheSkipsExistingSharedBlocks) {
   release_prefix_cache(block_manager);
 }
 
-TEST(PDSchedulerTest, MtpFirstGenerationRequiresBootstrapBeforeQueue) {
-  FakeEngine engine(/*num_blocks=*/8,
-                    /*block_size=*/2,
-                    /*num_speculative_tokens=*/1);
-  TestPDScheduler scheduler(&engine, make_mtp_decode_options());
-  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
-  ASSERT_TRUE(
-      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
-  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
-
-  EXPECT_FALSE(recv_first_generation(&scheduler, torch::Tensor()));
-  std::shared_ptr<Request> queued;
-  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
-}
-
 TEST(PDSchedulerTest, InvalidFirstGenerationSequenceReleasesReservation) {
   for (const bool empty : {false, true}) {
     SCOPED_TRACE(empty);
@@ -1046,7 +1170,8 @@ TEST(PDSchedulerTest, InvalidFirstGenerationSequenceReleasesReservation) {
       request->sequences()[0].reset();
     }
 
-    EXPECT_FALSE(recv_first_generation(&scheduler, torch::Tensor()));
+    EXPECT_FALSE(recv_first_generation(
+        &scheduler, /*num_cached_tokens=*/0, 0.1, 0.0, "", std::nullopt));
     EXPECT_TRUE(scheduler.reservations_empty());
     EXPECT_EQ(engine.block_manager_pool()->num_used_blocks()[0], 0u);
     std::shared_ptr<Request> queued;
@@ -1054,7 +1179,7 @@ TEST(PDSchedulerTest, InvalidFirstGenerationSequenceReleasesReservation) {
   }
 }
 
-TEST(PDSchedulerTest, MtpFirstGenerationStoresBootstrapThenQueues) {
+TEST(PDSchedulerTest, MtpFirstGenerationStoresOnlyDraftInput) {
   FakeEngine engine(/*num_blocks=*/8,
                     /*block_size=*/2,
                     /*num_speculative_tokens=*/1);
@@ -1066,15 +1191,275 @@ TEST(PDSchedulerTest, MtpFirstGenerationStoresBootstrapThenQueues) {
   ASSERT_GE(sequence->get_embedding_block_id(), 0);
   ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
 
-  torch::Tensor embedding = torch::tensor({1.0f, 2.0f});
-  EXPECT_TRUE(recv_first_generation(&scheduler, embedding));
+  EXPECT_TRUE(recv_first_generation(&scheduler));
 
   std::shared_ptr<Request> queued;
   ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
   EXPECT_EQ(queued->request_id(), "req");
   EXPECT_EQ(queued->sequences()[0]->tokens().back(), 42);
+  EXPECT_FALSE(queued->sequences()[0]->has_target_decode_bootstrap());
+  const auto& draft_input = queued->sequences()[0]->get_draft_input();
+  ASSERT_TRUE(draft_input.has_value());
+  EXPECT_EQ(draft_input->token_ids.item<int64_t>(), 43);
+  EXPECT_TRUE(
+      torch::equal(draft_input->hidden_states, torch::tensor({{4.0f, 5.0f}})));
+}
+
+TEST(PDSchedulerTest, MalformedRpcHandoffReleasesRequestAndReservedBlocks) {
+  for (int32_t malformed = 0; malformed < 6; ++malformed) {
+    SCOPED_TRACE(malformed);
+    FakeEngine engine(8, 2, /*num_speculative_tokens=*/1);
+    TestPDScheduler scheduler(&engine, make_mtp_decode_options());
+    PDServiceImpl service(&scheduler, &engine);
+    const auto free_before = engine.block_manager_pool()->num_free_blocks();
+    auto request = make_request({1, 2, 3, 4});
+    ASSERT_TRUE(
+        engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+    ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+    std::weak_ptr<Request> pending = request;
+    request.reset();
+
+    proto::DisaggGenerationsRequests wire;
+    auto* generation = wire.add_multi_gens();
+    generation->set_req_id("req");
+    if (malformed != 0) {
+      generation->add_tokens()->set_token_id(42);
+      generation->mutable_draft_input();
+    }
+    if (malformed >= 2) {
+      ASSERT_TRUE(draft_input_to_proto(make_pd_draft_input(),
+                                       generation->mutable_draft_input()));
+      auto* hidden = generation->mutable_draft_input()->mutable_hidden_states();
+      if (malformed == 2) {
+        ASSERT_TRUE(util::torch_to_proto(torch::ones({2, 2}), hidden));
+      } else if (malformed == 3) {
+        hidden->set_datatype("UNKNOWN_DTYPE");
+      } else if (malformed == 4) {
+        hidden->clear_shape();
+        hidden->add_shape(std::numeric_limits<int64_t>::max());
+        hidden->add_shape(std::numeric_limits<int64_t>::max());
+        hidden->mutable_contents()->clear_fp32_contents();
+        hidden->mutable_contents()->add_fp32_contents(0.0F);
+      } else {
+        hidden->set_datatype("BF16");
+        hidden->mutable_contents()->Clear();
+        hidden->mutable_contents()->set_bytes_contents(std::string(5, '\0'));
+      }
+    }
+    // The service calls the production scheduler path directly; run it under
+    // the test scheduler's release-drain harness so the failure paths that
+    // enqueue block releases do not wait forever on a dispatch thread that a
+    // SkipRuntimeStart scheduler never starts.
+    auto recv_via_service = [&]() {
+      proto::Status status;
+      service.decode_recv_first_generation(&wire, &status);
+      return status.ok();
+    };
+    EXPECT_FALSE(scheduler.run_with_releases(recv_via_service));
+    EXPECT_TRUE(pending.expired());
+    EXPECT_EQ(engine.block_manager_pool()->num_free_blocks(), free_before);
+    std::shared_ptr<Request> queued;
+    EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+    EXPECT_FALSE(recv_first_generation(&scheduler));
+    EXPECT_FALSE(scheduler.run_with_releases(recv_via_service));
+    EXPECT_EQ(engine.block_manager_pool()->num_free_blocks(), free_before);
+  }
+}
+
+TEST(PDSchedulerTest, RpcHandoffProcessesRowsAfterAnInvalidGeneration) {
+  FakeEngine engine(8, 2, /*num_speculative_tokens=*/1);
+  TestPDScheduler scheduler(&engine, make_mtp_decode_options());
+  PDServiceImpl service(&scheduler, &engine);
+  auto request = make_request({1, 2, 3, 4});
+  auto* sequence = request->sequences()[0].get();
+  ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
+  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  proto::DisaggGenerationsRequests wire;
+  wire.add_multi_gens()->set_req_id("missing");
+  auto* generation = wire.add_multi_gens();
+  generation->set_req_id("req");
+  generation->add_tokens()->set_token_id(42);
+  ASSERT_TRUE(draft_input_to_proto(make_pd_draft_input(),
+                                   generation->mutable_draft_input()));
+  proto::Status status;
+  service.decode_recv_first_generation(&wire, &status);
+  EXPECT_FALSE(status.ok());
+  std::shared_ptr<Request> queued;
+  ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_EQ(queued, request);
+  EXPECT_TRUE(queued->sequences()[0]->get_draft_input().has_value());
+}
+
+TEST(PDSchedulerTest, MtpHandoffRejectsIncompatibleModelHidden) {
+  for (int32_t mismatch = 0; mismatch < 3; ++mismatch) {
+    SCOPED_TRACE(mismatch);
+    FakeEngine engine(8, 2, /*num_speculative_tokens=*/1);
+    TestPDScheduler scheduler(&engine, make_mtp_decode_options());
+    auto request = make_request({1, 2, 3, 4});
+    ASSERT_TRUE(
+        engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+    ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+    DraftInput draft_input = make_pd_draft_input();
+    if (mismatch == 0) {
+      draft_input.hidden_states = torch::ones({1, 1});
+    } else if (mismatch == 1) {
+      draft_input.hidden_states =
+          draft_input.hidden_states.to(torch::kBFloat16);
+    } else {
+      engine.set_seed_spec(std::nullopt);
+    }
+    EXPECT_FALSE(recv_first_generation(&scheduler,
+                                       0,
+                                       0.1,
+                                       0.0,
+                                       /*reservation_id=*/"",
+                                       std::move(draft_input)));
+    std::shared_ptr<Request> queued;
+    EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+  }
+}
+
+TEST(PDSchedulerTest, MtpHandoffUsesDraftHiddenSpecAndPreservesDtype) {
+  FakeEngine engine(8, 2, /*num_speculative_tokens=*/1);
+  engine.set_seed_spec(DraftInputModelSpec{2, torch::kBFloat16});
+  TestPDScheduler scheduler(&engine, make_mtp_decode_options());
+  auto request = make_request({1, 2, 3, 4});
+  Sequence* sequence = request->sequences()[0].get();
+  ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
+  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  DraftInput draft_input = make_pd_draft_input();
+  draft_input.hidden_states = draft_input.hidden_states.to(torch::kBFloat16);
+  ASSERT_TRUE(recv_first_generation(
+      &scheduler, 0, 0.1, 0.0, /*reservation_id=*/"", std::move(draft_input)));
+  std::shared_ptr<Request> queued;
+  ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+  const auto& imported = queued->sequences()[0]->get_draft_input();
+  ASSERT_TRUE(imported.has_value());
+  EXPECT_EQ(imported->hidden_states.size(1), 2);
+  EXPECT_EQ(imported->hidden_states.scalar_type(), torch::kBFloat16);
+}
+
+TEST(PDSchedulerTest, MtpProbabilisticHandoffRequiresProposalQ) {
+  FakeEngine engine(8, 2, /*num_speculative_tokens=*/1);
+  auto options = make_mtp_decode_options();
+  ScopedSpeculativeConfig config("MTP", /*probabilistic=*/true);
+  TestPDScheduler scheduler(&engine, options);
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  ASSERT_TRUE(
+      engine.block_manager_pool()->allocate(request->sequences()[0].get()));
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  DraftInput draft_input = make_pd_draft_input();
+  draft_input.selected_probs = torch::Tensor();
+  // No point-mass q and no draft logits: a probabilistic handoff must be
+  // rejected instead of silently degrading to greedy semantics.
+  EXPECT_FALSE(recv_first_generation(
+      &scheduler, 0, 0.1, 0.0, /*reservation_id=*/"", std::move(draft_input)));
+  std::shared_ptr<Request> queued;
+  EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
+}
+
+TEST(PDSchedulerTest, MtpProbabilisticHandoffPreservesPointMassMarker) {
+  FakeEngine engine(8, 2, /*num_speculative_tokens=*/1);
+  auto options = make_mtp_decode_options();
+  ScopedSpeculativeConfig config("MTP", /*probabilistic=*/true);
+  TestPDScheduler scheduler(&engine, options);
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  Sequence* sequence = request->sequences()[0].get();
+  ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
+  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  DraftInput draft_input = make_pd_draft_input();
+  draft_input.point_mass_q = true;
+  ASSERT_TRUE(recv_first_generation(
+      &scheduler, 0, 0.1, 0.0, /*reservation_id=*/"", std::move(draft_input)));
+  std::shared_ptr<Request> queued;
+  ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+  const auto& imported = queued->sequences()[0]->get_draft_input();
+  ASSERT_TRUE(imported.has_value());
+  EXPECT_TRUE(imported->point_mass_q);
+  EXPECT_FALSE(imported->draft_logits.defined());
+}
+
+TEST(PDSchedulerTest, MtpProbabilisticHandoffPreservesFullVocabularyQ) {
+  FakeEngine engine(8, 2, /*num_speculative_tokens=*/1);
+  auto options = make_mtp_decode_options();
+  ScopedSpeculativeConfig config("MTP", /*probabilistic=*/true);
+  TestPDScheduler scheduler(&engine, options);
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  Sequence* sequence = request->sequences()[0].get();
+  ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
+  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  DraftInput draft_input = make_pd_draft_input();
+  draft_input.draft_logits = torch::zeros({1, 64});
+  draft_input.draft_logits.index_put_({0, 43}, 1.0f);
+  draft_input.selected_probs = torch::ones({1});
+  const torch::Tensor expected_probs = draft_input.draft_logits;
+  ASSERT_TRUE(recv_first_generation(
+      &scheduler, 0, 0.1, 0.0, /*reservation_id=*/"", std::move(draft_input)));
+  std::shared_ptr<Request> queued;
+  ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+  ASSERT_TRUE(queued->sequences()[0]->get_draft_input().has_value());
   EXPECT_TRUE(torch::equal(
-      queued->sequences()[0]->get_mtp_bootstrap_embedding(), embedding));
+      queued->sequences()[0]->get_draft_input()->draft_logits, expected_probs));
+}
+
+TEST(PDSchedulerTest, DFlashHandoffMarksTokenBootstrapWithoutDraftInput) {
+  FakeEngine engine(8, 2, /*num_speculative_tokens=*/1);
+  auto options = make_mtp_decode_options();
+  ScopedSpeculativeConfig config("DFlash", /*probabilistic=*/false);
+  TestPDScheduler scheduler(&engine, options);
+  std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+  Sequence* sequence = request->sequences()[0].get();
+  ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
+  sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+  ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+  EXPECT_TRUE(recv_first_generation(
+      &scheduler, 0, 0.1, 0.0, /*reservation_id=*/"", std::nullopt));
+  std::shared_ptr<Request> queued;
+  ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+  EXPECT_FALSE(queued->sequences()[0]->get_draft_input().has_value());
+  EXPECT_TRUE(queued->sequences()[0]->has_target_decode_bootstrap());
+}
+
+TEST(PDSchedulerTest, DFlashRpcUsesTokenOnlyBootstrap) {
+  for (bool has_legacy_payload : {false, true}) {
+    SCOPED_TRACE(has_legacy_payload);
+    FakeEngine engine(8, 2, /*num_speculative_tokens=*/1);
+    auto options = make_mtp_decode_options();
+    ScopedSpeculativeConfig config("DFlash", /*probabilistic=*/false);
+    TestPDScheduler scheduler(&engine, options);
+    PDServiceImpl service(&scheduler, &engine);
+    std::shared_ptr<Request> request = make_request({1, 2, 3, 4});
+    Sequence* sequence = request->sequences()[0].get();
+    ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
+    sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
+    ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
+
+    proto::DisaggGenerationsRequests wire;
+    proto::DisaggGenerationsRequest* generation = wire.add_multi_gens();
+    generation->set_req_id("req");
+    generation->add_tokens()->set_token_id(42);
+    if (has_legacy_payload) {
+      // Field 14 is reserved: no descriptor exists, so a legacy sender's
+      // length-delimited payload is spliced into the serialized wire bytes to
+      // prove the parser drops unknown fields without rejecting the request.
+      std::string wire_bytes = wire.SerializeAsString();
+      const std::string legacy_field =
+          std::string("\x72\x02\x10\x01", 4);  // tag 14, len 2, sub-bytes
+      wire_bytes.insert(wire_bytes.size(), legacy_field);
+      ASSERT_TRUE(wire.ParseFromString(wire_bytes));
+      generation = wire.mutable_multi_gens(0);
+    }
+    proto::Status status;
+    service.decode_recv_first_generation(&wire, &status);
+    ASSERT_TRUE(status.ok());
+    std::shared_ptr<Request> queued;
+    ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
+    EXPECT_TRUE(queued->sequences()[0]->has_target_decode_bootstrap());
+  }
 }
 
 TEST(PDSchedulerTest, GroupedPullAlignsActiveSwaSuffix) {
@@ -1194,7 +1579,7 @@ TEST(PDSchedulerTest, FirstDecodeTokenLatencyIsNonNegative) {
   sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
   ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
 
-  EXPECT_TRUE(recv_first_generation(&scheduler, torch::Tensor()));
+  EXPECT_TRUE(recv_first_generation(&scheduler));
 
   std::shared_ptr<Request> queued;
   ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
@@ -1215,7 +1600,6 @@ TEST(PDSchedulerTest, DecodeLatencyIncludesPrefillTtft) {
 
   constexpr double kPrefillTtftSeconds = 10.0;
   EXPECT_TRUE(recv_first_generation(&scheduler,
-                                    torch::Tensor(),
                                     /*num_cached_tokens=*/0,
                                     kPrefillTtftSeconds));
 
@@ -1237,7 +1621,6 @@ TEST(PDSchedulerTest, DecodeLatencyUsesCumulativeUpstreamElapsed) {
   constexpr double kTtftSeconds = 2.0;
   constexpr double kUpstreamElapsedSeconds = 10.0;
   EXPECT_TRUE(recv_first_generation(&scheduler,
-                                    torch::Tensor(),
                                     /*num_cached_tokens=*/0,
                                     kTtftSeconds,
                                     kUpstreamElapsedSeconds));
@@ -1274,24 +1657,11 @@ TEST(PDSchedulerTest, PreservesPrefillCachedTokensOnDecodeRequest) {
   sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
   ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
 
-  ASSERT_TRUE(recv_first_generation(
-      &scheduler, torch::Tensor(), /*num_cached_tokens=*/2));
+  ASSERT_TRUE(recv_first_generation(&scheduler, /*num_cached_tokens=*/2));
 
   std::shared_ptr<Request> queued;
   ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
   EXPECT_EQ(queued->num_prefix_cache_tokens(), 2u);
-}
-
-TEST(PDSchedulerTest, PromptAtDecodeBlockCapacityIsNotPermanent) {
-  EXPECT_FALSE(exceeds_decode_capacity(
-      /*num_prompt_tokens=*/6, /*block_size=*/2, /*num_blocks=*/4));
-}
-
-TEST(PDSchedulerTest, InvalidMetadataAndOversizedResponsesAreTerminal) {
-  EXPECT_FALSE(is_permanent_rejection(/*status_code=*/404));
-  EXPECT_TRUE(is_permanent_rejection(kDecodeAddNewInvalidRequestStatusCode));
-  EXPECT_TRUE(is_permanent_rejection(kDecodeAddNewPromptTooLongStatusCode));
-  EXPECT_FALSE(is_permanent_rejection(/*status_code=*/500));
 }
 
 TEST(PDSchedulerTest, MissingServiceMetadataFailsBeforeDecodeLookup) {
@@ -1459,9 +1829,6 @@ TEST(PDSchedulerTest, DecodeOutputCallbacksOutliveRpcService) {
 
 TEST(PDSchedulerTest, DecodeRejectsMalformedMetadataBeforeKvAllocation) {
   // This rejection must not need an actual service connection or KV allocation.
-  const bool initialized = XServiceClientTestPeer::set_initialized(true);
-  ScopeGuard restore_client(
-      [initialized] { XServiceClientTestPeer::set_initialized(initialized); });
   FakeEngine engine(/*num_blocks=*/8, /*block_size=*/2);
   TestPDScheduler scheduler(&engine, make_options());
   PDServiceOptions options;
@@ -1490,26 +1857,6 @@ TEST(PDSchedulerTest, DecodeRejectsMalformedMetadataBeforeKvAllocation) {
               kDecodeAddNewInvalidRequestStatusCode);
     EXPECT_TRUE(scheduler.reservations_empty());
   }
-}
-
-TEST(PDSchedulerTest, DetectsRankPreservingFlatKvGroups) {
-  proto::DisaggResponse response;
-  response.add_groups()->set_group_id(cache_group_id(BlockType::KV));
-  response.add_groups()->set_group_id(cache_group_id(BlockType::LINEAR));
-
-  EXPECT_TRUE(has_rank_preserving_kv_groups(response));
-}
-
-TEST(PDSchedulerTest, KeepsExpandedGroupedCacheMappings) {
-  proto::DisaggResponse response;
-  response.add_groups()->set_group_id(cache_group_id(BlockType::C4));
-
-  EXPECT_FALSE(has_rank_preserving_kv_groups(response));
-}
-
-TEST(PDSchedulerTest, PromptBeyondDecodeBlockCapacityIsPermanent) {
-  EXPECT_TRUE(exceeds_decode_capacity(
-      /*num_prompt_tokens=*/7, /*block_size=*/2, /*num_blocks=*/4));
 }
 
 TEST(PDSchedulerTest, TemporaryDecodeBlockPressureIsNotPermanent) {
@@ -1550,8 +1897,7 @@ TEST(PDSchedulerTest, InvalidPrefillCachedTokensFallBackToZero) {
     sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
     ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
 
-    ASSERT_TRUE(
-        recv_first_generation(&scheduler, torch::Tensor(), num_cached_tokens));
+    ASSERT_TRUE(recv_first_generation(&scheduler, num_cached_tokens));
 
     std::shared_ptr<Request> queued;
     ASSERT_TRUE(scheduler.pop_decode_request_for_test(&queued));
@@ -2020,12 +2366,12 @@ TEST_F(ReservationTest, ReleasePreventsLateHandoff) {
   EXPECT_TRUE(decode_.release_reservation("req", "reservation"));
   auto replacement = reserve("req", "replacement");
   EXPECT_FALSE(recv_first_generation(
-      &decode_, torch::tensor({1.0f}), 0, 0.1, 0.0, "reservation"));
+      &decode_, /*num_cached_tokens=*/0, 0.1, 0.0, "reservation"));
   std::shared_ptr<Request> queued;
   EXPECT_FALSE(decode_.pop_decode_request_for_test(&queued));
   EXPECT_GE(replacement->sequences()[0]->get_embedding_block_id(), 0);
   EXPECT_TRUE(recv_first_generation(
-      &decode_, torch::tensor({1.0f}), 0, 0.1, 0.0, "replacement"));
+      &decode_, /*num_cached_tokens=*/0, 0.1, 0.0, "replacement"));
   ASSERT_TRUE(decode_.pop_decode_request_for_test(&queued));
   EXPECT_EQ(queued, replacement);
   EXPECT_TRUE(decode_.reservations_empty());
@@ -2036,7 +2382,7 @@ TEST_F(ReservationTest, ReleasePreventsLateHandoff) {
 TEST_F(ReservationTest, HandoffPreventsReleaseOfRunningResources) {
   auto request = reserve();
   EXPECT_TRUE(recv_first_generation(
-      &decode_, torch::tensor({1.0f}), 0, 0.1, 0.0, "reservation"));
+      &decode_, /*num_cached_tokens=*/0, 0.1, 0.0, "reservation"));
   EXPECT_FALSE(decode_.release_reservation("req", "reservation"));
   EXPECT_GE(request->sequences()[0]->get_embedding_block_id(), 0);
   std::shared_ptr<Request> queued;
@@ -2056,7 +2402,7 @@ TEST_F(ReservationTest, ConcurrentHandoffAndReleaseHaveOneOwner) {
   });
   start.arrive_and_wait();
   const bool handed_off = recv_first_generation(
-      &decode_, torch::tensor({1.0f}), 0, 0.1, 0.0, "reservation");
+      &decode_, /*num_cached_tokens=*/0, 0.1, 0.0, "reservation");
   EXPECT_EQ(decode_.wait_for_ready(release, std::chrono::seconds(5)),
             std::future_status::ready);
   EXPECT_NE(release.get(), handed_off);
@@ -2073,13 +2419,13 @@ TEST_F(ReservationTest, ConcurrentHandoffAndReleaseHaveOneOwner) {
 
 TEST_F(ReservationTest, ReleasePreservesValidPrefixOnly) {
   auto* pool = engine_.block_manager_pool();
-  auto seed = make_request({1, 2, 3, 4}, "seed");
-  auto* seq = seed->sequences()[0].get();
+  auto draft_input = make_request({1, 2, 3, 4}, "draft_input");
+  auto* seq = draft_input->sequences()[0].get();
   ASSERT_TRUE(pool->allocate(seq));
   const int32_t dp_rank = seq->dp_rank();
   finish_prefill(seq);
-  decode_.cache_prefill_blocks_for_test(seed.get());
-  pool->deallocate(seed.get());
+  decode_.cache_prefill_blocks_for_test(draft_input.get());
+  pool->deallocate(draft_input.get());
   const auto cache_before = pool->num_blocks_in_prefix_cache();
   auto request = make_request({1, 2, 3, 4, 5, 6, 7, 8});
   request->state().pd_reservation_id = "reservation";
@@ -2374,6 +2720,7 @@ TEST(PDSchedulerTest, DecodeEmitsFirstTokenAsynchronouslyBeforeAnyDecodeStep) {
   const bool initialized = XServiceClientTestPeer::set_initialized(true);
   ScopeGuard restore_client(
       [initialized] { XServiceClientTestPeer::set_initialized(initialized); });
+
   for (const auto& [overlap, batched] : std::vector<std::pair<bool, bool>>{
            {false, false}, {true, false}, {false, true}, {true, true}}) {
     SCOPED_TRACE("overlap=" + std::to_string(overlap) +
@@ -2514,7 +2861,8 @@ TEST(PDSchedulerTest, DecodeTerminatesFirstTokenWithoutQueueingDecodeWork) {
     ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
     sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
     ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
-    ASSERT_TRUE(recv_first_generation(&scheduler, torch::Tensor()));
+    ASSERT_TRUE(
+        recv_first_generation(&scheduler, 0, 0.1, 0.0, "", std::nullopt));
     scheduler.wait_for_responses();
     std::shared_ptr<Request> queued;
     EXPECT_FALSE(scheduler.pop_decode_request_for_test(&queued));
@@ -2553,7 +2901,8 @@ TEST(PDSchedulerTest, FullDecodeQueueFailsAfterFirstTokenAndReleasesKv) {
   ASSERT_TRUE(engine.block_manager_pool()->allocate(sequence));
   sequence->kv_state().set_kv_cache_tokens_num(sequence->num_prompt_tokens());
   ASSERT_TRUE(scheduler.decode_schedule(request, "prefill"));
-  EXPECT_FALSE(recv_first_generation(&scheduler, torch::Tensor()));
+  EXPECT_FALSE(
+      recv_first_generation(&scheduler, 0, 0.1, 0.0, "", std::nullopt));
   scheduler.wait_for_responses();
   EXPECT_TRUE(scheduler.reservations_empty());
   EXPECT_FALSE(sequence->has_any_blocks());

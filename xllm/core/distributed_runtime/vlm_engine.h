@@ -49,11 +49,13 @@ class VLMEngine : public Engine {
   const runtime::Options& options() const { return options_; }
 
   std::shared_ptr<DistributedWorkerManager> get_distributed_worker_manager()
-      const {
+      const override {
     return distributed_worker_manager_;
   }
 
   bool init(MasterStatus master_status) override;
+
+  void flush_released_requests() override;
 
   std::vector<RawForwardOutput> collect_step_outputs(const BatchGroup& batch);
 

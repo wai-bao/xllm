@@ -133,7 +133,8 @@ class SamplingPenalties final {
 
 class SamplingConstraints final {
  public:
-  // Compact allowed-token bitmask [num_tokens, ceil(vocab/32)] int32.
+  // Compact allowed-token bitmask [num_tokens, ceil(vocab/32)] int32 for
+  // token-level structured output constraints.
   PROPERTY(torch::Tensor, filter_bitmask);
 
   // Per-selected-row additive logits bias.
@@ -245,7 +246,6 @@ class SamplingParameters final {
            !return_logits();
   }
 
-  // Fails fast unless the batch is mixed (see do_sample()).
   const torch::Tensor& require_do_sample() const {
     CHECK(do_sample().defined())
         << "mixed sampling requires do_sample to be defined";
@@ -367,8 +367,6 @@ inline bool SamplingParameters::has_sampling_fields() const {
                      });
 }
 
-// Clears the per-token transform and seed fields that are dead on a greedy
-// draft leg (see is_greedy above).
 inline void clear_sampling_transforms(SamplingParameters& sampling_params) {
   for (const auto& field : kSamplingFields) {
     if (field.is_greedy) {
@@ -423,6 +421,36 @@ inline void expand_sampling_params_for_verify(
                                : arange_indices(total_num_val_tokens, device);
   repeat_interleave_if_defined(sampling_params.do_sample(),
                                num_speculative_tokens + 1);
+}
+
+inline bool has_penalty_params(const SamplingParameters& params) {
+  return params.frequency_penalties().defined() ||
+         params.presence_penalties().defined() ||
+         params.repetition_penalties().defined();
+}
+
+// A new penalty member must be added here, not at the call sites.
+inline void clear_penalty_history_fields(SamplingParameters& params) {
+  params.frequency_penalties() = torch::Tensor();
+  params.presence_penalties() = torch::Tensor();
+  params.repetition_penalties() = torch::Tensor();
+  params.unique_token_ids() = torch::Tensor();
+  params.unique_token_counts() = torch::Tensor();
+  params.unique_token_ids_lens() = torch::Tensor();
+}
+
+// The draft proposal never applies penalties, penalty history, or grammar
+// filter masks; the rejection sampler enforces them on the target's verify
+// logits.
+inline void clear_verify_only_sampling_fields(SamplingParameters& params) {
+  clear_penalty_history_fields(params);
+  params.filter_bitmask() = torch::Tensor();
+}
+
+inline void prepare_draft_proposal_sampling(bool is_probabilistic_draft,
+                                            SamplingParameters& params) {
+  clear_verify_only_sampling_fields(params);
+  prepare_draft_sampling(is_probabilistic_draft, params);
 }
 
 // Advance the compact generated suffix with a padded accepted-token prefix.
