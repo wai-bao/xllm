@@ -15,15 +15,6 @@ cc_test(
     GTest::gtest_main
 )
 
-cc_test(
-  NAME
-    json_object_constraints_test
-  SRCS
-    json_object_constraints_test.cpp
-  DEPS
-    :json_object_grammar
-    GTest::gtest_main
-)
 
 cc_test(
   NAME

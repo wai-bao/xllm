@@ -57,6 +57,8 @@ class Worker {
   bool wakeup(const WakeupOptions& options);
 
   folly::SemiFuture<bool> wakeup_async(const WakeupOptions& options);
+  folly::SemiFuture<bool> release_idle_request_state_async(
+      std::vector<int32_t> embedding_ids);
 
   // Start/stop online timeline profiling on this worker's device.
   bool start_profile();

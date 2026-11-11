@@ -15,12 +15,17 @@ limitations under the License.
 
 #pragma once
 
+#include <functional>
 #include <utility>
 
 #include "core/framework/sampling/sampling_params.h"
+#include "core/framework/speculative/draft_proposal.h"
+#include "core/framework/speculative/draft_vocab_mapping.h"
 #include "runtime/dflash_worker_impl.h"
 
 namespace xllm {
+
+class ProcessGroup;
 
 class DSparkWorkerImpl final : public DFlashWorkerImpl {
  public:
@@ -35,6 +40,8 @@ class DSparkWorkerImpl final : public DFlashWorkerImpl {
                   MasterStatus master_status) override;
 
  protected:
+  bool query_forward_logits_only() const override { return true; }
+
   std::pair<torch::Tensor, torch::Tensor> run_decode_draft(
       const LlmForwardInput& input,
       LlmForwardInput& validate_input,

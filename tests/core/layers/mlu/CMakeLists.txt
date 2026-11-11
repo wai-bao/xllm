@@ -61,6 +61,7 @@ cc_test(
     :util
     :decode_input_builder
     :config
+    :runtime
     :mlu_layers
     :common_layers
     :block

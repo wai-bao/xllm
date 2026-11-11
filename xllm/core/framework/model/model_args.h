@@ -749,6 +749,12 @@ struct ModelArgs {
 
   FORWARD_PROPERTY(int64_t, draft_vocab_size, speculative_args);
 
+  // The draft's effective proposal vocabulary: its reduced vocabulary when
+  // configured, else the full vocab.
+  int64_t effective_draft_vocab_size() const {
+    return draft_vocab_size() > 0 ? draft_vocab_size() : vocab_size();
+  }
+
   PROPERTY(DSparkArgs, dspark_args);
 
   FORWARD_PROPERTY(int64_t, markov_rank, dspark_args);

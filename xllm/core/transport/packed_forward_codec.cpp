@@ -2206,6 +2206,38 @@ inline void finalize_device_buffer_session(DeviceBufferSession& session,
 #endif
 }
 
+// Draft-input serialization: tensors go to the sectioned tensor arena,
+// scalars to the descriptor, matching the surrounding read/write calls.
+inline void write_draft_input(RawInputSerializeContext& context,
+                              const std::optional<DraftInput>& draft_input) {
+  write_data(context.descriptor, draft_input.has_value());
+  if (!draft_input.has_value()) {
+    return;
+  }
+  write_data(context.descriptor, draft_input->point_mass_q);
+  for (torch::Tensor DraftInput::* member : kDraftInputTensors) {
+    write_tensor(context, (*draft_input).*member);
+  }
+}
+
+template <typename Stream>
+inline void read_draft_input(ReadContext& context,
+                             std::optional<DraftInput>& draft_input,
+                             Stream stream) {
+  bool has_draft_input = false;
+  read_data(context, has_draft_input);
+  if (!has_draft_input) {
+    draft_input.reset();
+    return;
+  }
+  DraftInput parsed;
+  read_data(context, parsed.point_mass_q);
+  for (torch::Tensor DraftInput::* member : kDraftInputTensors) {
+    read_tensor(context, parsed.*member, stream);
+  }
+  draft_input = std::move(parsed);
+}
+
 template <typename Input>
 inline void deserialize_forward_input_payload(
     const char*& buffer,
@@ -2309,7 +2341,6 @@ inline void deserialize_forward_input_payload(
   read_vector(context, input_params.parallel.dp_global_token_nums);
   read_vector(context, input_params.parallel.dp_global_sequence_nums);
   read_vector(context, input_params.parallel.raw_dp_global_token_nums);
-  read_vector(context, input_params.parallel.dp_global_batch_generations);
   read_vector(context, input_params.parallel.dp_global_kv_max_seq_lens);
   read_vector(context, input_params.parallel.dp_global_json_object_active);
   read_vector(context, input_params.parallel.dp_is_decode);
@@ -2318,7 +2349,9 @@ inline void deserialize_forward_input_payload(
   read_vector(context, input_params.embedding.linear_state_read_ids);
   normalize_linear_state_ids(input_params.embedding.linear_state_ids,
                              input_params.meta.num_sequences);
-  if (materialize_device_buffer &&
+  // A CPU target device has no H2D to upload: the pinned staging allocation
+  // would still route through torch_npu's Python-initialized host allocator.
+  if (materialize_device_buffer && !device.is_cpu() &&
       !input_params.embedding.linear_state_ids.empty()) {
     input_params.embedding.linear_state_indices =
         async_h2d_tensor(input_params.embedding.linear_state_ids, device);
@@ -2332,8 +2365,11 @@ inline void deserialize_forward_input_payload(
   read_vector(context, input_params.embedding.full_block_slot_rows);
   read_vector(context, input_params.embedding.full_block_lease_epochs);
   read_vector(context, input_params.embedding.extra_token_ids);
-  read_vector(context, input_params.embedding.mtp_bootstrap_row_idxes);
-  read_tensor(context, input_params.embedding.mtp_bootstrap_embeddings, stream);
+  if constexpr (std::is_same_v<Input, LlmForwardInput>) {
+    read_draft_input(context, forward_input.request_state.draft_input, stream);
+    read_vector(context, forward_input.request_state.draft_input_row_idxes);
+    read_vector(context, forward_input.request_state.released_embedding_ids);
+  }
   if constexpr (std::is_same_v<Input, VlmForwardInput>) {
     read_mm_batch_data(context, input_params.multimodal.mm_data);
     read_vector_tensor(context, input_params.multimodal.deep_stacks, stream);
@@ -2662,8 +2698,6 @@ inline void serialize_forward_input_sections(
   write_vector(context.descriptor,
                input_params.parallel.raw_dp_global_token_nums);
   write_vector(context.descriptor,
-               input_params.parallel.dp_global_batch_generations);
-  write_vector(context.descriptor,
                input_params.parallel.dp_global_kv_max_seq_lens);
   write_vector(context.descriptor,
                input_params.parallel.dp_global_json_object_active);
@@ -2679,9 +2713,12 @@ inline void serialize_forward_input_sections(
   write_vector(context.descriptor,
                input_params.embedding.full_block_lease_epochs);
   write_vector(context.descriptor, input_params.embedding.extra_token_ids);
-  write_vector(context.descriptor,
-               input_params.embedding.mtp_bootstrap_row_idxes);
-  write_tensor(context, input_params.embedding.mtp_bootstrap_embeddings);
+  if constexpr (std::is_same_v<Input, LlmForwardInput>) {
+    write_draft_input(context, input.request_state.draft_input);
+    write_vector(context.descriptor, input.request_state.draft_input_row_idxes);
+    write_vector(context.descriptor,
+                 input.request_state.released_embedding_ids);
+  }
   if constexpr (std::is_same_v<Input, VlmForwardInput>) {
     write_mm_batch_data(context, input_params.multimodal.mm_data);
     write_vector_tensor(context, input_params.multimodal.deep_stacks);
@@ -3056,6 +3093,69 @@ bool read_string_vector(PackedOutputReader& reader,
       return false;
     }
   }
+  return true;
+}
+
+// Flat-output draft-input row codec: the presence flag is per row, the
+// payload only when present, in row order matching the sample rows. Estimate,
+// write, and read all route through these three so the byte accounting cannot
+// drift from the wire format.
+std::optional<DraftInput> draft_input_row(
+    const std::optional<DraftInput>& draft_input,
+    int64_t row) {
+  if (!draft_input.has_value()) {
+    return std::nullopt;
+  }
+  return take_draft_input_row(*draft_input, row);
+}
+
+size_t draft_input_row_bytes(const std::optional<DraftInput>& draft_input) {
+  if (!draft_input.has_value()) {
+    return sizeof(bool);
+  }
+  size_t bytes = 2 * sizeof(bool);
+  for (torch::Tensor DraftInput::* member : kDraftInputTensors) {
+    bytes += get_tensor_size((*draft_input).*member);
+  }
+  return bytes;
+}
+
+void write_draft_input_row(char*& cursor,
+                           const std::optional<DraftInput>& draft_input) {
+  write_data(cursor, draft_input.has_value());
+  if (!draft_input.has_value()) {
+    return;
+  }
+  write_data(cursor, draft_input->point_mass_q);
+  for (torch::Tensor DraftInput::* member : kDraftInputTensors) {
+    write_tensor(cursor, (*draft_input).*member);
+  }
+}
+
+// read_draft_input_row mirrors write_draft_input_row/draft_input_row_bytes;
+// returns false on stream corruption.
+bool read_draft_input_row(PackedOutputReader& reader,
+                          std::optional<DraftInput>& draft_input) {
+  bool has_draft_input = false;
+  if (!reader.read_bool(has_draft_input)) {
+    return false;
+  }
+  if (!has_draft_input) {
+    draft_input.reset();
+    return true;
+  }
+  DraftInput parsed;
+  bool point_mass = false;
+  if (!reader.read_bool(point_mass)) {
+    return false;
+  }
+  parsed.point_mass_q = point_mass;
+  for (torch::Tensor DraftInput::* member : kDraftInputTensors) {
+    if (!reader.read_tensor(parsed.*member)) {
+      return false;
+    }
+  }
+  draft_input = std::move(parsed);
   return true;
 }
 
@@ -3584,6 +3684,10 @@ bool PackedForwardCodec::write_token_output(
             : sizeof(int32_t);
     payload_bytes += sizeof(uint64_t) + 3 * sizeof(int64_t);
   }
+  // Rows without a seed still pay the presence flag.
+  const std::optional<DraftInput> first_row =
+      draft_input_row(output.draft_input, 0);
+  payload_bytes += row_count * draft_input_row_bytes(first_row);
   payload_bytes += calculate_json_object_errors_size(output.json_object_errors);
   payload_bytes += get_string_vector_size(output.failed_request_ids);
   payload_bytes += sizeof(uint64_t) + expert_count * sizeof(int64_t);
@@ -3646,6 +3750,11 @@ bool PackedForwardCodec::write_token_output(
     write_data(cursor, stats.proposed_tokens);
     write_data(cursor, stats.verified_rounds);
   }
+  // Per-row seed views follow the sample rows, in row order.
+  for (int64_t row_index = 0; row_index < row_count; ++row_index) {
+    write_draft_input_row(cursor,
+                          draft_input_row(output.draft_input, row_index));
+  }
   write_json_object_errors(cursor, output.json_object_errors);
   write_string_vector(cursor, output.failed_request_ids);
   write_output_values(cursor,
@@ -3676,6 +3785,12 @@ bool PackedForwardCodec::read_token_output(RawForwardOutput& output,
   decoded.outputs.resize(rows);
   for (RawSampleOutput& row : decoded.outputs) {
     if (!read_raw_sample_output(reader, row)) {
+      return false;
+    }
+  }
+  // Per-row draft inputs follow the sample rows, matching the writer.
+  for (RawSampleOutput& row : decoded.outputs) {
+    if (!read_draft_input_row(reader, row.draft_input)) {
       return false;
     }
   }

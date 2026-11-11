@@ -1083,7 +1083,7 @@ TEST(Glm5NextKPoolIndexerTest,
   const std::vector<int32_t> query_lens{6, 3};
   prepare_decode_buffers(buffers,
                          context,
-                         9,
+                         /*num_tokens=*/9,
                          /*emit_kv_len=*/true,
                          /*emit_block_tables=*/true);
   for (int32_t seq = 0; seq < 2; ++seq) {
@@ -1091,12 +1091,16 @@ TEST(Glm5NextKPoolIndexerTest,
       DecodeTokenInput token_input;
       token_input.req_id = seq;
       token_input.position_offset = offset;
+      token_input.append_token = false;
       append_decode_token(context, token_input, /*block_size=*/16, buffers);
     }
   }
   params.meta.num_sequences = 9;
-  DecodeInputOptions commit_plan;
-  build_decode_metadata(params, buffers, commit_plan);
+  build_decode_metadata(
+      params,
+      buffers,
+      DecodeInputOptions{.num_val_tokens = 6,
+                         .forward_type = BatchForwardType::DECODE});
   params.attention.host.kpool_query_lens = query_lens;
   params.enable_graph = false;
   params.attention.rebuild_device_buffer(device);

@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <atomic>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <queue>
 #include <string>
 #include <vector>
@@ -107,6 +109,7 @@ class BlockManagerPool : public KVCacheManager {
   void deallocate(Request* request) override;
   void deallocate(std::vector<Sequence*>& sequences) override;
   void deallocate(Sequence* sequence) override;
+  std::vector<int32_t> take_released_embedding_ids(int32_t dp_rank) override;
 
   void deallocate_without_cache(Sequence* sequence);
 
@@ -153,7 +156,16 @@ class BlockManagerPool : public KVCacheManager {
   // the options for the block manager
   Options options_;
   std::unique_ptr<KVCacheEventPublisher> event_publisher_;
+
+  struct ReleasedEmbeddingIds {
+    std::mutex mutex;
+    std::vector<std::vector<int32_t>> ids;
+  };
+  std::shared_ptr<ReleasedEmbeddingIds> released_embedding_ids_;
   std::vector<std::unique_ptr<BlockManager>> block_managers_;
+  // Raw EMBEDDING leaf per DP rank; the composite owns it. Null when spec
+  // decode is off.
+  std::vector<BlockManager*> embedding_leaves_;
 };
 
 }  // namespace xllm

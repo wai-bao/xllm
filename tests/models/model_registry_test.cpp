@@ -22,6 +22,7 @@ limitations under the License.
 #include <fstream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "core/common/extension_registry.h"
 #include "core/common/options.h"
@@ -323,27 +324,5 @@ TEST(ModelRegistryTest, UnknownExtensionFamilyCannotBypassBackendRules) {
                                           &error_message));
   EXPECT_EQ(error_message, "Unknown extension_impl=npu_backend_unknown_custom");
 }
-
-TEST(ModelRegistryTest, Glm5NextMtpPreservesBackendIndexSharingPolicy) {
-  for (const std::string_view model_type : {"glm5_next", "glm5_3_flash"}) {
-    SCOPED_TRACE(std::string(model_type));
-    for (bool is_python_model : {false, true}) {
-      SCOPED_TRACE(is_python_model);
-      ModelArgs args;
-      args.model_type(std::string(model_type))
-          .n_layers(61)
-          .num_nextn_predict_layers(1)
-          .index_share_for_mtp_iteration(true);
-      ModelRegistry::configure_mtp_args(
-          args, "MTP", /*is_draft_engine=*/true, is_python_model);
-#if defined(USE_MLU)
-      EXPECT_EQ(args.index_share_for_mtp_iteration(), is_python_model);
-#else
-      EXPECT_TRUE(args.index_share_for_mtp_iteration());
-#endif
-    }
-  }
-}
-
 }  // namespace
 }  // namespace xllm

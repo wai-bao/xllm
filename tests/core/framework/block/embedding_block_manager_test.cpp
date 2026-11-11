@@ -48,7 +48,6 @@ TEST(EmbeddingBlockManagerTest, AllocateAndFreeRoundTrip) {
   EXPECT_EQ(manager.num_used_blocks(), 0);
   EXPECT_DOUBLE_EQ(manager.kv_cache_utilization(), 0.0);
 }
-
 TEST(EmbeddingBlockManagerTest, AllocateReturnsEmptyWhenExhausted) {
   // id 0 is reserved internally, so 3 physical slots expose 2 usable blocks.
   EmbeddingBlockManager manager(3, "single");

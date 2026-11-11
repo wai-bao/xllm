@@ -70,6 +70,7 @@ cc_library(
     :runtime
     :kv_cache_manager_factory
     :xllm_server
+    :speculative_transport_adapter
     :util
     glog::glog
     nlohmann_json::nlohmann_json

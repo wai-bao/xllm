@@ -107,7 +107,6 @@ void UnifiedPolicy::schedule_from_unified_queue(
   const auto preempt_request = [&](auto it) {
     std::shared_ptr<Request> request = *it;
     ++budget.num_preempted_requests;
-    clear_mtp_bootstrap(request.get(), state);
     state.kv_cache_manager->deallocate(request.get());
     unified.erase(it);
     request->set_preempted();
@@ -128,7 +127,6 @@ void UnifiedPolicy::schedule_from_unified_queue(
     }
 
     if (request->finished() || request->cancelled()) {
-      clear_mtp_bootstrap(request.get(), state);
       state.kv_cache_manager->deallocate(request.get());
       finished.emplace_back(request);
       unified.pop_front();
@@ -147,7 +145,6 @@ void UnifiedPolicy::schedule_from_unified_queue(
     if (state.kv_cache_manager->exceeds_total_capacity(candidate,
                                                        total_target_tokens)) {
       unified.pop_front();
-      clear_mtp_bootstrap(request.get(), state);
       state.kv_cache_manager->deallocate(request.get());
       state.output_dispatcher->process_failed_request(
           request,
@@ -336,7 +333,6 @@ void UnifiedPolicy::schedule_from_unified_queue(
                    << " is too long, please set a larger "
                       "max_tokens value via --max_tokens_per_batch.";
         unified.pop_front();
-        clear_mtp_bootstrap(request.get(), state);
         state.kv_cache_manager->deallocate(request.get());
         state.output_dispatcher->process_failed_request(
             request,

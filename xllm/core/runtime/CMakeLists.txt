@@ -29,6 +29,8 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.h>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.h>
     py_executor_impl.h
+    spec_verify_input_layout.h
+    $<$<BOOL:${USE_NPU}>:mtp_npu_validate_input_state.h>
     py_attention_metadata.h
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.h>
     worker.h
@@ -67,6 +69,8 @@ cc_library(
     $<$<BOOL:${USE_CUDA}>:cuda_graph_executor_impl.cpp>
     $<$<BOOL:${USE_MUSA}>:musa_graph_executor_impl.cpp>
     py_executor_impl.cpp
+    spec_verify_input_layout.cpp
+    $<$<BOOL:${USE_NPU}>:mtp_npu_validate_input_state.cpp>
     py_attention_metadata.cpp
     $<$<BOOL:${USE_DCU}>:dcu_graph_executor_impl.cpp>
     worker.cpp
@@ -120,6 +124,7 @@ cc_library(
     :models
     :sampler
     :json_object_grammar
+    :json_object_constraint_batch
     :tokenizer
     :model_loader
     :util

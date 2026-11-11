@@ -57,7 +57,7 @@ class VLMEngine : public Engine {
   const runtime::Options& options() const { return options_; }
 
   std::shared_ptr<DistributedWorkerManager> get_distributed_worker_manager()
-      const {
+      const override {
     return distributed_worker_manager_;
   }
 
@@ -70,6 +70,8 @@ class VLMEngine : public Engine {
 
   bool start_profile() override;
   bool stop_profile() override;
+
+  void flush_released_requests() override;
 
   std::vector<RawForwardOutput> collect_step_outputs(const BatchGroup& batch);
 

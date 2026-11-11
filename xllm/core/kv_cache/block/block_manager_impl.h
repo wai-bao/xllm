@@ -117,6 +117,12 @@ class BlockManagerImpl : public BlockManager {
                : free_blocks_.size() - 1;
   }
 
+  bool is_block_used(int32_t block_id) const override {
+    CHECK_GT(block_id, 0);
+    CHECK_LT(static_cast<size_t>(block_id), usage_accounted_ids_.size());
+    return usage_accounted_ids_[static_cast<size_t>(block_id)] != 0;
+  }
+
  protected:
   std::vector<Block> allocate_with_placement(size_t num_blocks,
                                              const void* placement_hint);

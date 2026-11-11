@@ -25,6 +25,8 @@ limitations under the License.
 
 #include "core/framework/sampling/logits_processor.h"
 #include "core/framework/sampling/sampler.h"
+#include "core/framework/sampling/sampling_params.h"
+#include "core/framework/speculative/draft_input.h"
 #if defined(USE_NPU)
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #endif
@@ -37,8 +39,7 @@ namespace {
 
 // Position of the first rejected draft per sequence [B, 1] int32 — the
 // number of accepted drafts. All-accepted rows argmin to the appended bonus
-// column (== width), which is the correct full-width count; gather callers
-// must clamp back into index range themselves.
+// column (== width); gather callers must clamp back into index range.
 torch::Tensor first_rejected_indices(const torch::Tensor& accepted) {
   const torch::Tensor accepted_int64 = accepted.to(torch::kInt64);
   const torch::Tensor bonus_mask =
@@ -48,12 +49,10 @@ torch::Tensor first_rejected_indices(const torch::Tensor& accepted) {
       .to(torch::kInt32);
 }
 
-// The committed-prefix construction shared by the dispatch legs: `accepted`
-// is per-position, but the committed row is the first-failure prefix — a
-// draft at position i commits only when every earlier position accepted
-// (all_accepted_before, from the inclusive cumprod shifted right one
-// column), so the prefix, the correction token at the first failure, and
-// the -1 sentinel tail come out of one elementwise where.
+// The committed row is the first-failure prefix: a draft at position i
+// commits only when every earlier position accepted (inclusive cumprod
+// shifted right one column), so the prefix, the correction token at the
+// first failure, and the -1 sentinel tail come out of one elementwise where.
 torch::Tensor all_accepted_before(const torch::Tensor& accepted) {
   const torch::Tensor prefix_so_far =
       torch::cumprod(accepted.to(torch::kInt32), /*dim=*/1) > 0;
@@ -74,10 +73,10 @@ void compute_logprobs(SampleOutput& output,
   }
   auto target_logprobs =
       torch::log_softmax(grouped_logits, /*dim=*/-1, /*dtype=*/torch::kFloat32);
+  // log p(token); -1 sentinels read 0 (the clamp maps them to column 0 and
+  // the mask zeroes them).
   auto selected_logprobs =
-      index_select_2d(target_logprobs,
-                      /*dim=*/-1,
-                      output.next_tokens.clamp_min(0).to(torch::kLong));
+      gather_from_logits(target_logprobs, output.next_tokens);
   selected_logprobs.masked_fill_(output.next_tokens.lt(0), 0);
   output.logprobs = std::move(selected_logprobs);
   if (params.max_top_logprobs() > 0) {
@@ -99,8 +98,11 @@ SampleOutput rejection_sample(const SamplingParameters& params,
   const int64_t batch_size = draft_token_ids.size(/*dim=*/0);
   const int64_t num_val_tokens = num_draft_tokens + 1;
   CHECK_EQ(target_logits.dim(), 2);
-  // Verify transforms: the penalty stages broadcast per-sequence inputs on
-  // the grouped view; the grammar bitmask stays on the flat rows.
+  // Per-sequence transform members stay sequence-scoped [B]: temperatures,
+  // min_p and the penalty stages broadcast on the [B, W, V] view, and the
+  // ragged unique_token_* members project per verify row. Only top_k/top_p
+  // (apply_top_k_top_p works on flat [rows, vocab]) expand at their call
+  // site, and the grammar bitmask likewise stays on the flat rows.
   const int64_t vocab_size = target_logits.size(1);
   torch::Tensor grouped_logits =
       target_logits.view({batch_size, num_val_tokens, vocab_size});
@@ -262,20 +264,18 @@ SampleOutput rejection_sample(const SamplingParameters& params,
   auto random_sample_dispatch =
       [&]() -> std::pair<torch::Tensor, torch::Tensor> {
     // Accept p/q > u in log space. −1 sentinel drafts clamp to column 0
-    // and are re-masked by the acceptance term.
+    // and are re-masked by the acceptance term; one clamped index feeds
+    // both gathers.
     const torch::Tensor draft_index =
         draft_token_ids.clamp_min(0).to(torch::kLong);
-    const auto gathered_logit = [&](const torch::Tensor& logits) {
-      return index_select_2d(logits, /*dim=*/-1, draft_index)
-          .to(torch::kFloat32);
-    };
     torch::Tensor target_log_prob =
-        gathered_logit(grouped_logits).sub(target_lse);
+        gather_log_probs_from_index(grouped_logits, target_lse, draft_index);
     torch::Tensor draft_lse;
     if (draft_logits.defined()) {
       draft_lse = torch::logsumexp(
           draft_logits.to(torch::kFloat32), /*dim=*/-1, /*keepdim=*/false);
-      target_log_prob.sub_(gathered_logit(draft_logits).sub(draft_lse));
+      target_log_prob.sub_(
+          gather_log_probs_from_index(draft_logits, draft_lse, draft_index));
     }
     torch::Tensor uniform_rand =
         torch::rand(draft_token_ids.sizes(),
@@ -289,8 +289,7 @@ SampleOutput rejection_sample(const SamplingParameters& params,
     const torch::Tensor rejected_tokens =
         draft_token_ids.gather(/*dim=*/1, gather_reject);
     // Row first_reject[i] of each [B, K, V] tensor as [B, V], kept as
-    // log-probs (row logsumexp subtracted) — the residual recovery works in
-    // log space.
+    // log-probs (row logsumexp subtracted) for the residual recovery.
     const auto row_log_probs = [&](const torch::Tensor& logits,
                                    const torch::Tensor& lse) {
       torch::Tensor gathered_logits =
@@ -342,9 +341,8 @@ SampleOutput rejection_sample(const SamplingParameters& params,
           kernel::npu::tilelang::greedy_prefix_verify(
               draft_token_ids, greedy_target_token_ids, bonus_token_ids);
       // The kernel -1-fills the rejected tail, so the non-sentinel draft-column
-      // count is the accepted count. Match first_rejected_indices' [B, 1]
-      // shape; token id 0 is a valid accepted draft, so count non-sentinel
-      // entries, not non-zero ones.
+      // count is the accepted count. Token id 0 is a valid accepted draft, so
+      // count non-sentinel entries, not non-zero ones.
       const torch::Tensor num_accepted_tokens =
           committed_tokens.narrow(/*dim=*/1,
                                   /*start=*/1,

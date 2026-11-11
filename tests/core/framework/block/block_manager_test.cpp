@@ -574,12 +574,19 @@ TEST_F(BlockManagerPoolTest, DeallocateReleasesSingleBlockId) {
   Sequence seq1 = make_sequence(0, /*prompt_tokens=*/{1, 2, 3});
   ASSERT_TRUE(pool.allocate(&seq1));
   const int32_t id1 = seq1.get_embedding_block_id();
+  EXPECT_TRUE(pool.take_released_embedding_ids(/*dp_rank=*/0).empty());
   pool.deallocate(&seq1);
   EXPECT_FALSE(seq1.get_embedding_block_id() >= 0);
 
   Sequence seq2 = make_sequence(1, /*prompt_tokens=*/{4, 5, 6});
   ASSERT_TRUE(pool.allocate(&seq2));
   EXPECT_EQ(seq2.get_embedding_block_id(), id1);
+  // take_released_embedding_ids filters id1 out: it is allocated again, so
+  // consumers must never see an id that belongs to an active row.
+  EXPECT_TRUE(pool.take_released_embedding_ids(/*dp_rank=*/0).empty());
+  pool.deallocate(&seq2);
+  EXPECT_EQ(pool.take_released_embedding_ids(/*dp_rank=*/0),
+            std::vector<int32_t>{id1});
 }
 
 TEST_F(BlockManagerPoolTest, EmbeddingBlockCapacityUsesNumEmbeddingBlocks) {

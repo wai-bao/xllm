@@ -124,6 +124,9 @@ class RpcChannel final : public CommChannel {
 
   bool stop_profile() override;
 
+  bool release_idle_request_state(
+      const std::vector<int32_t>& embedding_ids) override;
+
  private:
   bool execute_llm_model_with_brpc(
       const LlmForwardInput& input,

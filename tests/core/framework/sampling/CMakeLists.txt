@@ -41,8 +41,19 @@ endif()
 cc_test(
   NAME sampler_controls_test
   NO_NPU_RUNTIME
-  SRCS logits_processor_test.cpp sampler_controls_test.cpp ${SAMPLER_CONTROLS_DEVICE_TEST_SRCS}
-  DEPS absl::strings GTest::gtest_main :config :sampler :speculative glog::glog :state_dict
+  SRCS
+    logits_processor_test.cpp
+    sampler_controls_test.cpp
+    ${SAMPLER_CONTROLS_DEVICE_TEST_SRCS}
+  DEPS
+    absl::strings
+    GTest::gtest_main
+    :config
+    :sampler
+    :runtime
+    :speculative
+    glog::glog
+    :state_dict
 )
 target_link_libraries(sampler_controls_test PRIVATE
   brpc OpenSSL::SSL OpenSSL::Crypto leveldb::leveldb protobuf::libprotobuf

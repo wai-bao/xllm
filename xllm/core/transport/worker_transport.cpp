@@ -176,4 +176,9 @@ bool WorkerTransport::start_profile() { return channel_->start_profile(); }
 
 bool WorkerTransport::stop_profile() { return channel_->stop_profile(); }
 
+bool WorkerTransport::release_idle_request_state(
+    const std::vector<int32_t>& embedding_ids) {
+  return channel_->release_idle_request_state(embedding_ids);
+}
+
 }  // namespace xllm

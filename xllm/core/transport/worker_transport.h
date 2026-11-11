@@ -123,6 +123,8 @@ class WorkerTransport final {
 
   bool stop_profile();
 
+  bool release_idle_request_state(const std::vector<int32_t>& embedding_ids);
+
  private:
   std::unique_ptr<CommChannel> channel_;
 };

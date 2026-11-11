@@ -15,6 +15,8 @@ limitations under the License.
 
 #pragma once
 
+#include <brpc/channel.h>
+#include <brpc/controller.h>
 #include <folly/futures/Future.h>
 
 #include <cstdint>
@@ -117,6 +119,30 @@ class CommChannel {
 
   virtual bool start_profile() = 0;
 
-  virtual bool stop_profile() = 0;
+  virtual bool stop_profile();
+
+  virtual bool release_idle_request_state(
+      const std::vector<int32_t>& embedding_ids);
+
+ protected:
+  bool execute_llm_model_with_brpc(
+      const LlmForwardInput& input,
+      folly::Promise<std::optional<RawForwardOutput>>& promise,
+      ForwardInputEncoding* encoding = nullptr);
+
+  bool execute_dit_model_with_brpc(
+      const DiTForwardInput& input,
+      folly::Promise<std::optional<RawForwardOutput>>& promise);
+
+  bool execute_vlm_model_with_brpc(
+      const VlmForwardInput& input,
+      folly::Promise<std::optional<RawForwardOutput>>& promise,
+      ForwardInputEncoding* encoding = nullptr);
+
+ private:
+  brpc::Channel channel_;
+  brpc::ChannelOptions options_;
+  std::unique_ptr<proto::DistributeWorker_Stub> stub_;
 };
+
 }  // namespace xllm

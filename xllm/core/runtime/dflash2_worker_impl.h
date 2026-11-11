@@ -17,10 +17,24 @@ limitations under the License.
 
 #include <utility>
 
+#include "core/framework/speculative/draft_proposal.h"
 #include "runtime/dflash_worker_impl.h"
 
 namespace xllm {
 
+class ProcessGroup;
+
+// Gumbel-noise walk of the DFlash2 candidate tree; undefined noise (greedy
+// draft) degrades to the raw argmax. TP noise consensus is the caller's.
+std::pair<torch::Tensor, torch::Tensor> sample_dflash2_path(
+    const DFlash2CandidateOutput& candidates,
+    const SamplingParameters& sampling_params,
+    torch::Tensor gumbel_noise,
+    int64_t vocab_size);
+// Selector noise for the DFlash2 candidate walk; only a deterministic draft
+// (SamplingMode::GREEDY) returns an undefined tensor — callers key
+// is_probabilistic_draft off that. A MIXED batch still draws noise (the
+// 0.0 greedy-row sentinel keeps its greedy rows).
 class DFlash2WorkerImpl final : public DFlashWorkerImpl {
  public:
   DFlash2WorkerImpl(const ParallelArgs& parallel_args,

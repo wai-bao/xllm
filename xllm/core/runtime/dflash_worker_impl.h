@@ -21,12 +21,11 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
-#include "core/framework/batch/decode_input_builder.h"
-#include "core/framework/speculative/embedding_cache.h"
+#include "core/framework/speculative/draft_proposal.h"
 #include "core/kv_cache/transfer/kv_transfer.h"
-#include "core/util/tensor_helper.h"
 #include "framework/model/model_args.h"
 #include "runtime/draft_model_spec_worker_impl.h"
+#include "runtime/llm_worker_impl.h"
 
 namespace xllm {
 
@@ -56,17 +55,9 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
                   int32_t random_seed,
                   MasterStatus master_status) override;
 
- protected:
-  DFlashWorkerImpl(const ParallelArgs& parallel_args,
-                   const torch::Device& device,
-                   const runtime::Options& options,
-                   const ParallelArgs& draft_parallel_args,
-                   const runtime::Options& draft_opts,
-                   int32_t (*configure_draft_config)(ModelArgs&,
-                                                     const runtime::Options&));
+  std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override;
 
-  static runtime::Options draft_options(const runtime::Options& options,
-                                        int32_t num_speculative_tokens = 0);
+ protected:
   std::optional<ForwardOutput> step_prefill(
       const LlmForwardInput& input) override;
 
@@ -93,6 +84,7 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   BatchForwardType draft_forward_type_ = BatchForwardType::CHUNKED_PREFILL;
   bool draft_needs_dummy_tokens_ = false;
   bool sample_from_anchor_ = false;
+  CachedDeviceIndices draft_logits_indices_;
 
  private:
   DecodeExpansionOptions prepare_for_draft() const;
@@ -100,12 +92,25 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
   bool prepare_parallel_draft_metadata(
       LlmForwardInput& query_input,
       const DecodeExpansionOptions& decode_options);
-
   std::optional<ForwardOutput> run_validate(
       const LlmForwardInput& input,
       const torch::Tensor& draft_token_ids,
       const torch::Tensor& draft_logits,
       LlmForwardInput& validate_input);
+
+  // Mirrors sampled tokens to rank 0 under schedule-overlap so every rank
+  // commits the same prefix. No-op for a single rank. Distinct from the
+  // base's two-argument maybe_broadcast_spec_tokens, which additionally
+  // covers orthogonal CP consensus.
+  void broadcast_committed_tokens(torch::Tensor& tokens);
+
+  // Per-row bases uploaded on prepare_stream_ for the device row builders.
+  struct RowBases {
+    torch::Tensor positions;
+    torch::Tensor kv_lens;
+    torch::Tensor block_tables;
+  };
+  RowBases upload_row_bases(const LlmForwardInput& input);
 
   std::vector<std::string> write_context_kv(
       const LlmForwardInput& input,
@@ -113,20 +118,65 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
       const torch::Tensor& positions_device,
       const torch::Tensor& new_cache_slots_device);
 
-  std::vector<std::string> write_target_context_to_cache(
+  // Device-side context-KV scatter behind rejection sampling; never waits on
+  // the host. The store-side bookkeeping rides the pinned handoff instead.
+  // Returns the request ids whose PD KV push failed (empty when no push).
+  // `bases`/`bases_ready` come from the caller's upload_row_bases so the
+  // scatter and the next-query launch share one upload per verify round.
+  std::vector<std::string> scatter_context_kv(
       const LlmForwardInput& input,
-      const SampleOutput& validate_output);
+      const SampleOutput& validate_output,
+      const RowBases& bases,
+      const StreamEventPtr& bases_ready);
 
  protected:
-  torch::Tensor anchor_token_ids(const LlmForwardInput& input) const;
+  // The query forward launched at the tail of the previous run_validate,
+  // consumed by the next step's run_decode_draft. Owned copies, at most one
+  // outstanding (same ownership rule as MTP's pending round).
+  struct PendingQueryRound {
+    OwnedBatchRows rows_;
+    ForwardOutput output;
+    // Keeps the no-sync query input's tensors alive until the stream work
+    // that reads them completes (CALLER_MANAGED completion).
+    LlmForwardInput prepared_input;
+    torch::Tensor anchors;  // last accepted token per sequence, device
+  };
+  std::optional<PendingQueryRound> pending_query_;
 
+  // Launches the next round's draft query from the device-side accepted
+  // block (build_next_query_rows_device) behind the context-KV scatter.
+  // Only the SEQUENCE layout under schedule overlap qualifies.
+  // Per-head query forward flags: DFlash samples in the query pass, DSpark
+  // needs logits only, DFlash2 also returns selected hidden states.
+  virtual bool query_forward_logits_only() const { return false; }
+  virtual bool query_forward_returns_selected_hidden() const { return false; }
+
+  // Runs this algorithm's query forward: the prelaunched output when a
+  // pending round matches the input batch, otherwise an inline no-sync draft
+  // forward with this head's output flags. `anchors` is always filled —
+  // moved from the pending round when prelaunched, gathered from the input
+  // on the inline path.
+  std::optional<ForwardOutput> launch_query_forward(
+      const LlmForwardInput& input,
+      torch::Tensor& anchors);
+
+  void launch_next_query(const LlmForwardInput& input,
+                         const SampleOutput& val_output,
+                         const RowBases& bases,
+                         const StreamEventPtr& bases_ready);
+  // Broadcast + sampled-output → proposal tail shared by both draft paths.
+  bool take_pending_query(const LlmForwardInput& input, PendingQueryRound& out);
+
+  // Shared by the DSpark/DFlash2 sampling sites.
+
+  // Block drafts (DFlash2/DSpark) condition their first step on the decode
+  // batch's first tokens.
+  torch::Tensor anchor_token_ids(const LlmForwardInput& input) const;
   int32_t mask_token_id_ = -1;
   int64_t expected_context_hidden_size_ = 0;
-  // Whether the target model owns recurrent (linear attention) layers.
+  // Whether the target model owns recurrent (linear attention) layers;
+  // fixed once the target finishes loading.
   bool target_is_hybrid_recurrent_ = false;
-
- private:
-  CachedDeviceIndices draft_logits_indices_;
 };
 
 }  // namespace xllm

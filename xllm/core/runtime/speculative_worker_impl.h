@@ -33,6 +33,17 @@ namespace xllm {
 
 class JsonObjectGrammarState;
 
+// Target-model options shared by the speculative algorithms: decode-order
+// schedule overlap stays off, the target is not a draft engine, and aux
+// hidden states are captured for the drafter.
+runtime::Options speculative_target_options(const runtime::Options& options);
+runtime::Options speculative_draft_options(const runtime::Options& options);
+
+class LLMWorkerImpl;
+
+// Expands an empty or idle-rank input into one dummy row so parallel
+// collectives still observe the batch shape (see prepare_input plumbing in
+// WorkerImpl::prepare_work_before_execute_on_stream_impl).
 void prepare_dummy_input(LlmForwardInput& input,
                          const ModelContext& context,
                          const torch::Device& device);
@@ -58,29 +69,6 @@ ForwardOutput finalize_verify_output(
     ForwardOutput target_output,
     SampleOutput val_output,
     const std::vector<JsonObjectGrammarState>& json_object_states);
-
-template <typename BaseWorker, typename Input, typename PrepareInput>
-class SpeculativeModelWorkerImpl final : public BaseWorker {
- public:
-  template <typename... Args>
-  explicit SpeculativeModelWorkerImpl(PrepareInput prepare_input,
-                                      Args&&... args)
-      : BaseWorker(std::forward<Args>(args)...),
-        prepare_input_(std::move(prepare_input)) {}
-
- protected:
-  using BaseWorker::prepare_model_input;
-
-  void prepare_model_input(Input& input) override { prepare_input_(input); }
-
-  bool owns_npu_parallel_input_prepare() const override { return false; }
-  bool can_prepare_without_compute_stream_wait() const override {
-    return false;
-  }
-
- private:
-  PrepareInput prepare_input_;
-};
 
 // Base class for all speculative decoding workers.
 // Provides common logic: target model management, step dispatch, and
@@ -180,6 +168,9 @@ class SpeculativeWorkerImpl : public WorkerImpl {
       const TargetInput& inputs) = 0;
   virtual std::optional<ForwardOutput> step_empty(
       const TargetInput& inputs) = 0;
+
+  void prepare_work_before_execute(const TargetInput& inputs,
+                                   TargetInput& processed_inputs) override;
 
   // prepare inputs for target model at Decode phase (validation).
   void prepare_validate_inputs(const TargetInput& inputs,

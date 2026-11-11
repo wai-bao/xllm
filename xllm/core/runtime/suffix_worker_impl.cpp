@@ -18,9 +18,9 @@ limitations under the License.
 #include <algorithm>
 
 #include "common/metrics.h"
-#include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/util/tensor_helper.h"
+#include "framework/sampling/sampling_params.h"
 #include "util/slice.h"
 #include "util/timer.h"
 
@@ -219,7 +219,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   SampleOutput val_output;
   {
     AUTO_COUNTER(speculative_execution_latency_seconds_validation);
-    val_output = run_rejection_sampling(input.sampling_params,
+    val_output = run_rejection_sampling(SamplingParameters{},
                                         draft_token_ids,
                                         {},
                                         target_output.logits,

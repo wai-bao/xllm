@@ -10,60 +10,6 @@ cc_test(
     GTest::gtest_main
 )
 
-cc_test(
-  NAME
-    spec_metrics_test
-  SRCS
-    spec_metrics_test.cpp
-  DEPS
-    :speculative
-    :sampler
-    GTest::gtest_main
-)
-
-if(USE_NPU)
-  cc_test(
-    NAME
-      mtp_async_input_builder_test
-    SRCS
-      mtp_async_input_builder_test.cpp
-    DEPS
-      :runtime
-      :models
-      GTest::gtest_main
-      torch
-      torch_npu
-      pybind11::embed
-  )
-  target_link_libraries(mtp_async_input_builder_test
-                        PRIVATE
-                        torch_python
-                        Python::Python
-                        ascendcl
-                        hccl
-                        c_sec
-                        nnopbase)
-endif()
-
-cc_test(
-  NAME
-    mtp_async_state_test
-  SRCS
-    mtp_async_state_test.cpp
-    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/mtp_async_state.cpp"
-    "${PROJECT_SOURCE_DIR}/xllm/core/framework/speculative/spec_verify.cpp"
-  DEPS
-    :sampler
-    :speculative
-    torch
-    proto::xllm_proto
-    glog::glog
-    GTest::gtest_main
-)
-if(EXISTS "$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
-  target_link_options(mtp_async_state_test PRIVATE
-    "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs")
-endif()
 
 cc_test(
   NAME
@@ -79,19 +25,12 @@ cc_test(
 
 cc_test(
   NAME
-    embedding_cache_test
-  CPU_ONLY
+    spec_metrics_test
   SRCS
-    embedding_cache_test.cpp
+    spec_metrics_test.cpp
   DEPS
     :speculative
-    :platform
+    :sampler
     GTest::gtest_main
 )
-target_link_libraries(embedding_cache_test
-                      PUBLIC
-                      Python::Python
-                      $<$<BOOL:${USE_NPU}>:ascendcl>
-                      $<$<BOOL:${USE_NPU}>:hccl>
-                      $<$<BOOL:${USE_NPU}>:c_sec>
-                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+

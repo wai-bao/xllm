@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <absl/strings/str_format.h>
 #include <absl/time/clock.h>
+#include <folly/futures/Future.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
@@ -195,12 +196,10 @@ bool LLMEngine::init_model(MasterStatus master_status,
   LOG(INFO) << "Initializing model from: " << model_path;
 
   args_ = model_loader->model_args();
-  ModelRegistry::configure_mtp_args(
-      args_,
-      options_.speculative_algorithm(),
-      options_.is_draft_engine(),
-      ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl()));
+  maybe_load_mtp_pair_draft(options_.is_draft_engine(),
+                            options_.speculative_algorithm(),
+                            options_.num_speculative_tokens(),
+                            args_);
   if (!options_.is_draft_engine() &&
       SpeculativeConfig::is_block_diffusion_algorithm(
           options_.speculative_algorithm())) {
@@ -561,6 +560,12 @@ ForwardOutput LLMEngine::step(BatchGroup& batch) {
   bool is_graph_warmup = false;
   forward_input_factory_->create_inputs(
       batch, args_, forward_inputs, is_graph_warmup);
+  // Released embedding ids ride the next forward input; the pool already
+  // drops reused ids at the release-queue choke point.
+  for (uint32_t dp_rank = 0; dp_rank < forward_inputs.size(); ++dp_rank) {
+    forward_inputs[dp_rank].request_state.released_embedding_ids =
+        kv_cache_manager_->take_released_embedding_ids(dp_rank);
+  }
   if (eplb_controller_ != nullptr) {
     eplb_controller_->on_step_dispatched(forward_inputs, is_graph_warmup);
   }
@@ -620,6 +625,41 @@ ForwardOutput LLMEngine::step(BatchGroup& batch) {
 
   COUNTER_ADD(engine_latency_seconds, timer.elapsed_seconds());
   return {};
+}
+
+void Engine::flush_released_request_state(
+    KVCacheManager& manager,
+    const std::vector<std::shared_ptr<WorkerClient>>& workers,
+    int32_t workers_per_dp) {
+  if (workers.empty()) {
+    return;
+  }
+  CHECK_GT(workers_per_dp, 0);
+  CHECK_EQ(workers.size() % workers_per_dp, 0);
+  std::vector<folly::SemiFuture<bool>> futures;
+  futures.reserve(workers.size());
+  const int32_t dp_size = static_cast<int32_t>(workers.size() / workers_per_dp);
+  for (int32_t dp_rank = 0; dp_rank < dp_size; ++dp_rank) {
+    const auto ids = manager.take_released_embedding_ids(dp_rank);
+    if (ids.empty()) {
+      continue;
+    }
+    const int32_t begin = dp_rank * workers_per_dp;
+    for (int32_t rank = begin; rank < begin + workers_per_dp; ++rank) {
+      futures.emplace_back(
+          workers[rank]->release_idle_request_state_async(ids));
+    }
+  }
+  auto results = folly::collectAll(futures).get();
+  for (auto& result : results) {
+    CHECK(result.hasValue() && result.value())
+        << "Failed to release idle worker request state";
+  }
+}
+
+void LLMEngine::flush_released_requests() {
+  flush_released_request_state(
+      *kv_cache_manager_, worker_clients_, dp_local_size_);
 }
 
 std::vector<RawForwardOutput> LLMEngine::collect_step_outputs(

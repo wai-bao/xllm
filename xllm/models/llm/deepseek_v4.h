@@ -49,6 +49,7 @@ limitations under the License.
 #include "layers/npu/deepseek_v4_rotary_embedding.h"
 #include "layers/npu_torch/deepseek_v4_cp_context.h"
 #include "llm_model_base.h"
+#include "models/llm/deepseek_v4_registry.h"
 
 namespace xllm {
 

@@ -447,6 +447,12 @@ void MooncakeKVTransferDefault::register_kv_cache(
 
   register_kv_cache_impl(kv_caches, ssm_checkpoint_stride);
   if (pending_registration_context_.has_value()) {
+    // configure_cache_layout cannot know whether this object already published
+    // MAIN (colocated draft vs independent engine); align the namespace with
+    // the registration order resolved above.
+    pending_registration_context_->cache_namespace =
+        is_spec_draft ? CacheNamespace::SPEC_DRAFT
+                      : pending_registration_context_->cache_namespace;
     publish_cache_layout(tensor_manifests, *pending_registration_context_);
     pending_registration_context_.reset();
   }
