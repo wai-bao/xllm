@@ -21,8 +21,9 @@ limitations under the License.
 #include <vector>
 
 #include "causal_lm.h"
+#include "core/framework/model_loader/model_loader.h"
+#include "core/framework/model_loader/model_weight_loader.h"
 #include "core/framework/quantization/quant_args.h"
-#include "core/framework/state_dict/state_dict.h"
 #include "core/kv_cache/storage/kv_cache.h"
 #include "model_args.h"
 #include "model_params_view.h"
@@ -41,8 +42,10 @@ class CausalVLM : public CausalLM {
 template <typename ModelType>
 class CausalVLMImpl : public CausalVLM {
  public:
-  CausalVLMImpl(ModelType model, const torch::TensorOptions& options)
-      : model_(std::move(model)), options_(options) {}
+  CausalVLMImpl(ModelType model, const ModelContext& context)
+      : model_(std::move(model)), options_(context.get_tensor_options()) {
+    set_lm_head(model_->make_lm_head(context));
+  }
 
   MMDict encode(const ModelParamsView& parameters) override {
     return model_->get_multimodal_embeddings(parameters);
@@ -86,35 +89,15 @@ class CausalVLMImpl : public CausalVLM {
     }
   }
 
-  torch::Tensor logits(const torch::Tensor& hidden_states,
-                       const torch::Tensor& seleted_idxes) override {
-    return model_->logits(hidden_states, seleted_idxes);
-  }
-
-  torch::Tensor logits(const torch::Tensor& hidden_states,
-                       const torch::Tensor& seleted_idxes,
-                       torch::Tensor& out_hidden) override {
-    if constexpr (detail::has_logits_with_hidden<ModelType>::value) {
-      return model_->logits(hidden_states, seleted_idxes, out_hidden);
-    } else {
-      return CausalLM::logits(hidden_states, seleted_idxes, out_hidden);
-    }
-  }
-
   void load_model(std::unique_ptr<ModelLoader> loader) override {
-    model_->load_model(std::move(loader));
+    load_model_weights(*model_,
+                       loader->get_state_dicts(),
+                       native_lm_head<layer::LmHead>(),
+                       ModelType::ContainedType::kLanguageWeightPrefix);
   }
 
   void prepare_expert_weight(int32_t, const std::vector<int32_t>&) override {}
   void update_expert_weight(int32_t) override {}
-
-  layer::LmHead get_lm_head() override {
-    if constexpr (detail::has_get_lm_head<ModelType>::value) {
-      return model_->get_lm_head();
-    } else {
-      return CausalLM::get_lm_head();
-    }
-  }
 
   layer::WordEmbedding get_word_embedding() override {
     if constexpr (detail::has_get_word_embedding<ModelType>::value) {

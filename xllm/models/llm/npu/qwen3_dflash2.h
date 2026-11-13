@@ -385,12 +385,14 @@ class DFlash2Qwen3ForCausalLMImpl final
   explicit DFlash2Qwen3ForCausalLMImpl(const ModelContext& context)
       : Base(context, /*share_lm_head=*/true) {}
 
-  void load_model(std::unique_ptr<ModelLoader> loader,
-                  std::string prefix = "") override {
-    for (const std::unique_ptr<StateDict>& state_dict :
-         loader->get_state_dicts()) {
-      model_->load_state_dict(state_dict->get_dict_with_prefix(prefix));
-    }
+  static constexpr const char* kWeightPrefix = "";
+
+  void load_body_weights(const StateDict& state_dict,
+                         const std::string& prefix) override {
+    model_->load_state_dict(state_dict.get_dict_with_prefix(prefix));
+  }
+
+  void verify_model_weights(const std::string&) override {
     model_->verify_loaded_weights();
     model_->finalize_loaded_weights();
   }

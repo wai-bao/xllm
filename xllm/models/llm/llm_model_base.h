@@ -154,59 +154,16 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
                                   bool share_lm_head = false)
       : LlmForCausalLMImplBase(context, LlmModelType(context), share_lm_head) {}
 
-  layer::LmHead get_lm_head() { return lm_head_; }
-
-  torch::Tensor logits(const torch::Tensor& hidden_states,
-                       const torch::Tensor& selected_idxes) {
-    auto selected = selected_idxes.defined()
-                        ? hidden_states.index_select(/*dim=*/0, selected_idxes)
-                        : hidden_states;
-    return lm_head_(selected);
+  layer::LmHead make_lm_head(const ModelContext& context) const {
+    if (!allocate_lm_head_ || context.get_model_args().embedding_mode()) {
+      return nullptr;
+    }
+    layer::LmHead lm_head(context);
+    lm_head->eval();
+    return lm_head;
   }
 
-  torch::Tensor logits(const torch::Tensor& hidden_states,
-                       const torch::Tensor& selected_idxes,
-                       torch::Tensor& out_hidden) {
-    if (selected_idxes.defined()) {
-      const auto idxes = selected_idxes.to(
-          torch::dtype(torch::kLong).device(hidden_states.device()));
-      out_hidden = hidden_states.index_select(/*dim=*/0, idxes);
-    } else {
-      out_hidden = hidden_states;
-    }
-    return logits(out_hidden, torch::Tensor());
-  }
-
-  void tie_word_embeddings(const layer::WordEmbedding& embedding) {
-    if (!tie_word_embeddings_ || lm_head_.is_empty() || embedding.is_empty() ||
-        !embedding->is_weight_loaded()) {
-      return;
-    }
-    auto head_weight = lm_head_->weight();
-    auto embedding_weight = embedding->weight();
-    // Tensor-parallel head and embedding weights may use different shard axes.
-    if (!head_weight.defined() || !embedding_weight.defined() ||
-        head_weight.sizes() != embedding_weight.sizes() ||
-        head_weight.scalar_type() != embedding_weight.scalar_type()) {
-      return;
-    }
-    lm_head_->tie_weights(embedding_weight);
-  }
-
-  bool has_own_lm_head() const {
-    return !lm_head_.is_empty() && lm_head_->is_weight_loaded();
-  }
-
-  void share_lm_head(layer::LmHead target_head) {
-    if (embedding_mode_ || has_own_lm_head()) {
-      return;
-    }
-    if (lm_head_.is_empty()) {
-      lm_head_ = register_module("lm_head", std::move(target_head));
-    } else {
-      lm_head_ = replace_module("lm_head", std::move(target_head));
-    }
-  }
+  bool tie_word_embeddings() const { return tie_word_embeddings_; }
 
   torch::Tensor get_input_embeddings(torch::Tensor input_ids) {
     return get_word_embedding()(input_ids);
@@ -239,21 +196,33 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
     return model_->forward(tokens, positions, kv_caches, input_params);
   }
 
-  virtual void load_model(
-      std::unique_ptr<ModelLoader> loader,
-      std::string prefix = "model." /*llm model weight prefix*/) {
-    this->load_lm_head(loader, prefix);
-    for (const auto& state_dict : loader->get_state_dicts()) {
-      // The same model_type may come from checkpoints with different top-level
-      // weight prefixes. Try these candidate prefixes in order to improve
-      // compatibility across such variants.
-      model_->load_state_dict(state_dict->get_dict_with_prefix(
-          std::vector<std::string>{"model.language_model.",
-                                   "language_model.model.",
-                                   prefix,
-                                   "model.",
-                                   ""}));
-    }
+  static constexpr const char* kWeightPrefix = "model.";
+
+  virtual void load_body_weights(const StateDict& state_dict,
+                                 const std::string& prefix) {
+    const std::vector<std::string> prefixes{
+        "model.language_model.", "language_model.model.", prefix, "model.", ""};
+    model_->load_state_dict(state_dict.get_dict_with_prefix(prefixes));
+  }
+
+  virtual void verify_model_weights(const std::string&) {}
+
+  virtual StateDict lm_head_weights(const StateDict& state_dict,
+                                    const std::string& model_prefix) {
+    const std::vector<std::string> prefixes =
+        tie_word_embeddings_
+            ? std::vector<std::string>{model_prefix + "embed_tokens.",
+                                       "model.embed_tokens.",
+                                       "embed_tokens.",
+                                       "embed."}
+            : std::vector<std::string>{"lm_head.",
+                                       "model.lm_head.",
+                                       "model.head.",
+                                       "head.",
+                                       model_prefix + "lm_head.",
+                                       model_prefix + "head.",
+                                       model_prefix};
+    return state_dict.get_dict_with_prefix(prefixes);
   }
 
   virtual void prepare_expert_weight(int32_t, const std::vector<int32_t>&) {}
@@ -271,47 +240,13 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
   LlmForCausalLMImplBase(const ModelContext& context,
                          LlmModelType model,
                          bool share_lm_head = false)
-      : model_(register_module("model", std::move(model))) {
-    const auto& args = context.get_model_args();
-    tie_word_embeddings_ = args.tie_word_embeddings();
-    embedding_mode_ = args.embedding_mode();
-    if (!embedding_mode_ && !share_lm_head) {
-      lm_head_ = register_module("lm_head", layer::LmHead(context));
-    }
-  }
-
-  void load_lm_head(const std::unique_ptr<ModelLoader>& loader,
-                    const std::string& model_prefix = "model.") {
-    if (lm_head_.is_empty()) {
-      return;
-    }
-    for (const auto& state_dict : loader->get_state_dicts()) {
-      load_lm_head(*state_dict, model_prefix);
-    }
-  }
-
-  virtual void load_lm_head(const StateDict& state_dict,
-                            const std::string& model_prefix) {
-    const std::vector<std::string> prefixes =
-        tie_word_embeddings_
-            ? std::vector<std::string>{model_prefix + "embed_tokens.",
-                                       "model.embed_tokens.",
-                                       "embed_tokens.",
-                                       "embed."}
-            : std::vector<std::string>{"lm_head.",
-                                       "model.lm_head.",
-                                       "model.head.",
-                                       "head.",
-                                       model_prefix + "lm_head.",
-                                       model_prefix + "head.",
-                                       model_prefix};
-    lm_head_->load_state_dict(state_dict.get_dict_with_prefix(prefixes));
-  }
+      : model_(register_module(/*name=*/"model", std::move(model))),
+        tie_word_embeddings_(context.get_model_args().tie_word_embeddings()),
+        allocate_lm_head_(!share_lm_head) {}
 
   LlmModelType model_{nullptr};
-  layer::LmHead lm_head_{nullptr};
   bool tie_word_embeddings_ = false;
-  bool embedding_mode_ = false;
+  bool allocate_lm_head_;
 };
 
 }  // namespace xllm

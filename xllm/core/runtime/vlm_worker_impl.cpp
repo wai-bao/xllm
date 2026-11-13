@@ -135,31 +135,22 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   };
 
   const auto& sampling_params = input.sampling_params;
-  ModelOutput model_output;
+  ModelParamsView params(input.input_params);
+  auto model_output = model_executor_->forward(
+      input.token_ids, input.positions, kv_caches_, params);
   torch::Tensor logits;
-  torch::Tensor lm_head_input_indices;
+  torch::Tensor logits_indices;
   torch::Tensor selected_hidden_from_lm_head;
-  {
-    ModelParamsView params(input.input_params);
-    model_output = model_executor_->forward(
-        input.token_ids, input.positions, kv_caches_, params);
-    if (sampling_params.num_sample_seqs() > 0) {
-      lm_head_input_indices =
-          remap_logits_indices(sampling_params.logits_indices(),
-                               params.parallel,
-                               model_output.hidden_states);
-    }
-  }
-
-  if (sampling_params.num_sample_seqs() > 0) {
-    if (options_.enable_speculative_decode()) {
-      logits = model_->logits(model_output.hidden_states,
-                              lm_head_input_indices,
-                              selected_hidden_from_lm_head);
-    } else {
-      logits =
-          model_->logits(model_output.hidden_states, lm_head_input_indices);
-    }
+  const bool should_compute_logits = sampling_params.num_sample_seqs() > 0;
+  if (should_compute_logits) {
+    logits_indices = remap_logits_indices(sampling_params.logits_indices(),
+                                          params.parallel,
+                                          model_output.hidden_states);
+    logits = model_->logits_processor(model_output.hidden_states,
+                                      logits_indices,
+                                      options_.enable_speculative_decode()
+                                          ? &selected_hidden_from_lm_head
+                                          : nullptr);
   }
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
@@ -174,7 +165,7 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
   }
 
   ForwardOutput output;
-  if (sampling_params.num_sample_seqs() > 0) {
+  if (should_compute_logits) {
     output.logprobs = sampling_params.logprobs();
     output.max_top_logprobs = sampling_params.max_top_logprobs();
     if (!input.skip_sampling_for_logits_only) {
@@ -195,7 +186,7 @@ std::optional<ForwardOutput> VLMWorkerImpl::step_internal(
         !options_.is_draft_engine();
     output_spec_hidden_states(output.sample_output,
                               model_output,
-                              lm_head_input_indices,
+                              logits_indices,
                               selected_hidden_from_lm_head,
                               is_target_prefill,
                               /*cp_enabled=*/options_.cp_size() > 1);

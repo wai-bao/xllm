@@ -236,10 +236,7 @@ class Glm52ForCausalLMImpl : public LlmForCausalLMImplBase<Glm52Model> {
     model_->prepare_graph_forward_metadata(state, positions, input_params);
   }
 
-  void load_model(
-      std::unique_ptr<ModelLoader> loader,
-      std::string prefix = "model." /*llm model weight prefix*/) override {
-    LlmForCausalLMImplBase<Glm52Model>::load_model(std::move(loader), prefix);
+  void verify_model_weights(const std::string&) override {
     model_->verify_loaded_weights();
   }
 };

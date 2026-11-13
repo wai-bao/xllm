@@ -233,13 +233,12 @@ class MiMoMtpForCausalLMImpl final
       : LlmForCausalLMImplBase<MiMoMtpModel>(context,
                                              /*share_lm_head=*/true) {}
 
-  void load_model(
-      std::unique_ptr<ModelLoader> loader,
-      std::string prefix = "model." /*llm model weight prefix*/) override {
-    // Only load MTP model weights, skip lm_head (shared with target model)
-    for (const auto& state_dict : loader->get_state_dicts()) {
-      model_->load_state_dict(state_dict->get_dict_with_prefix(prefix));
-    }
+  void load_body_weights(const StateDict& state_dict,
+                         const std::string& prefix) override {
+    model_->load_state_dict(state_dict.get_dict_with_prefix(prefix));
+  }
+
+  void verify_model_weights(const std::string&) override {
     model_->verify_loaded_weights();
   }
 };

@@ -582,22 +582,22 @@ class OxygenvlmForConditionalGenerationImpl : public torch::nn::Module {
     return language_model_->forward(tokens, positions, kv_caches, input_params);
   }
 
-  torch::Tensor logits(const torch::Tensor& hidden_states,
-                       const torch::Tensor& seleted_idxes) {
-    return language_model_->logits(hidden_states, seleted_idxes);
+  void load_vision_weights(const StateDict& state_dict) {
+    constexpr char kVisionWeightPrefix[] = "model.visual.";
+    visual_->load_state_dict(
+        state_dict.get_dict_with_prefix(kVisionWeightPrefix));
   }
 
-  void load_model(std::unique_ptr<ModelLoader> loader) {
-    for (const auto& state_dict : loader->get_state_dicts()) {
-      visual_->load_state_dict(
-          state_dict->get_dict_with_prefix("model.visual."));
-    }
-    if (!model_args_.encoder_embedding_mode()) {
-      language_model_->load_model(std::move(loader), "model.language_model.");
-    }
+  auto* language_model_for_loading() {
+    return model_args_.encoder_embedding_mode() ? nullptr
+                                                : language_model_.get();
   }
 
-  layer::LmHead get_lm_head() { return language_model_->get_lm_head(); }
+  static constexpr const char* kLanguageWeightPrefix = "model.language_model.";
+
+  layer::LmHead make_lm_head(const ModelContext& context) const {
+    return language_model_->make_lm_head(context);
+  }
   layer::WordEmbedding get_word_embedding() {
     return language_model_->get_word_embedding();
   }

@@ -35,10 +35,7 @@ class Glm5ForCausalLMImpl : public LlmForCausalLMImplBase<Glm5Model> {
   Glm5ForCausalLMImpl(const ModelContext& context)
       : LlmForCausalLMImplBase<Glm5Model>(context) {}
 
-  void load_model(
-      std::unique_ptr<ModelLoader> loader,
-      std::string prefix = "model." /*llm model weight prefix*/) override {
-    LlmForCausalLMImplBase<Glm5Model>::load_model(std::move(loader), prefix);
+  void verify_model_weights(const std::string&) override {
     model_->verify_loaded_weights();
   }
 };

@@ -24,9 +24,9 @@ limitations under the License.
 #include <c10/core/Device.h>
 #include <torch/torch.h>
 
+#include <functional>
 #include <memory>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -35,8 +35,9 @@ limitations under the License.
 #include "core/framework/model/model_output.h"
 #include "core/framework/model/model_params_view.h"
 #include "core/framework/model/model_traits.h"
+#include "core/framework/model_loader/model_loader.h"
+#include "core/framework/model_loader/model_weight_loader.h"
 #include "core/framework/quantization/quant_args.h"
-#include "core/framework/state_dict/state_dict.h"
 #include "core/kv_cache/storage/kv_cache.h"
 #include "core/layers/common/lm_head.h"
 #include "core/layers/common/word_embedding.h"
@@ -60,7 +61,23 @@ struct DFlash2CandidateOutput {
 };
 
 class CausalLM : public torch::nn::Module, public Model {
+  using LmHead = std::function<torch::Tensor(const torch::Tensor&)>;
+
  public:
+  torch::Tensor logits_processor(const torch::Tensor& hidden_states,
+                                 const torch::Tensor& logits_indices,
+                                 torch::Tensor* output_hidden_states) const {
+    if (output_hidden_states == nullptr) {
+      return lm_head_(hidden_states.index_select(/*dim=*/0, logits_indices));
+    }
+    const auto indices = logits_indices.to(
+        torch::dtype(torch::kLong).device(hidden_states.device()));
+    auto sample_hidden_states = hidden_states.index_select(/*dim=*/0, indices);
+    auto logits = lm_head_(sample_hidden_states);
+    *output_hidden_states = std::move(sample_hidden_states);
+    return logits;
+  }
+
   ~CausalLM() override = default;
 
   // An empty key keeps the runtime's default executor selection.
@@ -100,30 +117,16 @@ class CausalLM : public torch::nn::Module, public Model {
     return hidden_states;
   }
 
-  // hidden_states: [num_tokens, hidden_size]
-  // seleted_idxes: [num_tokens]
-  // returns: [num_tokens, vocab_size]
-  virtual torch::Tensor logits(const torch::Tensor& hidden_states,
-                               const torch::Tensor& seleted_idxes) = 0;
-
-  // hidden_states: [num_tokens, hidden_size]
-  // seleted_idxes: [num_tokens]
-  // out_hidden: [num_selected_tokens, hidden_size]
-  // returns: [num_selected_tokens, vocab_size]
-  virtual torch::Tensor logits(const torch::Tensor& hidden_states,
-                               const torch::Tensor& seleted_idxes,
-                               torch::Tensor& out_hidden) {
-    if (seleted_idxes.defined()) {
-      const auto idxes = seleted_idxes.to(
-          torch::dtype(torch::kLong).device(hidden_states.device()));
-      out_hidden = hidden_states.index_select(/*dim=*/0, idxes);
-    } else {
-      out_hidden = hidden_states;
+  virtual void share_lm_head(CausalLM& target_model) {
+    auto* lm_head = lm_head_.target<layer::LmHead>();
+    if (lm_head != nullptr &&
+        (lm_head->is_empty() || !(*lm_head)->is_weight_loaded())) {
+      const auto* target_head = target_model.lm_head_.target<layer::LmHead>();
+      CHECK(target_head != nullptr && !target_head->is_empty())
+          << "Target model has no native LM head";
+      *lm_head = *target_head;
     }
-    return logits(hidden_states, seleted_idxes);
   }
-
-  virtual void share_lm_head(CausalLM&) {}
   virtual void share_embed_tokens(CausalLM&) {}
 
   virtual void prepare_expert_weight(
@@ -172,13 +175,29 @@ class CausalLM : public torch::nn::Module, public Model {
     NOT_IMPLEMENTED();
     return {};
   }
+
+ protected:
+  void set_lm_head(LmHead lm_head) { lm_head_ = std::move(lm_head); }
+
+  template <typename Head>
+  Head& native_lm_head() {
+    return *lm_head_.target<Head>();
+  }
+
+ private:
+  LmHead lm_head_;
 };
 
 template <typename ModelType>
 class CausalLMImpl : public CausalLM {
+  using ModelLmHead = decltype(std::declval<ModelType&>()->make_lm_head(
+      std::declval<const ModelContext&>()));
+
  public:
-  CausalLMImpl(ModelType model, const torch::TensorOptions& options)
-      : model_(std::move(model)), options_(options) {}
+  CausalLMImpl(ModelType model, const ModelContext& context)
+      : model_(std::move(model)), options_(context.get_tensor_options()) {
+    set_lm_head(model_->make_lm_head(context));
+  }
 
   ModelOutput forward(const torch::Tensor& tokens,
                       const torch::Tensor& positions,
@@ -236,26 +255,33 @@ class CausalLMImpl : public CausalLM {
     return model_->pooler(hidden_states, seleted_idxes);
   }
 
-  torch::Tensor logits(const torch::Tensor& hidden_states,
-                       const torch::Tensor& seleted_idxes) override {
-    return model_->logits(hidden_states, seleted_idxes);
-  }
-
-  torch::Tensor logits(const torch::Tensor& hidden_states,
-                       const torch::Tensor& seleted_idxes,
-                       torch::Tensor& out_hidden) override {
-    if constexpr (detail::has_logits_with_hidden<ModelType>::value) {
-      return model_->logits(hidden_states, seleted_idxes, out_hidden);
-    } else {
-      return CausalLM::logits(hidden_states, seleted_idxes, out_hidden);
-    }
-  }
-
   void load_model(std::unique_ptr<ModelLoader> loader) override {
-    model_->load_model(std::move(loader));
-    if constexpr (detail::has_tie_word_embeddings<ModelType>::value &&
-                  detail::has_get_word_embedding<ModelType>::value) {
-      model_->tie_word_embeddings(model_->get_word_embedding());
+    auto& lm_head = native_lm_head<ModelLmHead>();
+    load_model_weights(*model_,
+                       loader->get_state_dicts(),
+                       lm_head,
+                       ModelType::ContainedType::kWeightPrefix);
+    if constexpr (requires {
+                    model_->tie_word_embeddings();
+                    lm_head->tie_weights(
+                        model_->get_word_embedding()->weight());
+                  }) {
+      if (!model_->tie_word_embeddings() || lm_head.is_empty()) {
+        return;
+      }
+      auto embedding = model_->get_word_embedding();
+      if (embedding.is_empty() || !embedding->is_weight_loaded()) {
+        return;
+      }
+      auto head_weight = lm_head->weight();
+      auto embedding_weight = embedding->weight();
+      // Tensor-parallel head and embedding weights can use different shard
+      // axes.
+      if (head_weight.defined() && embedding_weight.defined() &&
+          head_weight.sizes() == embedding_weight.sizes() &&
+          head_weight.scalar_type() == embedding_weight.scalar_type()) {
+        lm_head->tie_weights(embedding_weight);
+      }
     }
   }
 
@@ -355,25 +381,11 @@ class CausalLMImpl : public CausalLM {
     }
   }
 
-  layer::LmHead get_lm_head() override {
-    if constexpr (detail::has_get_lm_head<ModelType>::value) {
-      return model_->get_lm_head();
-    } else {
-      return CausalLM::get_lm_head();
-    }
-  }
-
   layer::WordEmbedding get_word_embedding() override {
     if constexpr (detail::has_get_word_embedding<ModelType>::value) {
       return model_->get_word_embedding();
     } else {
       return CausalLM::get_word_embedding();
-    }
-  }
-
-  void share_lm_head(CausalLM& target_model) override {
-    if constexpr (detail::has_own_lm_head<ModelType>::value) {
-      model_->share_lm_head(target_model.get_lm_head());
     }
   }
 

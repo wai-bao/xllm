@@ -349,20 +349,14 @@ class DeepseekV4ForCausalLMImpl final
         state, positions, input_params);
   }
 
-  void load_model(std::unique_ptr<ModelLoader> loader,
-                  std::string prefix = "model.") override {
-    for (const std::unique_ptr<StateDict>& state_dict :
-         loader->get_state_dicts()) {
-      std::unordered_map<std::string, torch::Tensor> remapped_dict;
-      for (auto it = state_dict->begin(); it != state_dict->end(); ++it) {
-        remapped_dict[detail::normalize_model_parameter_name(
-            it->first, prefix)] = it->second;
-      }
+  StateDict normalize_checkpoint(const StateDict& state_dict,
+                                 const std::string& prefix) {
+    return detail::normalize_model_state_dict(state_dict, prefix);
+  }
 
-      StateDict remapped_state_dict(remapped_dict);
-      load_lm_head(remapped_state_dict, "");
-      model_->load_state_dict(remapped_state_dict);
-    }
+  void load_body_weights(const StateDict& state_dict,
+                         const std::string&) override {
+    model_->load_state_dict(state_dict);
   }
 };
 TORCH_MODULE(DeepseekV4ForCausalLM);
