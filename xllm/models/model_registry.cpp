@@ -751,7 +751,7 @@ std::unique_ptr<CausalLM> create_llm_model(const ModelContext& context) {
   return nullptr;
 }
 
-std::unique_ptr<CausalVLM> create_vlm_model(const ModelContext& context) {
+std::unique_ptr<CausalLM> create_vlm_model(const ModelContext& context) {
   if (!validate_implementation_selection(context)) {
     return nullptr;
   }

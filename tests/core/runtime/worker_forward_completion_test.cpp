@@ -65,7 +65,7 @@ struct ForwardObservation {
   bool weights_loaded = false;
 };
 
-class CompletionTestModel final : public CausalVLM {
+class CompletionTestModel final : public CausalLM {
  public:
   CompletionTestModel(const ModelContext& context,
                       std::shared_ptr<ForwardObservation> observation)
@@ -102,12 +102,6 @@ class CompletionTestModel final : public CausalVLM {
   torch::Device device() const override { return options_.device(); }
 
   const torch::TensorOptions& options() const override { return options_; }
-
-  void prepare_expert_weight(
-      int32_t /*layer_id*/,
-      const std::vector<int32_t>& /*expert_ids*/) override {}
-
-  void update_expert_weight(int32_t /*layer_id*/) override {}
 
   MMDict encode(const ModelParamsView& /*parameters*/) override { return {}; }
 

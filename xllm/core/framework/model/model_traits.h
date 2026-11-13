@@ -22,7 +22,20 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+// The macro must expand to a real virtual override: a member function
+// template would hide the base virtual and silently dispatch base defaults
+// through base pointers.
+#define FORWARD_IF_SUPPORTED(ModelType, Base, trait, hook, ret, sig, args) \
+  ret hook sig override {                                                  \
+    if constexpr (trait<ModelType>::value) {                               \
+      return model_->hook args;                                            \
+    } else {                                                               \
+      return Base::hook args;                                              \
+    }                                                                      \
+  }
+
 namespace xllm {
+
 class ModelParamsView;
 struct ModelGraphMetadataState;
 class KVCache;
@@ -33,6 +46,7 @@ class WordEmbedding;
 }  // namespace layer
 
 namespace detail {
+
 template <typename T, typename = void>
 struct has_get_lm_head : std::false_type {};
 
@@ -224,6 +238,44 @@ struct has_dspark_markov_bias<
     T,
     std::void_t<decltype(std::declval<T>()->dspark_markov_bias(
         std::declval<const torch::Tensor&>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_get_multimodal_embeddings : std::false_type {};
+
+template <typename T>
+struct has_get_multimodal_embeddings<
+    T,
+    std::void_t<decltype(std::declval<T>()->get_multimodal_embeddings(
+        std::declval<const ModelParamsView&>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_vlm_get_input_embeddings : std::false_type {};
+
+template <typename T>
+struct has_vlm_get_input_embeddings<
+    T,
+    std::void_t<decltype(std::declval<T>()->get_input_embeddings(
+        std::declval<const torch::Tensor&>(),
+        std::declval<const ModelParamsView&>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_prepare_expert_weight : std::false_type {};
+
+template <typename T>
+struct has_prepare_expert_weight<
+    T,
+    std::void_t<decltype(std::declval<T>()->prepare_expert_weight(
+        std::declval<int32_t>(),
+        std::declval<const std::vector<int32_t>&>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_update_expert_weight : std::false_type {};
+
+template <typename T>
+struct has_update_expert_weight<
+    T,
+    std::void_t<decltype(std::declval<T>()->update_expert_weight(
+        std::declval<int32_t>()))>> : std::true_type {};
 
 }  // namespace detail
 }  // namespace xllm

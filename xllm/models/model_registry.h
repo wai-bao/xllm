@@ -24,7 +24,6 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/causal_lm.h"
-#include "core/framework/model/causal_vlm.h"
 #include "core/framework/model/dit_model.h"
 #include "core/framework/model_context/dit_model_context.h"
 #include "core/framework/model_context/model_context.h"
@@ -48,7 +47,7 @@ using CausalLMFactory =
     std::function<std::unique_ptr<CausalLM>(const ModelContext& context)>;
 
 using CausalVLMFactory =
-    std::function<std::unique_ptr<CausalVLM>(const ModelContext& context)>;
+    std::function<std::unique_ptr<CausalLM>(const ModelContext& context)>;
 
 using DiTModelFactory =
     std::function<std::unique_ptr<DiTModel>(const DiTModelContext& context)>;
@@ -193,7 +192,6 @@ class ModelRegistry {
 
   static void register_dcp_capability(const std::string& name);
   static bool supports_dcp(const std::string& name);
-
   static void register_mtp_shared_weight_owner(const std::string& name);
 
   static void register_mtp_args_adapter(const std::string& name,
@@ -290,7 +288,7 @@ void resolve_npu_kernel_backend(Options* options,
 
 std::unique_ptr<CausalLM> create_llm_model(const ModelContext& context);
 
-std::unique_ptr<CausalVLM> create_vlm_model(const ModelContext& context);
+std::unique_ptr<CausalLM> create_vlm_model(const ModelContext& context);
 
 std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
 
@@ -339,17 +337,17 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
       Implementation,                                                       \
       ModelClass __VA_OPT__(, ) __VA_ARGS__)
 
-#define REGISTER_CAUSAL_VLM_MODEL_WITH_VARNAME(                     \
-    VarName, ModelType, ModelClass, ...)                            \
-  const bool VarName##_registered = []() {                          \
-    ::xllm::ModelRegistry::register_causalvlm_factory(              \
-        #ModelType, [](const ::xllm::ModelContext& context) {       \
-          ModelClass model(context);                                \
-          model->eval();                                            \
-          return std::make_unique<xllm::CausalVLMImpl<ModelClass>>( \
-              std::move(model), context.get_tensor_options());      \
-        } __VA_OPT__(, ) __VA_ARGS__);                              \
-    return true;                                                    \
+#define REGISTER_CAUSAL_VLM_MODEL_WITH_VARNAME(                    \
+    VarName, ModelType, ModelClass, ...)                           \
+  const bool VarName##_registered = []() {                         \
+    ::xllm::ModelRegistry::register_causalvlm_factory(             \
+        #ModelType, [](const ::xllm::ModelContext& context) {      \
+          ModelClass model(context);                               \
+          model->eval();                                           \
+          return std::make_unique<xllm::CausalLMImpl<ModelClass>>( \
+              std::move(model), context.get_tensor_options());     \
+        } __VA_OPT__(, ) __VA_ARGS__);                             \
+    return true;                                                   \
   }()
 
 #define REGISTER_CAUSAL_VLM_MODEL(ModelType, ModelClass, ...) \

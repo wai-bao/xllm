@@ -40,8 +40,8 @@ CausalLMFactory unused_lm_factory() {
   };
 }
 
-CausalVLMFactory unused_vlm_factory() {
-  return [](const ModelContext& /*context*/) -> std::unique_ptr<CausalVLM> {
+CausalVLMFactory unused_causalvlm_factory() {
+  return [](const ModelContext& /*context*/) -> std::unique_ptr<CausalLM> {
     return nullptr;
   };
 }
@@ -198,7 +198,7 @@ TEST(ModelRegistryTest, SelectedLlmExtensionResolvesBeforeBuiltinBackendRules) {
 TEST(ModelRegistryTest, SelectedVlmExtensionResolvesBeforeBuiltinBackendRules) {
   const std::string family = "npu_backend_vlm_custom";
   ASSERT_TRUE(ModelRegistry::register_causalvlm_factory(
-      "qwen2_5_vl", family, unused_vlm_factory()));
+      "qwen2_5_vl", family, unused_causalvlm_factory()));
   std::string effective_backend;
   std::string resolved_name;
   std::string error_message;
@@ -253,7 +253,7 @@ TEST(ModelRegistryTest, ExecutorOnlyFamilyRetainsBuiltinBackendRules) {
 TEST(ModelRegistryTest, ExtensionBackendSelectionIsSpecificToModelComponent) {
   const std::string family = "npu_backend_other_component_custom";
   ASSERT_TRUE(ModelRegistry::register_causalvlm_factory(
-      "qwen2", family, unused_vlm_factory()));
+      "qwen2", family, unused_causalvlm_factory()));
   std::string effective_backend;
   std::string resolved_name;
   std::string error_message;

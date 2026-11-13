@@ -28,7 +28,6 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/causal_lm.h"
-#include "core/framework/model/causal_vlm.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model_context/model_context.h"
 
@@ -53,13 +52,13 @@ int64_t python_qwen3_5_mega_moe_max_num_tokens_per_rank(
     int64_t num_speculative_tokens);
 }  // namespace detail
 
-// Inherits CausalVLM so that ``--backend vlm --model_impl python`` can route a
+// A CausalLM so that ``--backend vlm --model_impl python`` can route a
 // Python VLM (e.g. GLM-5.3-Flash-VL) through the VLM engine while
-// PyExecutorImpl drives it. The CausalVLM ``encode`` / ``get_input_embeddings``
-// virtuals are stubbed: in the Python path, PyExecutorImpl::run calls the
+// PyExecutorImpl drives it. The multimodal entry points fall back to their
+// CausalLM defaults: in the Python path, PyExecutorImpl::run calls the
 // Python model's own encode/get_input_embeddings via pybind (they are never
 // reached here).
-class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
+class __attribute__((visibility("hidden"))) PyCausalLM : public CausalLM {
  public:
   explicit PyCausalLM(const ModelContext& context,
                       std::string python_model_name = {});
