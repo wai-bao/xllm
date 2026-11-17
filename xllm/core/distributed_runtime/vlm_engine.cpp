@@ -181,11 +181,8 @@ bool VLMEngine::init(
     return false;
   }
 
-  auto kv_cache_cap = estimate_kv_cache_capacity();
-
-  if (!allocate_kv_cache(kv_cache_cap,
-                         /*shared_vmm_layout=*/nullptr,
-                         std::move(transfer_coordinator))) {
+  if (!::xllm::allocate_kv_cache(
+          *this, std::move(transfer_coordinator), nullptr)) {
     LOG(ERROR) << "Failed to allocate kv cache";
     return false;
   }
@@ -254,22 +251,10 @@ bool VLMEngine::init_model(MasterStatus master_status) {
   return true;
 }
 
-KVCacheCapacity VLMEngine::estimate_kv_cache_capacity(
-    bool initialize_virtual_memory) {
-  return KVCapacityPlanner(args_,
-                           options_,
-                           dtype_,
-                           dp_local_tp_size_,
-                           worker_clients_,
-                           /*is_multimodal=*/true,
-                           /*reserved_memory_bytes=*/0)
-      .plan(initialize_virtual_memory);
-}
-
 bool VLMEngine::allocate_kv_cache(
     const KVCacheCapacity& kv_cache_cap,
-    const VmmKVCacheLayout* shared_vmm_layout,
-    std::shared_ptr<KVCacheTransferCoordinatorBase> transfer_coordinator) {
+    std::shared_ptr<KVCacheTransferCoordinatorBase> transfer_coordinator,
+    const VmmKVCacheLayout* shared_vmm_layout) {
   const bool enable_state_cache = has_linear_attention_layers(args_) ||
                                   kv_cache_cap.kpool_tail_slot_size() > 0;
 

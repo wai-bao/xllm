@@ -1502,6 +1502,7 @@ TEST_F(HostKVCacheTest, HostKVCacheDeepSeekV4PerBlockType) {
             scale_host_block_count(kC128Count, kHostFactor));
 }
 
+#if defined(USE_MLU) || defined(USE_NPU)
 TEST_F(HostKVCacheTest, HostLinearKPoolOnlyPreservesTailRoleAndAllowsStore) {
   ModelArgs args;
   args.model_type("glm5_next")
@@ -1513,7 +1514,6 @@ TEST_F(HostKVCacheTest, HostLinearKPoolOnlyPreservesTailRoleAndAllowsStore) {
       .index_kpool_compress(true)
       .index_kpool_always_select_tail(true);
   KVCacheEstimateOptions estimate_options;
-  estimate_options.kpool_layout = KPoolCacheLayout::COMPRESSED_WITH_TAIL;
   estimate_options.cache_size_in_bytes = 1024 * 1024;
   estimate_options.block_size = 16;
   estimate_options.n_local_kv_heads = 1;
@@ -1564,6 +1564,7 @@ TEST_F(HostKVCacheTest, HostLinearKPoolOnlyPreservesTailRoleAndAllowsStore) {
   validation.enable_kvcache_store = false;
   EXPECT_FALSE(validate_host_cache_options(validation).has_value());
 }
+#endif
 
 TEST_F(HostKVCacheConfigTest, AcceptsQuantizedIndexerCache) {
   HostCacheValidationOptions options;
@@ -1806,6 +1807,7 @@ TEST_F(HostKVCacheConfigTest, RejectsPartialLinearAttentionCache) {
   EXPECT_NE(error->find("requires both conv and SSM"), std::string::npos);
 }
 
+#if defined(USE_MLU) || defined(USE_NPU)
 TEST(KVCacheTest, KPoolShapeRoundTripKeepsRequestTailSeparateFromPages) {
   ModelArgs args;
   args.model_type("glm5_next")
@@ -1817,7 +1819,6 @@ TEST(KVCacheTest, KPoolShapeRoundTripKeepsRequestTailSeparateFromPages) {
       .index_kpool_compress(true)
       .index_kpool_always_select_tail(true);
   KVCacheEstimateOptions options;
-  options.kpool_layout = KPoolCacheLayout::COMPRESSED_WITH_TAIL;
   options.cache_size_in_bytes = 1024 * 1024;
   options.block_size = 16;
   options.n_local_kv_heads = 1;
@@ -1858,14 +1859,16 @@ TEST(KVCacheTest, KPoolShapeRoundTripKeepsRequestTailSeparateFromPages) {
   EXPECT_EQ(cache.get_shapes().back(), restored.kpool_tail_shape());
 #endif
 
+#if defined(USE_NPU)
   args.index_kpool_always_select_tail(false);
-  options.kpool_layout = KPoolCacheLayout::PACKED;
   const KVCacheCapacity packed = estimate_kv_cache_capacity(args, options);
   const KVCacheShape packed_shape(packed, args, 1);
   EXPECT_FALSE(packed_shape.has_kpool_tail_shape());
   EXPECT_EQ(packed.index_slot_size(), 66);
   EXPECT_EQ(packed_shape.index_cache_shape().back(), 33);
+#endif
 }
+#endif
 
 #if defined(USE_MLU)
 TEST(KVCacheTest, SharedKPoolBudgetCoversBothModelsWithoutDoubleCounting) {
@@ -1877,7 +1880,6 @@ TEST(KVCacheTest, SharedKPoolBudgetCoversBothModelsWithoutDoubleCounting) {
       .index_kpool(4)
       .index_kpool_compress(true);
   KVCacheEstimateOptions options;
-  options.kpool_layout = KPoolCacheLayout::COMPRESSED_WITH_TAIL;
   options.cache_size_in_bytes = 64 * 1024;
   options.block_size = 32;
   options.n_local_kv_heads = 1;
@@ -1903,7 +1905,7 @@ TEST(KVCacheTest, SharedKPoolBudgetCoversBothModelsWithoutDoubleCounting) {
           estimate_kv_cache_capacity(draft_args, draft_options);
       ASSERT_NE(target_cap.num_linear_state_blocks(),
                 draft_cap.num_linear_state_blocks());
-      const SharedKPoolPlan plan =
+      const SharedKVCachePlan plan =
           plan_shared_kpool(target_cap, draft_cap, draft_args);
       const int64_t n_blocks = plan.target.n_blocks();
       const int64_t budget = std::min(target_cap.cache_size_in_bytes(),

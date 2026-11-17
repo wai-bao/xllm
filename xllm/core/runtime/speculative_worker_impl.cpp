@@ -303,20 +303,6 @@ bool SpeculativeWorkerImpl<TargetInput>::init_model(
 }
 
 template <typename TargetInput>
-bool SpeculativeWorkerImpl<TargetInput>::allocate_kv_cache(
-    const KVCacheShape& kv_cache_shape) {
-  return impl_->allocate_kv_cache(kv_cache_shape);
-}
-
-#if defined(USE_NPU)
-template <typename TargetInput>
-bool SpeculativeWorkerImpl<TargetInput>::allocate_kv_cache_with_transfer(
-    const KVCacheShape& kv_cache_shape) {
-  return impl_->allocate_kv_cache_with_transfer(kv_cache_shape);
-}
-#endif
-
-template <typename TargetInput>
 std::optional<ForwardOutput> SpeculativeWorkerImpl<TargetInput>::step(
     const TargetInput& input) {
   if constexpr (std::is_same_v<TargetInput, VlmForwardInput>) {

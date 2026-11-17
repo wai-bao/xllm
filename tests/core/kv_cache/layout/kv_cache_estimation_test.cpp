@@ -276,18 +276,6 @@ TEST(KVCacheEstimationTest, EstimatesStandardAttentionBlocks) {
   EXPECT_EQ(capacity.n_blocks(), 128);
 }
 
-TEST(KVCacheEstimationTest, EmbeddingContextSharesTheAvailableMemoryBudget) {
-  ModelArgs model_args = make_standard_args();
-  KVCacheEstimateOptions options = make_estimate_options();
-  options.embedding_context_bytes_per_block = 2048;
-  const KVCacheCapacity capacity =
-      estimate_kv_cache_capacity(model_args, options);
-  EXPECT_EQ(capacity.n_blocks(), 102);
-  EXPECT_LE(capacity.n_blocks() * (8192 + 2048), options.cache_size_in_bytes);
-  EXPECT_GT((capacity.n_blocks() + 1) * (8192 + 2048),
-            options.cache_size_in_bytes);
-}
-
 TEST(KVCacheEstimationTest, IgnoresLinearStateSlotsWithoutLinearAttention) {
   ModelArgs model_args = make_standard_args();
   KVCacheEstimateOptions options = make_estimate_options();
@@ -967,7 +955,7 @@ TEST(KVCacheEstimationTest, SharedStaticPlanPlacesDraftInsideArenaBudget) {
   const KVCacheCapacity draft =
       estimate_kv_cache_capacity(draft_args, make_estimate_options());
 
-  const SharedStaticKVCachePlan plan = plan_shared_static_kv_cache(
+  const SharedKVCachePlan plan = plan_shared_static_kv_cache(
       target, draft, target_args, /*world_size=*/1, torch::kFloat16);
 
   EXPECT_EQ(plan.target.shared_draft_layers(), 2);
@@ -1052,7 +1040,7 @@ TEST(KVCacheEstimationTest, SharedStaticQwen38DraftSharesAllBanksWithGdn) {
   const KVCacheCapacity draft =
       estimate_kv_cache_capacity(draft_args, draft_options);
 
-  const SharedStaticKVCachePlan plan = plan_shared_static_kv_cache(
+  const SharedKVCachePlan plan = plan_shared_static_kv_cache(
       target, draft, target_args, /*world_size=*/2, torch::kBFloat16);
 
   EXPECT_EQ(plan.target.shared_slot_bytes(), 17 * 7864320);
@@ -1163,7 +1151,7 @@ TEST(KVCacheEstimationTest, SharedKPoolPlanAlignsStateBeforeBudgeting) {
           .linear_cache_size_in_bytes(draft_slots *
                                       (draft_kpool == 4 ? 1024 : 8192))
           .cache_size_in_bytes(131072);
-      const SharedKPoolPlan plan =
+      const SharedKVCachePlan plan =
           plan_shared_kpool(target_cap, draft_cap, draft_args);
 
       EXPECT_EQ(plan.target.num_linear_state_blocks(), 4);

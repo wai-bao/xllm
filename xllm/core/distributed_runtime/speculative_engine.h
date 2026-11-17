@@ -16,7 +16,6 @@ limitations under the License.
 #pragma once
 
 #include "common/macros.h"
-#include "core/kv_cache/storage/kv_cache_utils.h"
 #include "engine.h"
 #include "framework/batch/batch_group.h"
 #include "framework/block/block_manager_pool.h"
@@ -76,15 +75,6 @@ class SpeculativeEngineBase : public Engine {
  private:
   bool init_model(MasterStatus master_status,
                   const LLMEngine::ModelInitCallback& prepare_model);
-
-  bool allocate_kv_cache(
-      std::shared_ptr<KVCacheTransferCoordinatorBase> transfer_coordinator);
-
-  int64_t calculate_kv_cache(const KVCacheCapacity& target_kv_cache_cap,
-                             const KVCacheCapacity& draft_kv_cache_cap) const;
-
-  // dtype
-  torch::ScalarType dtype_;
 
   // options
   const runtime::Options options_;

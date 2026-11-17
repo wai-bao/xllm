@@ -52,14 +52,10 @@ struct KVCacheEstimateContext {
 };
 
 struct KVCacheEstimateOptions {
-  KPoolCacheLayout kpool_layout = default_kpool_layout();
   torch::ScalarType dtype = torch::kBFloat16;
   std::string kv_cache_dtype = "auto";
   std::string indexer_cache_dtype = "auto";
   int64_t cache_size_in_bytes = 0;
-  // Derived storage cost for the existing embedding row paired with each KV
-  // block id. Internal accounting only; this is not a user configuration.
-  int64_t embedding_context_bytes_per_block = 0;
   int64_t block_size = 0;
   int64_t world_size = 1;
   int64_t n_local_kv_heads = 0;
@@ -97,8 +93,6 @@ class KVCacheEstimator final {
   explicit KVCacheEstimator(const ModelArgs& model_args)
       : model_args_(model_args) {}
 
-  KVCacheCapacity estimate(KVCacheEstimateOptions options) const;
-
   KVCacheCapacity estimate(const runtime::Options& options,
                            const KVCacheEstimateContext& context) const;
 
@@ -131,44 +125,33 @@ std::vector<bool> build_layer_cache_owned(const ModelArgs& model_args,
                                           const LayerwiseSplitLayout& layout,
                                           int64_t num_layers);
 
-// Common block count across a layerwise split group. Each rank pays for the
-// layers it owns plus one shared scratch layer of the same per-block cost, so
-// the group settles on the smallest count any rank can afford.
-int64_t estimate_layerwise_split_block_count(
-    const ModelArgs& model_args,
-    int32_t layerwise_split_size,
-    const KVCacheCapacity& kv_cache_cap,
-    int64_t available_bytes,
-    int64_t additional_block_bytes);
-
 KVCacheCapacity estimate_kv_cache_capacity(
     const ModelArgs& model_args,
     const KVCacheEstimateOptions& options);
 
-// Co-located full-attention KPool target and draft share one cache budget.
-// The draft inherits the target's request slots and verify window; each
-// capacity keeps its own model's layer counts and page costs.
-struct SharedKPoolPlan {
+struct SharedKVCachePlan {
   KVCacheCapacity target;
   KVCacheCapacity draft;
 };
 
-SharedKPoolPlan plan_shared_kpool(KVCacheCapacity target_cap,
-                                  KVCacheCapacity draft_cap,
-                                  const ModelArgs& draft_args);
+SharedKVCachePlan plan_shared_kpool(KVCacheCapacity target_cap,
+                                    KVCacheCapacity draft_cap,
+                                    const ModelArgs& draft_args);
 
-// Target Full/GDN and the co-located Full-only draft share one physical arena
-// and the same final Full pages. The draft capacity owns no separate storage.
-struct SharedStaticKVCachePlan {
-  KVCacheCapacity target;
-  KVCacheCapacity draft;
-};
+SharedKVCachePlan plan_shared_static_kv_cache(KVCacheCapacity target_cap,
+                                              KVCacheCapacity draft_cap,
+                                              const ModelArgs& target_args,
+                                              int64_t world_size,
+                                              torch::ScalarType dtype);
 
-SharedStaticKVCachePlan plan_shared_static_kv_cache(
+SharedKVCachePlan plan_shared_kv_cache(
     KVCacheCapacity target_cap,
     KVCacheCapacity draft_cap,
     const ModelArgs& target_args,
+    const ModelArgs& draft_args,
     int64_t world_size,
-    torch::ScalarType dtype);
+    torch::ScalarType dtype,
+    int32_t layerwise_split_size,
+    std::optional<int64_t> shared_vmm_blocks = std::nullopt);
 
 }  // namespace xllm

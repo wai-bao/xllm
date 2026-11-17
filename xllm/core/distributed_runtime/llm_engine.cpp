@@ -175,9 +175,8 @@ bool LLMEngine::init(
                              options_.eplb_controller_config());
   forward_input_factory_->set_eplb_controller(eplb_controller_.get());
 
-  auto kv_cache_cap = estimate_kv_cache_capacity();
-
-  if (!allocate_kv_cache(kv_cache_cap, std::move(transfer_coordinator))) {
+  if (!::xllm::allocate_kv_cache(
+          *this, std::move(transfer_coordinator), nullptr)) {
     LOG(ERROR) << "Failed to initialize kv cache";
     return false;
   } else {
@@ -290,18 +289,6 @@ bool LLMEngine::init_model(MasterStatus master_status,
   }
 
   return true;
-}
-
-KVCacheCapacity LLMEngine::estimate_kv_cache_capacity(
-    bool initialize_virtual_memory) {
-  return KVCapacityPlanner(args_,
-                           options_,
-                           dtype_,
-                           dp_local_tp_size_,
-                           worker_clients_,
-                           /*is_multimodal=*/false,
-                           initial_weight_reservation_bytes_)
-      .plan(initialize_virtual_memory);
 }
 
 bool LLMEngine::allocate_kv_cache(

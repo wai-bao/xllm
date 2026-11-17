@@ -654,7 +654,6 @@ void init_shared_counts(const ModelArgs& model_args,
       << "Shared static storage derives linear capacity from its arena.";
   CHECK_EQ(options.kv_cache_dtype, "auto")
       << "Shared static storage requires model-dtype Full KV rows.";
-  CHECK_EQ(options.embedding_context_bytes_per_block, 0);
   CHECK_EQ(capacity->index_block_bytes(), 0);
   CHECK_EQ(capacity->scale_slot_size(), 0);
   CHECK_EQ(capacity->kpool_tail_slot_size(), 0);
@@ -751,10 +750,8 @@ void init_standard_counts(const ModelArgs& model_args,
     return;
   }
 
-  CHECK_GE(options.embedding_context_bytes_per_block, 0);
   const int64_t full_cache_block_size_in_bytes =
-      standard_full_cache_block_size_in_bytes(*kv_cache_cap) +
-      options.embedding_context_bytes_per_block;
+      standard_full_cache_block_size_in_bytes(*kv_cache_cap);
   const int64_t gdn_state_bytes = kv_cache_cap->num_linear_attention_layers() *
                                   kv_cache_cap->linear_slot_size();
   const int64_t kpool_state_bytes =
@@ -783,15 +780,6 @@ void init_standard_counts(const ModelArgs& model_args,
   const int64_t available_full_cache_size_in_bytes =
       kv_cache_cap->cache_size_in_bytes() -
       kv_cache_cap->linear_cache_size_in_bytes();
-  if (total_state_bytes > 0) {
-    CHECK_GT(kv_cache_cap->cache_size_in_bytes(),
-             kv_cache_cap->linear_cache_size_in_bytes())
-        << "failed to reserve linear state cache for linear-attention "
-           "layers: "
-        << "max_seqs_per_batch (" << options.max_seqs_per_batch
-        << ") is too large. Please reduce max_seqs_per_batch to less than "
-        << kv_cache_cap->cache_size_in_bytes() / total_state_bytes - 2;
-  }
   CHECK_GT(available_full_cache_size_in_bytes, 0)
       << "no memory left for full-attention kv cache after reserving linear "
          "state cache";
@@ -801,7 +789,7 @@ void init_standard_counts(const ModelArgs& model_args,
                                     options.layerwise_split_size,
                                     *kv_cache_cap,
                                     available_full_cache_size_in_bytes,
-                                    options.embedding_context_bytes_per_block));
+                                    0));
   } else {
     kv_cache_cap->n_blocks(available_full_cache_size_in_bytes /
                            full_cache_block_size_in_bytes);
@@ -816,9 +804,9 @@ KPoolCacheLayout default_kpool_layout() {
                             : KPoolCacheLayout::PACKED;
 }
 
-SharedKPoolPlan plan_shared_kpool(KVCacheCapacity target_cap,
-                                  KVCacheCapacity draft_cap,
-                                  const ModelArgs& draft_args) {
+SharedKVCachePlan plan_shared_kpool(KVCacheCapacity target_cap,
+                                    KVCacheCapacity draft_cap,
+                                    const ModelArgs& draft_args) {
   CHECK_EQ(target_cap.block_size(), draft_cap.block_size());
   CHECK_GT(target_cap.kpool_tail_slot_size(), 0);
   CHECK_GT(draft_cap.kpool_tail_slot_size(), 0);
@@ -851,12 +839,11 @@ SharedKPoolPlan plan_shared_kpool(KVCacheCapacity target_cap,
   return {std::move(target_cap), std::move(draft_cap)};
 }
 
-SharedStaticKVCachePlan plan_shared_static_kv_cache(
-    KVCacheCapacity target_cap,
-    KVCacheCapacity draft_cap,
-    const ModelArgs& target_args,
-    int64_t world_size,
-    torch::ScalarType dtype) {
+SharedKVCachePlan plan_shared_static_kv_cache(KVCacheCapacity target_cap,
+                                              KVCacheCapacity draft_cap,
+                                              const ModelArgs& target_args,
+                                              int64_t world_size,
+                                              torch::ScalarType dtype) {
   CHECK_GT(world_size, 0);
   CHECK_GT(target_cap.shared_slot_bytes(), 0);
   CHECK_EQ(target_cap.linear_cache_size_in_bytes(), 0);
@@ -923,6 +910,62 @@ SharedStaticKVCachePlan plan_shared_static_kv_cache(
   return {std::move(target_cap), std::move(draft_cap)};
 }
 
+SharedKVCachePlan plan_shared_kv_cache(
+    KVCacheCapacity target_cap,
+    KVCacheCapacity draft_cap,
+    const ModelArgs& target_args,
+    const ModelArgs& draft_args,
+    int64_t world_size,
+    torch::ScalarType dtype,
+    int32_t layerwise_split_size,
+    std::optional<int64_t> shared_vmm_blocks) {
+  if (target_cap.shared_slot_bytes() > 0) {
+    return plan_shared_static_kv_cache(std::move(target_cap),
+                                       std::move(draft_cap),
+                                       target_args,
+                                       world_size,
+                                       dtype);
+  }
+  if (target_cap.c4_count() > 0 || target_cap.c128_count() > 0) {
+    draft_cap.n_blocks(target_cap.n_blocks());
+    return {std::move(target_cap), std::move(draft_cap)};
+  }
+  if (target_cap.kpool_tail_slot_size() > 0 &&
+      draft_cap.kpool_tail_slot_size() > 0) {
+    return plan_shared_kpool(
+        std::move(target_cap), std::move(draft_cap), draft_args);
+  }
+  const int64_t budget = std::min(target_cap.cache_size_in_bytes(),
+                                  draft_cap.cache_size_in_bytes());
+  int64_t n_blocks = shared_vmm_blocks.value_or(0);
+  if (!shared_vmm_blocks.has_value()) {
+    const int64_t available_bytes = budget -
+                                    target_cap.linear_cache_size_in_bytes() -
+                                    draft_cap.linear_cache_size_in_bytes();
+    CHECK_GT(available_bytes, 0)
+        << "no memory left for full-attention kv cache after reserving "
+           "target and draft state caches";
+    const int64_t draft_block_bytes =
+        standard_full_cache_block_size_in_bytes(draft_cap);
+    if (layerwise_split_size > 1) {
+      n_blocks = layerwise_split_block_count(target_args,
+                                             layerwise_split_size,
+                                             target_cap,
+                                             available_bytes,
+                                             draft_block_bytes);
+    } else {
+      const int64_t block_bytes =
+          standard_full_cache_block_size_in_bytes(target_cap) +
+          draft_block_bytes;
+      n_blocks = available_bytes / block_bytes;
+    }
+  }
+  CHECK_GT(n_blocks, 0) << "no memory for kv cache";
+  target_cap.n_blocks(n_blocks).cache_size_in_bytes(budget);
+  draft_cap.n_blocks(n_blocks).cache_size_in_bytes(budget);
+  return {std::move(target_cap), std::move(draft_cap)};
+}
+
 std::vector<bool> resolve_indexer_cache_enabled_layers(
     const ModelArgs& model_args,
     int64_t num_cache_layers) {
@@ -943,19 +986,6 @@ std::vector<bool> build_layer_cache_owned(const ModelArgs& model_args,
         layout.owns(layer_id));
   }
   return layer_cache_owned;
-}
-
-int64_t estimate_layerwise_split_block_count(
-    const ModelArgs& model_args,
-    int32_t layerwise_split_size,
-    const KVCacheCapacity& kv_cache_cap,
-    int64_t available_bytes,
-    int64_t additional_block_bytes) {
-  return layerwise_split_block_count(model_args,
-                                     layerwise_split_size,
-                                     kv_cache_cap,
-                                     available_bytes,
-                                     additional_block_bytes);
 }
 
 int64_t KVCacheEstimator::estimate_memory_budget(
@@ -1056,27 +1086,19 @@ KVCacheCapacity KVCacheEstimator::estimate(
             : ParallelConfig::get_instance().layerwise_split_size();
   }
 
-  return estimate(std::move(estimate_options));
-}
-
-KVCacheCapacity KVCacheEstimator::estimate(
-    KVCacheEstimateOptions options) const {
-  CHECK_GT(options.world_size, 0) << "world_size must be positive";
+  CHECK_GT(estimate_options.world_size, 0) << "world_size must be positive";
   const int64_t n_heads = model_args_.n_heads();
   const int64_t n_kv_heads = model_args_.n_kv_heads().value_or(n_heads);
-  options.n_local_kv_heads =
-      std::max<int64_t>(1, n_kv_heads / options.world_size);
+  estimate_options.n_local_kv_heads =
+      std::max<int64_t>(1, n_kv_heads / estimate_options.world_size);
   if (has_linear_attention_layers(model_args_) &&
       model_args_.linear_num_value_heads() > 0) {
-    options.n_local_linear_k_heads = std::max<int64_t>(
-        1, model_args_.linear_num_key_heads() / options.world_size);
-    options.n_local_linear_v_heads = std::max<int64_t>(
-        1, model_args_.linear_num_value_heads() / options.world_size);
-  } else {
-    options.n_local_linear_k_heads = 0;
-    options.n_local_linear_v_heads = 0;
+    estimate_options.n_local_linear_k_heads = std::max<int64_t>(
+        1, model_args_.linear_num_key_heads() / estimate_options.world_size);
+    estimate_options.n_local_linear_v_heads = std::max<int64_t>(
+        1, model_args_.linear_num_value_heads() / estimate_options.world_size);
   }
-  return estimate_kv_cache_capacity(model_args_, options);
+  return estimate_kv_cache_capacity(model_args_, estimate_options);
 }
 
 KVCacheCapacity estimate_kv_cache_capacity(
@@ -1103,7 +1125,7 @@ KVCacheCapacity estimate_kv_cache_capacity(
       kv_cache_dtype_size(options.kv_cache_dtype, dtype_size);
   const bool enable_indexer_cache_quantization =
       options.indexer_cache_dtype == "int8";
-  KPoolCacheLayout kpool_layout = options.kpool_layout;
+  KPoolCacheLayout kpool_layout = default_kpool_layout();
   if (Platform::is_npu()) {
     kpool_layout = uses_compressed_kpool_tail_cache(model_args)
                        ? KPoolCacheLayout::COMPRESSED_WITH_TAIL

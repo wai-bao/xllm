@@ -15,6 +15,7 @@ limitations under the License.
 
 #pragma once
 
+#include <tuple>
 #include <unordered_set>
 
 #include "core/framework/speculative/draft_proposal.h"
@@ -33,6 +34,17 @@ class SuffixWorkerImpl : public SpeculativeWorkerImpl<LlmForwardInput> {
                    const runtime::Options& options);
 
   ~SuffixWorkerImpl() override = default;
+
+  std::tuple<int64_t, int64_t> estimate_kv_cache_capacity() override {
+    return impl_->estimate_kv_cache_capacity();
+  }
+
+  bool allocate_kv_cache(const KVCacheShape& kv_cache_shape) override;
+
+#if defined(USE_NPU)
+  bool allocate_kv_cache_with_transfer(
+      const KVCacheShape& kv_cache_shape) override;
+#endif
 
  protected:
   std::optional<ForwardOutput> step_prefill(

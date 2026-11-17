@@ -63,6 +63,17 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_empty(
   }
 }
 
+bool SuffixWorkerImpl::allocate_kv_cache(const KVCacheShape& kv_cache_shape) {
+  return impl_->allocate_kv_cache(kv_cache_shape);
+}
+
+#if defined(USE_NPU)
+bool SuffixWorkerImpl::allocate_kv_cache_with_transfer(
+    const KVCacheShape& kv_cache_shape) {
+  return impl_->allocate_kv_cache_with_transfer(kv_cache_shape);
+}
+#endif
+
 std::optional<ForwardOutput> SuffixWorkerImpl::step_prefill(
     const LlmForwardInput& input) {
   // run the target model to get first token and hidden states

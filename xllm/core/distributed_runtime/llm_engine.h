@@ -41,6 +41,7 @@ limitations under the License.
 #include "runtime/worker_client.h"
 namespace xllm {
 
+class KVCapacityPlanner;
 class EplbController;
 class KVCacheTransferCoordinatorBase;
 class ModelLoader;
@@ -96,8 +97,12 @@ class LLMEngine : public Engine {
   void setup_workers(const runtime::Options& options);
   bool init_model(MasterStatus master_status,
                   const ModelInitCallback& prepare_model);
-  KVCacheCapacity estimate_kv_cache_capacity(
-      bool initialize_virtual_memory = true);
+  friend class KVCapacityPlanner;
+  template <typename TargetEngine>
+  friend bool allocate_kv_cache(
+      TargetEngine& target,
+      std::shared_ptr<KVCacheTransferCoordinatorBase> transfer_coordinator,
+      LLMEngine* draft);
   bool allocate_kv_cache(
       const KVCacheCapacity& kv_cache_cap,
       std::shared_ptr<KVCacheTransferCoordinatorBase> transfer_coordinator,
