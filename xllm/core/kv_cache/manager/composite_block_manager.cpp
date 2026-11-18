@@ -63,7 +63,6 @@ void publish_blocks(Sequence* seq,
   const size_t token_end = end * block_size + block_hash_lookahead(hasher_type);
   KVCacheState& kv = seq->kv_state();
   std::vector<Block>* blocks = kv.mutable_blocks(type);
-  CHECK(blocks != nullptr);
   CHECK_LE(end, blocks->size());
   seq->update_block_hashes(static_cast<uint32_t>(block_size), hasher_type);
   leaf.cache(seq->hash_tokens(hasher_type).slice(0, token_end),
@@ -88,18 +87,6 @@ std::optional<BlockType> legacy_history_type(uint32_t ratio) {
     return BlockType::C128;
   }
   return std::nullopt;
-}
-
-// Wrap the leaf in a concurrency adapter when sequence-level calls may run
-// off the scheduler thread (disagg PD / kvcache store / host-offload).
-std::unique_ptr<BlockManager> maybe_concurrent(
-    std::unique_ptr<BlockManager> leaf,
-    const BlockManager::Options& options) {
-  if (options.enable_disagg_pd() || options.enable_kvcache_store() ||
-      options.enable_host_offload()) {
-    return std::make_unique<ConcurrentBlockManagerImpl>(std::move(leaf));
-  }
-  return leaf;
 }
 
 // Choose the paged virtual memory manager or the flat free-list manager.
@@ -375,7 +362,7 @@ CompositeBlockManager::PartitionMap build_composite_partitions(
     CHECK(leaves
               .emplace(linear_id,
                        CompositeBlockManager::LeafEntry{
-                           maybe_concurrent(
+                           ConcurrentBlockManagerImpl::wrap_if_needed(
                                std::make_unique<LinearStateBlockManager>(
                                    std::move(linear_opts)),
                                options),
@@ -396,7 +383,7 @@ CompositeBlockManager::PartitionMap build_composite_partitions(
     CHECK(leaves
               .emplace(*kv_opts.partition_id(),
                        CompositeBlockManager::LeafEntry{
-                           maybe_concurrent(
+                           ConcurrentBlockManagerImpl::wrap_if_needed(
                                make_kv_leaf(kv_opts, dp_rank, page_allocator),
                                options),
                            /*participates_in_admission=*/true,
@@ -449,7 +436,8 @@ CompositeBlockManager::PartitionMap build_composite_partitions(
         leaves
             .emplace(partition.id(),
                      CompositeBlockManager::LeafEntry{
-                         maybe_concurrent(std::move(leaf), options),
+                         ConcurrentBlockManagerImpl::wrap_if_needed(
+                             std::move(leaf), options),
                          partition.participates_in_admission(),
                          enable_prefix,
                          legacy_type})
@@ -655,7 +643,7 @@ void CompositeBlockManager::publish_completed_prefix(Sequence* seq,
       continue;
     }
     std::vector<Block>* blocks = kv.mutable_blocks(type);
-    if (blocks == nullptr || blocks->empty()) {
+    if (blocks->empty()) {
       continue;
     }
     const size_t num_full =

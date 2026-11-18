@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstddef>
 #include <map>
 #include <optional>
+#include <ranges>
 #include <utility>
 #include <vector>
 
@@ -86,6 +87,16 @@ class KVCacheState {
   std::vector<Block>* mutable_blocks(BlockType type);
   // Number of blocks held under `type`.
   size_t num_blocks(BlockType type) const;
+  auto block_groups(std::optional<BlockType> excluded_type) const {
+    const CachePartitionId* excluded_partition =
+        excluded_type ? &partition_id(*excluded_type) : nullptr;
+    return composite_blocks_ |
+           std::views::filter([excluded_partition](const auto& group) {
+             return excluded_partition == nullptr ||
+                    group.first != *excluded_partition;
+           }) |
+           std::views::values;
+  }
   // True if the sequence holds any cache-bearing blocks (KV / SWA / C4 / C128).
   // Excludes EMBEDDING, which is a per-sequence resource, not token cache. Used
   // to decide whether an allocation that started from an empty sequence should
@@ -177,13 +188,6 @@ class KVCacheState {
   void set_transfer_kv_info(TransferKVInfo&& info);
   std::optional<TransferKVInfo>& transfer_kv_info();
 
-  uint32_t pushed_local_block_count() const {
-    return pushed_local_block_count_;
-  }
-  void set_pushed_local_block_count(uint32_t n) {
-    pushed_local_block_count_ = n;
-  }
-
   size_t next_transfer_block_idx() const;
   void advance_transfer_block_idx(size_t idx);
 
@@ -238,10 +242,6 @@ class KVCacheState {
 
   // Pre-grow cache insert cursor per partition. See num_cached_blocks() above.
   std::map<CachePartitionId, size_t> num_cached_blocks_;
-
-  // Number of local KV blocks already pushed to the decode instance.
-  // Used for incremental push in chunked prefill + PD disagg mode.
-  uint32_t pushed_local_block_count_ = 0;
 };
 
 }  // namespace xllm

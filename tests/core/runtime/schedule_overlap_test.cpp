@@ -90,10 +90,11 @@ class OverlapTestWorker final : public WorkerImpl {
                     ContinuationMode continuation_mode =
                         ContinuationMode::DEFAULT_REPLACEMENT,
                     bool speculative_decode = false,
-                    EplbWorkerConfig eplb_config = {})
+                    EplbWorkerConfig eplb_config = {},
+                    InstanceRole instance_role = InstanceRole::DEFAULT)
       : WorkerImpl(parallel_args,
                    torch::Device(torch::kPrivateUse1, /*index=*/0),
-                   options(speculative_decode, eplb_config),
+                   options(speculative_decode, eplb_config, instance_role),
                    /*is_input_release_deferred=*/speculative_decode &&
                        parallel_args.dp_size() > 1),
         outputs_(std::move(outputs)),
@@ -159,11 +160,14 @@ class OverlapTestWorker final : public WorkerImpl {
 
  private:
   static runtime::Options options(bool speculative_decode,
-                                  EplbWorkerConfig eplb_config) {
+                                  EplbWorkerConfig eplb_config,
+                                  InstanceRole instance_role) {
     runtime::Options options;
     options.enable_schedule_overlap(true);
     options.enable_speculative_decode(speculative_decode);
     options.eplb_worker_config(eplb_config);
+    options.instance_role(instance_role);
+    options.enable_disagg_pd(instance_role.can_receive_pd_kv());
     return options;
   }
 
@@ -329,7 +333,7 @@ void expect_rejected_json_continuation(torch::Tensor prior_tokens) {
   EXPECT_EQ(output->json_object_errors.front().sample_sequence_id, "request#0");
   EXPECT_EQ(output->json_object_errors.front().message,
             "prior token violates json_object grammar");
-  const ForwardOutput published = worker.get_last_step_result();
+  const ForwardOutput published = worker.get_last_step_result().value();
   ASSERT_EQ(published.json_object_errors.size(), 1U);
   EXPECT_EQ(published.json_object_errors.front().sample_sequence_id,
             "request#0");
@@ -357,6 +361,7 @@ TEST(ScheduleOverlapContinuationTest,
   auto first = worker.step_async(step_input<LlmForwardInput>(/*decode=*/false));
   ASSERT_TRUE(std::move(first).get().has_value());
   ASSERT_EQ(worker.get_last_step_result()
+                .value()
                 .sample_output.next_tokens.template item<int64_t>(),
             17);
 
@@ -365,6 +370,7 @@ TEST(ScheduleOverlapContinuationTest,
   ASSERT_TRUE(std::move(second).get().has_value());
   EXPECT_EQ(worker.executed_tokens().template item<int32_t>(), 7);
   ASSERT_EQ(worker.get_last_step_result()
+                .value()
                 .sample_output.next_tokens.template item<int64_t>(),
             23);
 
@@ -372,6 +378,7 @@ TEST(ScheduleOverlapContinuationTest,
   ASSERT_TRUE(std::move(third).get().has_value());
   EXPECT_EQ(worker.executed_tokens().template item<int32_t>(), 23);
   EXPECT_EQ(worker.get_last_step_result()
+                .value()
                 .sample_output.next_tokens.template item<int64_t>(),
             41);
 }
@@ -517,8 +524,9 @@ TYPED_TEST(ScheduleOverlapTest, EmptyStepClearsPriorContinuation) {
   empty.token_ids = torch::empty({0}, torch::kInt32);
   auto idle = worker.step_async(empty);
   EXPECT_FALSE(std::move(idle).get().has_value());
-  EXPECT_FALSE(
-      worker.get_last_step_result().sample_output.next_tokens.defined());
+  EXPECT_FALSE(worker.get_last_step_result()
+                   .value()
+                   .sample_output.next_tokens.defined());
 
   auto next = worker.step_async(
       step_input<TypeParam>(/*decode=*/true, /*token_id=*/-1));
@@ -545,7 +553,7 @@ TYPED_TEST(ScheduleOverlapTest, AddsWarmupAndJsonErrorsToBothResultPaths) {
   EXPECT_EQ(returned->json_object_errors[0].message, "model error");
   EXPECT_EQ(returned->json_object_errors[1].message, "input error");
 
-  const ForwardOutput published = worker.get_last_step_result();
+  const ForwardOutput published = worker.get_last_step_result().value();
   EXPECT_TRUE(published.is_graph_warmup);
   ASSERT_EQ(published.json_object_errors.size(), 2U);
   EXPECT_EQ(published.json_object_errors[0].message, "model error");
@@ -573,7 +581,8 @@ TYPED_TEST(ScheduleOverlapTest, ConstrainedDecodeRejectsUnrelatedPriorResult) {
   EXPECT_EQ(output->json_object_errors.front().sample_sequence_id, "current#0");
   EXPECT_NE(output->json_object_errors.front().message.find("missing"),
             std::string::npos);
-  ASSERT_EQ(worker.get_last_step_result().json_object_errors.size(), 1U);
+  ASSERT_EQ(worker.get_last_step_result().value().json_object_errors.size(),
+            1U);
 }
 
 TYPED_TEST(ScheduleOverlapTest, ConstrainedContinuationAdvancesGrammar) {
@@ -729,7 +738,8 @@ TYPED_TEST(ScheduleOverlapTest,
         torch::equal(input.sampling_params.seed_offsets().to(torch::kCPU),
                      torch::tensor({10, 20, 30}, torch::kInt64)));
     EXPECT_TRUE(torch::equal(
-        worker.get_last_step_result().sample_output.next_tokens.to(torch::kCPU),
+        worker.get_last_step_result().value().sample_output.next_tokens.to(
+            /*device=*/torch::kCPU),
         output->sample_output.next_tokens.to(torch::kCPU)));
   }
 }
@@ -759,6 +769,46 @@ TYPED_TEST(ScheduleOverlapTest, NonDriverContinuesWithoutHostConsumption) {
   EXPECT_TRUE(second_ready);
   ASSERT_TRUE(std::move(second).get().has_value());
   EXPECT_EQ(worker.executed_tokens().template item<int32_t>(), 17);
+}
+
+TYPED_TEST(ScheduleOverlapTest, PdFollowerBindsDeviceOnFreshResultThread) {
+  const ParallelArgs parallel_args(/*rank=*/1,
+                                   /*world_size=*/2,
+                                   /*dp_size=*/1,
+                                   /*process_group=*/nullptr);
+  OverlapTestWorker worker(
+      {token_output(/*token_id=*/17)},
+      parallel_args,
+      OverlapTestWorker::ContinuationMode::DEFAULT_REPLACEMENT,
+      /*speculative_decode=*/false,
+      /*eplb_config=*/{},
+      /*instance_role=*/InstanceRole::DECODE);
+  auto step = worker.step_async(step_input<TypeParam>(/*decode=*/true))
+                  .toUnsafeFuture();
+  step.wait(/*dur=*/2s);
+  if (!step.isReady()) {
+    worker.begin_shutdown();
+  }
+  ASSERT_TRUE(step.isReady());
+  const auto submitted = std::move(step).get();
+  ASSERT_TRUE(submitted.has_value());
+  ASSERT_NE(submitted->ready_event, nullptr);
+
+  auto publication = std::async(std::launch::async, [&worker]() {
+    auto result = worker.get_last_step_result();
+    aclrtContext context = nullptr;
+    EXPECT_EQ(aclrtGetCurrentContext(&context), ACL_SUCCESS);
+    EXPECT_NE(context, nullptr);
+    return result;
+  });
+  const auto status = publication.wait_for(/*timeout=*/2s);
+  if (status != std::future_status::ready) {
+    worker.begin_shutdown();
+  }
+  ASSERT_EQ(status, std::future_status::ready);
+  const auto result = publication.get();
+  ASSERT_TRUE(result.has_value());
+  EXPECT_FALSE(result->sample_output.next_tokens.defined());
 }
 
 TYPED_TEST(ScheduleOverlapTest,
@@ -792,7 +842,7 @@ TYPED_TEST(ScheduleOverlapTest,
     worker.begin_shutdown();
   }
   ASSERT_EQ(publication_status, std::future_status::ready);
-  const ForwardOutput published = publication.get();
+  const ForwardOutput published = publication.get().value();
   EXPECT_FALSE(published.sample_output.next_tokens.defined());
   ASSERT_TRUE(published.expert_load_data.defined());
   EXPECT_TRUE(torch::equal(published.expert_load_data,
@@ -825,7 +875,7 @@ TYPED_TEST(ScheduleOverlapTest, DpDriverPublishesWithoutEplb) {
     worker.begin_shutdown();
   }
   ASSERT_EQ(publication_status, std::future_status::ready);
-  const ForwardOutput published = publication.get();
+  const ForwardOutput published = publication.get().value();
   ASSERT_TRUE(published.sample_output.next_tokens.defined());
   EXPECT_EQ(published.sample_output.next_tokens.template item<int64_t>(), 17);
 }
@@ -880,7 +930,7 @@ TYPED_TEST(ScheduleOverlapTest,
   if (publication_status != std::future_status::ready) {
     worker.begin_shutdown();
   }
-  const ForwardOutput published = publication.get();
+  const ForwardOutput published = publication.get().value();
   auto second = worker.step_async(step_input<TypeParam>(/*decode=*/false))
                     .toUnsafeFuture()
                     .thenValue([](std::optional<ForwardOutput> output) {
