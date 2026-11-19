@@ -82,6 +82,13 @@ if("ascend910b" IN_LIST ASCEND_COMPUTE_UNIT OR "ascend910_93" IN_LIST ASCEND_COM
         "${mla_host}/mla_preprocess_v2_tiling.cpp"
     )
 endif()
+if("ascend910_93" IN_LIST ASCEND_COMPUTE_UNIT)
+    set(row_col_int8_quant_host "row_col_int8_quant/op_host")
+    list(APPEND op_definitions "${CMAKE_CURRENT_SOURCE_DIR}/${row_col_int8_quant_host}/row_col_int8_quant_def.cpp")
+    set(row_col_int8_quant_aclnn
+        "${ASCEND_AUTOGEN_PATH}/aclnn_xllm_kernel_row_col_int8_quant.cpp"
+    )
+endif()
 npu_op_code_gen(
     SRC ${op_definitions}
     PACKAGE ${vendor}
@@ -101,6 +108,7 @@ npu_op_library(cust_opapi ACLNN
     "${ASCEND_AUTOGEN_PATH}/aclnn_xllm_kernel_dequant_swiglu_quant.cpp"
     "${ASCEND_AUTOGEN_PATH}/aclnn_xllm_kernel_dequant_swiglu_quant_v2.cpp"
     ${a2_aclnn_sources}
+    ${row_col_int8_quant_aclnn}
 )
 target_include_directories(cust_opapi PRIVATE "${ASCEND_CANN_PACKAGE_PATH}/include/aclnn")
 target_link_libraries(cust_opapi PRIVATE
@@ -214,6 +222,13 @@ if(a2_aclnn_sources)
         "-I${catlass_include}")
     npu_op_kernel_options(ascendc_kernels XllmKernelMlaPreprocessV2
         OPTIONS --cce-auto-sync=off -Wno-deprecated-declarations -Werror)
+endif()
+if(row_col_int8_quant_host)
+    npu_op_kernel_sources(ascendc_kernels OP_TYPE XllmKernelRowColInt8Quant
+        KERNEL_DIR row_col_int8_quant/op_kernel
+        KERNEL_FILE xllm_kernel_row_col_int8_quant.cpp)
+    npu_op_kernel_options(ascendc_kernels XllmKernelRowColInt8Quant
+        OPTIONS "-I${CMAKE_CURRENT_SOURCE_DIR}/${row_col_int8_quant_host}")
 endif()
 npu_op_kernel_library(ascendc_kernels SRC_BASE "${CMAKE_CURRENT_SOURCE_DIR}" TILING_LIBRARY cust_optiling)
 npu_op_package_add(${vendor} LIBRARY cust_opapi cust_op_proto cust_optiling ascendc_kernels)
