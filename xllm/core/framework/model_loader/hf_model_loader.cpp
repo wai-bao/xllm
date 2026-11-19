@@ -39,6 +39,8 @@ limitations under the License.
 
 #include "core/common/types.h"
 #include "core/framework/config/model_config.h"
+#include "core/framework/config/speculative_config.h"
+#include "core/framework/model/model_type.h"
 #include "core/framework/model_loader/hf_model_args.h"
 #include "core/framework/state_dict/safetensors/safetensors.h"
 #include "core/framework/tokenizer/fast_tokenizer.h"
@@ -62,8 +64,8 @@ namespace {
 
 bool try_parse_layer_id_with_prefix(const std::string& tensor_name,
                                     const std::string& prefix,
-                                    int64_t* layer_id) {
-  if (!absl::StartsWith(tensor_name, prefix) || layer_id == nullptr) {
+                                    int64_t& layer_id) {
+  if (!absl::StartsWith(tensor_name, prefix)) {
     return false;
   }
 
@@ -88,11 +90,11 @@ bool try_parse_layer_id_with_prefix(const std::string& tensor_name,
     return false;
   }
 
-  *layer_id = value;
+  layer_id = value;
   return true;
 }
 
-bool try_parse_layer_id(const std::string& tensor_name, int64_t* layer_id) {
+bool try_parse_layer_id(const std::string& tensor_name, int64_t& layer_id) {
   static const std::vector<std::string> kLayerPrefixes = {
       "model.layers.", "layers.", "transformer.layers."};
   for (const auto& prefix : kLayerPrefixes) {
@@ -212,18 +214,72 @@ void check_safetensors_cleanup(::Status status,
   }
 }
 
+void configure_draft_model_args(
+    ModelArgs& args,
+    const DraftModelLoadOptions& draft,
+    [[maybe_unused]] const JsonReader& checkpoint_config) {
+  if (SpeculativeConfig::is_block_diffusion_algorithm(draft.algorithm_)) {
+    args.layers_to_capture({});
+    if (SpeculativeConfig::is_dspark_algorithm(draft.algorithm_)) {
+      if (is_deepseek_v4_family(args.model_type())) {
+        args.model_type(/*value=*/"deepseek_v4_dspark");
+#if defined(USE_NPU)
+        const auto draft_layers =
+            checkpoint_config.value_or<std::vector<int32_t>>(
+                /*key=*/"dspark_target_layer_ids", std::vector<int32_t>{});
+        CHECK(!draft_layers.empty())
+            << "DeepSeek-V4 DSpark requires at least one draft layer.";
+        args.n_layers(static_cast<int64_t>(draft_layers.size()));
+        args.n_hash_layers(/*value=*/0);
+        args.compress_ratios(
+            std::vector<int32_t>(args.n_layers(), /*value=*/1));
+#endif
+      } else if (args.model_type() != "glm5_dspark") {
+        args.model_type(/*value=*/"DSparkDraftModel");
+      }
+    } else {
+      args.model_type(SpeculativeConfig::is_dflash2_algorithm(draft.algorithm_)
+                          ? "DFlash2DraftModel"
+                          : "DFlashDraftModel");
+    }
+    return;
+  }
+  if (!SpeculativeConfig::is_mtp_algorithm(draft.algorithm_)) {
+    return;
+  }
+  const int64_t num_layers = args.n_layers();
+  const auto& mtp = ModelRegistry::get_mtp_metadata(
+      canonical_model_registration_name(args.model_type()));
+  if (mtp.prepare_args_) {
+    mtp.prepare_args_(args,
+                      ModelConfig::is_python_model_impl(draft.model_impl_));
+  } else if (!mtp.draft_model_type_.empty() &&
+             args.num_nextn_predict_layers() > 0) {
+    args.model_type(mtp.draft_model_type_);
+  }
+  const int32_t num_draft_layers = args.num_nextn_predict_layers();
+  if (num_draft_layers <= 0) {
+    return;
+  }
+  if (args.n_layers() != num_draft_layers) {
+    args.mtp_start_layer_idx(args.n_layers()).n_layers(num_draft_layers);
+  }
+  const auto& index_topk_pattern = args.index_topk_pattern();
+  if (num_draft_layers < num_layers &&
+      index_topk_pattern.size() == static_cast<size_t>(num_layers)) {
+    args.index_topk_pattern(
+        index_topk_pattern.substr(/*pos=*/0, num_draft_layers));
+  }
+  args.first_k_dense_replace(
+      std::min(args.first_k_dense_replace(), num_draft_layers));
+}
+
 }  // namespace
 
-HFModelLoader::HFModelLoader(std::string model_weights_path)
-    : HFModelLoader(std::move(model_weights_path),
-                    ModelConfig::get_instance().backend()) {}
-
 HFModelLoader::HFModelLoader(std::string model_weights_path,
-                             const std::string& backend)
+                             const std::string& backend,
+                             const DraftModelLoadOptions& draft)
     : model_weights_path_(std::move(model_weights_path)) {
-  CHECK(load_args(model_weights_path_, backend))
-      << "Failed to load model args from " << model_weights_path_;
-  // try to load safetensors first
   for (const auto& entry :
        std::filesystem::directory_iterator(model_weights_path_)) {
     // load bin or safe tensors
@@ -235,6 +291,12 @@ HFModelLoader::HFModelLoader(std::string model_weights_path,
       << "Failed to find model weights files in " << model_weights_path_;
   // sort the model weights files by name
   std::sort(model_weights_files_.begin(), model_weights_files_.end());
+
+  CHECK(load_args(backend, draft))
+      << "Failed to load model args from " << model_weights_path_;
+  if (draft.reference_model_weights_path_ != model_weights_path_) {
+    reference_model_weights_path_ = draft.reference_model_weights_path_;
+  }
 
   threadpool_ = std::make_unique<ThreadPool>(
       /*num_threads=*/32,
@@ -249,17 +311,15 @@ std::unique_ptr<Tokenizer> HFModelLoader::tokenizer() const {
 
 std::vector<std::unique_ptr<StateDict>>& HFModelLoader::get_state_dicts() {
   if (state_dicts_.empty()) {
-    // load state dict
-    state_dicts_.reserve(model_weights_files_.size());
-    auto file_cnt = model_weights_files_.size();
+    const size_t file_cnt = model_weights_files_.size();
     BlockingCounter counter(file_cnt);
-    state_dicts_.resize(model_weights_files_.size());
-    for (int file_id = 0; file_id < file_cnt; file_id++) {
-      threadpool_->schedule([this, file_id, &counter]() mutable {
+    state_dicts_.resize(file_cnt);
+    for (size_t file_id = 0; file_id < file_cnt; ++file_id) {
+      threadpool_->schedule([this, file_id, &counter]() {
         LOG(INFO) << "Loading model weights from "
                   << model_weights_files_[file_id];
-        state_dicts_[file_id] = std::move(
-            StateDictFromSafeTensor::load(model_weights_files_[file_id]));
+        state_dicts_[file_id] =
+            StateDictFromSafeTensor::load(model_weights_files_[file_id]);
         counter.decrement_count();
       });
     }
@@ -402,7 +462,7 @@ int64_t HFModelLoader::get_max_decoder_layer_weight_size() const {
       const char* tensor_name_cstr = tensor_names[i];
       const std::string tensor_name(tensor_name_cstr);
       int64_t layer_id = -1;
-      if (!try_parse_layer_id(tensor_name, &layer_id) || layer_id < 0 ||
+      if (!try_parse_layer_id(tensor_name, layer_id) ||
           layer_id >= args_.n_layers()) {
         continue;
       }
@@ -468,45 +528,48 @@ int64_t HFModelLoader::get_max_decoder_layer_weight_size() const {
   return max_layer_size;
 }
 
-bool HFModelLoader::load_args(const std::string& model_weights_path,
-                              const std::string& backend) {
-  if (!load_hf_model_args(model_weights_path, backend, &args_)) {
-    LOG(ERROR) << "Failed to load model args from " << model_weights_path;
+bool HFModelLoader::load_args(const std::string& backend,
+                              const DraftModelLoadOptions& draft) {
+  JsonReader checkpoint_config;
+  if (!load_hf_model_args(
+          model_weights_path_, backend, &args_, checkpoint_config)) {
     return false;
   }
 
 #if defined(USE_CUDA)
-  if (ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl())) {
+  const std::string_view model_impl =
+      draft.algorithm_.empty() ? ModelConfig::get_instance().model_impl()
+                               : draft.model_impl_;
+  if (ModelConfig::is_python_model_impl(model_impl)) {
     configure_flashinfer_kv_cache_layout(args_);
   }
 #endif
 
-  if (!load_quant_args(model_weights_path)) {
-    LOG(ERROR) << "Failed to load quant args from " << model_weights_path;
+  if (!load_quant_args(checkpoint_config)) {
+    LOG(ERROR) << "Failed to load quant args from " << model_weights_path_;
     return false;
   }
 
-  if (!load_tokenizer_args(model_weights_path)) {
-    LOG(ERROR) << "Failed to load tokenizer args from " << model_weights_path;
+  if (!load_tokenizer_args()) {
+    LOG(ERROR) << "Failed to load tokenizer args from " << model_weights_path_;
     return false;
   }
 
-  if (!load_hf_image_preprocessor_args(model_weights_path, args_)) {
+  if (!load_hf_image_preprocessor_args(model_weights_path_, args_)) {
     LOG(ERROR) << "Failed to load image preprocess args from "
-               << model_weights_path;
+               << model_weights_path_;
     return false;
   }
 
-  if (!load_hf_video_preprocessor_args(model_weights_path, args_)) {
+  if (!load_hf_video_preprocessor_args(model_weights_path_, args_)) {
     LOG(ERROR) << "Failed to load video preprocess args from "
-               << model_weights_path;
+               << model_weights_path_;
     return false;
   }
 
-  if (!load_hf_audio_preprocessor_args(model_weights_path, args_)) {
+  if (!load_hf_audio_preprocessor_args(model_weights_path_, args_)) {
     LOG(ERROR) << "Failed to load audio preprocess args from "
-               << model_weights_path;
+               << model_weights_path_;
     return false;
   }
 
@@ -519,19 +582,14 @@ bool HFModelLoader::load_args(const std::string& model_weights_path,
     args_.dtype() = "bfloat16";
   }
 
+  if (!draft.algorithm_.empty()) {
+    configure_draft_model_args(args_, draft, checkpoint_config);
+  }
+
   return true;
 }
 
-bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
-  JsonReader reader;
-  const std::string args_file_path = model_weights_path + "/config.json";
-  if (!reader.parse(args_file_path)) {
-    LOG(ERROR) << "Failed to parse model args file: " << args_file_path;
-    return false;
-  }
-
-  normalize_config_torch_dtype(reader);
-
+bool HFModelLoader::load_quant_args(const JsonReader& reader) {
   if (!load_quant_cfg(reader, quant_args_)) {
     return false;
   }
@@ -553,11 +611,6 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
   }
   bool model_is_w4a8_dynamic =
       boost::iequals(quant_args_.quantize_type(), "w4a8_dynamic");
-  if (boost::iequals(quant_args_.quantize_type(), "w4a8_dynamic")) {
-    quant_args_.bits() = 8;
-    quant_args_.moe_weight_bits() = 4;
-    quant_args_.activation_dynamic() = true;
-  }
 
   bool explicit_quant_group_size =
       reader.contains("quantization_config.group_size");
@@ -567,11 +620,10 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
   // "layers.0.attn.wq_a.weight": "W8A8_DYNAMIC".
   JsonReader quant_desc_reader;
   const std::string quant_desc_file_path =
-      model_weights_path + "/quant_model_description.json";
+      model_weights_path_ + "/quant_model_description.json";
   if (quant_desc_reader.parse(quant_desc_file_path)) {
     std::unordered_map<std::string, std::string> quant_descs;
-    const auto quant_desc_data = quant_desc_reader.data();
-    bool desc_model_quant_is_w4a8_dynamic = false;
+    const auto& quant_desc_data = quant_desc_reader.mutable_data();
     bool desc_has_w4a8 = false;
     bool desc_has_w8a8 = false;
     bool desc_has_w4a8_dynamic = false;
@@ -642,49 +694,42 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
                   << quant_args_.quantize_type();
       }
     }
-    desc_model_quant_is_w4a8_dynamic =
-        boost::iequals(quant_args_.quantize_type(), "w4a8_dynamic") ||
-        desc_has_w4a8_dynamic;
     model_is_w4a8_dynamic =
-        model_is_w4a8_dynamic || desc_model_quant_is_w4a8_dynamic;
-    if (desc_model_quant_is_w4a8_dynamic) {
-      if (quant_args_.quantize_type().empty()) {
-        quant_args_.quantize_type() = "w4a8_dynamic";
-      }
-      quant_args_.bits() = 8;
-      quant_args_.moe_weight_bits() = 4;
-      quant_args_.activation_dynamic() = true;
+        model_is_w4a8_dynamic || desc_has_w4a8_dynamic ||
+        boost::iequals(quant_args_.quantize_type(), /*Input2=*/"w4a8_dynamic");
+    if (desc_has_w4a8_dynamic && quant_args_.quantize_type().empty()) {
+      quant_args_.quantize_type() = "w4a8_dynamic";
     }
     if (auto v = quant_desc_reader.value<int64_t>("group_size")) {
       quant_args_.group_size() = v.value();
-      explicit_quant_group_size = true;
-    } else if (desc_model_quant_is_w4a8_dynamic && !explicit_quant_group_size) {
-      // Match vllm-ascend W4A8_DYNAMIC's default. A config value of 0 is still
-      // respected as the per-channel mode.
-      quant_args_.group_size() = 256;
       explicit_quant_group_size = true;
     }
     if (auto v = quant_desc_reader.value<std::string>("version")) {
       quant_args_.quant_version() = v.value();
     }
   }
-  if (model_is_w4a8_dynamic && !explicit_quant_group_size) {
-    quant_args_.group_size() = 256;
-  }
-  if (model_is_w4a8_dynamic && quant_args_.quant_version() != "1.0.0") {
-    LOG(ERROR) << "W4A8_DYNAMIC only supports quant_version 1.0.0, got "
-               << (quant_args_.quant_version().empty()
-                       ? "<empty>"
-                       : quant_args_.quant_version())
-               << ". Please provide quant_model_description.json version "
-                  "\"1.0.0\".";
-    return false;
+  if (model_is_w4a8_dynamic) {
+    quant_args_.bits() = 8;
+    quant_args_.moe_weight_bits() = 4;
+    quant_args_.activation_dynamic() = true;
+    if (!explicit_quant_group_size) {
+      quant_args_.group_size() = 256;
+    }
+    if (quant_args_.quant_version() != "1.0.0") {
+      LOG(ERROR) << "W4A8_DYNAMIC only supports quant_version 1.0.0, got "
+                 << (quant_args_.quant_version().empty()
+                         ? "<empty>"
+                         : quant_args_.quant_version())
+                 << ". Please provide quant_model_description.json version "
+                    "\"1.0.0\".";
+      return false;
+    }
   }
 
   // awq quantization args
   JsonReader awq_reader;
   const std::string quant_args_file_path =
-      model_weights_path + "/quant_config.json";
+      model_weights_path_ + "/quant_config.json";
   if (awq_reader.parse(quant_args_file_path)) {
     // hardcode the quant_method to awq if not exists
     quant_args_.quant_method() =
@@ -700,7 +745,7 @@ bool HFModelLoader::load_quant_args(const std::string& model_weights_path) {
 
   // gptq quantization args
   const std::string gptq_args_file_path =
-      model_weights_path + "/quantize_config.json";
+      model_weights_path_ + "/quantize_config.json";
   JsonReader gptq_reader;
   if (gptq_reader.parse(gptq_args_file_path)) {
     // hardcode the quant_method to gptq if not exists
@@ -746,7 +791,7 @@ std::optional<std::string> load_chat_template_file(const std::string& dir) {
 }
 }  // namespace
 
-bool HFModelLoader::load_tokenizer_args(const std::string& model_weights_path) {
+bool HFModelLoader::load_tokenizer_args() {
   // tokenizer args from tokenizer_config.json
   JsonReader tokenizer_reader;
   const std::string tokenizer_args_file_path =
@@ -754,7 +799,7 @@ bool HFModelLoader::load_tokenizer_args(const std::string& model_weights_path) {
 
   // check if tokenizer.json exists, if exists, set the tokenizer type to fast
   const std::string tokenizer_json_path =
-      model_weights_path + "/tokenizer.json";
+      model_weights_path_ + "/tokenizer.json";
   if (std::filesystem::exists(tokenizer_json_path)) {
     tokenizer_args_.tokenizer_type() = "fast";
     tokenizer_args_.vocab_file() = tokenizer_json_path;

@@ -24,6 +24,7 @@ limitations under the License.
 #include <vector>
 
 #include "core/framework/model/model_args.h"
+#include "core/framework/model/model_type.h"
 #include "core/framework/model_loader/hf_model_config.h"
 #include "core/framework/quantization/quant_args.h"
 #include "core/platform/platform.h"
@@ -327,34 +328,26 @@ void lift_speculators_config(nlohmann::json& config) {
   }
 }
 
-}  // namespace
-
-void normalize_config_torch_dtype(JsonReader& reader) {
-  nlohmann::json& config = reader.mutable_data();
-  if (!config.contains("torch_dtype") && config.contains("dtype")) {
-    config["torch_dtype"] = config["dtype"];
-  }
-  lift_speculators_config(config);
-}
-
-void normalize_speculators_config(nlohmann::json* config) {
-  const auto spec_type_it = config->find("speculators_model_type");
-  if (spec_type_it == config->end() || !spec_type_it->is_string() ||
+void normalize_speculators_config(nlohmann::json& config) {
+  const auto spec_type_it = config.find(/*key=*/"speculators_model_type");
+  if (spec_type_it == config.end() || !spec_type_it->is_string() ||
       spec_type_it->get<std::string>() != "eagle3") {
     return;
   }
-  const auto layer_it = config->find("transformer_layer_config");
-  CHECK(layer_it != config->end() && layer_it->is_object())
+  const auto layer_it = config.find(/*key=*/"transformer_layer_config");
+  CHECK(layer_it != config.end() && layer_it->is_object())
       << "speculators eagle3 draft config requires a "
          "transformer_layer_config object";
   const std::string layer_model_type = layer_it->value("model_type", "");
   const bool layer_use_qk_norm =
       layer_it->value("use_qk_norm", layer_model_type == "qwen3");
-  (*config)["model_type"] = "qwen3_eagle3";
-  if (!config->contains("use_qk_norm")) {
-    (*config)["use_qk_norm"] = layer_use_qk_norm;
+  config["model_type"] = "qwen3_eagle3";
+  if (!config.contains(/*key=*/"use_qk_norm")) {
+    config["use_qk_norm"] = layer_use_qk_norm;
   }
 }
+
+}  // namespace
 
 bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args) {
   if (!reader.contains("quantization_config") &&
@@ -418,6 +411,13 @@ bool load_hf_model_args(const std::filesystem::path& model_weights_path,
                         const std::string& backend,
                         ModelArgs* args) {
   JsonReader reader;
+  return load_hf_model_args(model_weights_path, backend, args, reader);
+}
+
+bool load_hf_model_args(const std::filesystem::path& model_weights_path,
+                        const std::string& backend,
+                        ModelArgs* args,
+                        JsonReader& reader) {
   const std::filesystem::path args_file_path =
       model_weights_path / "config.json";
   if (!reader.parse(args_file_path.string())) {
@@ -425,7 +425,8 @@ bool load_hf_model_args(const std::filesystem::path& model_weights_path,
     return false;
   }
 
-  normalize_speculators_config(&reader.mutable_data());
+  auto& config = reader.mutable_data();
+  normalize_speculators_config(config);
 
   const std::string model_type =
       get_model_type(reader, model_weights_path, backend);
@@ -445,13 +446,17 @@ bool load_hf_model_args(const std::filesystem::path& model_weights_path,
                << resolved_model_type;
     return false;
   }
-  normalize_config_torch_dtype(reader);
+  if (!config.contains(/*key=*/"torch_dtype") &&
+      config.contains(/*key=*/"dtype")) {
+    config["torch_dtype"] = config["dtype"];
+  }
+  lift_speculators_config(config);
   if (!model_args_loader(reader, args)) {
     LOG(ERROR) << "Failed to load model args for model type "
                << resolved_model_type;
     return false;
   }
-  args->enable_mla(should_enable_mla(model_weights_path, backend));
+  args->enable_mla(backend != "dit" && util::is_mla_model_type(model_type));
 
   return true;
 }

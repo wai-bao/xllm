@@ -59,7 +59,6 @@ limitations under the License.
 #include "core/util/tensor_helper.h"
 #include "core/util/tensor_options.h"
 #include "framework/model/model_args.h"
-#include "models/model_registry.h"
 #include "runtime/decode_graph_bucket.h"
 #include "runtime/llm_worker_impl.h"
 #include "runtime/worker.h"
@@ -192,16 +191,17 @@ bool LLMEngine::init(
 bool LLMEngine::init_model(MasterStatus master_status,
                            const ModelInitCallback& prepare_model) {
   const std::string& model_path = options_.model_path();
-  auto model_loader = ModelLoader::create(model_path);
+  auto model_loader = ModelLoader::create(
+      model_path,
+      options_.backend(),
+      options_.is_draft_engine()
+          ? DraftModelLoadOptions{.algorithm_ =
+                                      options_.speculative_algorithm(),
+                                  .model_impl_ = options_.model_impl()}
+          : DraftModelLoadOptions{});
   LOG(INFO) << "Initializing model from: " << model_path;
 
   args_ = model_loader->model_args();
-  ModelRegistry::configure_mtp_args(
-      args_,
-      options_.speculative_algorithm(),
-      options_.is_draft_engine(),
-      ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl()));
   if (!options_.is_draft_engine() &&
       SpeculativeConfig::is_block_diffusion_algorithm(
           options_.speculative_algorithm())) {

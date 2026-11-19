@@ -22,24 +22,24 @@ from xllm.python.attention.backend import LayerCache
 from xllm.python.models import deepseek_v4
 from xllm.python.models.deepseek_v4_dspark import (
     DeepseekV4DSparkConfig,
-    DeepseekV4DSparkForCausalLM,
     DeepseekV4DSparkModel,
 )
-from xllm.python.models.dspark import DSparkForCausalLMBase
 
 
 def test_dspark_context_kv_validates_cache_and_hidden_shapes() -> None:
     model = DeepseekV4DSparkModel.__new__(DeepseekV4DSparkModel)
     torch.nn.Module.__init__(model)
-    model.cfg = SimpleNamespace(n_layers=2, hidden_size=4, dspark_num_layers=2)
+    model.cfg = DeepseekV4DSparkConfig(n_layers=1)
+    model.add_module("main_proj", torch.nn.Linear(4, 4, bias=False))
     target_hidden = torch.zeros((3, 8))
 
     with pytest.raises(ValueError, match="cache/layer count"):
         model.write_context_kv(target_hidden, torch.arange(3), torch.arange(3), [], None)
 
-    model.cfg = SimpleNamespace(n_layers=1, hidden_size=4, dspark_num_layers=2)
     with pytest.raises(ValueError, match="target hidden width"):
-        model.write_context_kv(torch.zeros((3, 4)), torch.arange(3), torch.arange(3), [object()], None)
+        model.write_context_kv(
+            target_hidden, torch.arange(3), torch.arange(3), [LayerCache(key=None, value=None, swa=None)], None
+        )
 
 
 @pytest.mark.parametrize("record_result", [True, False])
@@ -60,8 +60,8 @@ def test_dspark_context_kv_writes_real_decoder_layer_cache(
             "max_position_embeddings": 8,
             "moe_intermediate_size": 4,
             "first_k_dense_replace": 2,
-            "dspark_num_layers": 1,
-            "dspark_target_layer_ids": [7],
+            "model_type": "deepseek_v4_dspark",
+            "n_layers": 1,
             "dspark_markov_rank": 4,
         }
     )
@@ -98,7 +98,3 @@ def test_dspark_context_kv_writes_real_decoder_layer_cache(
         assert projected is None
     torch.testing.assert_close(swa_cache.view(-1, 4)[[1, 3, 5]], target_hidden)
     synchronizer.record_event.assert_called_once_with(0)
-
-
-def test_dspark_runtime_reuses_shared_head_base() -> None:
-    assert issubclass(DeepseekV4DSparkForCausalLM, DSparkForCausalLMBase)

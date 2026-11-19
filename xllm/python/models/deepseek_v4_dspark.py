@@ -54,45 +54,31 @@ class _DSparkQuantAwareLinear(QLinear):
 class DeepseekV4DSparkConfig(DeepseekV4Config):
     """DeepSeek-V4 target configuration narrowed to its DSpark draft."""
 
-    dspark_num_layers: int = 0
-    dspark_target_layer_ids: tuple[int, ...] = ()
     dspark_noise_token_id: int = 0
     markov_rank: int = 0
     enable_confidence_head: bool = False
-    confidence_head_with_markov: bool = True
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> DeepseekV4DSparkConfig:
-        base = DeepseekV4Config.from_dict(d)
-        target_layer_ids = tuple(int(layer_id) for layer_id in d.get("dspark_target_layer_ids", ()))
-        num_layers = int(d.get("dspark_num_layers", len(target_layer_ids)))
-        values = dict(base.__dict__)
-        values.update(
-            model_type="deepseek_v4_dspark",
-            n_layers=num_layers,
-            n_hash_layers=0,
-            compress_ratios=[1] * num_layers,
-            dspark_num_layers=num_layers,
-            dspark_target_layer_ids=target_layer_ids,
-            dspark_noise_token_id=int(d.get("dspark_noise_token_id", 0)),
-            markov_rank=int(d.get("markov_rank", d.get("dspark_markov_rank", 0))),
-            enable_confidence_head=bool(d.get("enable_confidence_head", False)),
-            # DeepSeek-V4 DSpark checkpoints always carry a markov (no-bias)
-            # confidence head: the C++ side initializes it with
-            # with_markov=true unconditionally (deepseek_v4_dspark.h). The
-            # reflected confidence_head_with_markov key is NOT consulted —
-            # ModelArgs defaults it to false and no worker sets it, so a
-            # plumb-through would build a [1, hidden] module for a
-            # [1, hidden + markov_rank] checkpoint.
-            confidence_head_with_markov=True,
-        )
-        return cls(**values)
+        config = super().from_dict(d)
+        target_layer_ids = d.get("dspark_target_layer_ids")
+        if target_layer_ids is not None:
+            config.n_layers = len(target_layer_ids)
+        elif config.model_type == "deepseek_v4_dspark":
+            config.n_layers = int(d.get("n_layers", 0))
+        else:
+            config.n_layers = 0
+        config.model_type = "deepseek_v4_dspark"
+        config.n_hash_layers = 0
+        config.compress_ratios = [1] * config.n_layers
+        config.dspark_noise_token_id = int(d.get("dspark_noise_token_id", 0))
+        config.markov_rank = int(d.get("markov_rank", d.get("dspark_markov_rank", 0)))
+        config.enable_confidence_head = bool(d.get("enable_confidence_head", False))
+        return config
 
     def validate(self) -> None:
-        if self.dspark_num_layers <= 0:
-            raise ValueError("DeepSeek-V4 DSpark requires dspark_num_layers > 0")
-        if self.dspark_target_layer_ids and len(self.dspark_target_layer_ids) != self.dspark_num_layers:
-            raise ValueError("DeepSeek-V4 DSpark target layer count must match dspark_num_layers")
+        if self.n_layers <= 0:
+            raise ValueError("DeepSeek-V4 DSpark requires at least one draft layer")
         if self.markov_rank <= 0:
             raise ValueError("DeepSeek-V4 DSpark requires dspark_markov_rank > 0")
 
@@ -108,7 +94,7 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
     ) -> None:
         super().__init__(cfg, dtype, device)
         self.main_proj = _DSparkQuantAwareLinear(
-            cfg.hidden_size * cfg.dspark_num_layers,
+            cfg.hidden_size * cfg.n_layers,
             cfg.hidden_size,
             dtype=dtype,
             device=device,
@@ -135,11 +121,9 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
             raise ValueError("DeepSeek-V4 DSpark cache/layer count mismatch")
         if cache_slots.numel() != target_hidden.size(0):
             raise ValueError("DeepSeek-V4 DSpark context slot count mismatch")
-        expected_width = self.cfg.hidden_size * self.cfg.dspark_num_layers
+        expected_width = self.main_proj.in_features
         if target_hidden.dim() != 2 or target_hidden.size(-1) != expected_width:
-            raise ValueError(
-                f"DeepSeek-V4 DSpark target hidden width must equal dspark_num_layers * hidden_size ({expected_width})"
-            )
+            raise ValueError(f"DeepSeek-V4 DSpark target hidden width must be {expected_width}")
 
         projected = self.main_norm(self.main_proj(target_hidden))
         positions = positions.to(torch.int64).contiguous()
@@ -179,7 +163,7 @@ class DeepseekV4DSparkForCausalLM(
             markov_rank=cfg.markov_rank,
             hidden_size=cfg.hidden_size,
             enable_confidence_head=cfg.enable_confidence_head,
-            confidence_head_with_markov=cfg.confidence_head_with_markov,
+            confidence_head_with_markov=True,
             dtype=dtype,
             device=device,
             confidence_head_bias=False,

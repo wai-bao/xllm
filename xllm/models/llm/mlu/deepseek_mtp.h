@@ -17,15 +17,13 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/layers/mlu/deepseek_v2_decoder_layer_impl.h"
 #include "models/llm/llm_model_base.h"
 #include "models/llm/mlu/mtp_model_base.h"
-
-// DeepSeek v2 compatible with huggingface weights
-// ref to:
-// https://github.com/vllm-project/vllm/blob/v0.6.6/vllm/model_executor/models/deepseek_v2.py
+#include "models/model_registry.h"
 
 namespace xllm::mlu::model {
 
@@ -69,6 +67,19 @@ TORCH_MODULE(DeepseekMtpForCausalLM);
 
 // register the causal model
 REGISTER_CAUSAL_MODEL(deepseek_v3_mtp, DeepseekMtpForCausalLM);
+REGISTER_CAUSAL_MODEL(glm_moe_dsa_mtp, DeepseekMtpForCausalLM);
+REGISTER_CAUSAL_MODEL(joyai_llm_flash_mtp, DeepseekMtpForCausalLM);
+
+const bool deepseek_mtp_types_registered = [] {
+  for (const auto& [model_type, draft_type] :
+       {std::pair{"deepseek_v32", "deepseek_v32_mtp"},
+        std::pair{"glm_moe_dsa", "glm_moe_dsa_mtp"},
+        std::pair{"joyai_llm_flash", "joyai_llm_flash_mtp"}}) {
+    ModelRegistry::register_mtp_metadata(model_type,
+                                         {.draft_model_type_ = draft_type});
+  }
+  return true;
+}();
 
 // example config:
 // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json

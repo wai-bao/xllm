@@ -16,7 +16,6 @@ limitations under the License.
 #pragma once
 
 #include <filesystem>
-#include <nlohmann/json_fwd.hpp>
 #include <string>
 
 namespace xllm {
@@ -25,17 +24,16 @@ class ModelArgs;
 class QuantArgs;
 class JsonReader;
 
-// Normalize speculators-format Eagle3 draft configs for the qwen3_eagle3
-// loader.
-void normalize_speculators_config(nlohmann::json* config);
-
-void normalize_config_torch_dtype(JsonReader& reader);
-
 bool load_quant_cfg(const JsonReader& reader, QuantArgs& quant_args);
 
 bool load_hf_model_args(const std::filesystem::path& model_weights_path,
                         const std::string& backend,
                         ModelArgs* args);
+
+bool load_hf_model_args(const std::filesystem::path& model_weights_path,
+                        const std::string& backend,
+                        ModelArgs* args,
+                        JsonReader& checkpoint_config);
 
 bool load_hf_audio_preprocessor_args(
     const std::filesystem::path& model_weights_path,

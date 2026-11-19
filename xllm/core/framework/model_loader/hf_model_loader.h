@@ -20,7 +20,6 @@ limitations under the License.
 
 #include <vector>
 
-#include "core/framework/model_loader/hf_model_args.h"
 #include "core/framework/model_loader/model_loader.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/util/json_reader.h"
@@ -30,9 +29,9 @@ namespace xllm {
 
 class HFModelLoader : public ModelLoader {
  public:
-  explicit HFModelLoader(std::string model_weights_path);
-
-  HFModelLoader(std::string model_weights_path, const std::string& backend);
+  HFModelLoader(std::string model_weights_path,
+                const std::string& backend,
+                const DraftModelLoadOptions& draft);
 
   std::unique_ptr<Tokenizer> tokenizer() const override;
 
@@ -45,10 +44,10 @@ class HFModelLoader : public ModelLoader {
   int64_t get_max_decoder_layer_weight_size() const override;
 
  private:
-  bool load_args(const std::string& model_weights_path,
-                 const std::string& backend);
-  bool load_quant_args(const std::string& model_weights_path);
-  bool load_tokenizer_args(const std::string& model_weights_path);
+  bool load_args(const std::string& backend,
+                 const DraftModelLoadOptions& draft);
+  bool load_quant_args(const JsonReader& reader);
+  bool load_tokenizer_args();
   std::string model_weights_path() const override {
     return model_weights_path_;
   }

@@ -49,7 +49,6 @@ std::pair<torch::Tensor, torch::Tensor> sample_dflash2_path(
     torch::Tensor gumbel_noise,
     int64_t vocab_size) {
   CHECK_EQ(candidates.candidate_ids.dim(), 3);
-  CHECK_EQ(candidates.edge_logits.dim(), 4);
   const int64_t batch_size = candidates.candidate_ids.size(0);
   const int64_t num_steps = candidates.candidate_ids.size(1);
   const int64_t top_k = candidates.candidate_ids.size(2);
@@ -87,8 +86,10 @@ std::pair<torch::Tensor, torch::Tensor> sample_dflash2_path(
 
   torch::Tensor greedy_rows;
   torch::Tensor zero_log_probs;
-  if (is_probabilistic_draft &&
-      sampling_params.sampling_mode() == SamplingMode::MIXED) {
+  const bool use_mixed_sampling =
+      is_probabilistic_draft &&
+      sampling_params.sampling_mode() == SamplingMode::MIXED;
+  if (use_mixed_sampling) {
     greedy_rows = greedy_mask(sampling_params, device);
     zero_log_probs = torch::zeros({batch_size, 1}, float_options);
   }
@@ -114,7 +115,7 @@ std::pair<torch::Tensor, torch::Tensor> sample_dflash2_path(
         index_select_2d(step_candidates, /*dim=*/1, sampled_indices);
     if (is_probabilistic_draft) {
       torch::Tensor step_log_probs = row_log_probs;
-      if (sampling_params.sampling_mode() == SamplingMode::MIXED) {
+      if (use_mixed_sampling) {
         // Greedy rows embed a log-space one-hot (q = 1).
         torch::Tensor one_hot =
             torch::full({batch_size, top_k},
@@ -135,11 +136,6 @@ std::pair<torch::Tensor, torch::Tensor> sample_dflash2_path(
 }
 
 }  // namespace
-
-void DFlash2WorkerImpl::apply_draft_model_overrides(ModelArgs& args) {
-  args.layers_to_capture({});
-  args.model_type(/*value=*/"DFlash2DraftModel");
-}
 
 bool DFlash2WorkerImpl::init_model(const std::string& model_weights_path,
                                    int32_t random_seed,

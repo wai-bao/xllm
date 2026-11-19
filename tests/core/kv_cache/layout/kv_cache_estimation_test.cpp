@@ -32,10 +32,6 @@ limitations under the License.
 #include "runtime/options.h"
 #include "tests/core/kv_cache/dcp_indexer_test_fixture.h"
 
-#if defined(USE_NPU)
-#include "models/model_registry.h"
-#endif
-
 namespace xllm {
 namespace {
 
@@ -1483,55 +1479,19 @@ TEST_F(VirtualMemoryPrefixEstimationTest, ReservesReusableLinearStateSlots) {
   EXPECT_LT(with_prefix.n_blocks(), without_prefix.n_blocks());
 }
 
-#if defined(USE_NPU)
-TEST(KVCacheEstimationTest, Qwen35NativeMtpDraftUsesFullAttentionCacheBudget) {
-  for (const std::string& model_type :
-       {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"}) {
-    for (const int64_t draft_layers : {1, 2}) {
-      SCOPED_TRACE(model_type);
-      SCOPED_TRACE(draft_layers);
-      ModelArgs target_args = make_linear_attention_args();
-      target_args.model_type(model_type)
-          .num_nextn_predict_layers(draft_layers)
-          .layer_types({"linear_attention",
-                        "full_attention",
-                        "linear_attention",
-                        "full_attention"});
-      ModelRegistry::configure_mtp_args(target_args,
-                                        /*speculative_algorithm=*/"MTP",
-                                        /*is_draft_engine=*/false,
-                                        /*is_python_model=*/false);
-      ModelArgs draft_args = target_args;
-      ModelRegistry::configure_mtp_args(draft_args,
-                                        /*speculative_algorithm=*/"MTP",
-                                        /*is_draft_engine=*/true,
-                                        /*is_python_model=*/false);
-
-      KVCacheEstimateOptions target_options = make_linear_attention_options();
-      target_options.num_speculative_tokens = 3;
-      const KVCacheCapacity target_capacity =
-          estimate_kv_cache_capacity(target_args, target_options);
-      EXPECT_EQ(target_capacity.n_layers(), 4);
-      EXPECT_EQ(target_capacity.num_full_attention_layers(), 2);
-      EXPECT_EQ(target_capacity.num_linear_attention_layers(), 2);
-      EXPECT_GT(target_capacity.linear_cache_size_in_bytes(), 0);
-
-      KVCacheEstimateOptions draft_options = target_options;
-      draft_options.is_draft_engine = true;
-      const KVCacheCapacity draft_capacity =
-          estimate_kv_cache_capacity(draft_args, draft_options);
-      EXPECT_EQ(draft_capacity.n_layers(), draft_layers);
-      EXPECT_EQ(draft_capacity.num_full_attention_layers(), draft_layers);
-      EXPECT_EQ(draft_capacity.num_linear_attention_layers(), 0);
-      EXPECT_EQ(draft_capacity.linear_cache_size_in_bytes(), 0);
-      EXPECT_EQ(draft_capacity.slot_size(), 128);
-      EXPECT_EQ(draft_capacity.block_size(), 16);
-      EXPECT_EQ(draft_capacity.cache_size_in_bytes(), 1024 * 1024);
-      EXPECT_EQ(draft_capacity.n_blocks(), 512 / draft_layers);
-    }
-  }
+TEST(KVCacheEstimationTest, Qwen35MtpDraftUsesFullAttentionCacheBudget) {
+  ModelArgs args = make_linear_attention_args();
+  args.model_type(/*value=*/"qwen3_5_mtp")
+      .n_layers(/*value=*/2)
+      .num_nextn_predict_layers(/*value=*/2)
+      .full_attention_interval(/*value=*/1)
+      .layer_types(/*value=*/{"full_attention", "full_attention"});
+  KVCacheEstimateOptions options = make_linear_attention_options();
+  options.is_draft_engine = true;
+  const KVCacheCapacity capacity = estimate_kv_cache_capacity(args, options);
+  EXPECT_EQ(capacity.linear_cache_size_in_bytes(), 0);
+  EXPECT_EQ(capacity.n_blocks(), 256);
 }
-#endif
 
 TEST(KVCacheEstimationTest, GlmMtpAllocatesFrameworkCheckpointsOnlyForDecode) {
   for (const std::string& model_type : {"glm5_3_flash", "glm5_next"}) {

@@ -97,7 +97,6 @@ class WorkerImpl {
                   MasterStatus master_status);
   ModelContext load_model_config(ModelArgs args,
                                  const QuantArgs& quant_args,
-                                 int32_t num_speculative_tokens,
                                  Tokenizer* tokenizer);
 
   virtual void load_model(std::unique_ptr<ModelLoader> loader);

@@ -356,7 +356,7 @@ class DeepseekV4Config:
     num_speculative_tokens: int = 0
 
     @classmethod
-    def from_dict(cls: type[_ConfigT], d: dict) -> _ConfigT:
+    def from_dict(cls: type[_ConfigT], d: dict[str, Any]) -> _ConfigT:
         rs_raw = d.get("rope_scaling")
         rs = rs_raw if isinstance(rs_raw, dict) else {}
 

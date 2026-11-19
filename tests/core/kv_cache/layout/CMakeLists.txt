@@ -88,7 +88,6 @@ cc_test(
     kv_cache_estimation_test.cpp
   DEPS
     :kv_cache_estimation
-    $<$<BOOL:${USE_NPU}>:models>
     GTest::gtest_main
 )
 target_link_libraries(kv_cache_estimation_test

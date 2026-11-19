@@ -1369,10 +1369,8 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
         device_.set_seed(random_seed);
         auto loader = create_model_loader(model_weights_path);
         auto tokenizer = loader->tokenizer();
-        auto context = load_model_config(loader->model_args(),
-                                         loader->quant_args(),
-                                         options_.num_speculative_tokens(),
-                                         tokenizer.get());
+        auto context = load_model_config(
+            loader->model_args(), loader->quant_args(), tokenizer.get());
         return init_model_impl(std::move(loader),
                                std::move(context),
                                std::move(tokenizer),
@@ -1397,7 +1395,6 @@ bool WorkerImpl::init_model(std::unique_ptr<ModelLoader> loader,
 
 ModelContext WorkerImpl::load_model_config(ModelArgs args,
                                            const QuantArgs& quant_args,
-                                           int32_t num_speculative_tokens,
                                            Tokenizer* tokenizer) {
   validate_shared_kv_cache_config(args, options_, parallel_args_);
   const bool embedding_mode = options_.task_type() == "embed";
@@ -1421,7 +1418,15 @@ ModelContext WorkerImpl::load_model_config(ModelArgs args,
                    << tokenizer_vocab_size << ", model: " << model_vocab_size;
     }
   }
-  // create model context
+  const bool is_draft = options_.is_draft_engine();
+  if (is_draft && args.draft_vocab_size() == 0) {
+    args.draft_vocab_size(args.vocab_size());
+  }
+  const int32_t num_speculative_tokens =
+      !is_draft || SpeculativeConfig::is_block_diffusion_algorithm(
+                       options_.speculative_algorithm())
+          ? options_.num_speculative_tokens()
+          : 0;
   auto tensor_options = torch::dtype(dtype).device(device_);
   ModelContext context(
       parallel_args_,

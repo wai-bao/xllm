@@ -195,11 +195,8 @@ bool SpeculativeWorkerImpl<TargetInput>::init_model(
     auto args = loader->model_args();
     apply_target_model_overrides(args);
     auto tokenizer = loader->tokenizer();
-    auto context =
-        impl_->load_model_config(std::move(args),
-                                 loader->quant_args(),
-                                 impl_->options().num_speculative_tokens(),
-                                 tokenizer.get());
+    auto context = impl_->load_model_config(
+        std::move(args), loader->quant_args(), tokenizer.get());
     result = impl_->init_model(std::move(loader),
                                std::move(context),
                                std::move(tokenizer),

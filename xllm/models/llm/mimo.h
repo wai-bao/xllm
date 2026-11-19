@@ -29,7 +29,7 @@ class MiMoModelImpl final : public LlmModelImplBase<layer::Qwen2DecoderLayer> {
   explicit MiMoModelImpl(const ModelContext& context)
       : LlmModelImplBase<layer::Qwen2DecoderLayer>(context.get_model_args()) {
     // register submodules
-    auto model_args = context.get_model_args();
+    const auto& model_args = context.get_model_args();
     auto options = context.get_tensor_options();
     if (!mrope_section_.empty()) {
       cos_sin_ = layer::rotary::get_concat_rotary_embedding(
@@ -86,10 +86,12 @@ TORCH_MODULE(MiMoForCausalLM);
 // register the causal model
 REGISTER_CAUSAL_MODEL(mimo, MiMoForCausalLM);
 
-// register the model args
-// example config: /root/models/MiMo-7B-Base/config.json
-REGISTER_MODEL_ARGS(mimo, [&] {
-  LOAD_ARG_OR(model_type, "model_type", "mimo");
+namespace mimo_args {
+
+inline void load_model_args(const JsonReader& json,
+                            ModelArgs* args,
+                            const char* default_model_type) {
+  LOAD_ARG_OR(model_type, "model_type", default_model_type);
   LOAD_ARG_OR(dtype, "torch_dtype", "");
   LOAD_ARG_OR(vocab_size, "vocab_size", 151680);
   LOAD_ARG_OR(hidden_size, "hidden_size", 4096);
@@ -116,6 +118,16 @@ REGISTER_MODEL_ARGS(mimo, [&] {
   });
 
   SET_ARG(stop_token_ids, std::unordered_set<int32_t>({args->eos_token_id()}));
+}
+
+}  // namespace mimo_args
+
+REGISTER_MODEL_ARGS(mimo, [&] {
+  mimo_args::load_model_args(json, args, /*default_model_type=*/"mimo");
+});
+
+REGISTER_MODEL_ARGS(mimo_mtp, [&] {
+  mimo_args::load_model_args(json, args, /*default_model_type=*/"mimo_mtp");
 });
 
 }  // namespace xllm

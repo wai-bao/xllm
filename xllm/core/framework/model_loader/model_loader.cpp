@@ -16,15 +16,8 @@ limitations under the License.
 
 #include "core/framework/model_loader/model_loader.h"
 
-#include <absl/strings/match.h>
-#include <absl/strings/str_replace.h>
-#include <glog/logging.h>
-#include <torch/torch.h>
-
-#include <boost/algorithm/string.hpp>
-#include <filesystem>
+#include <memory>
 #include <utility>
-#include <vector>
 
 #include "core/framework/config/model_config.h"
 #include "core/framework/model_loader/hf_model_loader.h"
@@ -32,30 +25,17 @@ limitations under the License.
 namespace xllm {
 
 std::unique_ptr<ModelLoader> ModelLoader::create(
-    const std::string& model_weights_path) {
-  return create(model_weights_path, ModelConfig::get_instance().backend());
+    std::string model_weights_path) {
+  return create(std::move(model_weights_path),
+                ModelConfig::get_instance().backend());
 }
 
-std::unique_ptr<ModelLoader> ModelLoader::create(std::string model_weights_path,
-                                                 const std::string& backend) {
-  ModelType model_type = ModelType::INVALID;
-  for (const auto& entry :
-       std::filesystem::directory_iterator(model_weights_path)) {
-    if (entry.path().extension() == ".safetensors" ||
-        entry.path().extension() == ".bin") {
-      model_type = ModelType::HF_MODEL_TYPE;
-      break;
-    }
-  }
-
-  if (model_type == ModelType::HF_MODEL_TYPE) {
-    return std::make_unique<HFModelLoader>(std::move(model_weights_path),
-                                           backend);
-  } else {
-    LOG(FATAL) << "Only support HF model type currently.";
-  }
-
-  return nullptr;
+std::unique_ptr<ModelLoader> ModelLoader::create(
+    std::string model_weights_path,
+    const std::string& backend,
+    const DraftModelLoadOptions& draft) {
+  return std::make_unique<HFModelLoader>(
+      std::move(model_weights_path), backend, draft);
 }
 
 }  // namespace xllm

@@ -145,40 +145,6 @@ void check_mtp_decode_states(
 }  // namespace
 
 template <typename TargetInput>
-void MTPWorkerImpl<TargetInput>::apply_draft_model_overrides(ModelArgs& args) {
-  ModelRegistry::configure_mtp_args(
-      args,
-      /*algorithm=*/"MTP",
-      /*is_draft_engine=*/true,
-      ModelConfig::is_python_model_impl(draft_impl_->options().model_impl()));
-
-#if !defined(USE_NPU)
-  if (args.num_nextn_predict_layers() != 0) {
-    static const std::unordered_map<std::string, std::string>
-        kModelTypeToMtpType = {
-            {"deepseek_v3", "deepseek_v3_mtp"},
-            {"deepseek_v32", "deepseek_v32_mtp"},
-            {"deepseek_v4", "deepseek_v4_mtp"},
-            {"glm_moe_dsa", "glm_moe_dsa_mtp"},
-            {"joyai_llm_flash", "joyai_llm_flash_mtp"},
-            {"mimo", "mimo_mtp"},
-            {"qwen3_5", "qwen3_5_mtp"},
-            {"qwen3_5_moe", "qwen3_5_moe_mtp"},
-            {"qwen3_5_text", "qwen3_5_mtp"},
-            {"qwen3_5_moe_text", "qwen3_5_moe_mtp"},
-        };
-    const std::string& current_type = args.model_type();
-    auto it = kModelTypeToMtpType.find(current_type);
-    if (it != kModelTypeToMtpType.end()) {
-      LOG(INFO) << "Overriding draft model_type from " << current_type << " to "
-                << it->second << " for speculative decoding";
-      args.model_type(it->second);
-    }
-  }
-#endif
-}
-
-template <typename TargetInput>
 runtime::Options MTPWorkerImpl<TargetInput>::draft_options(
     const runtime::Options& options) {
   runtime::Options draft_options = options;
@@ -978,7 +944,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
                                   draft_sampling_params.sampling_mode());
       this->draft_vocab_.remap(draft_sample);
     }
-    if (draft_idx == num_speculative_tokens - 1) {
+    if (is_final_draft) {
       continue;
     }
 
