@@ -88,9 +88,9 @@ torch::Tensor MiniMaxM2DecoderLayerImpl::forward(
     torch::Tensor& positions,
     const AttentionMetadata& attn_metadata,
     KVCache& kv_cache,
-    const ModelParamsView& input_params) {
+    const MoeExecutionInput& moe_input) {
   if (x.numel() == 0) {
-    return moe_->forward(x, input_params);
+    return moe_->forward(x, moe_input);
   }
 
   if (!residual.has_value()) {
@@ -102,7 +102,7 @@ torch::Tensor MiniMaxM2DecoderLayerImpl::forward(
 
   x = attention_->forward(positions, x, attn_metadata, kv_cache);
   std::tie(x, residual) = post_norm_->forward(x, residual);
-  x = moe_->forward(x, input_params);
+  x = moe_->forward(x, moe_input);
   return x;
 }
 

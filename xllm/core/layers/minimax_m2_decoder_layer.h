@@ -31,8 +31,8 @@ limitations under the License.
 #include "layers/common/fused_moe.h"
 #endif
 #include "common/rms_norm.h"
+#include "core/framework/model/moe_execution_input.h"
 #include "core/kv_cache/storage/kv_cache.h"
-#include "framework/model/model_params_view.h"
 #include "framework/model_context/model_context.h"
 #include "minimax_m2_attention.h"
 
@@ -49,7 +49,7 @@ class MiniMaxM2DecoderLayerImpl : public torch::nn::Module {
                         torch::Tensor& positions,
                         const AttentionMetadata& attn_metadata,
                         KVCache& kv_cache,
-                        const ModelParamsView& input_params);
+                        const MoeExecutionInput& moe_input);
 
   void load_state_dict(const StateDict& state_dict);
 

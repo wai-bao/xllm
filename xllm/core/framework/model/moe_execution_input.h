@@ -15,15 +15,20 @@ limitations under the License.
 
 #pragma once
 
+#include <type_traits>
+
 #include "core/framework/model/model_input_types.h"
 
 namespace xllm {
+
+class ModelParamsView;
 
 // Borrows only the batch and parallel state consumed by expert execution.
 class MoeExecutionInput final {
  public:
   template <typename InputParams>
-  explicit MoeExecutionInput(const InputParams& params)
+  explicit(!std::is_same_v<InputParams, ModelParamsView>)
+      MoeExecutionInput(const InputParams& params)
       : meta(params.meta),
         parallel(params.parallel),
         expert(params.expert),

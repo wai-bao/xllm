@@ -62,12 +62,12 @@ class LlmModelImplBase : public torch::nn::Module {
   ModelOutput forward_impl(torch::Tensor tokens,
                            torch::Tensor positions,
                            std::vector<KVCache>& kv_caches,
-                           InputParams& input_params) {
+                           InputParams& params) {
     if (tokens.numel() == 0) {
       tokens = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
       positions = torch::tensor({1}).to(torch::kInt32).to(tokens.device());
     }
-    auto inputs_embeds = input_params.embedding.input_embedding;
+    auto inputs_embeds = params.embedding.input_embedding;
     torch::Tensor h;
     if (inputs_embeds.defined()) {
       h = inputs_embeds;
@@ -75,16 +75,14 @@ class LlmModelImplBase : public torch::nn::Module {
       h = embed_tokens_(tokens);
     }
 
-    auto& modified_input_params = input_params;
-    auto& dp_token_nums = modified_input_params.parallel.dp_global_token_nums;
+    auto& dp_token_nums = params.parallel.dp_global_token_nums;
     std::replace(dp_token_nums.begin(), dp_token_nums.end(), 0, 1);
-    if (!modified_input_params.attn_metadata) {
-      modified_input_params.attn_metadata =
-          std::make_shared<layer::AttentionMetadata>(
-              layer::AttentionMetadataBuilder::build(modified_input_params,
-                                                     model_args_.enable_mla()));
+    if (!params.attn_metadata) {
+      params.attn_metadata = std::make_shared<layer::AttentionMetadata>(
+          layer::AttentionMetadataBuilder::build(params,
+                                                 model_args_.enable_mla()));
     }
-    auto& attn_metadata = *(modified_input_params.attn_metadata);
+    auto& attn_metadata = *(params.attn_metadata);
     if (positions.dim() == 2) {
       std::tie(attn_metadata.mrope_cos, attn_metadata.mrope_sin) =
           apply_mrope(positions);
@@ -92,21 +90,24 @@ class LlmModelImplBase : public torch::nn::Module {
 
     std::optional<torch::Tensor> residual;
     for (size_t i = 0; i < layers_.size(); i++) {
-      if (!modified_input_params.synchronize_layer(static_cast<uint32_t>(i))) {
+      if (!params.synchronize_layer(static_cast<uint32_t>(i))) {
         return ModelOutput();
       }
 #if defined(USE_CUDA) || defined(USE_MUSA)
       attn_metadata.plan_info->layer_id = i;
 #endif
       auto& layer = layers_[i];
-      h = layer->forward(h,
-                         residual,
-                         positions,
-                         attn_metadata,
-                         kv_caches[i],
-                         modified_input_params);
-      if (!modified_input_params.record_layer(static_cast<uint32_t>(i),
-                                              h.device())) {
+      auto& cache = kv_caches[i];
+      if constexpr (requires {
+                      layer->forward(
+                          h, residual, positions, attn_metadata, cache, params);
+                    }) {
+        h = layer->forward(
+            h, residual, positions, attn_metadata, cache, params);
+      } else {
+        h = layer->forward(h, residual, positions, attn_metadata, cache);
+      }
+      if (!params.record_layer(static_cast<uint32_t>(i), h.device())) {
         return ModelOutput();
       }
     }

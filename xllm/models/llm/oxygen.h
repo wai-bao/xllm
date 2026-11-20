@@ -21,9 +21,9 @@ limitations under the License.
 
 namespace xllm {
 
-class OxygenModelImpl : public QWen3ModelImpl {
+class OxygenModelImpl : public QWen3ModelImpl<> {
  public:
-  OxygenModelImpl(const ModelContext& context) : QWen3ModelImpl(context) {}
+  OxygenModelImpl(const ModelContext& context) : QWen3ModelImpl<>(context) {}
 
   ModelOutput forward(torch::Tensor tokens,
                       torch::Tensor positions,
@@ -70,12 +70,7 @@ class OxygenModelImpl : public QWen3ModelImpl {
     std::optional<torch::Tensor> residual;
     for (size_t i = 0; i < layers_.size(); i++) {
       auto& layer = layers_[i];
-      h = layer->forward(h,
-                         residual,
-                         positions,
-                         attn_metadata,
-                         kv_caches[i],
-                         input_params_new);
+      h = layer->forward(h, residual, positions, attn_metadata, kv_caches[i]);
       if (!input_params_new.record_layer(static_cast<uint32_t>(i),
                                          h.device())) {
         return ModelOutput();

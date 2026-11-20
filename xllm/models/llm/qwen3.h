@@ -25,37 +25,15 @@ limitations under the License.
 
 namespace xllm {
 
-class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
+template <typename DecoderLayerType = layer::Qwen3DecoderLayer>
+class QWen3ModelImpl : public LlmModelImplBase<DecoderLayerType> {
  public:
-  QWen3ModelImpl(const ModelContext& context)
-      : LlmModelImplBase<layer::Qwen3DecoderLayer>(context.get_model_args()) {
-    // register submodules
-    auto model_args = context.get_model_args();
-    auto options = context.get_tensor_options();
-
-    if (!mrope_section_.empty()) {
-      cos_sin_ = layer::rotary::get_concat_rotary_embedding(
-          128,
-          model_args.max_position_embeddings(),
-          model_args.rope_theta(),
-          options);
-    }
-
-    layers_.reserve(model_args.n_layers());
-    norm_ = register_module("norm", layer::RMSNorm(context));
-    if (!is_dflash2_draft_model_type(model_args.model_type())) {
-      embed_tokens_ =
-          register_module("embed_tokens", layer::WordEmbedding(context));
-    }
-    for (int32_t i = 0; i < model_args.n_layers(); i++) {
-      auto layer = layer::Qwen3DecoderLayer(context, i);
-      layers_.push_back(layer);
-    }
-  }
+  explicit QWen3ModelImpl(const ModelContext& context)
+      : QWen3ModelImpl(context, layer::WordEmbedding(context)) {}
 
   std::pair<torch::Tensor, torch::Tensor> apply_mrope(
       const torch::Tensor positions) override {
-    auto target_cos_sin = cos_sin_.index({positions});
+    auto target_cos_sin = this->cos_sin_.index({positions});
     auto target_cos_sin_chunks = target_cos_sin.chunk(/*chunks=*/2, /*dim=*/-1);
     auto cos_pos = target_cos_sin_chunks[0].contiguous();
     auto sin_pos = target_cos_sin_chunks[1].contiguous();
@@ -66,7 +44,7 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
 
       for (int dim_idx = 1; dim_idx <= 2; ++dim_idx) {
         int64_t offset = dim_idx;
-        int64_t section_len = mrope_section_[dim_idx];
+        int64_t section_len = this->mrope_section_[dim_idx];
         int64_t length = section_len * 3;
 
         // Since the last dim of freqs is repeated to 2*mrop_length
@@ -114,7 +92,7 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
     if (inputs_embeds.defined()) {
       h = inputs_embeds;
     } else {
-      h = embed_tokens_(tokens);
+      h = this->embed_tokens_(tokens);
     }
 
     auto& dp_token_nums = input_params_new.parallel.dp_global_token_nums;
@@ -128,26 +106,21 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
     auto& attn_metadata = *(input_params_new.attn_metadata);
     bool only_prefill =
         (attn_metadata.is_prefill || attn_metadata.is_chunked_prefill);
-    if (positions.dim() == 2 && only_prefill && !mrope_section_.empty()) {
+    if (positions.dim() == 2 && only_prefill && !this->mrope_section_.empty()) {
       std::tie(attn_metadata.mrope_cos, attn_metadata.mrope_sin) =
           apply_mrope(positions);
     }
 
     std::optional<torch::Tensor> residual;
-    for (size_t i = 0; i < layers_.size(); i++) {
+    for (size_t i = 0; i < this->layers_.size(); i++) {
       if (!input_params_new.synchronize_layer(static_cast<uint32_t>(i))) {
         return ModelOutput();
       }
 #if defined(USE_CUDA)
       attn_metadata.plan_info->layer_id = i;
 #endif
-      auto& layer = layers_[i];
-      h = layer->forward(h,
-                         residual,
-                         positions,
-                         attn_metadata,
-                         kv_caches[i],
-                         input_params_new);
+      auto& layer = this->layers_[i];
+      h = layer->forward(h, residual, positions, attn_metadata, kv_caches[i]);
       if (!input_params_new.record_layer(static_cast<uint32_t>(i),
                                          h.device())) {
         return ModelOutput();
@@ -160,18 +133,43 @@ class QWen3ModelImpl : public LlmModelImplBase<layer::Qwen3DecoderLayer> {
         }
       }
     }
-    auto [hidden_states, residual_out] = norm_(h, residual);
+    auto [hidden_states, residual_out] = this->norm_(h, residual);
     return ModelOutput(hidden_states, residual_out);
   }
 
  protected:
+  QWen3ModelImpl(const ModelContext& context,
+                 layer::WordEmbedding word_embedding)
+      : LlmModelImplBase<DecoderLayerType>(context.get_model_args()) {
+    const auto& model_args = context.get_model_args();
+    const auto& options = context.get_tensor_options();
+
+    if (!this->mrope_section_.empty()) {
+      this->cos_sin_ = layer::rotary::get_concat_rotary_embedding(
+          /*dim=*/128,
+          model_args.max_position_embeddings(),
+          model_args.rope_theta(),
+          options);
+    }
+
+    this->layers_.reserve(model_args.n_layers());
+    this->norm_ =
+        this->register_module(/*name=*/"norm", layer::RMSNorm(context));
+    if (word_embedding) {
+      this->set_word_embedding(word_embedding);
+    }
+    for (int32_t i = 0; i < model_args.n_layers(); ++i) {
+      this->layers_.emplace_back(context, i);
+    }
+  }
+
   virtual layer::AttentionMetadata get_attention_metadata(
       const ModelParamsView& params) {
-    return layer::AttentionMetadataBuilder::build(params,
-                                                  model_args_.enable_mla());
+    return layer::AttentionMetadataBuilder::build(
+        params, this->model_args_.enable_mla());
   }
 };
-TORCH_MODULE(QWen3Model);
+TORCH_MODULE_IMPL(QWen3Model, QWen3ModelImpl<>);
 
 class QWen3ForCausalLMImpl : public LlmForCausalLMImplBase<QWen3Model> {
  public:

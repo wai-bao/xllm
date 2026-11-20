@@ -80,8 +80,7 @@ Qwen3MoeDecoderLayerImpl::Qwen3MoeDecoderLayerImpl(const ModelContext& context,
         << "Qwen3 MoE only support deep ep all2all when dp_size == ep_size";
   }
 
-  // Initialize attention layers
-  attention_ = register_module("self_attn", Qwen2Attention(context));
+  attention_ = register_module(/*name=*/"self_attn", Qwen3Attention(context));
 
   // Initialize norm layers
   input_norm_ = register_module(

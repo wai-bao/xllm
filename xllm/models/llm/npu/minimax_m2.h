@@ -29,6 +29,7 @@ limitations under the License.
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/model/model_params_view.h"
+#include "core/framework/model/moe_execution_input.h"
 #include "core/framework/model_context/model_context.h"
 #include "core/framework/model_loader/hf_model_loader.h"
 #include "core/framework/model_loader/model_loader.h"
@@ -64,9 +65,9 @@ class MiniMaxM2MoeDecoderLayerImpl : public torch::nn::Module {
                         torch::Tensor& positions,
                         const layer::AttentionMetadata& attn_metadata,
                         KVCache& kv_cache,
-                        const ModelParamsView& input_params) {
+                        const MoeExecutionInput& moe_input) {
     return layer_->forward(
-        x, residual, positions, attn_metadata, kv_cache, input_params);
+        x, residual, positions, attn_metadata, kv_cache, moe_input);
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -244,14 +245,11 @@ class MiniMaxM2ModelImpl : public torch::nn::Module {
     }
 
     auto& attn_metadata = *(modified_input_params.attn_metadata);
+    const MoeExecutionInput moe_input(modified_input_params);
     std::optional<torch::Tensor> residual;
     for (size_t i = 0; i < layers_.size(); ++i) {
-      h = layers_[i]->forward(h,
-                              residual,
-                              positions,
-                              attn_metadata,
-                              kv_caches[i],
-                              modified_input_params);
+      h = layers_[i]->forward(
+          h, residual, positions, attn_metadata, kv_caches[i], moe_input);
     }
 
     if (h.numel() == 0) {

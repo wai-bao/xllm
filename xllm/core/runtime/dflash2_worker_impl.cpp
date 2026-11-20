@@ -45,7 +45,7 @@ namespace {
 int32_t configure_draft_config(ModelArgs& args,
                                const runtime::Options& options) {
   args.layers_to_capture({});
-  args.model_type(std::string(kDFlash2DraftModelType));
+  args.model_type(/*value=*/"DFlash2DraftModel");
   CHECK_EQ(options.num_speculative_tokens() + 1, args.block_size())
       << "Runtime block size must match the draft model configuration.";
   return options.num_speculative_tokens();
