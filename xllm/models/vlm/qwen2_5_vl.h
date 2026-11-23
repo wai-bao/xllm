@@ -15,12 +15,17 @@ limitations under the License.
 
 #pragma once
 
+#include <algorithm>
+
 #include "core/framework/config/model_config.h"
 #include "core/framework/model/model_output.h"
 #include "core/framework/multimodal/mposition.h"
+#include "core/framework/multimodal/multimodal_utils.h"
 #include "core/layers/common/lm_head.h"
 #include "core/layers/qwen2_5_vision_layer.h"
 #include "core/layers/qwen2_decoder_layer.h"
+#include "core/layers/qwen2_vision_layer.h"
+#include "core/util/tensor_helper.h"
 #include "models/llm/qwen2.h"
 #include "models/model_registry.h"
 #include "processors/multimodal_processor_pipeline.h"
@@ -29,95 +34,6 @@ limitations under the License.
 #include "processors/qwen2_vl_video_processor.h"
 
 namespace xllm {
-
-class Qwen2_5_VisionPatchEmbedImpl : public torch::nn::Module {
- public:
-  Qwen2_5_VisionPatchEmbedImpl(const ModelContext& context) {
-    auto model_args = context.get_model_args();
-    auto options = context.get_tensor_options();
-
-    auto in_features = model_args.mm_num_channels() *
-                       model_args.mm_temporal_patch_size() *
-                       model_args.mm_patch_size() * model_args.mm_patch_size();
-
-    auto out_features = model_args.mm_hidden_size();
-
-    proj_ = register_module(
-        "proj",
-        torch::nn::Linear(
-            torch::nn::LinearOptions(in_features, out_features).bias(false)));
-
-    proj_->weight.set_data(proj_->weight.to(options));
-  }
-
-  torch::Tensor forward(torch::Tensor x) { return proj_(x); }
-
-  void load_state_dict(const StateDict& state_dict) {
-    auto weight = state_dict.get_tensor("proj.weight");
-    if (weight.defined()) {
-      weight = weight.reshape({weight.size(0), -1});
-      DCHECK_EQ(proj_->weight.sizes(), weight.sizes())
-          << "proj weight size mismatch for " << name();
-      proj_->weight.data().copy_(weight);
-      proj_weight_loaded_ = true;
-    }
-  }
-
-  void verify_loaded_weights(const std::string& prefix) const {
-    CHECK(proj_weight_loaded_)
-        << "weight is not loaded for " << prefix + "proj.weight";
-  }
-
- private:
-  bool proj_weight_loaded_ = false;
-  torch::nn::Linear proj_{nullptr};
-};
-TORCH_MODULE(Qwen2_5_VisionPatchEmbed);
-
-class Qwen2_5_VisionRotaryEmbeddingImpl : public torch::nn::Module {
- public:
-  Qwen2_5_VisionRotaryEmbeddingImpl(const ModelContext& context) {
-    auto model_args = context.get_model_args();
-    auto options = context.get_tensor_options();
-
-    dim_ = model_args.mm_head_dim() / 2;
-    theta_ = 10000.0;
-
-    auto opts = options.dtype(torch::kFloat32);
-    auto inv_freq =
-        1.0 / torch::pow(theta_, torch::arange(0, dim_, 2, opts) / dim_);
-    inv_freq_ = register_buffer("inv_freq", inv_freq);
-  }
-
-  void update_freqs_cache(int64_t seqlen) {
-    if (seqlen <= seq_len_cached_) return;
-
-    seqlen *= 2;
-    seq_len_cached_ = seqlen;
-
-    auto options = torch::TensorOptions()
-                       .dtype(torch::kFloat32)
-                       .device(inv_freq_.device());
-    inv_freq_ =
-        1.0 / torch::pow(theta_, torch::arange(0, dim_, 2, options) / dim_);
-    auto seq = torch::arange(seqlen, options);
-    freqs_cached_ = torch::outer(seq, inv_freq_);
-  }
-
-  torch::Tensor forward(int seqlen) {
-    update_freqs_cache(seqlen);
-    return freqs_cached_.slice(0, 0, seqlen);
-  }
-
- private:
-  int dim_ = 0;
-  double theta_ = 0.0;
-
-  int64_t seq_len_cached_ = 0;
-  torch::Tensor inv_freq_;
-  torch::Tensor freqs_cached_;
-};
-TORCH_MODULE(Qwen2_5_VisionRotaryEmbedding);
 
 class Qwen2_5_VisionPatchMergerImpl : public torch::nn::Module {
  public:
@@ -136,17 +52,9 @@ class Qwen2_5_VisionPatchMergerImpl : public torch::nn::Module {
         "ln_q",
         layer::RMSNorm(context_dim, model_args.rms_norm_eps(), options));
 
-    auto cpl = torch::nn::Linear(
-        torch::nn::LinearOptions(hidden_size_, hidden_size_).bias(true));
-    cpl->weight.set_data(cpl->weight.to(options));
-    cpl->bias.set_data(cpl->bias.to(options));
-    auto act = torch::nn::GELU();
-    auto rpl = torch::nn::Linear(
-        torch::nn::LinearOptions(hidden_size_, d_model).bias(true));
-    rpl->weight.set_data(rpl->weight.to(options));
-    rpl->bias.set_data(rpl->bias.to(options));
-    mlp_ = register_module("mlp", torch::nn::Sequential(cpl, act, rpl));
-    layers_ = std::make_tuple(cpl, act, rpl);
+    mlp_ = register_module(
+        /*name=*/"mlp",
+        layer::build_vision_merger_mlp(hidden_size_, d_model, options));
   }
 
   torch::Tensor forward(torch::Tensor x) {
@@ -158,33 +66,7 @@ class Qwen2_5_VisionPatchMergerImpl : public torch::nn::Module {
   void load_state_dict(const StateDict& state_dict) {
     ln_q_->load_state_dict(state_dict.get_dict_with_prefix("ln_q."));
 
-    const auto& cpl_dict = state_dict.get_dict_with_prefix("mlp.0.");
-    const auto& cpl_weight = cpl_dict.get_tensor("weight");
-    if (cpl_weight.defined()) {
-      CHECK_EQ(std::get<0>(layers_)->weight.sizes(), cpl_weight.sizes())
-          << "weight size mismatch for " << name();
-      std::get<0>(layers_)->weight.data().copy_(cpl_weight);
-    }
-    const auto cpl_bias = cpl_dict.get_tensor("bias");
-    if (cpl_bias.defined()) {
-      CHECK_EQ(std::get<0>(layers_)->bias.sizes(), cpl_bias.sizes())
-          << "bias size mismatch for " << name();
-      std::get<0>(layers_)->bias.data().copy_(cpl_bias);
-    }
-
-    const auto& rpl_dict = state_dict.get_dict_with_prefix("mlp.2.");
-    const auto& rpl_weight = rpl_dict.get_tensor("weight");
-    if (rpl_weight.defined()) {
-      CHECK_EQ(std::get<2>(layers_)->weight.sizes(), rpl_weight.sizes())
-          << "weight size mismatch for " << name();
-      std::get<2>(layers_)->weight.data().copy_(rpl_weight);
-    }
-    const auto rpl_bias = rpl_dict.get_tensor("bias");
-    if (rpl_bias.defined()) {
-      CHECK_EQ(std::get<2>(layers_)->bias.sizes(), rpl_bias.sizes())
-          << "bias size mismatch for " << name();
-      std::get<2>(layers_)->bias.data().copy_(rpl_bias);
-    }
+    layer::load_vision_merger_mlp(state_dict, mlp_, name());
   }
 
  private:
@@ -192,10 +74,6 @@ class Qwen2_5_VisionPatchMergerImpl : public torch::nn::Module {
 
   layer::RMSNorm ln_q_{nullptr};
   torch::nn::Sequential mlp_{nullptr};
-  std::tuple<torch::nn::Linear, torch::nn::GELU, torch::nn::Linear> layers_ = {
-      nullptr,
-      nullptr,
-      nullptr};
 };
 TORCH_MODULE(Qwen2_5_VisionPatchMerger);
 
@@ -211,10 +89,10 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
     fullatt_block_indexes_.insert(block_indexes.begin(), block_indexes.end());
     spatial_merge_unit_ = static_cast<int>(std::pow(spatial_merge_size_, 2));
 
-    patch_embed_ =
-        register_module("patch_embed", Qwen2_5_VisionPatchEmbed(context));
-    rotary_pos_emb_ = register_module("rotary_pos_emb",
-                                      Qwen2_5_VisionRotaryEmbedding(context));
+    patch_embed_ = register_module(/*name=*/"patch_embed",
+                                   layer::Qwen2_VisionPatchEmbed(context));
+    rotary_pos_emb_ = register_module(
+        /*name=*/"rotary_pos_emb", layer::Qwen2_VisionRotaryEmbedding(context));
     blocks_ = register_module("blocks", torch::nn::ModuleList());
 
     for (int32_t idx = 0; idx < model_args.mm_num_hidden_layers(); idx++) {
@@ -223,55 +101,6 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
       layers_.push_back(block);
     }
     merger_ = register_module("merger", Qwen2_5_VisionPatchMerger(context));
-  }
-
-  torch::Tensor rot_pos_emb(torch::Tensor grid_thw) {
-    std::vector<torch::Tensor> pos_ids_vec;
-    auto count = grid_thw.sizes()[0];
-    pos_ids_vec.reserve(count);
-
-    auto grid_thw_cpu = grid_thw.cpu();
-    auto options =
-        torch::TensorOptions().dtype(torch::kLong).device(grid_thw.device());
-
-    for (int idx = 0; idx < count; ++idx) {
-      auto t = grid_thw_cpu[idx][0].item<int64_t>();
-      auto h = grid_thw_cpu[idx][1].item<int64_t>();
-      auto w = grid_thw_cpu[idx][2].item<int64_t>();
-
-      auto hpos_ids = torch::arange(h, options).unsqueeze(1).expand({-1, w});
-      hpos_ids = hpos_ids
-                     .reshape({h / spatial_merge_size_,
-                               spatial_merge_size_,
-                               w / spatial_merge_size_,
-                               spatial_merge_size_})
-                     .permute({0, 2, 1, 3})
-                     .flatten();
-
-      auto wpos_ids = torch::arange(w, options).unsqueeze(0).expand({h, -1});
-      wpos_ids = wpos_ids
-                     .reshape({h / spatial_merge_size_,
-                               spatial_merge_size_,
-                               w / spatial_merge_size_,
-                               spatial_merge_size_})
-                     .permute({0, 2, 1, 3})
-                     .flatten();
-
-      pos_ids_vec.push_back(
-          torch::stack({hpos_ids, wpos_ids}, -1).repeat({t, 1}));
-    }
-
-    auto pos_ids = torch::cat(pos_ids_vec, 0);
-    auto max_grid_size =
-        grid_thw
-            .index({torch::indexing::Slice(),
-                    torch::indexing::Slice(1, torch::indexing::None)})
-            .max();
-
-    auto rotary_pos_emb_full = rotary_pos_emb_(max_grid_size.item<int64_t>());
-    auto rotary_pos_emb = rotary_pos_emb_full.index({pos_ids}).flatten(1);
-
-    return rotary_pos_emb;
   }
 
   torch::Tensor get_window_index(torch::Tensor grid_thw,
@@ -346,11 +175,8 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
 
   torch::Tensor forward(torch::Tensor hidden_states,
                         torch::Tensor grid_thw) {  // [batch,thw]
-    // patchify
-    // hidden_states = x.to(device=self.device, dtype=self.dtype);
     hidden_states = patch_embed_(hidden_states);
-    //  compute position embedding
-    auto rotary_pos_emb = rot_pos_emb(grid_thw);
+    auto rotary_pos_emb = std::get<0>(rotary_pos_emb_(grid_thw));
 
     // windows attention
     std::vector<int> cu_window_seqlens_vec;
@@ -358,9 +184,10 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
     torch::TensorOptions options = torch::TensorOptions()
                                        .dtype(torch::kInt32)
                                        .device(hidden_states.device());
+    cu_window_seqlens_vec.erase(
+        std::unique(cu_window_seqlens_vec.begin(), cu_window_seqlens_vec.end()),
+        cu_window_seqlens_vec.end());
     auto cu_window_seqlens = torch::tensor(cu_window_seqlens_vec, options);
-    cu_window_seqlens =
-        std::get<0>(torch::unique_consecutive(cu_window_seqlens));
     auto seq_len = hidden_states.sizes()[0];
     hidden_states = hidden_states.reshape(
         {seq_len / spatial_merge_unit_, spatial_merge_unit_, -1});
@@ -374,41 +201,20 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
         {window_index, torch::indexing::Slice(), torch::indexing::Slice()});
     rotary_pos_emb = rotary_pos_emb.reshape({seq_len, -1});
 
-    // compute cu_seqlens
-    auto cu_seqlens = torch::repeat_interleave(
-                          grid_thw.index({torch::indexing::Slice(), 1}) *
-                              grid_thw.index({torch::indexing::Slice(), 2}),
-                          grid_thw.index({torch::indexing::Slice(), 0}))
-                          .cumsum(0, torch::kInt32);
-    namespace F = torch::nn::functional;
-    cu_seqlens = F::pad(
-        cu_seqlens, F::PadFuncOptions({1, 0}).mode(torch::kConstant).value(0));
+    auto cu_seqlens = layer::build_vision_cu_seqlens(grid_thw);
 
-    m_cos = rotary_pos_emb.cos().type_as(hidden_states);
-    m_sin = rotary_pos_emb.sin().type_as(hidden_states);
-
-    m_cos = m_cos.repeat({1, 2});
-    m_sin = m_sin.repeat({1, 2});
-    torch::Tensor cu_seqlens_cpu = cu_seqlens.cpu();
-    torch::Tensor cu_window_seqlens_cpu = cu_window_seqlens.cpu();
-    std::vector<int> cu_seqlens_vec(
-        cu_seqlens_cpu.data_ptr<int>(),  // full seqlen vec
-        cu_seqlens_cpu.data_ptr<int>() + cu_seqlens_cpu.numel());
-    std::vector<int> cu_w_seqlens_vec(
-        cu_window_seqlens_cpu.data_ptr<int>(),  // windows seqlen vec
-        cu_window_seqlens_cpu.data_ptr<int>() + cu_window_seqlens_cpu.numel());
+    auto m_cos = rotary_pos_emb.cos().type_as(hidden_states).repeat({1, 2});
+    auto m_sin = rotary_pos_emb.sin().type_as(hidden_states).repeat({1, 2});
+    auto cu_seqlens_vec = tensor_to_vector<int32_t>(cu_seqlens);
     for (int idx = 0; idx < blocks_->size(); ++idx) {
-      torch::Tensor cu_seqlens_now;
-      std::vector<int> cu_seqlens_now_vec;
-      if (fullatt_block_indexes_.find(idx) != fullatt_block_indexes_.end()) {
-        cu_seqlens_now = cu_seqlens;
-        cu_seqlens_now_vec = cu_seqlens_vec;
-      } else {
-        cu_seqlens_now = cu_window_seqlens;
-        cu_seqlens_now_vec = cu_w_seqlens_vec;
-      }
-      hidden_states = layers_[idx](
-          hidden_states, m_cos, m_sin, cu_seqlens_now, cu_seqlens_now_vec, idx);
+      const bool full_attention = fullatt_block_indexes_.contains(idx);
+      hidden_states =
+          layers_[idx](hidden_states,
+                       m_cos,
+                       m_sin,
+                       full_attention ? cu_seqlens : cu_window_seqlens,
+                       full_attention ? cu_seqlens_vec : cu_window_seqlens_vec,
+                       idx);
     }
     // adapter
     hidden_states = merger_(hidden_states);
@@ -437,27 +243,13 @@ class Qwen2_5_VisionTransformerImpl : public torch::nn::Module {
   std::unordered_set<int> fullatt_block_indexes_;
   int spatial_merge_unit_ = 0;
 
-  Qwen2_5_VisionPatchEmbed patch_embed_{nullptr};
-  Qwen2_5_VisionRotaryEmbedding rotary_pos_emb_{nullptr};
+  layer::Qwen2_VisionPatchEmbed patch_embed_{nullptr};
+  layer::Qwen2_VisionRotaryEmbedding rotary_pos_emb_{nullptr};
   torch::nn::ModuleList blocks_{nullptr};
   std::vector<layer::Qwen2_5_VisionLayer> layers_;
   Qwen2_5_VisionPatchMerger merger_{nullptr};
-
-  torch::Tensor m_cos;
-  torch::Tensor m_sin;
 };
 TORCH_MODULE(Qwen2_5_VisionTransformer);
-
-struct Qwen2_5_VLImageInputs {
-  torch::Tensor pixel_values;
-  torch::Tensor image_grid_thw;
-};
-
-struct Qwen2_5_VLVideoInputs {
-  torch::Tensor pixel_values_videos;
-  torch::Tensor video_grid_thw;
-  torch::Tensor second_per_grid_ts;
-};
 
 class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
  public:
@@ -469,106 +261,44 @@ class Qwen2_5_VLForConditionalGenerationImpl : public torch::nn::Module {
     language_model_ =
         register_module("language_model", QWen2ForCausalLM(context));
   }
-  void prepare_encoder_input(
-      const ModelParamsView& input_params,
-      std::optional<Qwen2_5_VLImageInputs>& image_inputs,
-      std::optional<Qwen2_5_VLVideoInputs>& video_inputs) {
-    const auto& mm_data = input_params.multimodal().mm_data;
-    torch::Tensor pixel_values;
-    if (const auto& res = mm_data.get<torch::Tensor>("pixel_values"))
-      pixel_values = res.value();
-
-    torch::Tensor image_grid_thw;
-    if (const auto& res = mm_data.get<torch::Tensor>("image_grid_thw"))
-      image_grid_thw = res.value();
-
-    torch::Tensor pixel_values_videos;
-    if (const auto& res = mm_data.get<torch::Tensor>("pixel_values_videos"))
-      pixel_values_videos = res.value();
-
-    torch::Tensor video_grid_thw;
-    if (const auto& res = mm_data.get<torch::Tensor>("video_grid_thw"))
-      video_grid_thw = res.value();
-
-    torch::Tensor second_per_grid_ts;
-    if (const auto& res = mm_data.get<torch::Tensor>("second_per_grid_ts"))
-      second_per_grid_ts = res.value();
-
-    if (pixel_values.defined() && image_grid_thw.defined())
-      image_inputs = Qwen2_5_VLImageInputs{pixel_values, image_grid_thw};
-
-    if (pixel_values_videos.defined() && video_grid_thw.defined() &&
-        second_per_grid_ts.defined())
-      video_inputs = Qwen2_5_VLVideoInputs{
-          pixel_values_videos, video_grid_thw, second_per_grid_ts};
-  }
-
   MMDict get_multimodal_embeddings(const ModelParamsView& input_params) {
-    std::optional<Qwen2_5_VLImageInputs> image_input;
-    std::optional<Qwen2_5_VLVideoInputs> video_input;
-    prepare_encoder_input(input_params, image_input, video_input);
-    auto merge_size = model_args_.mm_image_merge_size();
+    const auto& mm_data = input_params.multimodal().mm_data;
+    const auto get_tensor = [&](const MMKey& key) {
+      return mm_data.get<torch::Tensor>(key).value_or(torch::Tensor());
+    };
+    const auto pixel_values = get_tensor(/*key=*/"pixel_values");
+    const auto image_grid_thw = get_tensor(/*key=*/"image_grid_thw");
+    const auto pixel_values_videos = get_tensor(/*key=*/"pixel_values_videos");
+    const auto video_grid_thw = get_tensor(/*key=*/"video_grid_thw");
+    const auto second_per_grid_ts = get_tensor(/*key=*/"second_per_grid_ts");
+
+    const int32_t merge_size = model_args_.mm_image_merge_size();
     MMDict multimodal_embeds;
-    if (image_input) {
-      // visual
-      auto image_embeds = visual_(image_input->pixel_values.to(options_),
-                                  image_input->image_grid_thw);
-      auto image_tokens =
-          (image_input->image_grid_thw.prod(-1) / merge_size / merge_size)
-              .cpu()
-              .contiguous()
-              .to(torch::kLong);
-
-      std::vector<int64_t> image_tokens_vec(
-          image_tokens.data_ptr<int64_t>(),
-          image_tokens.data_ptr<int64_t>() + image_tokens.numel());
-      multimodal_embeds["image|embedding"] =
-          image_embeds.split(image_tokens_vec, /*dim=*/0);
-    }
-    if (video_input) {
-      // visual
-      auto video_embeds = visual_(video_input->pixel_values_videos.to(options_),
-                                  video_input->video_grid_thw);
-      auto video_tokens =
-          (video_input->video_grid_thw.prod(-1) / merge_size / merge_size)
-              .cpu()
-              .contiguous()
-              .to(torch::kLong);
-      std::vector<int64_t> video_tokens_vec(
-          video_tokens.data_ptr<int64_t>(),
-          video_tokens.data_ptr<int64_t>() + video_tokens.numel());
-
-      multimodal_embeds["video|embedding"] =
-          video_embeds.split(video_tokens_vec, /*dim=*/0);
+    const auto add_embeddings = [&](const torch::Tensor& pixels,
+                                    const torch::Tensor& grid_thw,
+                                    const MMKey& embed_key) {
+      if (!pixels.defined() || !grid_thw.defined()) {
+        return;
+      }
+      auto embeds = visual_(pixels.to(options_), grid_thw);
+      multimodal_embeds[embed_key] =
+          split_vision_embeddings(embeds, grid_thw, merge_size);
+    };
+    add_embeddings(
+        pixel_values, image_grid_thw, /*embed_key=*/"image|embedding");
+    if (second_per_grid_ts.defined()) {
+      add_embeddings(pixel_values_videos,
+                     video_grid_thw,
+                     /*embed_key=*/"video|embedding");
     }
     return multimodal_embeds;
-  }
-
-  torch::Tensor merge_multimodal_embeddings(
-      torch::Tensor inputs_embeds,
-      const torch::Tensor& multimodal_embeds,
-      const torch::Tensor& is_multimodal) {
-    inputs_embeds.index_put_({is_multimodal}, multimodal_embeds);
-    return inputs_embeds;
   }
 
   torch::Tensor get_input_embeddings(const torch::Tensor input_ids,
                                      const ModelParamsView& input_params) {
     const auto& mm_data = input_params.multimodal().mm_data;
     auto inputs_embeds = language_model_->get_input_embeddings(input_ids);
-    auto merge_modality = [&](const std::string& embed_key,
-                              const std::string& mask_key) {
-      auto emb = mm_data.get<torch::Tensor>(embed_key);
-      if (!emb.has_value()) return;
-      auto mask = mm_data.get<torch::Tensor>(mask_key);
-      if (!mask.has_value()) return;
-      inputs_embeds =
-          merge_multimodal_embeddings(inputs_embeds, emb.value(), mask.value());
-    };
-
-    merge_modality("image|embedding", "image|mask");
-    merge_modality("video|embedding", "video|mask");
-
+    merge_vision_embeddings(mm_data, inputs_embeds);
     return inputs_embeds;
   }
 

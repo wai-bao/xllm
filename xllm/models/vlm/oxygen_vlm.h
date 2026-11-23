@@ -17,25 +17,21 @@ limitations under the License.
 
 #include "core/framework/model/model_output.h"
 #include "core/framework/multimodal/mposition.h"
+#include "core/framework/multimodal/multimodal_utils.h"
 #include "core/layers/common/lm_head.h"
 #include "core/layers/oxygen_vision_layer.h"
 #include "core/layers/qwen2_5_vision_layer.h"
 #include "core/layers/qwen2_decoder_layer.h"
+#include "core/layers/qwen2_vision_layer.h"
+#include "core/util/tensor_helper.h"
 #include "models/llm/oxygen.h"
 #include "models/model_registry.h"
 #include "processors/multimodal_processor_pipeline.h"
 #include "processors/qwen2_vl_image_processor.h"
+#include "processors/qwen2_vl_prompt_processor.h"
 #include "processors/qwen2_vl_video_processor.h"
-#include "qwen2_5_vl.h"
 
 namespace xllm {
-using OxygenImageInputs = Qwen2_5_VLImageInputs;
-
-struct OxygenVideoInputs {
-  torch::Tensor pixel_values_videos;
-  torch::Tensor video_grid_thw;
-};
-
 class OxygenVisionPatchEmbedImpl : public torch::nn::Module {
  public:
   OxygenVisionPatchEmbedImpl(const ModelContext& context) {
@@ -84,15 +80,14 @@ TORCH_MODULE(OxygenVisionPatchEmbed);
 class OxygenVisionEmbeddingsImpl : public torch::nn::Module {
  public:
   OxygenVisionEmbeddingsImpl(const ModelContext& context) {
-    auto model_args = context.get_model_args();
-    auto options = context.get_tensor_options();
-    embed_dim_ = model_args.mm_hidden_size();
-    image_size_ = model_args.mm_image_size();
-    patch_size_ = model_args.mm_patch_size();
-    num_positions_ = image_size_ / patch_size_;
-    num_positions_ = num_positions_ * num_positions_;
+    const auto& model_args = context.get_model_args();
+    const auto& options = context.get_tensor_options();
+    const auto patches_per_side =
+        model_args.mm_image_size() / model_args.mm_patch_size();
     position_embedding_ = register_module(
-        "position_embedding", torch::nn::Embedding(num_positions_, embed_dim_));
+        /*name=*/"position_embedding",
+        torch::nn::Embedding(patches_per_side * patches_per_side,
+                             model_args.mm_hidden_size()));
     position_embedding_->weight.set_data(
         position_embedding_->weight.to(options));
   }
@@ -170,11 +165,6 @@ class OxygenVisionEmbeddingsImpl : public torch::nn::Module {
   }
 
  private:
-  int64_t embed_dim_ = 0;
-  int64_t image_size_ = 0;
-  int64_t patch_size_ = 0;
-  int64_t num_positions_ = 0;
-
   torch::nn::Embedding position_embedding_{nullptr};
 };
 TORCH_MODULE(OxygenVisionEmbeddings);
@@ -182,19 +172,18 @@ TORCH_MODULE(OxygenVisionEmbeddings);
 class OxygenVisionPatchMergerImpl : public torch::nn::Module {
  public:
   OxygenVisionPatchMergerImpl(const ModelContext& context) {
-    auto model_args = context.get_model_args();
-    options_ = context.get_tensor_options();
-    auto parallel_args = context.get_parallel_args();
+    const auto& model_args = context.get_model_args();
+    const auto& options = context.get_tensor_options();
     int64_t dim = model_args.mm_projection_dim();
     int64_t context_dim = model_args.mm_projector_hidden_size();
     norm_ = register_module(
         "norm", torch::nn::LayerNorm(torch::nn::LayerNormOptions({dim})));
-    norm_->weight.set_data(norm_->weight.to(options_));
-    norm_->bias.set_data(norm_->bias.to(options_));
+    norm_->weight.set_data(norm_->weight.to(options));
+    norm_->bias.set_data(norm_->bias.to(options));
     proj_ = register_module(
         "proj",
         torch::nn::Linear(torch::nn::LinearOptions(dim, dim).bias(false)));
-    proj_->weight.set_data(proj_->weight.to(options_));
+    proj_->weight.set_data(proj_->weight.to(options));
     act_ = register_module("act", torch::nn::GELU());
     silu_ = register_module("silu", torch::nn::SiLU());
 
@@ -202,17 +191,17 @@ class OxygenVisionPatchMergerImpl : public torch::nn::Module {
         "gate",
         torch::nn::Linear(
             torch::nn::LinearOptions(dim, context_dim).bias(false)));
-    gate_->weight.set_data(gate_->weight.to(options_));
+    gate_->weight.set_data(gate_->weight.to(options));
     up_ = register_module(
         "up",
         torch::nn::Linear(
             torch::nn::LinearOptions(dim, context_dim).bias(false)));
-    up_->weight.set_data(up_->weight.to(options_));
+    up_->weight.set_data(up_->weight.to(options));
     down_ = register_module(
         "down",
         torch::nn::Linear(
             torch::nn::LinearOptions(context_dim, dim).bias(false)));
-    down_->weight.set_data(down_->weight.to(options_));
+    down_->weight.set_data(down_->weight.to(options));
   }
 
   torch::Tensor forward(torch::Tensor x) {
@@ -272,27 +261,26 @@ class OxygenVisionPatchMergerImpl : public torch::nn::Module {
   torch::nn::Linear down_{nullptr};
   torch::nn::GELU act_{nullptr};
   torch::nn::SiLU silu_{nullptr};
-  torch::TensorOptions options_;
 };
 TORCH_MODULE(OxygenVisionPatchMerger);
 
 class OxygenVisionTransformerImpl : public torch::nn::Module {
  public:
-  OxygenVisionTransformerImpl(const ModelContext& context)
-      : options_(context.get_tensor_options()) {
-    auto model_args = context.get_model_args();
+  OxygenVisionTransformerImpl(const ModelContext& context) {
+    const auto& model_args = context.get_model_args();
+    const auto& options = context.get_tensor_options();
     spatial_merge_size_ = model_args.mm_spatial_merge_size();
-    hidden_size_ = model_args.mm_hidden_size();
+    const int hidden_size = model_args.mm_hidden_size();
     out_hidden_size_ = model_args.mm_projection_dim();
 
     patch_embed_ =
         register_module("patch_embed", OxygenVisionPatchEmbed(context));
-    rotary_pos_emb_ = register_module("rotary_pos_emb",
-                                      Qwen2_5_VisionRotaryEmbedding(context));
+    rotary_pos_emb_ = register_module(
+        /*name=*/"rotary_pos_emb", layer::Qwen2_VisionRotaryEmbedding(context));
     post_conv_layernorm_ = register_module(
         "post_conv_layernorm",
         layer::RMSNorm(
-            model_args.mm_hidden_size(), model_args.rms_norm_eps(), options_));
+            model_args.mm_hidden_size(), model_args.rms_norm_eps(), options));
 
     embeddings_ =
         register_module("embeddings", OxygenVisionEmbeddings(context));
@@ -307,107 +295,40 @@ class OxygenVisionTransformerImpl : public torch::nn::Module {
     post_layernorm_ = register_module(
         "post_layernorm",
         layer::RMSNorm(
-            model_args.mm_hidden_size(), model_args.rms_norm_eps(), options_));
+            model_args.mm_hidden_size(), model_args.rms_norm_eps(), options));
 
     downsample_ = register_module(
         "downsample",
-        torch::nn::Conv2d(torch::nn::Conv2dOptions(hidden_size_,
+        torch::nn::Conv2d(torch::nn::Conv2dOptions(hidden_size,
                                                    out_hidden_size_,
                                                    spatial_merge_size_)
                               .stride(spatial_merge_size_)
                               .bias(true)
                               .padding(0)));
-    downsample_->weight.set_data(downsample_->weight.to(options_));
-    downsample_->bias.set_data(downsample_->bias.to(options_));
+    downsample_->weight.set_data(downsample_->weight.to(options));
+    downsample_->bias.set_data(downsample_->bias.to(options));
     merger_ = register_module("merger", OxygenVisionPatchMerger(context));
-  }
-
-  std::tuple<torch::Tensor, torch::Tensor> rot_pos_emb(torch::Tensor grid_thw) {
-    std::vector<torch::Tensor> pos_ids_vec;
-    auto count = grid_thw.sizes()[0];
-    pos_ids_vec.reserve(count);
-    auto options =
-        torch::TensorOptions().dtype(torch::kLong).device(grid_thw.device());
-
-    auto grid_thw_cpu = grid_thw.cpu();
-    for (int idx = 0; idx < count; ++idx) {
-      auto t = grid_thw_cpu[idx][0].item<int64_t>();
-      auto h = grid_thw_cpu[idx][1].item<int64_t>();
-      auto w = grid_thw_cpu[idx][2].item<int64_t>();
-      auto hpos_ids = torch::arange(h, options).unsqueeze(1).expand({-1, w});
-      hpos_ids = hpos_ids
-                     .reshape({h / spatial_merge_size_,
-                               spatial_merge_size_,
-                               w / spatial_merge_size_,
-                               spatial_merge_size_})
-                     .permute({0, 2, 1, 3})
-                     .flatten();
-      auto wpos_ids = torch::arange(w, options).unsqueeze(0).expand({h, -1});
-      wpos_ids = wpos_ids
-                     .reshape({h / spatial_merge_size_,
-                               spatial_merge_size_,
-                               w / spatial_merge_size_,
-                               spatial_merge_size_})
-                     .permute({0, 2, 1, 3})
-                     .flatten();
-      pos_ids_vec.push_back(
-          torch::stack({hpos_ids, wpos_ids}, -1).repeat({t, 1}));
-    }
-    auto pos_ids = torch::cat(pos_ids_vec, 0);
-    auto max_grid_size =
-        grid_thw
-            .index({torch::indexing::Slice(),
-                    torch::indexing::Slice(1, torch::indexing::None)})
-            .max();
-    auto rotary_pos_emb_full = rotary_pos_emb_(max_grid_size.item<int64_t>());
-    auto rotary_pos_emb = rotary_pos_emb_full.index({pos_ids}).flatten(1);
-
-    return std::make_tuple(rotary_pos_emb, pos_ids);
   }
 
   torch::Tensor forward(torch::Tensor hidden_states, torch::Tensor grid_thw) {
     hidden_states = patch_embed_(hidden_states);
     hidden_states = std::get<0>(post_conv_layernorm_(hidden_states));
 
-    auto [rotary_pos_emb, image_type_ids] = rot_pos_emb(grid_thw);
+    auto [rotary_pos_emb, image_type_ids] = rotary_pos_emb_(grid_thw);
     auto emb = torch::cat({rotary_pos_emb, rotary_pos_emb}, -1);
     auto m_cos = emb.cos().type_as(hidden_states);
     auto m_sin = emb.sin().type_as(hidden_states);
 
-    auto device = grid_thw.device();
-    auto grid_t = grid_thw.index_select(
-        1,
-        torch::tensor(
-            {0}, torch::TensorOptions().dtype(torch::kInt).device(device)));
-    auto grid_h = grid_thw.index_select(
-        1,
-        torch::tensor(
-            {1}, torch::TensorOptions().dtype(torch::kInt).device(device)));
-    auto grid_w = grid_thw.index_select(
-        1,
-        torch::tensor(
-            {2}, torch::TensorOptions().dtype(torch::kInt).device(device)));
-    auto h_times_w = (grid_h * grid_w).squeeze(1);
-    auto repeats = grid_t.squeeze(1);
-    auto repeated = torch::repeat_interleave(h_times_w, repeats, 0);
-    auto cu_seqlens = torch::cumsum(repeated, 0, torch::kInt32);
-    namespace F = torch::nn::functional;
-    cu_seqlens = F::pad(
-        cu_seqlens, F::PadFuncOptions({1, 0}).mode(torch::kConstant).value(0));
-    auto seqlens_cpu = torch::diff(cu_seqlens).cpu().to(torch::kInt);
-    std::vector<int> seqlens;
-    seqlens.assign(seqlens_cpu.data_ptr<int>(),
-                   seqlens_cpu.data_ptr<int>() + seqlens_cpu.numel());
+    auto cu_seqlens = layer::build_vision_cu_seqlens(grid_thw);
+    const auto cu_seqlens_cpu = cu_seqlens.cpu();
+    auto seqlens = tensor_to_vector<int32_t>(torch::diff(cu_seqlens_cpu));
 
     hidden_states = embeddings_(hidden_states,
-                                seqlens,
+                                std::move(seqlens),
                                 grid_thw,
                                 image_type_ids.select(1, 0),
                                 image_type_ids.select(1, 1));
-    torch::Tensor cu_seqlens_cpu = cu_seqlens.cpu();
-    std::vector<int> cu_seqlens_vec(
-        cu_seqlens_cpu.data_ptr<int>(),
-        cu_seqlens_cpu.data_ptr<int>() + cu_seqlens_cpu.numel());
+    auto cu_seqlens_vec = tensor_to_vector<int32_t>(cu_seqlens_cpu);
     cu_seqlens = cu_seqlens.to(hidden_states.device());
     for (int idx = 0; idx < blocks_->size(); ++idx) {
       hidden_states = layers_[idx](
@@ -450,12 +371,11 @@ class OxygenVisionTransformerImpl : public torch::nn::Module {
   }
 
  private:
-  int hidden_size_ = 0;
   int out_hidden_size_ = 0;
   int spatial_merge_size_ = 0;
 
   OxygenVisionPatchEmbed patch_embed_{nullptr};
-  Qwen2_5_VisionRotaryEmbedding rotary_pos_emb_{nullptr};
+  layer::Qwen2_VisionRotaryEmbedding rotary_pos_emb_{nullptr};
   torch::nn::ModuleList blocks_{nullptr};
   OxygenVisionEmbeddings embeddings_{nullptr};
   layer::RMSNorm post_conv_layernorm_{nullptr};
@@ -463,7 +383,6 @@ class OxygenVisionTransformerImpl : public torch::nn::Module {
   torch::nn::Conv2d downsample_{nullptr};
   std::vector<layer::OxygenVisionLayer> layers_;
   OxygenVisionPatchMerger merger_{nullptr};
-  torch::TensorOptions options_;
 };
 TORCH_MODULE(OxygenVisionTransformer);
 
@@ -478,101 +397,44 @@ class OxygenvlmForConditionalGenerationImpl : public torch::nn::Module {
         register_module("language_model", OxygenForCausalLM(context));
   }
 
-  void prepare_encoder_input(const ModelParamsView& input_params,
-                             std::optional<OxygenImageInputs>& image_inputs,
-                             std::optional<OxygenVideoInputs>& video_inputs) {
-    const auto& mm_data = input_params.multimodal().mm_data;
-    torch::Tensor pixel_values;
-    if (const auto& res = mm_data.get<torch::Tensor>("pixel_values"))
-      pixel_values = res.value();
-
-    torch::Tensor image_grid_thw;
-    if (const auto& res = mm_data.get<torch::Tensor>("image_grid_thw"))
-      image_grid_thw = res.value();
-
-    torch::Tensor pixel_values_videos;
-    if (const auto& res = mm_data.get<torch::Tensor>("pixel_values_videos"))
-      pixel_values_videos = res.value();
-
-    torch::Tensor video_grid_thw;
-    if (const auto& res = mm_data.get<torch::Tensor>("video_grid_thw"))
-      video_grid_thw = res.value();
-
-    if (pixel_values.defined() && image_grid_thw.defined())
-      image_inputs = OxygenImageInputs{pixel_values, image_grid_thw};
-
-    if (pixel_values_videos.defined() && video_grid_thw.defined())
-      video_inputs = OxygenVideoInputs{pixel_values_videos, video_grid_thw};
-  }
-
   MMDict get_multimodal_embeddings(const ModelParamsView& input_params) {
-    std::optional<OxygenImageInputs> image_input;
-    std::optional<OxygenVideoInputs> video_input;
-    prepare_encoder_input(input_params, image_input, video_input);
+    const auto& mm_data = input_params.multimodal().mm_data;
+    const auto get_tensor = [&](const MMKey& key) {
+      return mm_data.get<torch::Tensor>(key).value_or(torch::Tensor());
+    };
+    const auto pixel_values = get_tensor(/*key=*/"pixel_values");
+    const auto image_grid_thw = get_tensor(/*key=*/"image_grid_thw");
+    const auto pixel_values_videos = get_tensor(/*key=*/"pixel_values_videos");
+    const auto video_grid_thw = get_tensor(/*key=*/"video_grid_thw");
 
     auto merge_size = model_args_.mm_image_merge_size();
     MMDict multimodal_embeds;
-    if (image_input) {
-      // visual
-      auto image_embeds = visual_(image_input->pixel_values.to(options_),
-                                  image_input->image_grid_thw);
-      auto image_tokens =
-          (image_input->image_grid_thw.prod(-1) / merge_size / merge_size)
-              .cpu()
-              .contiguous()
-              .to(torch::kLong);
-
-      std::vector<int64_t> image_tokens_vec(
-          image_tokens.data_ptr<int64_t>(),
-          image_tokens.data_ptr<int64_t>() + image_tokens.numel());
+    if (pixel_values.defined() && image_grid_thw.defined()) {
+      auto image_embeds = visual_(pixel_values.to(options_), image_grid_thw);
       multimodal_embeds["image|embedding"] =
-          image_embeds.split(image_tokens_vec, 0);
+          split_vision_embeddings(image_embeds, image_grid_thw, merge_size);
     }
-    if (video_input) {
-      std::vector<torch::Tensor> temp_frames_hw;
-      std::vector<int64_t> split_sizes;
-      for (int i = 0; i < video_input->video_grid_thw.size(0); ++i) {
-        auto t = video_input->video_grid_thw[i][0].item<int32_t>();
-        auto h = video_input->video_grid_thw[i][1].item<int32_t>();
-        auto w = video_input->video_grid_thw[i][2].item<int32_t>();
-        auto repeated_row =
-            torch::tensor({1, h, w}).unsqueeze(0).repeat({t, 1});
-        temp_frames_hw.push_back(repeated_row);
-        split_sizes.push_back(t * h * w / merge_size / merge_size);
-      }
-      auto flatten_video_grid_thw = torch::cat(temp_frames_hw, 0);
-      // visual
-      auto video_embeds = visual_(video_input->pixel_values_videos.to(options_),
-                                  flatten_video_grid_thw);
-      multimodal_embeds["video|embedding"] = video_embeds.split(split_sizes, 0);
+    if (pixel_values_videos.defined() && video_grid_thw.defined()) {
+      const auto video_grid_cpu =
+          video_grid_thw.to(/*device=*/torch::kCPU, /*dtype=*/torch::kInt32);
+      auto frame_grid_thw = torch::repeat_interleave(
+          video_grid_cpu,
+          video_grid_cpu.select(/*dim=*/1, /*index=*/0),
+          /*dim=*/0);
+      frame_grid_thw.select(/*dim=*/1, /*index=*/0).fill_(/*value=*/1);
+      auto video_embeds =
+          visual_(pixel_values_videos.to(options_), frame_grid_thw);
+      multimodal_embeds["video|embedding"] =
+          split_vision_embeddings(video_embeds, video_grid_cpu, merge_size);
     }
     return multimodal_embeds;
   }
 
-  torch::Tensor merge_multimodal_embeddings(
-      torch::Tensor inputs_embeds,
-      const torch::Tensor& multimodal_embeds,
-      const torch::Tensor& is_multimodal) {
-    inputs_embeds.index_put_({is_multimodal}, multimodal_embeds);
-    return inputs_embeds;
-  }
   torch::Tensor get_input_embeddings(const torch::Tensor input_ids,
                                      const ModelParamsView& input_params) {
     const auto& mm_data = input_params.multimodal().mm_data;
     auto inputs_embeds = language_model_->get_input_embeddings(input_ids);
-    auto merge_modality = [&](const std::string& embed_key,
-                              const std::string& mask_key) {
-      auto emb = mm_data.get<torch::Tensor>(embed_key);
-      if (!emb.has_value()) return;
-      auto mask = mm_data.get<torch::Tensor>(mask_key);
-      if (!mask.has_value()) return;
-      inputs_embeds =
-          merge_multimodal_embeddings(inputs_embeds, emb.value(), mask.value());
-    };
-
-    merge_modality("image|embedding", "image|mask");
-    merge_modality("video|embedding", "video|mask");
-
+    merge_vision_embeddings(mm_data, inputs_embeds);
     return inputs_embeds;
   }
   ModelOutput forward(const torch::Tensor& tokens,

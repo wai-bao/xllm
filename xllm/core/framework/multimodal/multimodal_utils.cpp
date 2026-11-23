@@ -21,8 +21,37 @@ limitations under the License.
 #include <numeric>
 
 #include "core/framework/multimodal/mm_visitor.h"
+#include "core/util/tensor_helper.h"
 
 namespace xllm {
+
+std::vector<torch::Tensor> split_vision_embeddings(
+    const torch::Tensor& embeddings,
+    const torch::Tensor& grid_thw,
+    int32_t spatial_merge_size) {
+  const auto token_sizes = to_cpu_contiguous(
+      grid_thw.prod(/*dim=*/-1) / spatial_merge_size / spatial_merge_size,
+      /*dtype=*/torch::kLong);
+  const torch::IntArrayRef sizes(token_sizes.const_data_ptr<int64_t>(),
+                                 token_sizes.numel());
+  return embeddings.split(sizes, /*dim=*/0);
+}
+
+void merge_vision_embeddings(const MMBatchData& mm_data,
+                             torch::Tensor& input_embeddings) {
+  const auto merge_modality = [&](const MMKey& embed_key,
+                                  const MMKey& mask_key) {
+    const auto embeddings = mm_data.get<torch::Tensor>(embed_key);
+    if (!embeddings) {
+      return;
+    }
+    if (const auto mask = mm_data.get<torch::Tensor>(mask_key)) {
+      input_embeddings.index_put_({*mask}, *embeddings);
+    }
+  };
+  merge_modality(/*embed_key=*/"image|embedding", /*mask_key=*/"image|mask");
+  merge_modality(/*embed_key=*/"video|embedding", /*mask_key=*/"video|mask");
+}
 
 std::vector<int32_t> get_mm_token_nums(MMBatchData& mm_data, MMType type) {
   MMTokenNumVisitor visitor(type);

@@ -48,6 +48,14 @@ int32_t compute_max_token_total(
 
 class ProcessGroup;
 
+std::vector<torch::Tensor> split_vision_embeddings(
+    const torch::Tensor& embeddings,
+    const torch::Tensor& grid_thw,
+    int32_t spatial_merge_size);
+
+void merge_vision_embeddings(const MMBatchData& mm_data,
+                             torch::Tensor& input_embeddings);
+
 std::vector<int32_t> get_mm_token_nums(MMBatchData& mm_data, MMType type);
 
 std::vector<torch::Tensor> split_by_token_nums(
