@@ -563,8 +563,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_prefill(
     const TargetInput& input) {
   flush_pending_target_context();
   if (uses_verifier_conditioned_draft_prefix()) {
-    for (const int32_t embedding_id :
-         input.input_params.embedding.embedding_ids) {
+    for (const int32_t embedding_id : input.speculative_.embedding_ids_) {
       draft_prefix_contexts_.erase(embedding_id);
     }
   }
@@ -680,9 +679,9 @@ void MTPWorkerImpl<TargetInput>::prepare_prefill_inputs(
   // it has neither a validity mask nor a recurrent cache for.
   // Full-attention KPool drafts still own per-request compression tails.
   if (!draft_impl_->has_request_state_cache()) {
-    input_params.clear_linear_attention_state();
+    input_params.cache_state_.clear_linear_attention_state();
   }
-  auto& extra_token_ids = input_params.embedding.extra_token_ids;
+  auto& extra_token_ids = prefill_input.speculative_.extra_token_ids_;
 
   const torch::Tensor& token_ids = input.token_ids_host;
   Slice<int32_t> tokens_ids_slice = tensor_slice(token_ids);
@@ -739,9 +738,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
   const bool matching_device_target_context =
       target_context.failed_rows.empty() &&
       target_context.accepted_tokens.defined() &&
-      target_context.embedding_ids ==
-          input.input_params.embedding.embedding_ids &&
-      target_context.request_ids == input.input_params.embedding.request_ids;
+      target_context.embedding_ids == input.speculative_.embedding_ids_ &&
+      target_context.request_ids == input.request_ids;
   const bool use_device_target_context =
       combined_first_draft && matching_device_target_context &&
       device_target_context_ready_for_batch(input);
@@ -769,10 +767,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
       // The first target-context publication for a new batch establishes the
       // scheduler's corrected position/KV base. Subsequent publications can
       // derive that base fully on device without waiting for the scheduler.
-      device_context_ready_embedding_ids_ =
-          input.input_params.embedding.embedding_ids;
-      device_context_ready_request_ids_ =
-          input.input_params.embedding.request_ids;
+      device_context_ready_embedding_ids_ = input.speculative_.embedding_ids_;
+      device_context_ready_request_ids_ = input.request_ids;
     } else if (!device_target_context_ready_for_batch(input)) {
       device_context_ready_embedding_ids_.clear();
       device_context_ready_request_ids_.clear();
@@ -787,29 +783,29 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
   Timer draft_timer;
   CHECK(embedding_cache_ != nullptr) << "MTP embedding cache is not allocated";
 
-  if (const auto& embedding = input.input_params.embedding;
-      embedding.mtp_bootstrap_embeddings.defined()) {
+  if (const auto& speculative = input.speculative_;
+      speculative.mtp_bootstrap_embeddings_.defined()) {
     const Slice<int32_t> token_ids = tensor_slice(input.token_ids_host);
 
     torch::Tensor bootstrap_embeddings =
-        safe_to(embedding.mtp_bootstrap_embeddings,
+        safe_to(speculative.mtp_bootstrap_embeddings_,
                 torch::dtype(dtype_).device(device_));
-    const int32_t num_rows =
-        static_cast<int32_t>(embedding.mtp_bootstrap_row_idxes.size());
+    const int32_t num_rows = static_cast<int32_t>(
+        speculative.mtp_bootstrap_sequence_indices_.size());
     CHECK_EQ(bootstrap_embeddings.size(/*dim=*/0),
              static_cast<int64_t>(num_rows))
         << "bootstrap row count mismatch";
-    CHECK_EQ(embedding.embedding_ids.size(), embedding.request_ids.size())
+    CHECK_EQ(speculative.embedding_ids_.size(), input.request_ids.size())
         << "bootstrap embedding/request id vectors must be parallel";
     const size_t row_limit =
-        std::min(embedding.embedding_ids.size(), token_ids.size());
+        std::min(speculative.embedding_ids_.size(), token_ids.size());
     for (int32_t i = 0; i < num_rows; ++i) {
-      const int32_t row_idx = embedding.mtp_bootstrap_row_idxes[i];
+      const int32_t row_idx = speculative.mtp_bootstrap_sequence_indices_[i];
       CHECK_LT(static_cast<size_t>(row_idx), row_limit)
           << "invalid bootstrap row index";
       embedding_cache_->write_mtp_bootstrap_context(
-          embedding.embedding_ids[row_idx],
-          embedding.request_ids[row_idx],
+          speculative.embedding_ids_[row_idx],
+          input.request_ids[row_idx],
           token_ids[row_idx],
           bootstrap_embeddings.select(/*dim=*/0, i),
           input.host_positions().dim() == 2
@@ -852,15 +848,14 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
   } else {
     // First decode after prefill and batch transitions use the host cache.
     std::vector<EmbeddingCache::DecodeState> last_states =
-        embedding_cache_->read_decode_states(
-            input.input_params.embedding.embedding_ids,
-            input.input_params.embedding.request_ids);
+        embedding_cache_->read_decode_states(input.speculative_.embedding_ids_,
+                                             input.request_ids);
     // Synthetic graph warmup requests do not have a target decode history.
     // Draft preparation already falls back to the initialized placeholder for
     // invalid states, so reserve strict cache validation for real requests.
     if (!input.input_params.meta.is_graph_warmup) {
       check_mtp_decode_states(last_states,
-                              input.input_params.embedding.request_ids,
+                              input.request_ids,
                               input.token_ids_host,
                               enable_schedule_overlap());
     }
@@ -876,15 +871,14 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::step_decode(
   const auto materialize_pending_target_host_state = [&]() {
     flush_pending_target_context();
     std::vector<EmbeddingCache::DecodeState> resolved_states =
-        embedding_cache_->read_decode_states(
-            input.input_params.embedding.embedding_ids,
-            input.input_params.embedding.request_ids);
+        embedding_cache_->read_decode_states(input.speculative_.embedding_ids_,
+                                             input.request_ids);
     // The scheduler input contains the conservative overlap placeholder.
     // Force cache correction before comparing it with the accepted target.
     input.token_ids_host = torch::full_like(input.token_ids_host, -1);
     update_decode_step_input(input, resolved_states);
     check_mtp_decode_states(resolved_states,
-                            input.input_params.embedding.request_ids,
+                            input.request_ids,
                             input.token_ids_host,
                             /*allow_overlap_fake_token=*/false);
     metadata_template = input.clone();
@@ -1243,7 +1237,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
         << "MTP JSON accepted output must be [sequence, token]";
     CHECK_EQ(input.sample_sequence_ids.size(), input.json_object_states.size())
         << "MTP JSON sequence ids must match grammar state rows";
-    CHECK_EQ(input.input_params.embedding.embedding_ids.size(),
+    CHECK_EQ(input.speculative_.embedding_ids_.size(),
              input.json_object_states.size())
         << "MTP JSON embedding ids must match grammar state rows";
     CHECK(target_context_ready_event == nullptr ||
@@ -1306,8 +1300,7 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
   const bool has_failed_sequence_rows = !failed_sequence_rows.empty();
   if (uses_verifier_conditioned_draft_prefix()) {
     for (const size_t row : failed_sequence_rows) {
-      draft_prefix_contexts_.erase(
-          input.input_params.embedding.embedding_ids[row]);
+      draft_prefix_contexts_.erase(input.speculative_.embedding_ids_[row]);
     }
   }
   // Overlap mode hands the verify tokens back still on device (the device copy
@@ -1318,8 +1311,8 @@ std::optional<ForwardOutput> MTPWorkerImpl<TargetInput>::run_validate(
   }
   PendingTargetContext context{
       .generation = next_pending_target_generation_++,
-      .embedding_ids = input.input_params.embedding.embedding_ids,
-      .request_ids = input.input_params.embedding.request_ids,
+      .embedding_ids = input.speculative_.embedding_ids_,
+      .request_ids = input.request_ids,
       .accepted_tokens = val_output.next_tokens,
       .accepted_tokens_host = std::move(accepted_tokens_host),
       .accepted_embeddings = val_output.embeddings,
@@ -1438,9 +1431,8 @@ template <typename TargetInput>
 bool MTPWorkerImpl<TargetInput>::device_target_context_ready_for_batch(
     const TargetInput& input) const {
   return device_context_ready_embedding_ids_ ==
-             input.input_params.embedding.embedding_ids &&
-         device_context_ready_request_ids_ ==
-             input.input_params.embedding.request_ids;
+             input.speculative_.embedding_ids_ &&
+         device_context_ready_request_ids_ == input.request_ids;
 }
 
 template <typename TargetInput>
@@ -1530,10 +1522,10 @@ void MTPWorkerImpl<TargetInput>::retain_draft_prefix(
     const SampleOutput& validate_output,
     const torch::Tensor& base_positions,
     const torch::Tensor& base_kv_seq_lens) {
-  const auto& embedding = input.input_params.embedding;
-  const int64_t batch_size = embedding.embedding_ids.size();
+  const auto& speculative = input.speculative_;
+  const int64_t batch_size = speculative.embedding_ids_.size();
   const int64_t width = options_.num_speculative_tokens() + 1;
-  CHECK_EQ(embedding.request_ids.size(), embedding.embedding_ids.size());
+  CHECK_EQ(input.request_ids.size(), speculative.embedding_ids_.size());
   CHECK_EQ(validate_output.next_tokens.size(0), batch_size);
   CHECK_EQ(validate_output.next_tokens.size(1), width);
   CHECK_EQ(validate_output.embeddings.dim(), 3);
@@ -1551,7 +1543,7 @@ void MTPWorkerImpl<TargetInput>::retain_draft_prefix(
   const torch::Tensor kv_lengths = base_kv_seq_lens.clone();
   for (int64_t row = 0; row < batch_size; ++row) {
     DraftPrefixContext context;
-    context.request_id = embedding.request_ids[row];
+    context.request_id = input.request_ids[row];
     context.tokens = tokens.select(/*dim=*/0, row);
     context.hidden = hidden.select(/*dim=*/0, row);
     context.base_position = positions.select(/*dim=*/0, row);
@@ -1568,7 +1560,7 @@ void MTPWorkerImpl<TargetInput>::retain_draft_prefix(
         << "Verifier prefix exceeds the reserved KV capacity";
     CHECK_LE(host_upper, std::numeric_limits<int32_t>::max());
     context.host_kv_upper_bound = static_cast<int32_t>(host_upper);
-    draft_prefix_contexts_.insert_or_assign(embedding.embedding_ids[row],
+    draft_prefix_contexts_.insert_or_assign(speculative.embedding_ids_[row],
                                             std::move(context));
   }
 }
@@ -1578,11 +1570,11 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_prefix(
     const TargetInput& input,
     const std::vector<EmbeddingCache::DecodeState>& bootstrap_states,
     LlmForwardInput& draft_input) {
-  const auto& embedding = input.input_params.embedding;
+  const auto& speculative = input.speculative_;
   const int32_t batch_size = input.input_params.meta.num_sequences;
   const int32_t width = options_.num_speculative_tokens() + 1;
-  CHECK_EQ(embedding.embedding_ids.size(), static_cast<size_t>(batch_size));
-  CHECK_EQ(embedding.request_ids.size(), static_cast<size_t>(batch_size));
+  CHECK_EQ(speculative.embedding_ids_.size(), static_cast<size_t>(batch_size));
+  CHECK_EQ(input.request_ids.size(), static_cast<size_t>(batch_size));
   CHECK(input.input_params.multi_block_tables.empty());
   {
     c10::StreamGuard guard = prepare_stream_->set_stream_guard();
@@ -1593,7 +1585,7 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_prefix(
     draft_input.runtime.metadata_ready_event.reset();
     draft_input.runtime.device_tensors_ready = false;
     auto& params = draft_input.input_params;
-    params.clear_linear_attention_state();
+    params.cache_state_.clear_linear_attention_state();
     params.mtp_topk_state.reset();
     layer::ExpandedDecodeMetadataBuilder::reset_expanded_decode_metadata(
         ModelParamsView(params));
@@ -1615,9 +1607,9 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_prefix(
       CHECK_GT(raw_kv_seq_len, 0);
       int64_t cached_upper = 0;
       const auto found =
-          draft_prefix_contexts_.find(embedding.embedding_ids[seq_id]);
+          draft_prefix_contexts_.find(speculative.embedding_ids_[seq_id]);
       if (found != draft_prefix_contexts_.end() &&
-          found->second.request_id == embedding.request_ids[seq_id]) {
+          found->second.request_id == input.request_ids[seq_id]) {
         cached_upper = found->second.host_kv_upper_bound;
       }
       CHECK_LE(std::max(raw_kv_seq_len + width - 1, cached_upper), kv_capacity)
@@ -1654,9 +1646,9 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_prefix(
   const auto& placeholder = embedding_cache_->embedding_placeholder();
   for (int32_t row = 0; row < batch_size; ++row) {
     const auto found =
-        draft_prefix_contexts_.find(embedding.embedding_ids[row]);
+        draft_prefix_contexts_.find(speculative.embedding_ids_[row]);
     if (found != draft_prefix_contexts_.end() &&
-        found->second.request_id == embedding.request_ids[row]) {
+        found->second.request_id == input.request_ids[row]) {
       const auto& context = found->second;
       tokens.emplace_back(context.tokens);
       hidden.emplace_back(context.hidden);
@@ -1791,8 +1783,7 @@ void MTPWorkerImpl<TargetInput>::prepare_first_draft_template(
        seq_id < metadata_template.input_params.meta.num_sequences;
        ++seq_id) {
     template_states[seq_id].valid = true;
-    template_states[seq_id].request_id =
-        metadata_template.input_params.embedding.request_ids[seq_id];
+    template_states[seq_id].request_id = metadata_template.request_ids[seq_id];
     template_states[seq_id].token_id = template_tokens[seq_id];
     template_states[seq_id].embedding = placeholder;
   }
@@ -1811,9 +1802,8 @@ void MTPWorkerImpl<TargetInput>::submit_pending_first_draft(
   CHECK(!pending_draft_context_.output.has_value())
       << "MTP first-draft prelaunch was not consumed";
   pending_draft_context_.embedding_ids =
-      batch_identity_input.input_params.embedding.embedding_ids;
-  pending_draft_context_.request_ids =
-      batch_identity_input.input_params.embedding.request_ids;
+      batch_identity_input.speculative_.embedding_ids_;
+  pending_draft_context_.request_ids = batch_identity_input.request_ids;
   pending_draft_context_.dp_global_token_nums =
       batch_identity_input.input_params.parallel.dp_global_token_nums;
   pending_draft_context_.dp_global_sequence_nums =
@@ -1837,9 +1827,8 @@ bool MTPWorkerImpl<TargetInput>::pending_draft_context_matches(
     const TargetInput& input) const {
   return pending_draft_context_.output.has_value() &&
          pending_draft_context_.embedding_ids ==
-             input.input_params.embedding.embedding_ids &&
-         pending_draft_context_.request_ids ==
-             input.input_params.embedding.request_ids &&
+             input.speculative_.embedding_ids_ &&
+         pending_draft_context_.request_ids == input.request_ids &&
          pending_draft_context_.dp_global_token_nums ==
              input.input_params.parallel.dp_global_token_nums &&
          pending_draft_context_.dp_global_sequence_nums ==
@@ -1921,8 +1910,8 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
     accepted_prefix_lengths =
         num_accepted_tokens(embedding_cache_.get(),
                             static_cast<size_t>(num_sequences),
-                            input.input_params.embedding.embedding_ids,
-                            input.input_params.embedding.request_ids);
+                            input.speculative_.embedding_ids_,
+                            input.request_ids);
     input_params.num_accepted_tokens_host.assign(
         accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());
     if (!use_explicit_spec_verify_replay_update) {
@@ -2059,7 +2048,7 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
       ensure_spec_verify_control_block_table(input_params, num_sequences);
     }
     std::vector<PackedAttentionIntInput> extra_int_inputs;
-    const auto& linear_state_ids = input_params.embedding.linear_state_ids;
+    const auto& linear_state_ids = input_params.cache_state_.linear_state_ids;
     std::vector<int32_t> expanded_linear_state_ids;
     if (!linear_state_ids.empty() &&
         (use_expanded_attention || num_val_tokens > 1) &&
@@ -2077,7 +2066,7 @@ void MTPWorkerImpl<TargetInput>::prepare_validate_inputs(
       extra_int_inputs.push_back(
           {packed_linear_state_ids,
            nullptr,
-           &input_params.embedding.linear_state_indices});
+           &input_params.cache_state_.linear_state_indices});
     }
     if (!expanded_shared_full_pages.empty()) {
       extra_int_inputs.push_back(
@@ -2117,9 +2106,9 @@ bool MTPWorkerImpl<TargetInput>::
         const TargetInput& input) {
 #if defined(USE_NPU)
   if (!should_use_explicit_spec_verify_replay_update(input) ||
-      input.input_params.embedding.linear_state_ids.size() != 1 ||
+      input.input_params.cache_state_.linear_state_ids.size() != 1 ||
       embedding_cache_ == nullptr ||
-      input.input_params.embedding.embedding_ids.empty()) {
+      input.speculative_.embedding_ids_.empty()) {
     return false;
   }
   const auto& block_tables = input.input_params.attention.host.block_tables;
@@ -2129,8 +2118,7 @@ bool MTPWorkerImpl<TargetInput>::
   }
   const std::vector<int32_t> accepted_prefix_lengths =
       embedding_cache_->read_accepted_prefix_lengths(
-          input.input_params.embedding.embedding_ids,
-          input.input_params.embedding.request_ids);
+          input.speculative_.embedding_ids_, input.request_ids);
   if (accepted_prefix_lengths.size() != 1) {
     return false;
   }
@@ -2144,7 +2132,8 @@ bool MTPWorkerImpl<TargetInput>::
   const int64_t base_kv_seq_len = kv_seq_lens.front();
   const int64_t spec_verify_max_kv_seq_len = base_kv_seq_len + spec_width - 1;
   const SpecVerifyGraphTaskSignal signal{
-      .linear_state_id = input.input_params.embedding.linear_state_ids.front(),
+      .linear_state_id =
+          input.input_params.cache_state_.linear_state_ids.front(),
       .num_accepted_tokens = accepted_prefix_lengths.front(),
       .spec_width = spec_width,
       .block_table_width = verify_block_table_width,
@@ -2292,7 +2281,7 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_extend_inputs(
       input_params.attention.host.kpool_query_lens.assign(
           batch_ctx.num_requests, uniform_width);
     } else {
-      input_params.clear_linear_attention_state();
+      input_params.cache_state_.clear_linear_attention_state();
       input_params.num_accepted_tokens = torch::Tensor();
       input_params.num_accepted_tokens_host.clear();
     }
@@ -2510,12 +2499,12 @@ void MTPWorkerImpl<TargetInput>::prepare_draft_inputs(
     input_params.attention.host.kpool_query_lens.assign(num_sequences, 1);
     // The first draft already restored its request slot. Subsequent drafts
     // append to that live state instead of replaying a prefix restore.
-    input_params.embedding.linear_state_read_ids =
-        input_params.embedding.linear_state_ids;
-    input_params.embedding.linear_state_read_indices =
-        input_params.embedding.linear_state_indices;
+    input_params.cache_state_.linear_state_read_ids =
+        input_params.cache_state_.linear_state_ids;
+    input_params.cache_state_.linear_state_read_indices =
+        input_params.cache_state_.linear_state_indices;
   } else {
-    input_params.clear_linear_attention_state();
+    input_params.cache_state_.clear_linear_attention_state();
     input_params.num_accepted_tokens = torch::Tensor();
     input_params.num_accepted_tokens_host.clear();
   }

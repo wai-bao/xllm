@@ -32,15 +32,7 @@ namespace xllm {
 
 namespace dflash_detail {
 
-inline void invalidate_draft_model_geometry(LlmModelParams& input_params) {
-  // Attention metadata is model-owned: DeepSeek-V4 bakes DSA group layout and
-  // sparse tiling values such as ori_win_left into opaque tensors. A draft
-  // input copied from the target must rebuild those tensors for draft geometry.
-  input_params.attn_metadata.reset();
-  // Block drafters own no recurrent layers. Target slots and validity masks
-  // must not reach the draft metadata builder, including during graph warmup.
-  input_params.clear_linear_attention_state();
-}
+void invalidate_draft_model_geometry(LlmModelParams& input_params);
 
 }  // namespace dflash_detail
 

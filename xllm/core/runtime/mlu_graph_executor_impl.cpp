@@ -284,8 +284,8 @@ void GraphPersistentParam::bind_buffers(ModelParamsView& graph_params,
     graph_params.embedding.input_embedding =
         input_embeds_.slice(0, 0, layout.padded_num_tokens);
   }
-  if (!graph_params.embedding.linear_state_ids.empty()) {
-    graph_params.embedding.linear_state_indices =
+  if (!graph_params.cache_state_.linear_state_ids.empty()) {
+    graph_params.cache_state_.linear_state_indices =
         linear_state_indices_.slice(0, 0, layout.padded_num_reqs);
   }
   // The EPLB decode mask is rebuilt per step and cannot be replayed.
@@ -371,16 +371,16 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
     }
   }
 
-  if (params.embedding.linear_state_indices.defined() ||
-      params.embedding.linear_state_ids.empty()) {
-    copy_rows(graph_params.embedding.linear_state_indices,
-              params.embedding.linear_state_indices,
+  if (params.cache_state_.linear_state_indices.defined() ||
+      params.cache_state_.linear_state_ids.empty()) {
+    copy_rows(graph_params.cache_state_.linear_state_indices,
+              params.cache_state_.linear_state_indices,
               kPaddingLinearStateId);
   } else {
-    graph_params.embedding.linear_state_indices.fill_(kPaddingLinearStateId);
-    copy_host(graph_params.embedding.linear_state_indices.narrow(
+    graph_params.cache_state_.linear_state_indices.fill_(kPaddingLinearStateId);
+    copy_host(graph_params.cache_state_.linear_state_indices.narrow(
                   0, 0, layout.num_reqs),
-              params.embedding.linear_state_ids);
+              params.cache_state_.linear_state_ids);
   }
   copy_rows(graph_params.embedding.input_embedding,
             params.embedding.input_embedding,
@@ -399,10 +399,11 @@ void GraphPersistentParam::update_input_buffer(const torch::Tensor& tokens,
     graph_params.multi_block_tables = params.multi_block_tables;
   }
 
-  if (!graph_params.embedding.linear_state_ids.empty()) {
-    graph_params.embedding.linear_state_ids = params.embedding.linear_state_ids;
-    graph_params.embedding.linear_state_ids.resize(layout.padded_num_reqs,
-                                                   kPaddingLinearStateId);
+  if (!graph_params.cache_state_.linear_state_ids.empty()) {
+    graph_params.cache_state_.linear_state_ids =
+        params.cache_state_.linear_state_ids;
+    graph_params.cache_state_.linear_state_ids.resize(layout.padded_num_reqs,
+                                                      kPaddingLinearStateId);
   }
 }
 
@@ -453,8 +454,8 @@ void MluGraph::prepare_model_graph_metadata(CausalLM* model,
   graph_params.attention.host.kv_seq_lens = captured.attention.host.kv_seq_lens;
   graph_params.attention.host.kpool_query_lens =
       captured.attention.host.kpool_query_lens;
-  graph_params.embedding.linear_state_indices =
-      captured.embedding.linear_state_indices;
+  graph_params.cache_state_.linear_state_indices =
+      captured.cache_state_.linear_state_indices;
   graph_params.num_accepted_tokens = captured.num_accepted_tokens;
   graph_params.num_accepted_tokens_host = captured.num_accepted_tokens_host;
   graph_params.multi_block_tables = captured.multi_block_tables;
@@ -708,7 +709,8 @@ void MluGraphExecutorImpl::log_memory_after_capture() {
 ModelOutput MluGraphExecutorImpl::run(const torch::Tensor& tokens,
                                       const torch::Tensor& positions,
                                       std::vector<KVCache>& kv_caches,
-                                      const ModelParamsView& params) {
+                                      const ModelParamsView& params,
+                                      MMBatchData* /*mm_data*/) {
   const int64_t actual_tokens = tokens.size(0);
   GraphDecision decision = planner_->plan(actual_tokens, params);
   const GraphPlan* plan = std::get_if<GraphPlan>(&decision);

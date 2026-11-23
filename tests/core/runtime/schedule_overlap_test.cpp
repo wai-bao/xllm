@@ -300,7 +300,7 @@ Input step_input(bool decode,
   input.token_ids = torch::tensor({token_id}, torch::kInt32);
   input.input_params.meta.batch_forward_type =
       decode ? BatchForwardType::DECODE : BatchForwardType::PREFILL;
-  input.input_params.embedding.request_ids = {request_id};
+  input.request_ids = {request_id};
   input.sample_sequence_ids = {request_id + "#0"};
   return input;
 }
@@ -479,7 +479,7 @@ TYPED_TEST(ScheduleOverlapTest, ExistingErrorsSanitizeOnlyTheirPlaceholders) {
                            /*driver=*/true,
                            OverlapTestWorker::ContinuationMode::MODEL_MANAGED);
   auto initial_input = step_input<TypeParam>(/*decode=*/false);
-  initial_input.input_params.embedding.request_ids = {"request", "other"};
+  initial_input.request_ids = {"request", "other"};
   initial_input.sample_sequence_ids = {"request#0", "other#0"};
   auto first = worker.step_async(initial_input);
   ASSERT_TRUE(std::move(first).get().has_value());
@@ -487,7 +487,7 @@ TYPED_TEST(ScheduleOverlapTest, ExistingErrorsSanitizeOnlyTheirPlaceholders) {
 
   auto input = step_input<TypeParam>(/*decode=*/true);
   input.token_ids = torch::tensor({-1, -2, 9}, torch::kInt32);
-  input.input_params.embedding.request_ids = {"request", "other"};
+  input.request_ids = {"request", "other"};
   input.sample_sequence_ids = {"request#0", "other#0"};
   input.sample_prior_output_rows = {0, 1};
   input.json_object_errors.emplace_back(
@@ -633,7 +633,7 @@ TYPED_TEST(ScheduleOverlapTest, MixedConstrainedSequencesAdvancePriorRow) {
 
   auto input = step_input<TypeParam>(/*decode=*/true);
   input.token_ids = torch::tensor({-1, 7}, torch::kInt32);
-  input.input_params.embedding.request_ids = {"request", "new"};
+  input.request_ids = {"request", "new"};
   input.sample_sequence_ids = {"request#0", "new#0"};
   input.sample_prior_output_rows = {0, -1};
   input.json_object_states = {grammar.initial_state(), grammar.initial_state()};
@@ -669,7 +669,7 @@ TYPED_TEST(ScheduleOverlapTest,
       });
     }
     auto initial_input = step_input<TypeParam>(/*decode=*/false);
-    initial_input.input_params.embedding.request_ids = {"first", "second"};
+    initial_input.request_ids = {"first", "second"};
     initial_input.sample_sequence_ids = {"first#0", "second#0"};
     auto first = worker.step_async(initial_input);
     ASSERT_TRUE(std::move(first).get().has_value());
@@ -677,7 +677,7 @@ TYPED_TEST(ScheduleOverlapTest,
 
     auto input = step_input<TypeParam>(/*decode=*/true);
     input.token_ids = torch::tensor({1, 2, 7}, torch::kInt32).to(device);
-    input.input_params.embedding.request_ids = {"second", "first", "new"};
+    input.request_ids = {"second", "first", "new"};
     input.sample_sequence_ids = {"second#0", "first#0", "new#0"};
     input.sample_prior_output_rows = {1, 0, -1};
     auto& sampling = input.sampling_params;

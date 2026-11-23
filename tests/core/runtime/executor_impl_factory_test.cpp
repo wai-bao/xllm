@@ -41,7 +41,8 @@ class FactoryTestExecutorImpl final : public ExecutorImpl {
   ModelOutput run(const torch::Tensor& /*tokens*/,
                   const torch::Tensor& /*positions*/,
                   std::vector<KVCache>& /*kv_caches*/,
-                  const ModelParamsView& /*params*/) override {
+                  const ModelParamsView& /*params*/,
+                  MMBatchData* /*mm_data*/) override {
     return ModelOutput{};
   }
 };
@@ -87,7 +88,8 @@ class NamespacedExecutorImpl final : public ExecutorImpl {
   ModelOutput run(const torch::Tensor& /*tokens*/,
                   const torch::Tensor& /*positions*/,
                   std::vector<KVCache>& /*kv_caches*/,
-                  const ModelParamsView& /*params*/) override {
+                  const ModelParamsView& /*params*/,
+                  MMBatchData* /*mm_data*/) override {
     return ModelOutput{};
   }
 };

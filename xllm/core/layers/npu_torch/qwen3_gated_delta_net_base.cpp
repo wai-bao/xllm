@@ -450,26 +450,33 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   const int64_t checkpoint_stride = kv_cache.linear_checkpoint_stride();
   const torch::Tensor conv_state_indices = kv_cache.physical_row_indices(
       logical_state_indices, KVCacheTensorRole::CONV);
+  const bool is_static_shared = kv_cache.is_static_shared();
   torch::Tensor linear_state_base_indices =
-      kv_cache.is_static_shared()
+      is_static_shared
           ? kv_cache.physical_row_indices(logical_state_indices,
-                                          KVCacheTensorRole::SSM)
+                                          /*role=*/KVCacheTensorRole::SSM)
           : build_linear_state_base_indices(logical_state_indices,
                                             checkpoint_stride);
   auto graph_context = input_params.graph.acl_graph_task_update_context;
   const bool register_conv1d_graph_update =
       graph_context != nullptr && graph_context->capturing;
 
+  if (use_spec_verify) {
+    CHECK(input_params.num_accepted_tokens.defined())
+        << "num_accepted_tokens must be populated for Qwen3.5 spec verify";
+  }
+  const auto& linear_state_ids = input_params.cache_state_.linear_state_ids;
+  std::vector<int64_t> linear_state_indices_host(linear_state_ids.begin(),
+                                                 linear_state_ids.end());
+  if (is_static_shared) {
+    for (int64_t& index : linear_state_indices_host) {
+      index =
+          kv_cache.physical_row_index(index, /*role=*/KVCacheTensorRole::CONV);
+    }
+  }
+
   if (!use_spec_verify && is_any_prefill) {
     torch::IntArrayRef num_accepted_tokens_opt;
-    std::vector<int64_t> linear_state_indices_vec(
-        input_params.embedding.linear_state_ids.begin(),
-        input_params.embedding.linear_state_ids.end());
-    if (kv_cache.is_static_shared()) {
-      for (int64_t& index : linear_state_indices_vec) {
-        index = kv_cache.physical_row_index(index, KVCacheTensorRole::CONV);
-      }
-    }
     torch::Tensor conv_input = reshape_qkvz_unpad(attn_metadata, mixed_qkv);
 
     const bool direct_qkv_model_supported =
@@ -481,9 +488,9 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
             static_cast<size_t>(batch_size) &&
         input_params.parallel.query_start_loc.size() ==
             static_cast<size_t>(batch_size + 1) &&
-        input_params.embedding.linear_state_ids.size() ==
+        input_params.cache_state_.linear_state_ids.size() ==
             static_cast<size_t>(batch_size) &&
-        input_params.linear_state_validity_mask.size() ==
+        input_params.cache_state_.linear_state_validity_mask.size() ==
             static_cast<size_t>(batch_size);
     int64_t total_valid_tokens = 0;
     bool direct_qkv_lengths_valid = direct_qkv_metadata_available;
@@ -517,8 +524,9 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
               conv_weight,
               conv_cache,
               torch::IntArrayRef(input_params.parallel.query_start_loc),
-              torch::IntArrayRef(linear_state_indices_vec),
-              torch::IntArrayRef(input_params.linear_state_validity_mask),
+              torch::IntArrayRef(linear_state_indices_host),
+              torch::IntArrayRef(
+                  input_params.cache_state_.linear_state_validity_mask),
               local_q_heads,
               local_v_heads,
               head_k_dim_,
@@ -531,8 +539,9 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
           conv_cache,
           std::optional<torch::Tensor>(),  // bias (no bias for qwen3)
           torch::IntArrayRef(input_params.parallel.query_start_loc),
-          torch::IntArrayRef(linear_state_indices_vec),
-          torch::IntArrayRef(input_params.linear_state_validity_mask),
+          torch::IntArrayRef(linear_state_indices_host),
+          torch::IntArrayRef(
+              input_params.cache_state_.linear_state_validity_mask),
           num_accepted_tokens_opt,
           xllm::npu::kCausalConv1dActivationSilu,
           xllm::npu::kCausalConv1dGraphPadSlotId,
@@ -542,22 +551,10 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       mixed_qkv = mixed_qkv.transpose(1, 2);
     }
   } else {
-    if (use_spec_verify) {
-      CHECK(input_params.num_accepted_tokens.defined())
-          << "num_accepted_tokens must be populated for Qwen3.5 spec verify";
-    }
     torch::Tensor conv_input = reshape_qkvz_unpad(attn_metadata, mixed_qkv);
     const auto& num_accepted = use_spec_verify
                                    ? input_params.num_accepted_tokens_host
                                    : std::vector<int64_t>();
-    std::vector<int64_t> linear_state_indices_host(
-        input_params.embedding.linear_state_ids.begin(),
-        input_params.embedding.linear_state_ids.end());
-    if (kv_cache.is_static_shared()) {
-      for (int64_t& index : linear_state_indices_host) {
-        index = kv_cache.physical_row_index(index, KVCacheTensorRole::CONV);
-      }
-    }
     if (register_conv1d_graph_update) {
       if (use_spec_verify) {
         const auto conv1d_branch =
@@ -767,12 +764,13 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     // Shape: [batch_size, num_heads, head_k_dim, head_v_dim]
     torch::Tensor initial_state_tensor =
         torch::index_select(ssm_cache, 0, linear_state_base_indices);
-    CHECK_EQ(input_params.linear_state_validity_mask.size(),
-             input_params.embedding.linear_state_ids.size())
+    CHECK_EQ(input_params.cache_state_.linear_state_validity_mask.size(),
+             input_params.cache_state_.linear_state_ids.size())
         << "linear state validity mask must be sequence-scoped.";
-    for (size_t i = 0; i < input_params.linear_state_validity_mask.size();
+    for (size_t i = 0;
+         i < input_params.cache_state_.linear_state_validity_mask.size();
          ++i) {
-      if (input_params.linear_state_validity_mask[i] == 0) {
+      if (input_params.cache_state_.linear_state_validity_mask[i] == 0) {
         initial_state_tensor.select(0, static_cast<int64_t>(i)).fill_(0.0);
       }
     }
@@ -935,10 +933,10 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::reshape_qkvz_unpad(
 torch::Tensor Qwen3GatedDeltaNetBaseImpl::get_linear_state_indices(
     const ModelParamsView& input_params,
     const torch::Device& device) const {
-  CHECK(!input_params.embedding.linear_state_ids.empty())
+  CHECK(!input_params.cache_state_.linear_state_ids.empty())
       << "linear_state_ids must be populated for gated delta net";
-  if (input_params.embedding.linear_state_indices.defined()) {
-    auto indices = input_params.embedding.linear_state_indices;
+  if (input_params.cache_state_.linear_state_indices.defined()) {
+    auto indices = input_params.cache_state_.linear_state_indices;
     if (indices.device() != device || indices.scalar_type() != torch::kInt) {
       indices =
           indices.to(torch::TensorOptions().dtype(torch::kInt).device(device),
@@ -948,7 +946,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::get_linear_state_indices(
     return indices.contiguous();
   }
   return torch::tensor(
-      input_params.embedding.linear_state_ids,
+      input_params.cache_state_.linear_state_ids,
       torch::TensorOptions().dtype(torch::kInt).device(device));
 }
 

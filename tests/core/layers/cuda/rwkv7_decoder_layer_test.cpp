@@ -157,7 +157,7 @@ ModelParamsView make_input_params(int32_t num_sequences,
   for (int32_t i = 0; i < num_sequences; ++i) {
     state_indices.push_back(i);
   }
-  params.embedding.linear_state_indices = torch::tensor(
+  params.cache_state_.linear_state_indices = torch::tensor(
       state_indices, torch::TensorOptions().dtype(torch::kLong).device(device));
   return params;
 }

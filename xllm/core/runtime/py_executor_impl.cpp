@@ -55,6 +55,56 @@ namespace py = pybind11;
 namespace xllm {
 namespace {
 
+MMDict encode_python_mm_inputs(const py::object& top_model,
+                               MMBatchData& encoder_inputs) {
+  const auto get_tensor = [&encoder_inputs](const MMKey& key) {
+    return encoder_inputs.get<torch::Tensor>(key).value_or(torch::Tensor());
+  };
+  const auto pixel_values = get_tensor(/*key=*/"pixel_values");
+  const auto image_grid_thw = get_tensor(/*key=*/"image_grid_thw");
+  const auto pixel_values_videos = get_tensor(/*key=*/"pixel_values_videos");
+  const auto video_grid_thw = get_tensor(/*key=*/"video_grid_thw");
+  const auto input_features = get_tensor(/*key=*/"input_features");
+  const auto speech_lengths = get_tensor(/*key=*/"speech_lengths");
+  CHECK_EQ(input_features.defined(), speech_lengths.defined())
+      << "input_features and speech_lengths must be provided together";
+
+  MMDict encoded;
+  const auto encode_visual = [&](const torch::Tensor& pixels,
+                                 const torch::Tensor& grid,
+                                 MMType type) {
+    auto raw =
+        top_model.attr(/*key=*/"encode")(pixels, grid).cast<torch::Tensor>();
+    encoded[get_embedding_key(type)] =
+        split_by_token_nums(raw, get_mm_token_nums(encoder_inputs, type));
+  };
+  if (pixel_values.defined() &&
+      py::hasattr(top_model, /*name=*/"encode_with_inputs")) {
+    py::dict inputs;
+    for (const auto& [key, value] : encoder_inputs.data()) {
+      inputs[py::str(key)] = py::cast(value);
+    }
+    torch::Tensor raw = top_model.attr(/*key=*/"encode_with_inputs")(inputs)
+                            .cast<torch::Tensor>();
+    encoded[get_embedding_key(/*type=*/MMType::IMAGE)] = split_by_token_nums(
+        raw, get_mm_token_nums(encoder_inputs, /*type=*/MMType::IMAGE));
+  } else if (pixel_values.defined() && image_grid_thw.defined()) {
+    encode_visual(pixel_values, image_grid_thw, /*type=*/MMType::IMAGE);
+  }
+  if (pixel_values_videos.defined() && video_grid_thw.defined()) {
+    encode_visual(pixel_values_videos, video_grid_thw, /*type=*/MMType::VIDEO);
+  }
+  if (input_features.defined()) {
+    const auto audio_meta = get_tensor(/*key=*/"audio_encode_meta");
+    CHECK(audio_meta.defined()) << "Missing audio encoder metadata";
+    encoded[get_embedding_key(/*type=*/MMType::AUDIO)] =
+        top_model
+            .attr(/*key=*/"encode")(input_features, speech_lengths, audio_meta)
+            .cast<std::vector<torch::Tensor>>();
+  }
+  return encoded;
+}
+
 py::object mtp_topk_indices(const ModelParamsView& params) {
   if (params.mtp_topk_state != nullptr) {
     const auto tensor = params.mtp_topk_state->as_tensor();
@@ -277,10 +327,13 @@ void PyExecutorImpl::clear_multimodal_cache() {
   }
 }
 
+bool PyExecutorImpl::supports_multimodal_input() const { return true; }
+
 ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                 const torch::Tensor& positions,
                                 std::vector<KVCache>& kv_caches,
-                                const ModelParamsView& params) {
+                                const ModelParamsView& params,
+                                MMBatchData* mm_batch_data) {
   torch::NoGradGuard no_grad;
   PyCausalLM::set_active_instance(py_causal_lm_);
 
@@ -350,83 +403,15 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
 
   // Full encoder outputs belong to the MM items; the shared gather selects
   // this step's chunk rows and builds modality masks before Python merges them.
-  if (params.has_multimodal() && params.multimodal().mm_data.valid()) {
-    auto& mm_data = params.multimodal().mm_data;
-    if (encoder_cache_) {
-      EncoderCacheLookupVisitor lookup(encoder_cache_.get());
-      CHECK(mm_data.foreach (lookup));
-    }
-    EncoderInputGatherVisitor input_gather;
-    CHECK(mm_data.foreach (input_gather));
-    CHECK(input_gather.finish(mm_data));
-
-    torch::Tensor pixel_values =
-        mm_data.get<torch::Tensor>("pixel_values").value_or(torch::Tensor());
-    torch::Tensor image_grid_thw =
-        mm_data.get<torch::Tensor>("image_grid_thw").value_or(torch::Tensor());
-    torch::Tensor pixel_values_videos =
-        mm_data.get<torch::Tensor>("pixel_values_videos")
-            .value_or(torch::Tensor());
-    torch::Tensor video_grid_thw =
-        mm_data.get<torch::Tensor>("video_grid_thw").value_or(torch::Tensor());
-
-    torch::Tensor input_features =
-        mm_data.get<torch::Tensor>("input_features").value_or(torch::Tensor());
-    torch::Tensor speech_lengths =
-        mm_data.get<torch::Tensor>("speech_lengths").value_or(torch::Tensor());
-    CHECK_EQ(input_features.defined(), speech_lengths.defined())
-        << "input_features and speech_lengths must be provided together";
-
+  if (mm_batch_data != nullptr) {
+    auto& mm_data = *mm_batch_data;
     py::object top_model = py_causal_lm_->python_model();
-    MMDict encoded;
-    // Models whose image encoder needs every gathered multimodal key (e.g.
-    // DeepSeek-OCR's separate global-view and crop tensors) expose
-    // encode_with_inputs; they take over the whole batch dict and the
-    // per-modality 2-argument encode branches below are skipped. The
-    // pixel_values guard keeps chunked prefill safe: later chunks see their
-    // image items already embedded, EncoderInputGatherVisitor skips them,
-    // and the gathered dict is empty — encoding is skipped, and
-    // EncoderEmbeddingGatherVisitor below re-slices the per-item embeddings
-    // stored by the first chunk.
-    if (py::hasattr(top_model, "encode_with_inputs") &&
-        pixel_values.defined()) {
-      py::dict inputs;
-      for (const auto& [key, value] : mm_data.data()) {
-        inputs[py::str(key)] = py::cast(value);
-      }
-      torch::Tensor raw =
-          top_model.attr("encode_with_inputs")(inputs).cast<torch::Tensor>();
-      encoded[get_embedding_key(MMType::IMAGE)] =
-          split_by_token_nums(raw, get_mm_token_nums(mm_data, MMType::IMAGE));
-    } else if (pixel_values.defined() && image_grid_thw.defined()) {
-      torch::Tensor raw = top_model.attr("encode")(pixel_values, image_grid_thw)
-                              .cast<torch::Tensor>();
-      encoded[get_embedding_key(MMType::IMAGE)] =
-          split_by_token_nums(raw, get_mm_token_nums(mm_data, MMType::IMAGE));
-    }
-    if (pixel_values_videos.defined() && video_grid_thw.defined()) {
-      torch::Tensor raw =
-          top_model.attr("encode")(pixel_values_videos, video_grid_thw)
-              .cast<torch::Tensor>();
-      encoded[get_embedding_key(MMType::VIDEO)] =
-          split_by_token_nums(raw, get_mm_token_nums(mm_data, MMType::VIDEO));
-    }
-    if (input_features.defined()) {
-      torch::Tensor audio_meta = mm_data.get<torch::Tensor>("audio_encode_meta")
-                                     .value_or(torch::Tensor());
-      CHECK(audio_meta.defined()) << "Missing audio encoder metadata";
-      encoded[get_embedding_key(MMType::AUDIO)] =
-          top_model.attr("encode")(input_features, speech_lengths, audio_meta)
-              .cast<std::vector<torch::Tensor>>();
-    }
-
-    EncoderOutputScatterVisitor scatter(encoded);
-    CHECK(mm_data.foreach (scatter));
-    CHECK(scatter.finish());
-    if (encoder_cache_) {
-      EncoderCacheInsertVisitor insert(encoder_cache_.get());
-      CHECK(mm_data.foreach (insert));
-    }
+    execute_mm_encoder(mm_data,
+                       encoder_cache_.get(),
+                       [&top_model](MMBatchData& encoder_inputs) {
+                         return encode_python_mm_inputs(top_model,
+                                                        encoder_inputs);
+                       });
     EncoderEmbeddingGatherVisitor gather(device_,
                                          mm_data.type(),
                                          params.attention.host.kv_seq_lens,

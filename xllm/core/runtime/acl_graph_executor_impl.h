@@ -61,20 +61,8 @@ struct StaticGraphTaskSignature {
   bool operator==(const StaticGraphTaskSignature&) const = default;
 };
 
-inline std::optional<StaticGraphTaskSignature> make_static_graph_task_signature(
-    const ModelParamsView& params) {
-  if (params.parallel.query_start_loc.size() != 2 ||
-      params.embedding.linear_state_ids.size() != 1 ||
-      params.num_accepted_tokens_host.size() != 1) {
-    return std::nullopt;
-  }
-  return StaticGraphTaskSignature{
-      .linear_state_id = params.embedding.linear_state_ids.front(),
-      .num_accepted_tokens = params.num_accepted_tokens_host.front(),
-      .query_start_loc_begin = params.parallel.query_start_loc.front(),
-      .query_start_loc_end = params.parallel.query_start_loc.back(),
-  };
-}
+std::optional<StaticGraphTaskSignature> make_static_graph_task_signature(
+    const ModelParamsView& params);
 
 inline StaticGraphTaskSignature make_static_graph_task_signature(
     const SpecVerifyGraphTaskSignal& signal) {
@@ -183,7 +171,8 @@ class AclGraphExecutorImpl final : public ExecutorImpl {
   ModelOutput run(const torch::Tensor& tokens,
                   const torch::Tensor& positions,
                   std::vector<KVCache>& kv_caches,
-                  const ModelParamsView& params) override;
+                  const ModelParamsView& params,
+                  MMBatchData* mm_data = nullptr) override;
 
   void prepare_graph_input(const torch::Tensor& tokens,
                            const torch::Tensor& positions,

@@ -2313,30 +2313,32 @@ inline void deserialize_forward_input_payload(
   read_vector(context, input_params.parallel.dp_global_kv_max_seq_lens);
   read_vector(context, input_params.parallel.dp_global_json_object_active);
   read_vector(context, input_params.parallel.dp_is_decode);
-  read_vector(context, input_params.embedding.embedding_ids);
-  read_vector(context, input_params.embedding.linear_state_ids);
-  read_vector(context, input_params.embedding.linear_state_read_ids);
-  normalize_linear_state_ids(input_params.embedding.linear_state_ids,
+  read_vector(context, forward_input.speculative_.embedding_ids_);
+  read_vector(context, input_params.cache_state_.linear_state_ids);
+  read_vector(context, input_params.cache_state_.linear_state_read_ids);
+  normalize_linear_state_ids(input_params.cache_state_.linear_state_ids,
                              input_params.meta.num_sequences);
   if (materialize_device_buffer &&
-      !input_params.embedding.linear_state_ids.empty()) {
-    input_params.embedding.linear_state_indices =
-        async_h2d_tensor(input_params.embedding.linear_state_ids, device);
-    if (!input_params.embedding.linear_state_read_ids.empty()) {
-      input_params.embedding.linear_state_read_indices = async_h2d_tensor(
-          input_params.embedding.linear_state_read_ids, device);
+      !input_params.cache_state_.linear_state_ids.empty()) {
+    input_params.cache_state_.linear_state_indices =
+        async_h2d_tensor(input_params.cache_state_.linear_state_ids, device);
+    if (!input_params.cache_state_.linear_state_read_ids.empty()) {
+      input_params.cache_state_.linear_state_read_indices = async_h2d_tensor(
+          input_params.cache_state_.linear_state_read_ids, device);
     }
   }
-  read_string_vector(context, input_params.embedding.request_ids);
-  read_vector(context, input_params.embedding.linear_state_slot_rows);
-  read_vector(context, input_params.embedding.full_block_slot_rows);
-  read_vector(context, input_params.embedding.full_block_lease_epochs);
-  read_vector(context, input_params.embedding.extra_token_ids);
-  read_vector(context, input_params.embedding.mtp_bootstrap_row_idxes);
-  read_tensor(context, input_params.embedding.mtp_bootstrap_embeddings, stream);
+  read_string_vector(context, forward_input.request_ids);
+  read_vector(context, input_params.cache_state_.linear_state_slot_rows);
+  read_vector(context, input_params.cache_state_.full_block_slot_rows);
+  read_vector(context, input_params.cache_state_.full_block_lease_epochs);
+  read_vector(context, forward_input.speculative_.extra_token_ids_);
+  read_vector(context,
+              forward_input.speculative_.mtp_bootstrap_sequence_indices_);
+  read_tensor(
+      context, forward_input.speculative_.mtp_bootstrap_embeddings_, stream);
   if constexpr (std::is_same_v<Input, VlmForwardInput>) {
-    read_mm_batch_data(context, input_params.multimodal.mm_data);
-    read_vector_tensor(context, input_params.multimodal.deep_stacks, stream);
+    read_mm_batch_data(context, forward_input.mm_data_);
+    read_vector_tensor(context, input_params.embedding.deep_stacks_, stream);
   }
   read_tensor_and_vector(context,
                          input_params.attention.device.kv_cache_tokens_nums,
@@ -2668,23 +2670,24 @@ inline void serialize_forward_input_sections(
   write_vector(context.descriptor,
                input_params.parallel.dp_global_json_object_active);
   write_vector(context.descriptor, input_params.parallel.dp_is_decode);
-  write_vector(context.descriptor, input_params.embedding.embedding_ids);
-  write_vector(context.descriptor, input_params.embedding.linear_state_ids);
+  write_vector(context.descriptor, input.speculative_.embedding_ids_);
+  write_vector(context.descriptor, input_params.cache_state_.linear_state_ids);
   write_vector(context.descriptor,
-               input_params.embedding.linear_state_read_ids);
-  write_string_vector(context.descriptor, input_params.embedding.request_ids);
+               input_params.cache_state_.linear_state_read_ids);
+  write_string_vector(context.descriptor, input.request_ids);
   write_vector(context.descriptor,
-               input_params.embedding.linear_state_slot_rows);
-  write_vector(context.descriptor, input_params.embedding.full_block_slot_rows);
+               input_params.cache_state_.linear_state_slot_rows);
   write_vector(context.descriptor,
-               input_params.embedding.full_block_lease_epochs);
-  write_vector(context.descriptor, input_params.embedding.extra_token_ids);
+               input_params.cache_state_.full_block_slot_rows);
   write_vector(context.descriptor,
-               input_params.embedding.mtp_bootstrap_row_idxes);
-  write_tensor(context, input_params.embedding.mtp_bootstrap_embeddings);
+               input_params.cache_state_.full_block_lease_epochs);
+  write_vector(context.descriptor, input.speculative_.extra_token_ids_);
+  write_vector(context.descriptor,
+               input.speculative_.mtp_bootstrap_sequence_indices_);
+  write_tensor(context, input.speculative_.mtp_bootstrap_embeddings_);
   if constexpr (std::is_same_v<Input, VlmForwardInput>) {
-    write_mm_batch_data(context, input_params.multimodal.mm_data);
-    write_vector_tensor(context, input_params.multimodal.deep_stacks);
+    write_mm_batch_data(context, input.mm_data_);
+    write_vector_tensor(context, input_params.embedding.deep_stacks_);
   }
   write_host_vector_or_tensor(
       context,

@@ -1073,10 +1073,11 @@ TEST(BatchTest, DecodeForwardInputConsumesMtpBootstrap) {
   LlmForwardInput forward_input =
       batch.prepare_forward_input(ModelArgs(), nullptr);
 
-  const auto& embed_params = forward_input.input_params.embedding;
-  EXPECT_EQ(embed_params.mtp_bootstrap_row_idxes, std::vector<int32_t>{0});
-  ASSERT_TRUE(embed_params.mtp_bootstrap_embeddings.defined());
-  EXPECT_TRUE(torch::equal(embed_params.mtp_bootstrap_embeddings,
+  const auto& speculative = forward_input.speculative_;
+  EXPECT_EQ(speculative.mtp_bootstrap_sequence_indices_,
+            std::vector<int32_t>{0});
+  ASSERT_TRUE(speculative.mtp_bootstrap_embeddings_.defined());
+  EXPECT_TRUE(torch::equal(speculative.mtp_bootstrap_embeddings_,
                            embedding.unsqueeze(0)));
   EXPECT_FALSE(sequence.get_mtp_bootstrap_embedding().defined());
 }
@@ -1106,10 +1107,11 @@ TEST(BatchTest, DecodeForwardInputMapsSparseMtpBootstrapRows) {
   LlmForwardInput forward_input =
       batch.prepare_forward_input(ModelArgs(), nullptr);
 
-  const auto& embed_params = forward_input.input_params.embedding;
-  EXPECT_EQ(embed_params.mtp_bootstrap_row_idxes, std::vector<int32_t>{1});
-  ASSERT_TRUE(embed_params.mtp_bootstrap_embeddings.defined());
-  EXPECT_TRUE(torch::equal(embed_params.mtp_bootstrap_embeddings,
+  const auto& speculative = forward_input.speculative_;
+  EXPECT_EQ(speculative.mtp_bootstrap_sequence_indices_,
+            std::vector<int32_t>{1});
+  ASSERT_TRUE(speculative.mtp_bootstrap_embeddings_.defined());
+  EXPECT_TRUE(torch::equal(speculative.mtp_bootstrap_embeddings_,
                            embedding.unsqueeze(0)));
 }
 
@@ -1140,7 +1142,7 @@ TEST(BatchTest, NativeVlmPrefillSchedulesOnlyVisibleVisionItems) {
   EXPECT_EQ(input.input_params.meta.num_sequences, 1);
   EXPECT_TRUE(equal(input.token_ids, std::vector<int32_t>{10, 11, 12}));
   EXPECT_TRUE(equal(input.positions, std::vector<int32_t>{0, 1, 2}));
-  const MMBatchData& vision = input.input_params.multimodal.mm_data;
+  const MMBatchData& vision = input.mm_data_;
   ASSERT_TRUE(vision.valid());
   ASSERT_EQ(vision.mm_data_vec().size(), 1u);
   const MMData& scheduled_data = vision.mm_data_vec().front();
@@ -1177,8 +1179,7 @@ TEST(BatchTest, NativeVlmDecodeKeepsDomainWithoutVisionPayload) {
   EXPECT_EQ(input.input_params.meta.num_sequences, 1);
   EXPECT_TRUE(equal(input.token_ids, std::vector<int32_t>{13}));
   EXPECT_TRUE(equal(input.positions, std::vector<int32_t>{3}));
-  EXPECT_FALSE(input.input_params.multimodal.mm_data.valid());
-  EXPECT_TRUE(input.input_params.multimodal.mm_data.mm_data_vec().empty());
+  EXPECT_FALSE(input.mm_data_.valid());
   EXPECT_TRUE(sequence.mm_data().valid());
 }
 
@@ -1323,8 +1324,8 @@ TEST(BatchTest, Basic) {
   EXPECT_EQ(input_params.meta.num_sequences, 4);
   EXPECT_EQ(input_params.meta.q_max_seq_len, 9);
   EXPECT_EQ(input_params.meta.kv_max_seq_len, 16);
-  EXPECT_EQ(input_params.embedding.embedding_ids, std::vector<int32_t>({-1, -1, -1}));
-  EXPECT_EQ(input_params.embedding.linear_state_ids,
+  EXPECT_EQ(forward_input.speculative_.embedding_ids_, (std::vector<int32_t>{-1, -1, -1}));
+  EXPECT_EQ(input_params.cache_state_.linear_state_ids,
             std::vector<int32_t>({-1, -1, -1, -1}));
 
   const std::vector<int32_t> q_seq_lens = {9, 1, 1, 4};
@@ -1914,9 +1915,8 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   LlmForwardInput input = builder.build_forward_input();
   input.input_params.parallel.dp_global_batch_generations = {3, 7};
   input.input_params.parallel.dp_global_sequence_nums = {1, 0};
-  input.input_params.embedding.mtp_bootstrap_row_idxes = {0};
-  input.input_params.embedding.mtp_bootstrap_embeddings =
-      torch::tensor({{3.0f, 4.0f}});
+  input.speculative_.mtp_bootstrap_sequence_indices_ = {0};
+  input.speculative_.mtp_bootstrap_embeddings_ = torch::tensor({{3.0f, 4.0f}});
   input.sample_sequence_ids = {"req-packed#0"};
   input.sample_prior_output_rows = {3};
   input.sampling_params.filter_bitmask() =
@@ -1947,7 +1947,7 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
       find_mapping(round_trip.transfer_kv_infos[0], BlockType::KV);
   EXPECT_EQ(mapping.local_ids, (std::vector<uint64_t>{1}));
   EXPECT_EQ(mapping.remote_ids, (std::vector<uint64_t>{100}));
-  EXPECT_EQ(round_trip.input_params.embedding.mtp_bootstrap_row_idxes,
+  EXPECT_EQ(round_trip.speculative_.mtp_bootstrap_sequence_indices_,
             std::vector<int32_t>{0});
   EXPECT_EQ(round_trip.input_params.parallel.dp_global_batch_generations,
             (std::vector<uint64_t>{3, 7}));
@@ -1960,12 +1960,10 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   EXPECT_TRUE(
       torch::equal(round_trip.sampling_params.filter_bitmask().to(torch::kCPU),
                    input.sampling_params.filter_bitmask()));
-  ASSERT_TRUE(
-      round_trip.input_params.embedding.mtp_bootstrap_embeddings.defined());
-  EXPECT_TRUE(torch::equal(
-      round_trip.input_params.embedding.mtp_bootstrap_embeddings.to(
-          torch::kCPU),
-      torch::tensor({{3.0f, 4.0f}})));
+  ASSERT_TRUE(round_trip.speculative_.mtp_bootstrap_embeddings_.defined());
+  EXPECT_TRUE(torch::equal(round_trip.speculative_.mtp_bootstrap_embeddings_.to(
+                               /*device=*/torch::kCPU),
+                           torch::tensor({{3.0f, 4.0f}})));
 }
 
 TEST(BatchTest, NativeDiTShmRoundTripOwnsTensorSourcesAcrossSegmentOverwrite) {
@@ -2263,13 +2261,12 @@ TEST(BatchTest, SampleRequestKeepsThreadedForwardBuilderOffsetsStable) {
   const std::vector<int32_t> expected_logits_indices = {1, 3, 4, 6};
   EXPECT_TRUE(equal(forward_input.sampling_params.logits_indices(),
                     expected_logits_indices));
-  ASSERT_EQ(forward_input.input_params.embedding.embedding_ids.size(),
+  ASSERT_EQ(forward_input.speculative_.embedding_ids_.size(), sequences.size());
+  ASSERT_EQ(forward_input.input_params.cache_state_.linear_state_ids.size(),
             sequences.size());
-  ASSERT_EQ(forward_input.input_params.embedding.linear_state_ids.size(),
-            sequences.size());
-  EXPECT_EQ(forward_input.input_params.embedding.embedding_ids,
+  EXPECT_EQ(forward_input.speculative_.embedding_ids_,
             std::vector<int32_t>({-1, -1}));
-  EXPECT_EQ(forward_input.input_params.embedding.linear_state_ids,
+  EXPECT_EQ(forward_input.input_params.cache_state_.linear_state_ids,
             std::vector<int32_t>({-1, -1}));
 }
 
@@ -2384,11 +2381,12 @@ TEST(BatchTest, DecodeEmbeddingAndLinearStateIdsAreIndependentSlots) {
 
   LlmForwardInput forward_input = builder.build_forward_input();
 
-  ASSERT_EQ(forward_input.input_params.embedding.embedding_ids.size(), 1u);
-  ASSERT_EQ(forward_input.input_params.embedding.linear_state_ids.size(), 1u);
-  EXPECT_EQ(forward_input.input_params.embedding.embedding_ids[0],
+  ASSERT_EQ(forward_input.speculative_.embedding_ids_.size(), 1u);
+  ASSERT_EQ(forward_input.input_params.cache_state_.linear_state_ids.size(),
+            1u);
+  EXPECT_EQ(forward_input.speculative_.embedding_ids_[0],
             expected_embedding_id);
-  EXPECT_EQ(forward_input.input_params.embedding.linear_state_ids[0],
+  EXPECT_EQ(forward_input.input_params.cache_state_.linear_state_ids[0],
             expected_linear_id);
 }
 
@@ -2444,10 +2442,10 @@ TEST(BatchTest, SharedArenaPublishesLinearGroupSlotsForReadAndWriteStates) {
   ForwardInputBuilder builder(batch_input_data, &args);
   LlmForwardInput forward_input = builder.build_forward_input();
 
-  const auto& embedding = forward_input.input_params.embedding;
-  EXPECT_EQ(embedding.linear_state_ids, std::vector<int32_t>({4}));
-  EXPECT_EQ(embedding.linear_state_read_ids, std::vector<int32_t>({2}));
-  EXPECT_EQ(embedding.linear_state_slot_rows,
+  const auto& cache_state = forward_input.input_params.cache_state_;
+  EXPECT_EQ(cache_state.linear_state_ids, (std::vector<int32_t>{4}));
+  EXPECT_EQ(cache_state.linear_state_read_ids, (std::vector<int32_t>{2}));
+  EXPECT_EQ(cache_state.linear_state_slot_rows,
             std::vector<int32_t>({4, 4, 5, 2, 2, 3}));
 }
 
@@ -2500,23 +2498,23 @@ TEST(BatchTest, ThreadedSharedSlabBuilderKeepsFullLeaseRowsAligned) {
   SharedKVMappingTracker mapping_tracker;
   const LlmForwardInput input = batch.prepare_forward_input(
       args, &thread_pool, /*cp_size=*/1, &mapping_tracker);
-  const auto& embedding = input.input_params.embedding;
-  ASSERT_EQ(embedding.full_block_slot_rows.size(), 9u);
-  EXPECT_EQ(embedding.full_block_lease_epochs,
+  const auto& cache_state = input.input_params.cache_state_;
+  ASSERT_EQ(cache_state.full_block_slot_rows.size(), 9u);
+  EXPECT_EQ(cache_state.full_block_lease_epochs,
             (std::vector<uint64_t>{2, 1, 1}));
-  EXPECT_EQ(embedding.full_block_slot_rows[0],
+  EXPECT_EQ(cache_state.full_block_slot_rows[0],
             first.kv_state().blocks(BlockType::KV)[0].id());
-  EXPECT_EQ(embedding.full_block_slot_rows[3],
+  EXPECT_EQ(cache_state.full_block_slot_rows[3],
             second.kv_state().blocks(BlockType::KV)[0].id());
-  EXPECT_EQ(embedding.full_block_slot_rows[6],
+  EXPECT_EQ(cache_state.full_block_slot_rows[6],
             second.kv_state().blocks(BlockType::KV)[1].id());
-  EXPECT_EQ(embedding.linear_state_read_ids[0], read_id);
-  EXPECT_EQ(embedding.linear_state_ids[0], write_id);
-  ASSERT_EQ(embedding.linear_state_slot_rows.size(), 15u);
+  EXPECT_EQ(cache_state.linear_state_read_ids[0], read_id);
+  EXPECT_EQ(cache_state.linear_state_ids[0], write_id);
+  ASSERT_EQ(cache_state.linear_state_slot_rows.size(), 15u);
   const std::unordered_set<int32_t> published_linear_ids = {
-      embedding.linear_state_slot_rows[0],
-      embedding.linear_state_slot_rows[5],
-      embedding.linear_state_slot_rows[10]};
+      cache_state.linear_state_slot_rows[0],
+      cache_state.linear_state_slot_rows[5],
+      cache_state.linear_state_slot_rows[10]};
   EXPECT_EQ(published_linear_ids,
             (std::unordered_set<int32_t>{
                 read_id,
@@ -2529,9 +2527,11 @@ TEST(BatchTest, ThreadedSharedSlabBuilderKeepsFullLeaseRowsAligned) {
   second.kv_state().set_kv_cache_tokens_num(kQueryTokens);
   const LlmForwardInput unchanged = batch.prepare_forward_input(
       args, &thread_pool, /*cp_size=*/1, &mapping_tracker);
-  EXPECT_TRUE(unchanged.input_params.embedding.full_block_slot_rows.empty());
-  EXPECT_TRUE(unchanged.input_params.embedding.full_block_lease_epochs.empty());
-  EXPECT_TRUE(unchanged.input_params.embedding.linear_state_slot_rows.empty());
+  EXPECT_TRUE(unchanged.input_params.cache_state_.full_block_slot_rows.empty());
+  EXPECT_TRUE(
+      unchanged.input_params.cache_state_.full_block_lease_epochs.empty());
+  EXPECT_TRUE(
+      unchanged.input_params.cache_state_.linear_state_slot_rows.empty());
   mapping_tracker.acknowledge();
 
   // Replacing only the write state preserves the published read mapping and
@@ -2546,13 +2546,13 @@ TEST(BatchTest, ThreadedSharedSlabBuilderKeepsFullLeaseRowsAligned) {
   second.kv_state().set_kv_cache_tokens_num(kQueryTokens);
   const LlmForwardInput reused_write = batch.prepare_forward_input(
       args, &thread_pool, /*cp_size=*/1, &mapping_tracker);
-  const auto& reused_embedding = reused_write.input_params.embedding;
-  EXPECT_TRUE(reused_embedding.full_block_slot_rows.empty());
-  EXPECT_TRUE(reused_embedding.full_block_lease_epochs.empty());
-  EXPECT_EQ(reused_embedding.linear_state_read_ids[0], read_id);
-  EXPECT_EQ(reused_embedding.linear_state_ids[0], write_id);
-  ASSERT_EQ(reused_embedding.linear_state_slot_rows.size(), 5u);
-  EXPECT_EQ(reused_embedding.linear_state_slot_rows[0], write_id);
+  const auto& reused_cache_state = reused_write.input_params.cache_state_;
+  EXPECT_TRUE(reused_cache_state.full_block_slot_rows.empty());
+  EXPECT_TRUE(reused_cache_state.full_block_lease_epochs.empty());
+  EXPECT_EQ(reused_cache_state.linear_state_read_ids[0], read_id);
+  EXPECT_EQ(reused_cache_state.linear_state_ids[0], write_id);
+  ASSERT_EQ(reused_cache_state.linear_state_slot_rows.size(), 5u);
+  EXPECT_EQ(reused_cache_state.linear_state_slot_rows[0], write_id);
 }
 
 TEST(BatchTest, SequenceOwnsReadAndWriteSlotsWithoutBatchAliases) {
@@ -2574,16 +2574,17 @@ TEST(BatchTest, SequenceOwnsReadAndWriteSlotsWithoutBatchAliases) {
   ModelArgs args;
   args.model_type("qwen3_5").layer_types({"linear_attention"});
   LlmForwardInput input = batch->prepare_forward_input(args);
-  ASSERT_EQ(input.input_params.embedding.linear_state_read_ids.size(), 1u);
+  ASSERT_EQ(input.input_params.cache_state_.linear_state_read_ids.size(), 1u);
   EXPECT_FALSE(
       (input.input_params.attention.host.kv_cache_tokens_nums.front() == 0 &&
-       input.input_params.embedding.linear_state_read_ids.front() ==
-           input.input_params.embedding.linear_state_ids.front()));
-  EXPECT_NE(input.input_params.embedding.linear_state_read_ids.front(),
-            input.input_params.embedding.linear_state_ids.front());
-  EXPECT_EQ(input.input_params.embedding.linear_state_read_ids.front(),
+       input.input_params.cache_state_.linear_state_read_ids.front() ==
+           input.input_params.cache_state_.linear_state_ids.front()));
+  EXPECT_NE(input.input_params.cache_state_.linear_state_read_ids.front(),
+            input.input_params.cache_state_.linear_state_ids.front());
+  EXPECT_EQ(input.input_params.cache_state_.linear_state_read_ids.front(),
             source_id);
-  EXPECT_EQ(input.input_params.embedding.linear_state_ids.front(), output_id);
+  EXPECT_EQ(input.input_params.cache_state_.linear_state_ids.front(),
+            output_id);
   ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 2u);
   EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR)[0].id(), source_id);
   EXPECT_TRUE(manager.allocate(1).empty());
@@ -2636,14 +2637,14 @@ TEST(BatchTest, MixedBatchPreservesPrefillReadIds) {
   args.layer_types({"linear_attention"});
   auto forward_input = batch.prepare_forward_input(args, nullptr);
 
-  ASSERT_EQ(forward_input.input_params.embedding.linear_state_read_ids.size(),
-            2u);
-  EXPECT_EQ(forward_input.input_params.embedding.linear_state_read_ids[0],
+  ASSERT_EQ(
+      forward_input.input_params.cache_state_.linear_state_read_ids.size(), 2u);
+  EXPECT_EQ(forward_input.input_params.cache_state_.linear_state_read_ids[0],
             prefill_source_id);
-  EXPECT_NE(forward_input.input_params.embedding.linear_state_read_ids[0],
-            forward_input.input_params.embedding.linear_state_ids[0]);
-  EXPECT_EQ(forward_input.input_params.embedding.linear_state_read_ids[1],
-            forward_input.input_params.embedding.linear_state_ids[1]);
+  EXPECT_NE(forward_input.input_params.cache_state_.linear_state_read_ids[0],
+            forward_input.input_params.cache_state_.linear_state_ids[0]);
+  EXPECT_EQ(forward_input.input_params.cache_state_.linear_state_read_ids[1],
+            forward_input.input_params.cache_state_.linear_state_ids[1]);
 }
 
 TEST(BatchTest, ColdPrefillResetsButShortPromptDecodeDoesNotReset) {
@@ -2660,31 +2661,33 @@ TEST(BatchTest, ColdPrefillResetsButShortPromptDecodeDoesNotReset) {
   Batch prefill;
   prefill.add(&sequence, 3);
   LlmForwardInput prefill_input = prefill.prepare_forward_input(args, nullptr);
-  ASSERT_EQ(prefill_input.input_params.embedding.linear_state_read_ids.size(),
-            1u);
+  ASSERT_EQ(
+      prefill_input.input_params.cache_state_.linear_state_read_ids.size(), 1u);
   EXPECT_TRUE(
       (prefill_input.input_params.attention.host.kv_cache_tokens_nums.front() ==
            0 &&
-       prefill_input.input_params.embedding.linear_state_read_ids.front() ==
-           prefill_input.input_params.embedding.linear_state_ids.front()));
+       prefill_input.input_params.cache_state_.linear_state_read_ids.front() ==
+           prefill_input.input_params.cache_state_.linear_state_ids.front()));
 
-  EXPECT_EQ(prefill_input.input_params.embedding.linear_state_read_ids.front(),
-            prefill_input.input_params.embedding.linear_state_ids.front());
+  EXPECT_EQ(
+      prefill_input.input_params.cache_state_.linear_state_read_ids.front(),
+      prefill_input.input_params.cache_state_.linear_state_ids.front());
   sequence.append_token(Token(/*id=*/4));
   Batch decode;
   decode.add(&sequence, 1);
   LlmForwardInput decode_input = decode.prepare_forward_input(args, nullptr);
-  ASSERT_EQ(decode_input.input_params.embedding.linear_state_read_ids.size(),
+  ASSERT_EQ(decode_input.input_params.cache_state_.linear_state_read_ids.size(),
             1u);
   EXPECT_FALSE(
       (decode_input.input_params.attention.host.kv_cache_tokens_nums.front() ==
            0 &&
-       decode_input.input_params.embedding.linear_state_read_ids.front() ==
-           decode_input.input_params.embedding.linear_state_ids.front()));
+       decode_input.input_params.cache_state_.linear_state_read_ids.front() ==
+           decode_input.input_params.cache_state_.linear_state_ids.front()));
 
-  EXPECT_EQ(decode_input.input_params.embedding.linear_state_read_ids.front(),
-            decode_input.input_params.embedding.linear_state_ids.front());
-  EXPECT_EQ(decode_input.input_params.embedding.linear_state_ids.front(),
+  EXPECT_EQ(
+      decode_input.input_params.cache_state_.linear_state_read_ids.front(),
+      decode_input.input_params.cache_state_.linear_state_ids.front());
+  EXPECT_EQ(decode_input.input_params.cache_state_.linear_state_ids.front(),
             output_id);
 }
 
@@ -2811,12 +2814,13 @@ TEST(BatchTest, ThreadedPrefillPreservesChunkSlicesAndFinalSamplingOffset) {
               std::vector<int32_t>({3, 5}));
     EXPECT_TRUE(torch::equal(input_params.attention.device.kv_cache_tokens_nums,
                              make_cpu_tensor(std::vector<int32_t>({3, 5}))));
-    EXPECT_EQ(input_params.embedding.embedding_ids, std::vector<int32_t>({-1}));
-    EXPECT_EQ(input_params.embedding.request_ids,
+    EXPECT_EQ(forward_input.speculative_.embedding_ids_,
+              (std::vector<int32_t>{-1}));
+    EXPECT_EQ(forward_input.request_ids,
               std::vector<std::string>({"finished"}));
-    EXPECT_EQ(input_params.embedding.linear_state_ids,
+    EXPECT_EQ(input_params.cache_state_.linear_state_ids,
               std::vector<int32_t>({-1, -1}));
-    EXPECT_EQ(input_params.embedding.extra_token_ids,
+    EXPECT_EQ(forward_input.speculative_.extra_token_ids_,
               std::vector<int32_t>({32871, -1}));
     EXPECT_TRUE(torch::equal(forward_input.sampling_params.logits_indices(),
                              make_cpu_tensor(std::vector<int32_t>({65535}))));
@@ -2842,15 +2846,15 @@ TEST(BatchTest, DecodeKeepsSingleTailWithoutRestore) {
   ModelArgs args;
   args.model_type("qwen3_5").layer_types({"linear_attention"});
   LlmForwardInput input = batch.prepare_forward_input(args, nullptr);
-  ASSERT_EQ(input.input_params.embedding.linear_state_read_ids.size(), 1u);
+  ASSERT_EQ(input.input_params.cache_state_.linear_state_read_ids.size(), 1u);
   EXPECT_FALSE(
       (input.input_params.attention.host.kv_cache_tokens_nums.front() == 0 &&
-       input.input_params.embedding.linear_state_read_ids.front() ==
-           input.input_params.embedding.linear_state_ids.front()));
+       input.input_params.cache_state_.linear_state_read_ids.front() ==
+           input.input_params.cache_state_.linear_state_ids.front()));
 
-  EXPECT_EQ(input.input_params.embedding.linear_state_read_ids.front(),
-            input.input_params.embedding.linear_state_ids.front());
-  EXPECT_EQ(input.input_params.embedding.linear_state_ids.front(),
+  EXPECT_EQ(input.input_params.cache_state_.linear_state_read_ids.front(),
+            input.input_params.cache_state_.linear_state_ids.front());
+  EXPECT_EQ(input.input_params.cache_state_.linear_state_ids.front(),
             sequence.get_linear_state_slot_id());
 }
 
@@ -2871,8 +2875,9 @@ TEST(BatchTest, DecodeDestinationIsOwnedOnlyBySequence) {
   ModelArgs args;
   args.model_type("qwen3_5").layer_types({"linear_attention"});
   LlmForwardInput input = batch->prepare_forward_input(args, nullptr);
-  ASSERT_EQ(input.input_params.embedding.linear_state_read_ids.size(), 1u);
-  EXPECT_EQ(input.input_params.embedding.linear_state_ids.front(), output_id);
+  ASSERT_EQ(input.input_params.cache_state_.linear_state_read_ids.size(), 1u);
+  EXPECT_EQ(input.input_params.cache_state_.linear_state_ids.front(),
+            output_id);
   EXPECT_TRUE(manager.allocate(1).empty());
   EXPECT_EQ(sequence.kv_state().blocks(BlockType::LINEAR).back().ref_count(),
             1u);
@@ -2924,8 +2929,9 @@ TEST(BatchTest, OverlapRawAcceptanceKeepsSingleLinearSlot) {
   second.add(&sequence, 1);
   LlmForwardInput second_input = second.prepare_forward_input(args, nullptr);
   ASSERT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
-  EXPECT_EQ(second_input.input_params.embedding.linear_state_read_ids.front(),
-            first_output_id);
+  EXPECT_EQ(
+      second_input.input_params.cache_state_.linear_state_read_ids.front(),
+      first_output_id);
   second.process_sample_output(fake, BatchOutputAction::RESERVE_PENDING);
   RawForwardOutput accepted;
   RawSampleOutput accepted_row;
@@ -2945,9 +2951,9 @@ TEST(BatchTest, OverlapRawAcceptanceKeepsSingleLinearSlot) {
   third.add(&sequence, 1);
   LlmForwardInput third_input = third.prepare_forward_input(args, nullptr);
   EXPECT_EQ(sequence.kv_state().num_blocks(BlockType::LINEAR), 1u);
-  EXPECT_EQ(third_input.input_params.embedding.linear_state_read_ids.front(),
+  EXPECT_EQ(third_input.input_params.cache_state_.linear_state_read_ids.front(),
             source_id);
-  EXPECT_EQ(third_input.input_params.embedding.linear_state_ids.front(),
+  EXPECT_EQ(third_input.input_params.cache_state_.linear_state_ids.front(),
             source_id);
   third.process_sample_output(fake, BatchOutputAction::RESERVE_PENDING);
   accepted.outputs.front().tokens.resize(2);
@@ -3257,12 +3263,12 @@ TEST(BatchTest, ThreadedInputBuildKeepsLinearOwnershipInSequences) {
   LlmForwardInput forward_input =
       batch->prepare_forward_input(args, &thread_pool);
 
-  ASSERT_EQ(forward_input.input_params.embedding.linear_state_read_ids.size(),
-            2u);
-  EXPECT_NE(forward_input.input_params.embedding.linear_state_read_ids[0],
-            forward_input.input_params.embedding.linear_state_ids[0]);
-  EXPECT_NE(forward_input.input_params.embedding.linear_state_read_ids[1],
-            forward_input.input_params.embedding.linear_state_ids[1]);
+  ASSERT_EQ(
+      forward_input.input_params.cache_state_.linear_state_read_ids.size(), 2u);
+  EXPECT_NE(forward_input.input_params.cache_state_.linear_state_read_ids[0],
+            forward_input.input_params.cache_state_.linear_state_ids[0]);
+  EXPECT_NE(forward_input.input_params.cache_state_.linear_state_read_ids[1],
+            forward_input.input_params.cache_state_.linear_state_ids[1]);
   EXPECT_TRUE(manager.allocate(1).empty());
   EXPECT_EQ(
       first_sequence.kv_state().blocks(BlockType::LINEAR).front().ref_count(),
@@ -3317,13 +3323,13 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateIds) {
       std::vector<std::vector<int32_t>>{{0}, {0}}, torch::kInt);
   forward_input.input_params.attention.host.block_tables =
       forward_input.input_params.attention.device.block_tables;
-  forward_input.input_params.embedding.linear_state_ids = {4, 6};
-  forward_input.input_params.embedding.linear_state_slot_rows = {
+  forward_input.input_params.cache_state_.linear_state_ids = {4, 6};
+  forward_input.input_params.cache_state_.linear_state_slot_rows = {
       4, 4, 9, 6, 6, 11};
-  forward_input.input_params.embedding.full_block_slot_rows = {
+  forward_input.input_params.cache_state_.full_block_slot_rows = {
       4, 120, 122, 6, 180, 182};
-  forward_input.input_params.embedding.embedding_ids = {2, 7};
-  forward_input.input_params.embedding.request_ids = {"mtp-a", "mtp-b"};
+  forward_input.speculative_.embedding_ids_ = {2, 7};
+  forward_input.request_ids = {"mtp-a", "mtp-b"};
 
   TransferKVInfo transfer_info;
   transfer_info.request_id = "dsv4-round-trip";
@@ -3350,16 +3356,14 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateIds) {
 
   LlmForwardInput from_shm;
   reader_manager.input_read(from_shm, torch::Device(torch::kCPU));
-  EXPECT_EQ(from_shm.input_params.embedding.linear_state_ids,
+  EXPECT_EQ(from_shm.input_params.cache_state_.linear_state_ids,
             std::vector<int32_t>({4, 6}));
-  EXPECT_EQ(from_shm.input_params.embedding.linear_state_slot_rows,
+  EXPECT_EQ(from_shm.input_params.cache_state_.linear_state_slot_rows,
             std::vector<int32_t>({4, 4, 9, 6, 6, 11}));
-  EXPECT_EQ(from_shm.input_params.embedding.full_block_slot_rows,
+  EXPECT_EQ(from_shm.input_params.cache_state_.full_block_slot_rows,
             std::vector<int32_t>({4, 120, 122, 6, 180, 182}));
-  EXPECT_EQ(from_shm.input_params.embedding.embedding_ids,
-            std::vector<int32_t>({2, 7}));
-  EXPECT_EQ(from_shm.input_params.embedding.request_ids,
-            (std::vector<std::string>{"mtp-a", "mtp-b"}));
+  EXPECT_EQ(from_shm.speculative_.embedding_ids_, (std::vector<int32_t>{2, 7}));
+  EXPECT_EQ(from_shm.request_ids, (std::vector<std::string>{"mtp-a", "mtp-b"}));
   ASSERT_EQ(from_shm.transfer_kv_infos.size(), 1u);
   EXPECT_EQ(from_shm.transfer_kv_infos[0].request_id, "dsv4-round-trip");
   EXPECT_TRUE(from_shm.transfer_kv_infos[0].rank_local_mapping);
@@ -3370,12 +3374,12 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateIds) {
   EXPECT_EQ(from_shm_mapping.local_ids, (std::vector<uint64_t>{11, 12}));
   EXPECT_EQ(from_shm_mapping.remote_ids, (std::vector<uint64_t>{101, 102}));
 
-  forward_input.input_params.embedding.linear_state_ids.clear();
+  forward_input.input_params.cache_state_.linear_state_ids.clear();
   ASSERT_TRUE(writer_manager.input_write(forward_input));
 
   LlmForwardInput legacy_from_shm;
   reader_manager.input_read(legacy_from_shm, torch::Device(torch::kCPU));
-  EXPECT_EQ(legacy_from_shm.input_params.embedding.linear_state_ids,
+  EXPECT_EQ(legacy_from_shm.input_params.cache_state_.linear_state_ids,
             std::vector<int32_t>({-1, -1}));
 }
 

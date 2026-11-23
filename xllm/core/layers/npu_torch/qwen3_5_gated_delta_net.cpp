@@ -369,15 +369,16 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
       << "SSM cache rows must be divisible by conv cache slots.";
   const int64_t checkpoint_stride = ssm_cache.size(0) / num_slots;
   const std::vector<int32_t>& live_slots =
-      input_params.embedding.linear_state_ids;
+      input_params.cache_state_.linear_state_ids;
   if (use_spec_verify || !is_any_prefill) {
     check_live_slots(live_slots, batch_size, num_slots);
-    CHECK_EQ(
-        static_cast<int64_t>(input_params.linear_state_validity_mask.size()),
-        batch_size)
+    CHECK_EQ(static_cast<int64_t>(
+                 input_params.cache_state_.linear_state_validity_mask.size()),
+             batch_size)
         << "decode linear state validity must be sequence-scoped.";
     for (int64_t i = 0; i < batch_size; ++i) {
-      const int64_t validity = input_params.linear_state_validity_mask[i];
+      const int64_t validity =
+          input_params.cache_state_.linear_state_validity_mask[i];
       CHECK(validity == 1 ||
             (live_slots[i] == kPaddingLinearStateId && validity == 0))
           << "decode requires a warm GDN state for every real sequence.";
@@ -390,9 +391,10 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
   const torch::Tensor contiguous_norm_weight = norm_->weight().contiguous();
 
   torch::Tensor fused_norm_output;
-  const auto& read_slots = input_params.embedding.linear_state_read_ids.empty()
-                               ? live_slots
-                               : input_params.embedding.linear_state_read_ids;
+  const auto& read_slots =
+      input_params.cache_state_.linear_state_read_ids.empty()
+          ? live_slots
+          : input_params.cache_state_.linear_state_read_ids;
   // Route order is semantic: spec verify is also decode-shaped and must win.
   if (use_spec_verify) {
     CHECK_EQ(checkpoint_stride, sequence_length)
@@ -428,7 +430,7 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
     CHECK_EQ(valid_verify_tokens, original_num_tokens)
         << "MTP host query lengths do not match the unpadded model input.";
     const torch::Tensor state_indices =
-        graph_safe_indices(input_params.embedding.linear_state_indices,
+        graph_safe_indices(input_params.cache_state_.linear_state_indices,
                            live_slots,
                            batch_size,
                            device,
@@ -440,7 +442,7 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
                            device,
                            "num_accepted_tokens");
     const torch::Tensor read_indices =
-        graph_safe_indices(input_params.embedding.linear_state_read_indices,
+        graph_safe_indices(input_params.cache_state_.linear_state_read_indices,
                            read_slots,
                            batch_size,
                            device,
@@ -514,8 +516,8 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
         qwen3_5_gdn_internal::get_or_build_prefill_indices(
             attn_metadata,
             live_slots,
-            input_params.linear_state_validity_mask,
-            input_params.embedding.linear_state_read_ids,
+            input_params.cache_state_.linear_state_validity_mask,
+            input_params.cache_state_.linear_state_read_ids,
             checkpoint_stride,
             num_slots,
             device);
@@ -549,7 +551,7 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
     CHECK_EQ(conv_cache.size(1), 3)
         << "MegaGdnDecode requires a three-token conv history.";
     const torch::Tensor state_indices =
-        graph_safe_indices(input_params.embedding.linear_state_indices,
+        graph_safe_indices(input_params.cache_state_.linear_state_indices,
                            live_slots,
                            batch_size,
                            device,
@@ -557,7 +559,7 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
     const torch::Tensor decode_qkv =
         mixed_qkv.reshape({batch_size, local_conv_dim});
     const torch::Tensor read_indices =
-        graph_safe_indices(input_params.embedding.linear_state_read_indices,
+        graph_safe_indices(input_params.cache_state_.linear_state_read_indices,
                            read_slots,
                            batch_size,
                            device,

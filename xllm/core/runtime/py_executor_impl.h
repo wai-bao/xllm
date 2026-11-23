@@ -44,11 +44,13 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
 
   ~PyExecutorImpl() override;
   void clear_multimodal_cache() override;
+  bool supports_multimodal_input() const override;
 
   ModelOutput run(const torch::Tensor& tokens,
                   const torch::Tensor& positions,
                   std::vector<KVCache>& kv_caches,
-                  const ModelParamsView& params) override;
+                  const ModelParamsView& params,
+                  MMBatchData* mm_data = nullptr) override;
 
  private:
   // Caller holds the GIL.

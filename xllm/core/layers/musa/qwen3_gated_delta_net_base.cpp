@@ -836,12 +836,13 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
         << "q_seq_lens_vec must be populated for Qwen3.5 prefill.";
     torch::Tensor initial_state_tensor =
         torch::index_select(ssm_cache, 0, linear_state_base_indices);
-    CHECK_EQ(input_params.linear_state_validity_mask.size(),
-             input_params.embedding.linear_state_ids.size())
+    CHECK_EQ(input_params.cache_state_.linear_state_validity_mask.size(),
+             input_params.cache_state_.linear_state_ids.size())
         << "linear state validity mask must be sequence-scoped.";
-    for (size_t i = 0; i < input_params.linear_state_validity_mask.size();
+    for (size_t i = 0;
+         i < input_params.cache_state_.linear_state_validity_mask.size();
          ++i) {
-      if (input_params.linear_state_validity_mask[i] == 0) {
+      if (input_params.cache_state_.linear_state_validity_mask[i] == 0) {
         initial_state_tensor.select(0, static_cast<int64_t>(i)).fill_(0.0);
       }
     }
@@ -1074,10 +1075,10 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::reshape_qkvz_unpad(
 torch::Tensor Qwen3GatedDeltaNetBaseImpl::get_linear_state_indices(
     const ModelParamsView& input_params,
     const torch::Device& device) const {
-  CHECK(!input_params.embedding.linear_state_ids.empty())
+  CHECK(!input_params.cache_state_.linear_state_ids.empty())
       << "linear_state_ids must be populated for gated delta net";
-  if (input_params.embedding.linear_state_indices.defined()) {
-    auto indices = input_params.embedding.linear_state_indices;
+  if (input_params.cache_state_.linear_state_indices.defined()) {
+    auto indices = input_params.cache_state_.linear_state_indices;
     if (indices.device() != device || indices.scalar_type() != torch::kInt) {
       indices =
           indices.to(torch::TensorOptions().dtype(torch::kInt).device(device),
@@ -1087,7 +1088,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::get_linear_state_indices(
     return indices.contiguous();
   }
   return torch::tensor(
-      input_params.embedding.linear_state_ids,
+      input_params.cache_state_.linear_state_ids,
       torch::TensorOptions().dtype(torch::kInt).device(device));
 }
 

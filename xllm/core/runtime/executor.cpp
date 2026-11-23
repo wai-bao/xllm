@@ -15,7 +15,10 @@ limitations under the License.
 
 #include "executor.h"
 
+#include <glog/logging.h>
+
 #include "core/framework/config/model_config.h"
+#include "core/framework/multimodal/mm_batch_data.h"
 #include "executor_impl_factory.h"
 #include "platform/device.h"
 #include "platform/platform.h"
@@ -55,6 +58,21 @@ ModelOutput Executor::forward(const torch::Tensor& tokens,
                               const ModelParamsView& params) {
   return impl_->run(tokens, positions, kv_caches, params);
 }
+
+ModelOutput Executor::forward(const torch::Tensor& tokens,
+                              const torch::Tensor& positions,
+                              std::vector<KVCache>& kv_caches,
+                              const ModelParamsView& params,
+                              MMBatchData& mm_data) {
+  if (!mm_data.valid()) {
+    return forward(tokens, positions, kv_caches, params);
+  }
+  CHECK(impl_->supports_multimodal_input())
+      << "Executor does not support multimodal input";
+  return impl_->run(tokens, positions, kv_caches, params, &mm_data);
+}
+
+bool ExecutorImpl::supports_multimodal_input() const { return false; }
 
 void Executor::prepare_graph_input(const torch::Tensor& tokens,
                                    const torch::Tensor& positions,

@@ -110,8 +110,8 @@ TYPED_TEST(SharedMemoryFullLeaseInputTest,
   TypeParam lazy;
   {
     TypeParam source = make_input<TypeParam>({});
-    source.input_params.embedding.full_block_slot_rows = expected_rows;
-    source.input_params.embedding.full_block_lease_epochs = expected_epochs;
+    source.input_params.cache_state_.full_block_slot_rows = expected_rows;
+    source.input_params.cache_state_.full_block_lease_epochs = expected_epochs;
     source.input_params.attention.host.shared_full_block_table =
         torch::tensor({{120, 180}}, torch::kInt32);
     source.input_params.attention.host.shared_full_slot_mapping =
@@ -123,9 +123,9 @@ TYPED_TEST(SharedMemoryFullLeaseInputTest,
         source.input_params.attention.host.shared_full_slot_mapping;
     const TypeParam copied =
         source.to(torch::Device(torch::kCPU), torch::kFloat32);
-    EXPECT_EQ(copied.input_params.embedding.full_block_slot_rows,
+    EXPECT_EQ(copied.input_params.cache_state_.full_block_slot_rows,
               expected_rows);
-    EXPECT_EQ(copied.input_params.embedding.full_block_lease_epochs,
+    EXPECT_EQ(copied.input_params.cache_state_.full_block_lease_epochs,
               expected_epochs);
     proto::PackedForwardInput packed;
     ASSERT_TRUE(copied.to_packed_proto(&packed));
@@ -134,8 +134,9 @@ TYPED_TEST(SharedMemoryFullLeaseInputTest,
   }
   const TypeParam decoded =
       lazy.to(torch::Device(torch::kCPU), torch::kFloat32);
-  EXPECT_EQ(decoded.input_params.embedding.full_block_slot_rows, expected_rows);
-  EXPECT_EQ(decoded.input_params.embedding.full_block_lease_epochs,
+  EXPECT_EQ(decoded.input_params.cache_state_.full_block_slot_rows,
+            expected_rows);
+  EXPECT_EQ(decoded.input_params.cache_state_.full_block_lease_epochs,
             expected_epochs);
   EXPECT_TRUE(
       torch::equal(decoded.input_params.attention.host.shared_full_block_table,
@@ -169,10 +170,10 @@ TYPED_TEST(SharedMemoryFullLeaseInputTest,
       name, kSegmentBytes, is_creator, ForwardType::RAW_INPUT);
   ASSERT_FALSE(is_creator);
   TypeParam source = make_input<TypeParam>({});
-  source.input_params.embedding.full_block_slot_rows = {
+  source.input_params.cache_state_.full_block_slot_rows = {
       4, 120, 122, 6, 180, 182};
   constexpr uint64_t kReusedEpoch = uint64_t{1} << 36;
-  source.input_params.embedding.full_block_lease_epochs = {1, kReusedEpoch};
+  source.input_params.cache_state_.full_block_lease_epochs = {1, kReusedEpoch};
   ASSERT_TRUE(SharedMemoryTransport::can_write_input(source, kSegmentBytes));
   ASSERT_TRUE(writer.input_write(source));
   TypeParam decoded;
@@ -180,30 +181,31 @@ TYPED_TEST(SharedMemoryFullLeaseInputTest,
       decoded,
       torch::Device(torch::kCPU),
       InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE));
-  EXPECT_EQ(decoded.input_params.embedding.full_block_lease_epochs,
+  EXPECT_EQ(decoded.input_params.cache_state_.full_block_lease_epochs,
             (std::vector<uint64_t>{1, kReusedEpoch}));
 
-  source.input_params.embedding.full_block_slot_rows = {4, 120, 122};
-  source.input_params.embedding.full_block_lease_epochs = {2};
+  source.input_params.cache_state_.full_block_slot_rows = {4, 120, 122};
+  source.input_params.cache_state_.full_block_lease_epochs = {2};
   ASSERT_TRUE(writer.input_write(source));
   ASSERT_TRUE(reader.input_read(
       decoded,
       torch::Device(torch::kCPU),
       InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE));
-  EXPECT_EQ(decoded.input_params.embedding.full_block_slot_rows,
+  EXPECT_EQ(decoded.input_params.cache_state_.full_block_slot_rows,
             (std::vector<int32_t>{4, 120, 122}));
-  EXPECT_EQ(decoded.input_params.embedding.full_block_lease_epochs,
+  EXPECT_EQ(decoded.input_params.cache_state_.full_block_lease_epochs,
             (std::vector<uint64_t>{2}));
 
-  source.input_params.embedding.full_block_slot_rows.clear();
-  source.input_params.embedding.full_block_lease_epochs.clear();
+  source.input_params.cache_state_.full_block_slot_rows.clear();
+  source.input_params.cache_state_.full_block_lease_epochs.clear();
   ASSERT_TRUE(writer.input_write(source));
   ASSERT_TRUE(reader.input_read(
       decoded,
       torch::Device(torch::kCPU),
       InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE));
-  EXPECT_TRUE(decoded.input_params.embedding.full_block_slot_rows.empty());
-  EXPECT_TRUE(decoded.input_params.embedding.full_block_lease_epochs.empty());
+  EXPECT_TRUE(decoded.input_params.cache_state_.full_block_slot_rows.empty());
+  EXPECT_TRUE(
+      decoded.input_params.cache_state_.full_block_lease_epochs.empty());
 }
 
 TYPED_TEST(SharedMemoryInputTest, RejectsPreviousPackedInputSchema) {
@@ -341,7 +343,7 @@ TEST_F(VlmSharedMemoryInputTest,
   {
     VlmForwardInput source = make_input<VlmForwardInput>({});
     auto pixels = expected.clone();
-    source.input_params.multimodal.mm_data.batch({MMData(
+    source.mm_data_.batch({MMData(
         MMType::IMAGE,
         MMItemVec{MMDataItem(MMType::IMAGE, {{"pixel_values", pixels}})})});
     proto::PackedForwardInput packed;
@@ -352,8 +354,7 @@ TEST_F(VlmSharedMemoryInputTest,
   const VlmForwardInput decoded =
       lazy.to(torch::Device(torch::kCPU), torch::kFloat32);
   const auto pixels =
-      decoded.input_params.multimodal.mm_data.get<torch::Tensor>(
-          "pixel_values");
+      decoded.mm_data_.get<torch::Tensor>(/*key=*/"pixel_values");
   ASSERT_TRUE(pixels.has_value());
   EXPECT_TRUE(torch::equal(*pixels, expected));
 }
@@ -370,7 +371,7 @@ TEST_F(VlmSharedMemoryInputTest,
   {
     VlmForwardInput source = make_input<VlmForwardInput>({});
     auto pixels = expected.clone();
-    source.input_params.multimodal.mm_data.batch({MMData(
+    source.mm_data_.batch({MMData(
         MMType::IMAGE,
         MMItemVec{MMDataItem(MMType::IMAGE, {{"pixel_values", pixels}})})});
     ASSERT_TRUE(writer.input_write(source));
@@ -382,8 +383,7 @@ TEST_F(VlmSharedMemoryInputTest,
       torch::Device(torch::kCPU),
       InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE));
   const auto pixels =
-      decoded.input_params.multimodal.mm_data.get<torch::Tensor>(
-          "pixel_values");
+      decoded.mm_data_.get<torch::Tensor>(/*key=*/"pixel_values");
   ASSERT_TRUE(pixels.has_value());
   EXPECT_TRUE(torch::equal(*pixels, expected));
 }

@@ -1154,7 +1154,7 @@ Input ForwardInputBuilder::build_forward_input() {
     batch_mm_data_vec.insert(batch_mm_data_vec.end(),
                              state_.scheduled_mm_data_vec.begin(),
                              state_.scheduled_mm_data_vec.end());
-    input_params.multimodal.mm_data.batch(batch_mm_data_vec);
+    forward_input.mm_data_.batch(std::move(batch_mm_data_vec));
   }
 
   // Setup block tables
@@ -1190,28 +1190,30 @@ Input ForwardInputBuilder::build_forward_input() {
     input_params.embedding.input_embedding = torch::cat(input_embeddings_vec_);
   }
 
-  input_params.embedding.embedding_ids = std::move(state_.embedding_ids);
-  input_params.embedding.linear_state_ids = std::move(state_.linear_state_ids);
-  input_params.embedding.linear_state_read_ids =
+  forward_input.speculative_.embedding_ids_ = std::move(state_.embedding_ids);
+  input_params.cache_state_.linear_state_ids =
+      std::move(state_.linear_state_ids);
+  input_params.cache_state_.linear_state_read_ids =
       std::move(state_.linear_state_read_ids);
-  if (!input_params.embedding.linear_state_ids.empty()) {
-    input_params.embedding.linear_state_indices =
-        make_cpu_tensor(input_params.embedding.linear_state_ids);
+  if (!input_params.cache_state_.linear_state_ids.empty()) {
+    input_params.cache_state_.linear_state_indices =
+        make_cpu_tensor(input_params.cache_state_.linear_state_ids);
   }
-  input_params.embedding.request_ids = std::move(state_.request_ids);
-  input_params.embedding.linear_state_slot_rows =
+  forward_input.request_ids = std::move(state_.request_ids);
+  input_params.cache_state_.linear_state_slot_rows =
       std::move(state_.linear_state_slot_rows);
-  input_params.embedding.full_block_slot_rows =
+  input_params.cache_state_.full_block_slot_rows =
       std::move(state_.full_block_slot_rows);
-  input_params.embedding.full_block_lease_epochs =
+  input_params.cache_state_.full_block_lease_epochs =
       std::move(state_.full_block_lease_epochs);
-  input_params.embedding.extra_token_ids = std::move(state_.extra_token_ids);
+  forward_input.speculative_.extra_token_ids_ =
+      std::move(state_.extra_token_ids);
   if (!state_.mtp_bootstrap_embeddings.empty()) {
     CHECK_EQ(state_.mtp_bootstrap_row_idxes.size(),
              state_.mtp_bootstrap_embeddings.size());
-    input_params.embedding.mtp_bootstrap_row_idxes =
+    forward_input.speculative_.mtp_bootstrap_sequence_indices_ =
         std::move(state_.mtp_bootstrap_row_idxes);
-    input_params.embedding.mtp_bootstrap_embeddings =
+    forward_input.speculative_.mtp_bootstrap_embeddings_ =
         torch::cat(state_.mtp_bootstrap_embeddings, /*dim=*/0);
     for (Sequence* sequence : sequences_) {
       sequence->clear_mtp_bootstrap_embedding();

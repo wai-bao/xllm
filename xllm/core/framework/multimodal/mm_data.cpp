@@ -165,34 +165,4 @@ bool MMData::foreach (IItemVisitor& v) {
   return true;
 }
 
-void MMData::debug_print() const {
-  LOG(INFO) << "mm data debug print, type:" << type_;
-
-  if (hold<MMItemVec>()) {
-    const auto& vec = items<MMItemVec>();
-    for (const auto& item : vec) {
-      item.debug_print();
-    }
-  } else if (hold<MMDict>()) {
-    const auto& dict = items<MMDict>();
-    for (const auto& pair : dict) {
-      if (std::holds_alternative<torch::Tensor>(pair.second)) {
-        torch::Tensor item = std::get<torch::Tensor>(pair.second);
-        LOG(INFO) << " single tensor, key:" << pair.first
-                  << " device:" << item.device() << " dtype:" << item.dtype()
-                  << " shape:" << item.sizes();
-      } else if (std::holds_alternative<std::vector<torch::Tensor>>(
-                     pair.second)) {
-        const auto& lst = std::get<std::vector<torch::Tensor>>(pair.second);
-
-        for (const auto& item : lst) {
-          LOG(INFO) << " vector tensor, key:" << pair.first
-                    << " device:" << item.device() << " dtype:" << item.dtype()
-                    << " shape:" << item.sizes();
-        }
-      }
-    }
-  }
-}
-
 }  // namespace xllm

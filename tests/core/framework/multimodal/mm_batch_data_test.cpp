@@ -69,7 +69,7 @@ TEST(MMBatchDataTest, MultipleImagesRemainAvailableAfterMoveAndSourceRelease) {
                               make_image(torch::full({1, 3}, 2.0))});
     // Reading the derived dictionary before moving must not discard the items.
     ASSERT_TRUE(source.get<torch::Tensor>("pixel_values").has_value());
-    moved = MMBatchData::to(source, torch::Device(torch::kCPU));
+    moved = source.copy_to(torch::Device(/*type=*/torch::kCPU));
   }
   const auto pixels = moved.get<torch::Tensor>("pixel_values");
   ASSERT_TRUE(pixels.has_value());
@@ -84,7 +84,7 @@ TEST(MMBatchDataTest, EncoderReplacementDiscardsPendingRawInputs) {
   const auto embeddings = torch::full({3, 4}, 2.0);
   batch.replace({{"image|embedding", embeddings}});
   batch.to(torch::Device(torch::kCPU));
-  EXPECT_FALSE(batch.has("pixel_values"));
+  EXPECT_FALSE(batch.get<torch::Tensor>(/*key=*/"pixel_values"));
   const auto gathered = batch.get<torch::Tensor>("image|embedding");
   ASSERT_TRUE(gathered.has_value());
   EXPECT_TRUE(torch::equal(*gathered, embeddings));

@@ -258,8 +258,8 @@ TEST(MluLinearStateRestoreWorkerTest,
   input.input_params.meta.batch_id = 42;
   input.input_params.attention.host.q_seq_lens = {1, 1, 1, 1};
   input.input_params.attention.host.kv_cache_tokens_nums = {0, 8, 0, 0};
-  input.input_params.embedding.linear_state_ids = {1, 2, 3, 5};
-  input.input_params.embedding.linear_state_read_ids = {
+  input.input_params.cache_state_.linear_state_ids = {1, 2, 3, 5};
+  input.input_params.cache_state_.linear_state_read_ids = {
       kRestoreSourceSlot, 2, 3, 5};
 
   Device xllm_device(device);
@@ -275,8 +275,9 @@ TEST(MluLinearStateRestoreWorkerTest,
       model_stream->wait_event(processed_input.runtime.metadata_ready_event));
   ASSERT_EQ(model_stream->synchronize(), 0);
 
-  EXPECT_EQ(processed_input.input_params.linear_state_validity_mask,
-            std::vector<int64_t>({1, 1, 0, 0}));
+  EXPECT_EQ(
+      processed_input.input_params.cache_state_.linear_state_validity_mask,
+      (std::vector<int64_t>{1, 1, 0, 0}));
   expect_slot_matches(first,
                       /*destination=*/1,
                       kRestoreSourceSlot,
@@ -322,8 +323,8 @@ TEST(MluLinearStateRestoreWorkerTest,
   input.input_params.meta.num_sequences = 2;
   input.input_params.attention.host.q_seq_lens = {1, 1, 1, 1, 1, 1};
   input.input_params.attention.host.kv_cache_tokens_nums = {0, 8};
-  input.input_params.embedding.linear_state_ids = {1, 2, 3, 4, 5, 6};
-  input.input_params.embedding.linear_state_read_ids = {1, 2, 3, 4, 5, 6};
+  input.input_params.cache_state_.linear_state_ids = {1, 2, 3, 4, 5, 6};
+  input.input_params.cache_state_.linear_state_read_ids = {1, 2, 3, 4, 5, 6};
 
   Device xllm_device(device);
   input.runtime.metadata_ready_event =
@@ -331,8 +332,9 @@ TEST(MluLinearStateRestoreWorkerTest,
   LlmForwardInput processed_input;
   worker.prepare_work_before_execute(input, processed_input);
 
-  EXPECT_EQ(processed_input.input_params.linear_state_validity_mask,
-            std::vector<int64_t>({0, 0, 0, 1, 1, 1}));
+  EXPECT_EQ(
+      processed_input.input_params.cache_state_.linear_state_validity_mask,
+      (std::vector<int64_t>{0, 0, 0, 1, 1, 1}));
 }
 
 TEST(MluLinearStateRestoreWorkerTest,
@@ -394,10 +396,10 @@ TEST(MluLinearStateRestoreWorkerTest,
 
   LlmForwardInput input;
   input.input_params.meta.batch_id = 43;
-  input.input_params.embedding.linear_state_ids = {1, 2, 3, 5};
-  input.input_params.embedding.linear_state_read_ids = {
+  input.input_params.cache_state_.linear_state_ids = {1, 2, 3, 5};
+  input.input_params.cache_state_.linear_state_read_ids = {
       kRestoreSourceSlot, 2, 3, 5};
-  input.input_params.linear_state_validity_mask = {0, 1, 0, 0};
+  input.input_params.cache_state_.linear_state_validity_mask = {0, 1, 0, 0};
 
   // Finish fixture initialization before the simulated previous forward writes
   // the same cache tensors on the worker's compute stream.
@@ -408,8 +410,8 @@ TEST(MluLinearStateRestoreWorkerTest,
   worker.run_overlap_forward(input, /*destination_slot=*/1);
   worker.synchronize_compute_stream();
 
-  EXPECT_EQ(input.input_params.linear_state_validity_mask,
-            std::vector<int64_t>({1, 1, 0, 0}));
+  EXPECT_EQ(input.input_params.cache_state_.linear_state_validity_mask,
+            (std::vector<int64_t>{1, 1, 0, 0}));
   expect_slot_equals(first, first_baseline, /*slot=*/1, kFirstStride);
   expect_slot_equals(second, second_baseline, /*slot=*/1, kSecondStride);
   EXPECT_TRUE(torch::all(first.conv.select(/*dim=*/0, /*index=*/2) == 13.0f)

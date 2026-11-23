@@ -300,12 +300,12 @@ class SharedMappingFactoryTest : public ::testing::Test {
       ASSERT_TRUE(lazy.from_packed_proto(packed));
       const Input decoded =
           lazy.to(torch::Device(torch::kCPU), torch::kFloat32);
-      EXPECT_EQ(decoded.input_params.embedding.full_block_slot_rows,
-                input.input_params.embedding.full_block_slot_rows);
-      EXPECT_EQ(decoded.input_params.embedding.full_block_lease_epochs,
-                input.input_params.embedding.full_block_lease_epochs);
-      EXPECT_EQ(decoded.input_params.embedding.linear_state_slot_rows,
-                input.input_params.embedding.linear_state_slot_rows);
+      EXPECT_EQ(decoded.input_params.cache_state_.full_block_slot_rows,
+                input.input_params.cache_state_.full_block_slot_rows);
+      EXPECT_EQ(decoded.input_params.cache_state_.full_block_lease_epochs,
+                input.input_params.cache_state_.full_block_lease_epochs);
+      EXPECT_EQ(decoded.input_params.cache_state_.linear_state_slot_rows,
+                input.input_params.cache_state_.linear_state_slot_rows);
     }
   }
 };
@@ -342,9 +342,10 @@ TYPED_TEST(SharedMappingFactoryTest,
   };
   prepare(factory);
   ASSERT_EQ(inputs.size(), 1u);
-  const auto full_rows = inputs[0].input_params.embedding.full_block_slot_rows;
+  const auto full_rows =
+      inputs[0].input_params.cache_state_.full_block_slot_rows;
   const auto linear_rows =
-      inputs[0].input_params.embedding.linear_state_slot_rows;
+      inputs[0].input_params.cache_state_.linear_state_slot_rows;
   ASSERT_EQ(full_rows.size(), 3u);
   ASSERT_EQ(linear_rows.size(), 5u);
   const auto& attention = inputs[0].input_params.attention;
@@ -361,14 +362,17 @@ TYPED_TEST(SharedMappingFactoryTest,
   const torch::Tensor final_slots =
       attention.host.shared_full_slot_mapping.clone();
   prepare(factory);
-  EXPECT_EQ(inputs[0].input_params.embedding.full_block_slot_rows, full_rows);
-  EXPECT_EQ(inputs[0].input_params.embedding.linear_state_slot_rows,
+  EXPECT_EQ(inputs[0].input_params.cache_state_.full_block_slot_rows,
+            full_rows);
+  EXPECT_EQ(inputs[0].input_params.cache_state_.linear_state_slot_rows,
             linear_rows);
   factory.acknowledge_shared_kv_cache();
   prepare(factory);
-  EXPECT_TRUE(inputs[0].input_params.embedding.full_block_slot_rows.empty());
-  EXPECT_TRUE(inputs[0].input_params.embedding.full_block_lease_epochs.empty());
-  EXPECT_TRUE(inputs[0].input_params.embedding.linear_state_slot_rows.empty());
+  EXPECT_TRUE(inputs[0].input_params.cache_state_.full_block_slot_rows.empty());
+  EXPECT_TRUE(
+      inputs[0].input_params.cache_state_.full_block_lease_epochs.empty());
+  EXPECT_TRUE(
+      inputs[0].input_params.cache_state_.linear_state_slot_rows.empty());
   EXPECT_TRUE(torch::equal(
       inputs[0].input_params.attention.host.shared_full_block_table,
       final_table));
@@ -394,21 +398,24 @@ TYPED_TEST(SharedMappingFactoryTest,
   EXPECT_TRUE(torch::equal(
       shared_draft.input_params.attention.host.shared_full_slot_mapping,
       final_slots));
-  EXPECT_TRUE(shared_draft.input_params.embedding.linear_state_ids.empty());
+  EXPECT_TRUE(shared_draft.input_params.cache_state_.linear_state_ids.empty());
   factory.acknowledge_shared_kv_cache();
   factory.reset_shared_kv_mapping_tracker();
   prepare(factory);
-  EXPECT_EQ(inputs[0].input_params.embedding.full_block_slot_rows, full_rows);
-  EXPECT_EQ(inputs[0].input_params.embedding.linear_state_slot_rows,
+  EXPECT_EQ(inputs[0].input_params.cache_state_.full_block_slot_rows,
+            full_rows);
+  EXPECT_EQ(inputs[0].input_params.cache_state_.linear_state_slot_rows,
             linear_rows);
 
   Factory snapshot_factory(FactoryOptions{});
   prepare(snapshot_factory);
-  EXPECT_EQ(inputs[0].input_params.embedding.full_block_slot_rows, full_rows);
+  EXPECT_EQ(inputs[0].input_params.cache_state_.full_block_slot_rows,
+            full_rows);
   snapshot_factory.acknowledge_shared_kv_cache();
   prepare(snapshot_factory);
-  EXPECT_EQ(inputs[0].input_params.embedding.full_block_slot_rows, full_rows);
-  EXPECT_EQ(inputs[0].input_params.embedding.linear_state_slot_rows,
+  EXPECT_EQ(inputs[0].input_params.cache_state_.full_block_slot_rows,
+            full_rows);
+  EXPECT_EQ(inputs[0].input_params.cache_state_.linear_state_slot_rows,
             linear_rows);
 }
 
@@ -459,26 +466,34 @@ TYPED_TEST(SharedMappingFactoryTest,
   };
   prepare(/*include_first=*/true, /*include_second=*/true);
   ASSERT_EQ(inputs.size(), 2u);
-  EXPECT_EQ(inputs[0].input_params.embedding.full_block_slot_rows.size(), 3u);
-  EXPECT_EQ(inputs[1].input_params.embedding.full_block_slot_rows.size(), 3u);
-  EXPECT_EQ(inputs[0].input_params.embedding.linear_state_slot_rows.size(), 5u);
-  EXPECT_EQ(inputs[1].input_params.embedding.linear_state_slot_rows.size(), 5u);
+  EXPECT_EQ(inputs[0].input_params.cache_state_.full_block_slot_rows.size(),
+            3u);
+  EXPECT_EQ(inputs[1].input_params.cache_state_.full_block_slot_rows.size(),
+            3u);
+  EXPECT_EQ(inputs[0].input_params.cache_state_.linear_state_slot_rows.size(),
+            5u);
+  EXPECT_EQ(inputs[1].input_params.cache_state_.linear_state_slot_rows.size(),
+            5u);
   factory.acknowledge_shared_kv_cache();
   prepare(/*include_first=*/true, /*include_second=*/true);
-  EXPECT_TRUE(inputs[0].input_params.embedding.full_block_slot_rows.empty());
-  EXPECT_TRUE(inputs[1].input_params.embedding.full_block_slot_rows.empty());
+  EXPECT_TRUE(inputs[0].input_params.cache_state_.full_block_slot_rows.empty());
+  EXPECT_TRUE(inputs[1].input_params.cache_state_.full_block_slot_rows.empty());
   factory.acknowledge_shared_kv_cache();
 
   factory.reset_shared_kv_mapping_tracker();
   prepare(/*include_first=*/false, /*include_second=*/true);
-  EXPECT_TRUE(inputs[0].input_params.embedding.full_block_slot_rows.empty());
-  EXPECT_EQ(inputs[1].input_params.embedding.full_block_slot_rows.size(), 3u);
+  EXPECT_TRUE(inputs[0].input_params.cache_state_.full_block_slot_rows.empty());
+  EXPECT_EQ(inputs[1].input_params.cache_state_.full_block_slot_rows.size(),
+            3u);
   factory.acknowledge_shared_kv_cache();
   prepare(/*include_first=*/true, /*include_second=*/true);
-  EXPECT_EQ(inputs[0].input_params.embedding.full_block_slot_rows.size(), 3u);
-  EXPECT_EQ(inputs[0].input_params.embedding.linear_state_slot_rows.size(), 5u);
-  EXPECT_TRUE(inputs[1].input_params.embedding.full_block_slot_rows.empty());
-  EXPECT_TRUE(inputs[1].input_params.embedding.linear_state_slot_rows.empty());
+  EXPECT_EQ(inputs[0].input_params.cache_state_.full_block_slot_rows.size(),
+            3u);
+  EXPECT_EQ(inputs[0].input_params.cache_state_.linear_state_slot_rows.size(),
+            5u);
+  EXPECT_TRUE(inputs[1].input_params.cache_state_.full_block_slot_rows.empty());
+  EXPECT_TRUE(
+      inputs[1].input_params.cache_state_.linear_state_slot_rows.empty());
 }
 
 TEST(ForwardInputFactoryTest, AggregatesDpMetadataAndMixedForwardTypes) {

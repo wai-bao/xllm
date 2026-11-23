@@ -41,12 +41,15 @@ class VlmExecutorImpl : public ExecutorImpl {
                   const runtime::Options& options);
 
   ~VlmExecutorImpl() override = default;
+  virtual MMDict encode(const MMBatchData& mm_data);
   void clear_multimodal_cache() override;
+  bool supports_multimodal_input() const override;
 
   ModelOutput run(const torch::Tensor& tokens,
                   const torch::Tensor& positions,
                   std::vector<KVCache>& kv_caches,
-                  const ModelParamsView& params) override;
+                  const ModelParamsView& params,
+                  MMBatchData* mm_data = nullptr) override;
 
   void prepare_graph_input(const torch::Tensor& tokens,
                            const torch::Tensor& positions,
@@ -55,19 +58,16 @@ class VlmExecutorImpl : public ExecutorImpl {
 
   void set_dp_process_group(ProcessGroup* group) override;
 
-  virtual MMDict encode(const ModelParamsView& params);
+ private:
+  MultimodalEmbeddings prepare_inputs_embeds(const torch::Tensor& tokens,
+                                             const ModelParamsView& params,
+                                             MMBatchData& mm_data);
 
-  // not own
   CausalVLM* model_;
-  ModelArgs args_;
   torch::Device device_;
-  runtime::Options options_;
+  const bool enable_graph_;
   std::unique_ptr<ExecutorImpl> llm_executor_;
   std::unique_ptr<EncoderCache> encoder_cache_;
-
- private:
-  torch::Tensor collapse_mrope_decode_positions(
-      const torch::Tensor& positions) const;
 };
 // Q: backend device ?
 REGISTER_EXECUTOR("vlm", VlmExecutorImpl);

@@ -63,27 +63,43 @@ MMBatchData::MMBatchData(std::vector<MMData> data) {
 MMBatchData::MMBatchData(uint32_t type, MMDict items)
     : type_(type), data_(std::move(items)) {}
 
-bool MMBatchData::has(const MMKey& key) const {
-  if (!valid()) return false;
-
-  const auto& dict = data();
-  const auto& itor = dict.find(key);
-  return itor != dict.end();
-}
-
-void MMBatchData::get(const MMKey& key, std::vector<torch::Tensor>& vec) const {
-  if (!valid()) return;
-
-  const auto& dict = data();
-  const auto& itor = dict.find(key);
-  if (itor == dict.end()) return;
-
-  if (std::holds_alternative<torch::Tensor>(itor->second)) {
-    vec.push_back(std::get<torch::Tensor>(itor->second));
-  } else if (std::holds_alternative<std::vector<torch::Tensor>>(itor->second)) {
-    const auto& data = std::get<std::vector<torch::Tensor>>(itor->second);
-    vec.insert(vec.end(), data.begin(), data.end());
+MultimodalEmbeddings MMBatchData::merge_visual_embeddings(
+    torch::Tensor inputs_embeds,
+    size_t num_deep_stacks) const {
+  if (!valid()) {
+    return {std::move(inputs_embeds), {}};
   }
+
+  std::vector<torch::Tensor> deep_stacks;
+  deep_stacks.reserve(num_deep_stacks);
+  for (size_t layer = 0; layer < num_deep_stacks; ++layer) {
+    deep_stacks.emplace_back(torch::zeros_like(inputs_embeds));
+  }
+  const auto merge = [&](const MMKey& embedding_key, const MMKey& mask_key) {
+    const auto embedding = get<torch::Tensor>(embedding_key);
+    if (!embedding) {
+      return;
+    }
+    const auto mask = get<torch::Tensor>(mask_key);
+    if (!mask) {
+      return;
+    }
+    if (num_deep_stacks == 0) {
+      inputs_embeds.index_put_({*mask}, *embedding);
+      return;
+    }
+    const std::vector<int64_t> embedding_split_sizes(
+        num_deep_stacks + 1, inputs_embeds.size(/*dim=*/-1));
+    const auto slices =
+        embedding->split_with_sizes(embedding_split_sizes, /*dim=*/-1);
+    inputs_embeds.index_put_({*mask}, slices.front());
+    for (size_t layer = 0; layer < num_deep_stacks; ++layer) {
+      deep_stacks[layer].index_put_({*mask}, slices[layer + 1]);
+    }
+  };
+  merge(/*embedding_key=*/"image|embedding", /*mask_key=*/"image|mask");
+  merge(/*embedding_key=*/"video|embedding", /*mask_key=*/"video|mask");
+  return {std::move(inputs_embeds), std::move(deep_stacks)};
 }
 
 namespace {
@@ -120,9 +136,8 @@ void MMBatchData::to(const torch::Device& device) {
   }
 }
 
-MMBatchData MMBatchData::to(const MMBatchData& mm_data,
-                            const torch::Device& device) {
-  MMBatchData new_mm_data = mm_data;
+MMBatchData MMBatchData::copy_to(const torch::Device& device) const {
+  MMBatchData new_mm_data = *this;
   new_mm_data.to(device);
   return new_mm_data;
 }
@@ -144,33 +159,6 @@ const MMDict& MMBatchData::data() const {
 void MMBatchData::replace(MMDict data) {
   aggregation_.reset();
   data_ = std::move(data);
-}
-
-void MMBatchData::debug_print() const {
-  LOG(INFO) << "mm batch data debug print, type:" << type_;
-  LOG(INFO) << "=============== mm batch vec data ================";
-  LOG(INFO) << "mm batch data vec count:" << mm_datas_.size();
-  for (const auto& mm_data : mm_datas_) {
-    mm_data.debug_print();
-  }
-  LOG(INFO) << "=============== mm batch data dict data ================";
-  for (const auto& pair : data()) {
-    if (std::holds_alternative<torch::Tensor>(pair.second)) {
-      torch::Tensor item = std::get<torch::Tensor>(pair.second);
-      LOG(INFO) << " single tensor, key:" << pair.first
-                << " device:" << item.device() << " dtype:" << item.dtype()
-                << " shape:" << item.sizes();
-    } else if (std::holds_alternative<std::vector<torch::Tensor>>(
-                   pair.second)) {
-      const auto& lst = std::get<std::vector<torch::Tensor>>(pair.second);
-
-      for (const auto& item : lst) {
-        LOG(INFO) << " vector tensor, key:" << pair.first
-                  << " device:" << item.device() << " dtype:" << item.dtype()
-                  << " shape:" << item.sizes();
-      }
-    }
-  }
 }
 
 }  // namespace xllm

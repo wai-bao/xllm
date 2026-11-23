@@ -43,16 +43,15 @@ class RoutingTestModel final : public CausalVLM {
     return ModelOutput((tokens + positions).unsqueeze(/*dim=*/1));
   }
 
-  MMDict encode(const ModelParamsView& /*params*/) override {
+  MMDict encode(const MMBatchData&) override {
     ++encoder_calls;
     return {};
   }
 
-  torch::Tensor get_input_embeddings(
-      const torch::Tensor& tokens,
-      const ModelParamsView& /*params*/) override {
+  MultimodalEmbeddings get_input_embeddings(const torch::Tensor& tokens,
+                                            const MMBatchData&) override {
     ++embedding_calls;
-    return tokens.unsqueeze(/*dim=*/1);
+    return {tokens.unsqueeze(/*dim=*/1), {}};
   }
 
   torch::Tensor logits(const torch::Tensor& hidden_states,
@@ -88,7 +87,8 @@ class RoutingTestExecutor final : public ExecutorImpl {
   ModelOutput run(const torch::Tensor& tokens,
                   const torch::Tensor& positions,
                   std::vector<KVCache>& kv_caches,
-                  const ModelParamsView& params) override {
+                  const ModelParamsView& params,
+                  MMBatchData* /*mm_data*/) override {
     ++model_->executor_runs;
     return model_->forward(tokens, positions, kv_caches, params);
   }
@@ -193,7 +193,6 @@ TEST(VlmExecutorImplTest, RoutingUsesIndependentInstanceGraphModes) {
   params.meta.num_sequences = 3;
   ModelParamsView view(params);
   ModelArgs args;
-  args.rope_scaling_rope_type("mrope");
 
   struct GraphModeCase {
     bool decode;
@@ -240,13 +239,15 @@ TEST(VlmExecutorImplTest, RoutingUsesIndependentInstanceGraphModes) {
     prefill_params.attention.host.kv_seq_lens = {3};
     ModelParamsView prefill_view(prefill_params);
     const ModelOutput output =
-        executor.run(tokens, positions[0], caches, prefill_view);
-    EXPECT_TRUE(torch::equal(output.hidden_states, expected));
-    EXPECT_EQ(model.encoder_calls, 1);
-    EXPECT_EQ(model.embedding_calls, 1);
-    EXPECT_EQ(
-        model.executor_runs,
-        (enable_graph ? 2 : 0) + (enable_graph || test_case.prefill ? 1 : 0));
+        executor.run(tokens, positions, caches, prefill_view);
+    EXPECT_TRUE(torch::equal(output.hidden_states,
+                             (tokens + positions).unsqueeze(/*dim=*/1)));
+    const bool uses_prefill_executor = enable_graph || test_case.prefill;
+    EXPECT_EQ(model.encoder_calls, 0);
+    EXPECT_EQ(prefill_view.embedding.input_embedding.defined(),
+              uses_prefill_executor);
+    EXPECT_EQ(model.executor_runs,
+              (enable_graph ? 2 : 0) + (uses_prefill_executor ? 1 : 0));
   }
 }
 

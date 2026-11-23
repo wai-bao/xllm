@@ -274,23 +274,24 @@ PyAttentionMetadataView::PyAttentionMetadataView(
   shared_full_slot_mapping_ = params.attention.device.shared_full_slot_mapping;
   shared_full_read_padding_page_ =
       params.attention.host.shared_full_read_padding_page;
-  linear_state_indices_ = params.embedding.linear_state_indices;
+  linear_state_indices_ = params.cache_state_.linear_state_indices;
   num_accepted_tokens_ = params.num_accepted_tokens;
   num_accepted_tokens_host_values_ = params.num_accepted_tokens_host;
-  if (!params.embedding.linear_state_read_ids.empty() &&
+  if (!params.cache_state_.linear_state_read_ids.empty() &&
       (metadata_->is_prefill || metadata_->is_chunked_prefill) &&
       params.meta.batch_forward_type.no_decode()) {
     CHECK(linear_state_indices_.defined());
-    CHECK_EQ(params.embedding.linear_state_read_ids.size(),
-             params.embedding.linear_state_ids.size());
-    CHECK_EQ(params.embedding.linear_state_read_ids.size(),
+    CHECK_EQ(params.cache_state_.linear_state_read_ids.size(),
+             params.cache_state_.linear_state_ids.size());
+    CHECK_EQ(params.cache_state_.linear_state_read_ids.size(),
              static_cast<size_t>(linear_state_indices_.numel()))
         << "linear-state read ids must align with Python metadata rows";
-    linear_state_read_indices_ = params.embedding.linear_state_read_indices;
+    linear_state_read_indices_ = params.cache_state_.linear_state_read_indices;
     if (!linear_state_read_indices_.defined()) {
-      materialize_linear_state_indices(params.embedding,
-                                       linear_state_indices_.device());
-      linear_state_read_indices_ = params.embedding.linear_state_read_indices;
+      params.cache_state_.materialize_linear_state_indices(
+          linear_state_indices_.device());
+      linear_state_read_indices_ =
+          params.cache_state_.linear_state_read_indices;
     }
   }
   raw_dp_execution_token_counts_ =

@@ -350,10 +350,10 @@ std::optional<Params> CudaGraphPersistentParam::update(
       params_for_capture->embedding.input_embedding =
           persistent_embedding(padded_num_tokens);
     }
-    if (!params.embedding.linear_state_ids.empty()) {
-      params_for_capture->embedding.linear_state_ids =
-          params.embedding.linear_state_ids;
-      params_for_capture->embedding.linear_state_indices =
+    if (!params.cache_state_.linear_state_ids.empty()) {
+      params_for_capture->cache_state_.linear_state_ids =
+          params.cache_state_.linear_state_ids;
+      params_for_capture->cache_state_.linear_state_indices =
           persistent_linear_state_indices(params.meta.num_sequences);
     }
     params_for_capture->attn_metadata = attn_metadata;
@@ -444,15 +444,17 @@ std::optional<Params> CudaGraphPersistentParam::update(
         persistent_new_cache_slots(slot_mapping_tokens);
   }
 
-  if (!params.embedding.linear_state_ids.empty()) {
-    if (params.embedding.linear_state_indices.defined()) {
+  if (!params.cache_state_.linear_state_ids.empty()) {
+    if (params.cache_state_.linear_state_indices.defined()) {
       persistent_linear_state_indices_
           .slice(/*dim=*/0, /*start=*/0, /*end=*/actual_batch_size)
-          .copy_(params.embedding.linear_state_indices, /*non_blocking=*/true);
+          .copy_(params.cache_state_.linear_state_indices,
+                 /*non_blocking=*/true);
     } else {
       persistent_linear_state_indices_
           .slice(/*dim=*/0, /*start=*/0, /*end=*/actual_batch_size)
-          .copy_(torch::tensor(params.embedding.linear_state_ids, torch::kInt)
+          .copy_(torch::tensor(params.cache_state_.linear_state_ids,
+                               /*options=*/torch::kInt)
                      .to(device_),
                  /*non_blocking=*/true);
     }
@@ -1262,7 +1264,8 @@ ModelOutput CudaGraphExecutorImpl::attach_aux_hidden_states_if_needed(
 ModelOutput CudaGraphExecutorImpl::run(const torch::Tensor& tokens,
                                        const torch::Tensor& positions,
                                        std::vector<KVCache>& kv_caches,
-                                       const ModelParamsView& params) {
+                                       const ModelParamsView& params,
+                                       MMBatchData* /*mm_data*/) {
   const bool is_prefill = params.meta.batch_forward_type.is_prefill();
   const bool is_decode = params.meta.batch_forward_type.is_decode() &&
                          params.meta.q_max_seq_len <= 1;

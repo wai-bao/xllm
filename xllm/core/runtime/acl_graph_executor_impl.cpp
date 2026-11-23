@@ -50,6 +50,13 @@ limitations under the License.
 namespace xllm::npu {
 
 namespace {
+
+bool has_static_graph_task_shape(const ModelParamsView& params) {
+  return params.parallel.query_start_loc.size() == 2 &&
+         params.cache_state_.linear_state_ids.size() == 1 &&
+         params.num_accepted_tokens_host.size() == 1;
+}
+
 constexpr uint64_t kSpecVerifyGraphKeyMask = 1ull << 63;
 constexpr uint64_t kSpecVerifyQMaxSeqLenShift = 32;
 constexpr uint64_t kSpecVerifyBucketMask = (1ull << 16) - 1;
@@ -61,26 +68,26 @@ constexpr uint64_t kMlaGraphKeyMask = 1ull << 62;
 constexpr uint64_t kMlaGraphKeyPayloadMask = (1ull << 62) - 1;
 
 void reset_capture_linear_state_to_padding(ModelParamsView& params) {
-  if (params.embedding.linear_state_ids.empty()) {
+  if (params.cache_state_.linear_state_ids.empty()) {
     return;
   }
-  std::fill(params.embedding.linear_state_ids.begin(),
-            params.embedding.linear_state_ids.end(),
+  std::fill(params.cache_state_.linear_state_ids.begin(),
+            params.cache_state_.linear_state_ids.end(),
             kPaddingLinearStateId);
-  CHECK(params.embedding.linear_state_indices.defined())
+  CHECK(params.cache_state_.linear_state_indices.defined())
       << "ACL graph capture requires persistent linear-state indices.";
-  CHECK_EQ(params.embedding.linear_state_indices.numel(),
-           static_cast<int64_t>(params.embedding.linear_state_ids.size()))
+  CHECK_EQ(params.cache_state_.linear_state_indices.numel(),
+           static_cast<int64_t>(params.cache_state_.linear_state_ids.size()))
       << "ACL graph capture linear-state host/device sizes must match.";
-  params.embedding.linear_state_indices.fill_(kPaddingLinearStateId);
-  std::fill(params.embedding.linear_state_read_ids.begin(),
-            params.embedding.linear_state_read_ids.end(),
+  params.cache_state_.linear_state_indices.fill_(kPaddingLinearStateId);
+  std::fill(params.cache_state_.linear_state_read_ids.begin(),
+            params.cache_state_.linear_state_read_ids.end(),
             kPaddingLinearStateId);
-  if (params.embedding.linear_state_read_indices.defined()) {
-    params.embedding.linear_state_read_indices.fill_(kPaddingLinearStateId);
+  if (params.cache_state_.linear_state_read_indices.defined()) {
+    params.cache_state_.linear_state_read_indices.fill_(kPaddingLinearStateId);
   }
-  params.linear_state_validity_mask.assign(
-      params.embedding.linear_state_ids.size(), 0);
+  params.cache_state_.linear_state_validity_mask.assign(
+      params.cache_state_.linear_state_ids.size(), /*value=*/0);
 }
 
 template <typename Params>
@@ -121,12 +128,7 @@ bool uses_static_mtp_graph_task_variant(const ModelParamsView& params,
          kernel::npu::tilelang::has_spec_verify_graph_update_specialization(
              spec_width, block_size) &&
          batch_size == 1 && bucket_num_tokens == batch_size * spec_width &&
-         params.parallel.query_start_loc.size() ==
-             static_cast<size_t>(batch_size + 1) &&
-         params.embedding.linear_state_ids.size() ==
-             static_cast<size_t>(batch_size) &&
-         params.num_accepted_tokens_host.size() ==
-             static_cast<size_t>(batch_size);
+         has_static_graph_task_shape(params);
 }
 
 uint64_t mix_graph_key(uint64_t hash, uint64_t value) {
@@ -299,8 +301,8 @@ std::optional<std::array<const void*, 12>> spec_verify_input_addresses(
       &params.attention.device.kv_seq_lens,
       &params.attention.device.new_cache_slots,
       &params.attention.device.block_tables,
-      &params.embedding.linear_state_indices,
-      &params.embedding.linear_state_read_indices,
+      &params.cache_state_.linear_state_indices,
+      &params.cache_state_.linear_state_read_indices,
       &params.num_accepted_tokens,
       &params.attention.device.q_cu_seq_lens,
       &params.graph.expanded_kv_seq_lens,
@@ -343,6 +345,19 @@ uint64_t get_mla_graph_key(uint32_t bucket_num_tokens,
   return kMlaGraphKeyMask | (hash & kMlaGraphKeyPayloadMask);
 }
 }  // namespace
+
+std::optional<StaticGraphTaskSignature> make_static_graph_task_signature(
+    const ModelParamsView& params) {
+  if (!has_static_graph_task_shape(params)) {
+    return std::nullopt;
+  }
+  return StaticGraphTaskSignature{
+      .linear_state_id = params.cache_state_.linear_state_ids.front(),
+      .num_accepted_tokens = params.num_accepted_tokens_host.front(),
+      .query_start_loc_begin = params.parallel.query_start_loc.front(),
+      .query_start_loc_end = params.parallel.query_start_loc.back(),
+  };
+}
 
 bool AclGraph::capture(CausalLM* model,
                        const runtime::Options& options,
@@ -582,10 +597,11 @@ bool AclGraph::update_graph_tasks(const ModelParamsView& params,
   if (has_causal_conv1d_tasks) {
     CHECK(!params.parallel.query_start_loc.empty())
         << "causal_conv1d graph update requires padded query_start_loc";
-    CHECK(!params.embedding.linear_state_ids.empty())
+    CHECK(!params.cache_state_.linear_state_ids.empty())
         << "causal_conv1d graph update requires padded cache indices";
-    linear_state_indices_host.assign(params.embedding.linear_state_ids.begin(),
-                                     params.embedding.linear_state_ids.end());
+    linear_state_indices_host.assign(
+        params.cache_state_.linear_state_ids.begin(),
+        params.cache_state_.linear_state_ids.end());
   }
 
   size_t graph_batch_size = 0;
@@ -1049,7 +1065,8 @@ void AclGraphExecutorImpl::initialize(bool need_update_attn_mask,
 ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
                                       const torch::Tensor& positions,
                                       std::vector<KVCache>& kv_caches,
-                                      const ModelParamsView& params) {
+                                      const ModelParamsView& params,
+                                      MMBatchData* /*mm_data*/) {
   auto run_eager = [&]() {
     ModelParamsView eager_params = params.clone().view();
     eager_params.enable_graph = false;

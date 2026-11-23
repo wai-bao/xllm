@@ -197,14 +197,14 @@ struct IndexedTensorSnapshot {
 template <typename Params>
 torch::Tensor get_linear_state_snapshot_indices(const Params& params,
                                                 const torch::Device& device) {
-  if (params.embedding.linear_state_indices.defined()) {
-    return params.embedding.linear_state_indices.to(
+  if (params.cache_state_.linear_state_indices.defined()) {
+    return params.cache_state_.linear_state_indices.to(
         torch::TensorOptions().dtype(torch::kLong).device(device));
   }
-  CHECK(!params.embedding.linear_state_ids.empty())
+  CHECK(!params.cache_state_.linear_state_ids.empty())
       << "MUSA graph capture requires linear state ids";
   return torch::tensor(
-      params.embedding.linear_state_ids,
+      params.cache_state_.linear_state_ids,
       torch::TensorOptions().dtype(torch::kLong).device(device));
 }
 
@@ -536,10 +536,10 @@ std::optional<ModelParamsView> MusaGraphPersistentParam::update(
                               persistent_num_accepted_tokens_.numel())
           : 0;
   const int64_t linear_state_batch_size =
-      params.embedding.linear_state_indices.defined()
-          ? std::min<int64_t>(params.embedding.linear_state_indices.numel(),
+      params.cache_state_.linear_state_indices.defined()
+          ? std::min<int64_t>(params.cache_state_.linear_state_indices.numel(),
                               persistent_linear_state_indices_.numel())
-          : std::min<int64_t>(params.embedding.linear_state_ids.size(),
+          : std::min<int64_t>(params.cache_state_.linear_state_ids.size(),
                               persistent_linear_state_indices_.numel());
 
   const bool use_llm_decode_fast_path =
@@ -586,10 +586,10 @@ std::optional<ModelParamsView> MusaGraphPersistentParam::update(
       params_for_capture->embedding.input_embedding =
           persistent_embedding(padded_num_tokens);
     }
-    if (!params.embedding.linear_state_ids.empty()) {
-      params_for_capture->embedding.linear_state_ids =
-          params.embedding.linear_state_ids;
-      params_for_capture->embedding.linear_state_indices =
+    if (!params.cache_state_.linear_state_ids.empty()) {
+      params_for_capture->cache_state_.linear_state_ids =
+          params.cache_state_.linear_state_ids;
+      params_for_capture->cache_state_.linear_state_indices =
           persistent_linear_state_indices(
               static_cast<uint32_t>(linear_state_batch_size));
     }
@@ -700,17 +700,18 @@ std::optional<ModelParamsView> MusaGraphPersistentParam::update(
         persistent_new_cache_slots(slot_mapping_tokens);
   }
 
-  if (!params.embedding.linear_state_ids.empty()) {
-    if (params.embedding.linear_state_indices.defined()) {
+  if (!params.cache_state_.linear_state_ids.empty()) {
+    if (params.cache_state_.linear_state_indices.defined()) {
       persistent_linear_state_indices_
           .slice(/*dim=*/0, /*start=*/0, /*end=*/linear_state_batch_size)
-          .copy_(params.embedding.linear_state_indices.slice(
+          .copy_(params.cache_state_.linear_state_indices.slice(
                      /*dim=*/0, /*start=*/0, /*end=*/linear_state_batch_size),
                  /*non_blocking=*/true);
     } else {
       persistent_linear_state_indices_
           .slice(/*dim=*/0, /*start=*/0, /*end=*/linear_state_batch_size)
-          .copy_(torch::tensor(params.embedding.linear_state_ids, torch::kInt)
+          .copy_(torch::tensor(params.cache_state_.linear_state_ids,
+                               /*options=*/torch::kInt)
                      .to(device_),
                  /*non_blocking=*/true);
     }
@@ -1228,8 +1229,8 @@ bool MusaGraph::capture(CausalLM* model,
   // every preparation pass starts from the same state and the first replay
   // applies the current token or chunk exactly once.
   const bool snapshot_linear_state =
-      params.embedding.linear_state_indices.defined() ||
-      !params.embedding.linear_state_ids.empty();
+      params.cache_state_.linear_state_indices.defined() ||
+      !params.cache_state_.linear_state_ids.empty();
   torch::Tensor linear_state_snapshot_indices;
   std::vector<IndexedTensorSnapshot> linear_state_snapshots;
   if (snapshot_linear_state) {
@@ -1644,7 +1645,8 @@ void MusaGraphExecutorImpl::prepare_graph_embedding(
 ModelOutput MusaGraphExecutorImpl::run(const torch::Tensor& tokens,
                                        const torch::Tensor& positions,
                                        std::vector<KVCache>& kv_caches,
-                                       const ModelParamsView& params) {
+                                       const ModelParamsView& params,
+                                       MMBatchData* /*mm_data*/) {
   torch::NoGradGuard no_grad;
   const bool is_prefill = params.meta.batch_forward_type.is_prefill();
   const bool is_decode = params.meta.batch_forward_type.is_decode();

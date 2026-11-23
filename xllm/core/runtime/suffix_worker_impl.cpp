@@ -106,7 +106,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_prefill(
 
   const auto& input_params = input.input_params;
   const int32_t num_sequences = input_params.meta.num_sequences;
-  const auto& request_ids = input_params.embedding.request_ids;
+  const auto& request_ids = input.request_ids;
 
   if (request_ids.size() == static_cast<size_t>(num_sequences)) {
     const torch::Tensor& token_ids = input.token_ids_host;
@@ -161,7 +161,7 @@ std::optional<ForwardOutput> SuffixWorkerImpl::step_decode(
   const int32_t num_speculative_tokens = options_.num_speculative_tokens();
   const int32_t num_sequences = input.input_params.meta.num_sequences;
   const int32_t num_val_tokens = num_speculative_tokens + 1;
-  const auto& request_ids = input.input_params.embedding.request_ids;
+  const auto& request_ids = input.request_ids;
 
   const bool has_request_ids =
       request_ids.size() == static_cast<size_t>(num_sequences);

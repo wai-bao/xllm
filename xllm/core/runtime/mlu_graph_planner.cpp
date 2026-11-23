@@ -232,11 +232,13 @@ std::optional<GraphLayout> get_graph_layout(
     }
     layout.padded_num_reqs = layout.padded_num_tokens / tokens_per_request;
   }
+  const auto& linear_state_ids = params.cache_state_.linear_state_ids;
+  const bool invalid_linear_state =
+      linear_state_ids.empty() ? state_required
+                               : linear_state_ids.size() !=
+                                     static_cast<std::size_t>(layout.num_reqs);
   if (grouped &&
-      ((state_required && params.embedding.linear_state_ids.empty()) ||
-       (!params.embedding.linear_state_ids.empty() &&
-        params.embedding.linear_state_ids.size() !=
-            static_cast<std::size_t>(layout.num_reqs)) ||
+      (invalid_linear_state ||
        (!options.is_draft_engine() && params.meta.q_max_seq_len > 1 &&
         (!params.num_accepted_tokens.defined() ||
          params.num_accepted_tokens.numel() != layout.num_reqs)))) {
@@ -251,8 +253,8 @@ std::optional<GraphLayout> get_graph_layout(
        attention.block_tables.size(0) !=
            tokens / layout.attention_row_query_len ||
        attention.new_cache_slots.numel() != tokens ||
-       (params.embedding.linear_state_indices.defined() &&
-        params.embedding.linear_state_indices.numel() != layout.num_reqs))) {
+       (params.cache_state_.linear_state_indices.defined() &&
+        params.cache_state_.linear_state_indices.numel() != layout.num_reqs))) {
     return std::nullopt;
   }
   return layout;

@@ -180,7 +180,6 @@ class MMData {
   bool foreach (MMDictItem::IVisitor& v);
 
   bool foreach (IItemVisitor& v);
-  void debug_print() const;
 
  private:
   uint32_t type_ = MMType::NONE;

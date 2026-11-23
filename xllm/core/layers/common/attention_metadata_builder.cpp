@@ -167,12 +167,12 @@ void materialize_linear_state_validity(
     return;
   }
 
-  const int64_t mask_rows =
-      static_cast<int64_t>(params.linear_state_validity_mask.size());
+  const int64_t mask_rows = static_cast<int64_t>(
+      params.cache_state_.linear_state_validity_mask.size());
   // Dense batches retain -1 linear-state rows; only real slots require a mask.
   const bool has_linear_state_rows =
-      std::any_of(params.embedding.linear_state_ids.begin(),
-                  params.embedding.linear_state_ids.end(),
+      std::any_of(params.cache_state_.linear_state_ids.begin(),
+                  params.cache_state_.linear_state_ids.end(),
                   [](int32_t linear_state_id) { return linear_state_id >= 0; });
   if (!attn_metadata.is_dummy && mask_rows == 0) {
     CHECK(!has_linear_state_rows)
@@ -182,11 +182,11 @@ void materialize_linear_state_validity(
 
   if (!(attn_metadata.is_dummy && mask_rows == 0)) {
     int64_t metadata_rows = mask_rows;
-    if (!params.embedding.linear_state_ids.empty()) {
+    if (!params.cache_state_.linear_state_ids.empty()) {
       metadata_rows =
-          static_cast<int64_t>(params.embedding.linear_state_ids.size());
-    } else if (params.embedding.linear_state_indices.defined()) {
-      metadata_rows = params.embedding.linear_state_indices.numel();
+          static_cast<int64_t>(params.cache_state_.linear_state_ids.size());
+    } else if (params.cache_state_.linear_state_indices.defined()) {
+      metadata_rows = params.cache_state_.linear_state_indices.numel();
     }
     CHECK_EQ(mask_rows, metadata_rows)
         << "linear state mask row count mismatch: mask_rows=" << mask_rows
@@ -198,8 +198,8 @@ void materialize_linear_state_validity(
   }
 
   torch::TensorOptions options;
-  if (params.embedding.linear_state_indices.defined()) {
-    options = params.embedding.linear_state_indices.options();
+  if (params.cache_state_.linear_state_indices.defined()) {
+    options = params.cache_state_.linear_state_indices.options();
   } else if (params.attention.device.q_seq_lens.defined()) {
     options = params.attention.device.q_seq_lens.options();
   } else {
@@ -211,7 +211,8 @@ void materialize_linear_state_validity(
   attn_metadata.has_initial_states =
       attn_metadata.is_dummy && mask_rows == 0
           ? torch::zeros({1}, options)
-          : torch::tensor(params.linear_state_validity_mask, options);
+          : torch::tensor(params.cache_state_.linear_state_validity_mask,
+                          options);
 }
 
 AttentionMetadata build_common_attention_metadata(
@@ -259,7 +260,7 @@ AttentionMetadata build_common_attention_metadata(
       params.attention.device.shared_full_block_table;
   attn_metadata.shared_full_slot_mapping =
       params.attention.device.shared_full_slot_mapping;
-  attn_metadata.linear_state_indices = params.embedding.linear_state_indices;
+  attn_metadata.linear_state_indices = params.cache_state_.linear_state_indices;
   attn_metadata.kpool_query_lens = params.attention.host.kpool_query_lens;
   attn_metadata.compute_dtype = compute_dtype;
 #if defined(USE_DCU)

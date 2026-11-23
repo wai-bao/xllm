@@ -52,6 +52,20 @@ limitations under the License.
 
 namespace xllm {
 
+namespace dflash_detail {
+
+void invalidate_draft_model_geometry(LlmModelParams& input_params) {
+  // Attention metadata is model-owned: DeepSeek-V4 bakes DSA group layout and
+  // sparse tiling values such as ori_win_left into opaque tensors. A draft
+  // input copied from the target must rebuild those tensors for draft geometry.
+  input_params.attn_metadata.reset();
+  // Block drafters own no recurrent layers. Target slots and validity masks
+  // must not reach the draft metadata builder, including during graph warmup.
+  input_params.cache_state_.clear_linear_attention_state();
+}
+
+}  // namespace dflash_detail
+
 namespace {
 
 std::vector<int64_t> build_accepted_context_rows(
@@ -337,9 +351,8 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_decode(
       << "DFlash embedding cache is not allocated";
 
   std::vector<EmbeddingCache::DecodeState> last_states =
-      embedding_cache_->read_decode_states(
-          input.input_params.embedding.embedding_ids,
-          input.input_params.embedding.request_ids);
+      embedding_cache_->read_decode_states(input.speculative_.embedding_ids_,
+                                           input.request_ids);
   update_decode_step_input(input, last_states);
   LlmForwardInput draft_forward_input;
   auto [draft_token_ids, draft_logits] =
@@ -476,8 +489,8 @@ void DFlashWorkerImpl::prepare_validate_inputs(
     const std::vector<int32_t> accepted_prefix_lengths = num_accepted_tokens(
         embedding_cache_.get(),
         static_cast<size_t>(input.input_params.meta.num_sequences),
-        input.input_params.embedding.embedding_ids,
-        input.input_params.embedding.request_ids);
+        input.speculative_.embedding_ids_,
+        input.request_ids);
     input_params.num_accepted_tokens_host.assign(
         accepted_prefix_lengths.begin(), accepted_prefix_lengths.end());
     input_params.num_accepted_tokens =
@@ -561,7 +574,7 @@ std::vector<std::string> DFlashWorkerImpl::write_context_kv(
   // on compute_stream_, so no explicit event dance is needed — the stream
   // orders them. Model methods below use torch ops on the same stream.
   c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
-  CHECK(input.input_params.synchronize_draft_layer())
+  CHECK(input.input_params.parallel.synchronize_draft_layer())
       << "Failed to wait for Draft Host KV load completion.";
 
 #if defined(USE_NPU)
@@ -675,15 +688,14 @@ std::vector<std::string> DFlashWorkerImpl::write_target_context_to_cache(
   }
   std::vector<std::string> failed_request_ids = write_context_kv(
       input, context_hidden, positions_device, new_cache_slots_device);
-  CHECK(!input.input_params.embedding.embedding_ids.empty())
+  CHECK(!input.speculative_.embedding_ids_.empty())
       << "DFlash target context cache write requires embedding ids";
-  embedding_cache_->write_target_context(
-      input.input_params.embedding.embedding_ids,
-      input.input_params.embedding.request_ids,
-      accepted_tokens,
-      validate_output.embeddings,
-      options_.num_speculative_tokens(),
-      /*retain_previous_embedding=*/false);
+  embedding_cache_->write_target_context(input.speculative_.embedding_ids_,
+                                         input.request_ids,
+                                         accepted_tokens,
+                                         validate_output.embeddings,
+                                         options_.num_speculative_tokens(),
+                                         /*retain_previous_embedding=*/false);
   return failed_request_ids;
 }
 

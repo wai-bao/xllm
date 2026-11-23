@@ -189,11 +189,11 @@ LinearStateInputRows get_mlu_linear_state_rows(
           : static_cast<int64_t>(
                 input_params.attention.host.kpool_query_lens.size());
   const int64_t slot_rows =
-      static_cast<int64_t>(input_params.embedding.linear_state_ids.size());
+      static_cast<int64_t>(input_params.cache_state_.linear_state_ids.size());
 
   // A data-parallel worker may receive an empty shard during graph warmup.
   if (sequence_rows == 0 && active_rows == 0 && slot_rows == 0) {
-    input_params.embedding.linear_state_ids = {kPaddingLinearStateId};
+    input_params.cache_state_.linear_state_ids = {kPaddingLinearStateId};
     return {{}, 0, /*empty_shard=*/true};
   }
 
@@ -737,9 +737,9 @@ void WorkerImpl::prepare_linear_state_cache(const ModelParamsView& params) {
       (!is_python_model && is_qwen3_5_target_model_type(args.model_type()));
 #endif
   restore_linear_state_slots(kv_caches_,
-                             params.embedding.linear_state_ids,
-                             params.embedding.linear_state_read_ids,
-                             params.linear_state_validity_mask,
+                             params.cache_state_.linear_state_ids,
+                             params.cache_state_.linear_state_read_ids,
+                             params.cache_state_.linear_state_validity_mask,
                              reads_distinct_state);
 #endif
 }
@@ -897,7 +897,7 @@ void build_dummy_forward_input(Input& input,
                               : torch::TensorOptions().dtype(torch::kInt32);
   input.token_ids = torch::ones({query_width}, token_options.device(device));
   input.positions = torch::arange(query_width, position_options.device(device));
-  input.input_params.embedding.linear_state_indices = torch::zeros(
+  input.input_params.cache_state_.linear_state_indices = torch::zeros(
       {query_width}, token_options.dtype(torch::kInt32).device(device));
   if (ModelConfig::is_python_model_impl(context.get_model_impl())) {
     auto& execution_batch = input.input_params.meta.execution_batch;
@@ -1020,8 +1020,8 @@ void WorkerImpl::prepare_work_before_execute(const Input& input,
   if (params.meta.num_sequences != 0 ||
       (processed_input.token_ids.defined() &&
        processed_input.token_ids.numel() != 0)) {
-    const auto& full_block_rows = params.embedding.full_block_slot_rows;
-    const auto& linear_state_rows = params.embedding.linear_state_slot_rows;
+    const auto& full_block_rows = params.cache_state_.full_block_slot_rows;
+    const auto& linear_state_rows = params.cache_state_.linear_state_slot_rows;
     if (static_kv_cache_allocator_ != nullptr &&
         (!full_block_rows.empty() || !linear_state_rows.empty())) {
       const auto shared_cache = std::find_if(
@@ -1031,7 +1031,9 @@ void WorkerImpl::prepare_work_before_execute(const Input& input,
       CHECK(shared_cache != kv_caches_.end());
       if (!full_block_rows.empty()) {
         initialize_shared_full_blocks(
-            full_block_rows, params.embedding.full_block_lease_epochs, stream);
+            full_block_rows,
+            params.cache_state_.full_block_lease_epochs,
+            stream);
         shared_cache->update_full_block_rows(full_block_rows);
       }
       shared_cache->update_linear_state_slots(linear_state_rows);
@@ -1059,9 +1061,9 @@ void WorkerImpl::prepare_work_before_execute(const Input& input,
       const auto rows = get_host_linear_state_rows(execution_params);
 #endif
       if (rows.empty_shard) {
-        execution_params.linear_state_validity_mask.clear();
+        execution_params.cache_state_.linear_state_validity_mask.clear();
       } else {
-        execution_params.linear_state_validity_mask =
+        execution_params.cache_state_.linear_state_validity_mask =
             build_linear_state_mask(rows.cached_tokens, rows.active_rows);
       }
       // Overlap restores in the worker thread on compute_stream_, after the

@@ -621,9 +621,9 @@ TEST_F(MluGraphExecutorTest, LinearStatePaddingTailUsesPaddingId) {
       model_args_, tensor_options_.device(), options_, {});
 
   LlmForwardInput first_input = prepare_inputs(/*batch_size=*/4, /*seed=*/83);
-  first_input.input_params.embedding.linear_state_ids = {10, 20, 30, 40};
-  first_input.input_params.embedding.linear_state_indices =
-      torch::tensor(first_input.input_params.embedding.linear_state_ids,
+  first_input.input_params.cache_state_.linear_state_ids = {10, 20, 30, 40};
+  first_input.input_params.cache_state_.linear_state_indices =
+      torch::tensor(first_input.input_params.cache_state_.linear_state_ids,
                     tensor_options_.dtype(torch::kInt32));
 
   ::xllm::mlu::GraphPlan first_plan;
@@ -640,9 +640,9 @@ TEST_F(MluGraphExecutorTest, LinearStatePaddingTailUsesPaddingId) {
                             first_plan);
 
   LlmForwardInput second_input = prepare_inputs(/*batch_size=*/3, /*seed=*/89);
-  second_input.input_params.embedding.linear_state_ids = {11, 21, 31};
-  second_input.input_params.embedding.linear_state_indices =
-      torch::tensor(second_input.input_params.embedding.linear_state_ids,
+  second_input.input_params.cache_state_.linear_state_ids = {11, 21, 31};
+  second_input.input_params.cache_state_.linear_state_indices =
+      torch::tensor(second_input.input_params.cache_state_.linear_state_ids,
                     tensor_options_.dtype(torch::kInt32));
 
   ::xllm::mlu::GraphPlan second_plan = first_plan;
@@ -655,7 +655,7 @@ TEST_F(MluGraphExecutorTest, LinearStatePaddingTailUsesPaddingId) {
 
   torch_mlu::synchronize();
   torch::Tensor linear_state_indices =
-      graph_params.embedding.linear_state_indices.cpu();
+      graph_params.cache_state_.linear_state_indices.cpu();
   EXPECT_TRUE(torch::equal(linear_state_indices,
                            torch::tensor({11, 21, 31, kPaddingLinearStateId},
                                          torch::dtype(torch::kInt32))));

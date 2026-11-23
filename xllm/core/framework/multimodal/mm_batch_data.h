@@ -17,10 +17,12 @@ limitations under the License.
 
 #include <torch/types.h>
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -29,24 +31,26 @@ limitations under the License.
 
 namespace xllm {
 
+using MultimodalEmbeddings =
+    std::pair<torch::Tensor, std::vector<torch::Tensor>>;
+
 class MMBatchData {
  public:
   MMBatchData() = default;
   MMBatchData(std::vector<MMData> data);
   MMBatchData(uint32_t type, MMDict items);
 
-  bool has(uint32_t type) const { return (type & type_) != 0; }
   bool valid() const { return type_ != MMType::NONE; }
 
   uint32_t type() const { return type_; }
   const MMDict& data() const;
 
-  bool has(const MMKey& key) const;
-  void get(const MMKey& key, std::vector<torch::Tensor>& vec) const;
+  MultimodalEmbeddings merge_visual_embeddings(
+      torch::Tensor inputs_embeds,
+      size_t num_deep_stacks = 0) const;
 
   void to(const torch::Device& device);
-  static MMBatchData to(const MMBatchData& mm_data,
-                        const torch::Device& device);
+  MMBatchData copy_to(const torch::Device& device) const;
 
   void batch(std::vector<MMData> mm_datas);
 
@@ -80,8 +84,6 @@ class MMBatchData {
     }
     return true;
   }
-
-  void debug_print() const;
 
  private:
   class TensorAggregation;

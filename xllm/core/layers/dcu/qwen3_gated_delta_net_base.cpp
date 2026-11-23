@@ -342,8 +342,8 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     auto cu_seqlens_vec = extract_cu_seqlens(attn_metadata);
     auto conv_input = reshape_qkvz_unpad(attn_metadata, mixed_qkv);
     std::vector<int64_t> state_indices_vec(
-        input_params.embedding.linear_state_ids.begin(),
-        input_params.embedding.linear_state_ids.end());
+        input_params.cache_state_.linear_state_ids.begin(),
+        input_params.cache_state_.linear_state_ids.end());
     mixed_qkv = causal_conv1d_prefill(conv_input,
                                       conv_weight,
                                       conv_cache,
@@ -500,10 +500,10 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::reshape_qkvz_unpad(
 torch::Tensor Qwen3GatedDeltaNetBaseImpl::get_linear_state_indices(
     const ModelParamsView& input_params,
     const torch::Device& device) const {
-  CHECK(!input_params.embedding.linear_state_ids.empty())
+  CHECK(!input_params.cache_state_.linear_state_ids.empty())
       << "linear_state_ids must be populated for gated delta net";
   return torch::tensor(
-      input_params.embedding.linear_state_ids,
+      input_params.cache_state_.linear_state_ids,
       torch::TensorOptions().dtype(torch::kInt).device(device));
 }
 
@@ -608,8 +608,8 @@ torch::Tensor Qwen3_5GatedDeltaNetImpl::forward(
     auto cu_seqlens_vec = extract_cu_seqlens(attn_metadata);
     auto conv_input = reshape_qkvz_unpad(attn_metadata, mixed_qkv);
     std::vector<int64_t> state_indices(
-        input_params.embedding.linear_state_ids.begin(),
-        input_params.embedding.linear_state_ids.end());
+        input_params.cache_state_.linear_state_ids.begin(),
+        input_params.cache_state_.linear_state_ids.end());
     mixed_qkv = causal_conv1d_prefill(conv_input,
                                       conv_weight,
                                       conv_cache,

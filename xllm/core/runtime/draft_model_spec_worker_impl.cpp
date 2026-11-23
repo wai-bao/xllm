@@ -518,12 +518,12 @@ template <typename TargetInput>
 std::optional<ForwardOutput> DraftModelSpecWorkerImpl<TargetInput>::step(
     const TargetInput& input) {
   if (draft_impl_->uses_shared_static_kv_cache()) {
-    const auto& embedding = input.input_params.embedding;
+    const auto& cache_state = input.input_params.cache_state_;
     // Decode can execute draft before target. Initialize their common leases
     // here so a newly admitted draft page cannot expose previous Linear state.
     // The compute stream orders this after preceding target/draft consumers.
-    impl_->initialize_shared_full_blocks(embedding.full_block_slot_rows,
-                                         embedding.full_block_lease_epochs,
+    impl_->initialize_shared_full_blocks(cache_state.full_block_slot_rows,
+                                         cache_state.full_block_lease_epochs,
                                          *compute_stream_);
   }
   return SpeculativeWorkerImpl<TargetInput>::step(input);

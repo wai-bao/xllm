@@ -259,9 +259,9 @@ class Qwen3_5GatedDeltaNetTest : public ::testing::Test {
     input_params.meta.q_max_seq_len = q_max_seq_len;
     input_params.num_accepted_tokens =
         torch::tensor(accepted_lengths, opts_int);
-    input_params.embedding.linear_state_ids.reserve(accepted_lengths.size());
+    input_params.cache_state_.linear_state_ids.reserve(accepted_lengths.size());
     for (size_t i = 0; i < accepted_lengths.size(); ++i) {
-      input_params.embedding.linear_state_ids.emplace_back(
+      input_params.cache_state_.linear_state_ids.emplace_back(
           static_cast<int32_t>(i) + 1);
     }
     input_params.num_accepted_tokens_host = std::move(accepted_lengths);
@@ -273,9 +273,9 @@ class Qwen3_5GatedDeltaNetTest : public ::testing::Test {
       const ModelParamsView& input_params,
       int64_t q_max_seq_len) {
     std::vector<int64_t> checkpoint_rows;
-    checkpoint_rows.reserve(input_params.embedding.linear_state_ids.size() *
+    checkpoint_rows.reserve(input_params.cache_state_.linear_state_ids.size() *
                             static_cast<size_t>(q_max_seq_len));
-    for (const int32_t state_id : input_params.embedding.linear_state_ids) {
+    for (const int32_t state_id : input_params.cache_state_.linear_state_ids) {
       ASSERT_GT(state_id, kPaddingLinearStateId)
           << "Spec Verify tests must use real linear state rows";
       for (int64_t offset = 0; offset < q_max_seq_len; ++offset) {
@@ -343,7 +343,7 @@ TEST_F(Qwen3_5GatedDeltaNetTest, PrefillForward) {
   auto metadata = MakePrefillMetadata(batch_size, seq_len);
 
   ModelParamsView input_params = ModelInputSnapshot(LlmModelParams()).view();
-  input_params.embedding.linear_state_ids = {1};
+  input_params.cache_state_.linear_state_ids = {1};
 
   auto output = layer->forward(hidden, metadata, kv_cache_, input_params);
   Device xllm_device(device_);
@@ -367,7 +367,7 @@ TEST_F(Qwen3_5GatedDeltaNetTest, PrefillStoresSsmStateAtCheckpointGroupBase) {
   auto metadata = MakePrefillMetadata(/*batch_size=*/1, kSequenceLength);
   auto spec_kv_cache = MakeSpecVerifyKvCache(kCheckpointStride);
   ModelParamsView input_params = ModelInputSnapshot(LlmModelParams()).view();
-  input_params.embedding.linear_state_ids = {kStateId};
+  input_params.cache_state_.linear_state_ids = {kStateId};
 
   layer->forward(hidden, metadata, spec_kv_cache, input_params);
   Device xllm_device(device_);
@@ -392,7 +392,7 @@ TEST_F(Qwen3_5GatedDeltaNetTest, DecodeForward) {
   auto metadata = MakeDecodeMetadata(batch_size);
 
   ModelParamsView input_params = ModelInputSnapshot(LlmModelParams()).view();
-  input_params.embedding.linear_state_ids = {1, 2};
+  input_params.cache_state_.linear_state_ids = {1, 2};
 
   auto output = layer->forward(hidden, metadata, kv_cache_, input_params);
   Device xllm_device(device_);

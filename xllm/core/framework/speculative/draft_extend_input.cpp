@@ -83,8 +83,8 @@ void prepare_first_draft_inputs(EmbeddingCache& embedding_cache,
          "selected_embeddings on the speculative "
          "prefill path";
   embedding_cache.write_prefill_target_context(
-      input.input_params.embedding.embedding_ids,
-      input.input_params.embedding.request_ids,
+      input.speculative_.embedding_ids_,
+      input.request_ids,
       output.sample_output.next_tokens,
       sample_hidden_states,
       input.sampling_params.logits_indices(),

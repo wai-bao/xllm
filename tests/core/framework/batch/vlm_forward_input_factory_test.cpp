@@ -253,15 +253,14 @@ TEST_F(VlmForwardInputFactoryTest,
 
   auto replaced_inputs = prepare(replacement);
   ASSERT_EQ(replaced_inputs.size(), 2u);
-  EXPECT_EQ(replaced_inputs[1].input_params.embedding.embedding_ids,
-            first_inputs[1].input_params.embedding.embedding_ids);
+  EXPECT_EQ(replaced_inputs[1].speculative_.embedding_ids_,
+            first_inputs[1].speculative_.embedding_ids_);
   const auto replaced_generations =
       replaced_inputs[0].input_params.parallel.dp_global_batch_generations;
   ASSERT_EQ(replaced_generations.size(), 2u);
   EXPECT_EQ(replaced_generations[0], generations[0]);
   EXPECT_GT(replaced_generations[1], generations[1]);
-  EXPECT_EQ(replaced_inputs[0].input_params.embedding.request_ids,
-            first_inputs[0].input_params.embedding.request_ids);
+  EXPECT_EQ(replaced_inputs[0].request_ids, first_inputs[0].request_ids);
   for (const auto& input : replaced_inputs) {
     EXPECT_EQ(input.input_params.parallel.dp_global_token_nums,
               first_inputs[0].input_params.parallel.dp_global_token_nums);
@@ -277,10 +276,9 @@ TEST_F(VlmForwardInputFactoryTest,
             generations);
 
   auto moved_inputs = prepare(moved_slot);
-  EXPECT_EQ(moved_inputs[1].input_params.embedding.request_ids,
-            replaced_inputs[1].input_params.embedding.request_ids);
-  EXPECT_NE(moved_inputs[1].input_params.embedding.embedding_ids,
-            replaced_inputs[1].input_params.embedding.embedding_ids);
+  EXPECT_EQ(moved_inputs[1].request_ids, replaced_inputs[1].request_ids);
+  EXPECT_NE(moved_inputs[1].speculative_.embedding_ids_,
+            replaced_inputs[1].speculative_.embedding_ids_);
   EXPECT_GT(
       moved_inputs[0].input_params.parallel.dp_global_batch_generations[1],
       replaced_generations[1]);

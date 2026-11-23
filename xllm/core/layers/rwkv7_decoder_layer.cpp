@@ -575,8 +575,8 @@ torch::Tensor RWKV7DecoderLayerImpl::forward(
   // Use scheduler-provided slot indices when available; otherwise fall back
   // to sequential slot assignment [0, 1, …, num_seqs-1].
   torch::Tensor state_indices;
-  if (input_params.embedding.linear_state_indices.defined()) {
-    state_indices = input_params.embedding.linear_state_indices;
+  if (input_params.cache_state_.linear_state_indices.defined()) {
+    state_indices = input_params.cache_state_.linear_state_indices;
   } else {
     state_indices = torch::arange(
         num_seqs,

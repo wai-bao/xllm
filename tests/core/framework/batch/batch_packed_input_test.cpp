@@ -138,9 +138,9 @@ TEST(SharedMemoryShutdownTest, CancellationDoesNotPublishOrConsumeInput) {
 
 TEST(BatchPackedInputTest, ModelInputConversionPreservesValidityMask) {
   LlmModelParams input_params;
-  input_params.linear_state_validity_mask = {0, 1, 1, 0};
+  input_params.cache_state_.linear_state_validity_mask = {0, 1, 1, 0};
   LlmModelParams converted = input_params.to(torch::Device(torch::kCPU));
-  EXPECT_EQ(converted.linear_state_validity_mask,
+  EXPECT_EQ(converted.cache_state_.linear_state_validity_mask,
             std::vector<int64_t>({0, 1, 1, 0}));
 }
 
@@ -222,11 +222,11 @@ VlmForwardInput make_vlm_transport_input() {
   input.input_params.attention.host.new_cache_slots = {3, 4};
   input.input_params.attention.host.block_tables =
       torch::tensor({{7, 9}}, torch::kInt32);
-  input.input_params.multimodal.mm_data.batch({MMData(
+  input.mm_data_.batch({MMData(
       MMType::IMAGE,
       MMDict{{"pixel_values", torch::tensor({{1.5F, 2.5F}})},
              {"image_grid_thw", torch::tensor({{1, 2, 2}}, torch::kInt64)}})});
-  input.input_params.multimodal.deep_stacks = {torch::tensor({{3.5F, 4.5F}}),
+  input.input_params.embedding.deep_stacks_ = {torch::tensor({{3.5F, 4.5F}}),
                                                torch::tensor({{5.5F, 6.5F}})};
   input.sampling_params.logits_indices() = torch::tensor({1}, torch::kInt32);
   input.sample_sequence_ids = {"vlm#0"};
@@ -245,18 +245,16 @@ void expect_vlm_transport_input(const VlmForwardInput& input) {
             (std::vector<int32_t>{2}));
   EXPECT_EQ(input.sample_sequence_ids, (std::vector<std::string>{"vlm#0"}));
   EXPECT_EQ(input.sample_prior_output_rows, (std::vector<int32_t>{-1}));
-  const auto pixels =
-      input.input_params.multimodal.mm_data.get<torch::Tensor>("pixel_values");
-  const auto grid = input.input_params.multimodal.mm_data.get<torch::Tensor>(
-      "image_grid_thw");
+  const auto pixels = input.mm_data_.get<torch::Tensor>(/*key=*/"pixel_values");
+  const auto grid = input.mm_data_.get<torch::Tensor>(/*key=*/"image_grid_thw");
   ASSERT_TRUE(pixels.has_value());
   ASSERT_TRUE(grid.has_value());
   EXPECT_TRUE(torch::equal(*pixels, torch::tensor({{1.5F, 2.5F}})));
   EXPECT_TRUE(torch::equal(*grid, torch::tensor({{1, 2, 2}}, torch::kInt64)));
-  ASSERT_EQ(input.input_params.multimodal.deep_stacks.size(), 2u);
-  EXPECT_TRUE(torch::equal(input.input_params.multimodal.deep_stacks[0],
+  ASSERT_EQ(input.input_params.embedding.deep_stacks_.size(), 2u);
+  EXPECT_TRUE(torch::equal(input.input_params.embedding.deep_stacks_[0],
                            torch::tensor({{3.5F, 4.5F}})));
-  EXPECT_TRUE(torch::equal(input.input_params.multimodal.deep_stacks[1],
+  EXPECT_TRUE(torch::equal(input.input_params.embedding.deep_stacks_[1],
                            torch::tensor({{5.5F, 6.5F}})));
 }
 
@@ -623,11 +621,11 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
   LlmForwardInput input = builder.build_forward_input();
   ASSERT_EQ(input.input_params.meta.num_sequences, 2);
   input.input_params.meta.requires_host_restore = true;
-  input.input_params.embedding.linear_state_ids = {7, 8};
-  input.input_params.embedding.linear_state_indices =
+  input.input_params.cache_state_.linear_state_ids = {7, 8};
+  input.input_params.cache_state_.linear_state_indices =
       torch::tensor({7, 8}, torch::kInt32);
-  input.input_params.embedding.linear_state_read_ids = {3, 4};
-  input.input_params.embedding.linear_state_read_indices =
+  input.input_params.cache_state_.linear_state_read_ids = {3, 4};
+  input.input_params.cache_state_.linear_state_read_indices =
       torch::tensor({3, 4}, torch::kInt32);
 
   proto::PackedForwardInput packed_input;
@@ -635,7 +633,8 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
 
   LlmForwardInput lazy_input;
   ASSERT_TRUE(lazy_input.from_packed_proto(packed_input));
-  EXPECT_TRUE(lazy_input.input_params.embedding.linear_state_read_ids.empty());
+  EXPECT_TRUE(
+      lazy_input.input_params.cache_state_.linear_state_read_ids.empty());
   EXPECT_TRUE(lazy_input.runtime.input_host_buffer_has_layout);
 
   LlmForwardInput unpacked_input;
@@ -645,32 +644,32 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
                                                     unpacked_input,
                                                     false));
   EXPECT_TRUE(unpacked_input.input_params.meta.requires_host_restore);
-  EXPECT_EQ(unpacked_input.input_params.embedding.linear_state_ids,
+  EXPECT_EQ(unpacked_input.input_params.cache_state_.linear_state_ids,
             std::vector<int32_t>({7, 8}));
-  EXPECT_EQ(unpacked_input.input_params.embedding.linear_state_read_ids,
+  EXPECT_EQ(unpacked_input.input_params.cache_state_.linear_state_read_ids,
             std::vector<int32_t>({3, 4}));
-  EXPECT_FALSE(unpacked_input.input_params.embedding.linear_state_read_indices
-                   .defined());
+  EXPECT_FALSE(unpacked_input.input_params.cache_state_
+                   .linear_state_read_indices.defined());
   LlmModelParams device_params =
       unpacked_input.input_params.to(torch::Device(torch::kCPU));
-  EXPECT_TRUE(torch::equal(device_params.embedding.linear_state_read_indices,
+  EXPECT_TRUE(torch::equal(device_params.cache_state_.linear_state_read_indices,
                            torch::tensor({3, 4}, torch::kInt32)));
 }
 TEST(BatchPackedInputTest,
      LinearReadIndicesPreserveHostIdsAndClearWithTargetState) {
   LlmModelParams params;
-  params.embedding.linear_state_ids = {7, 8};
-  params.embedding.linear_state_read_ids = {3, 4};
+  params.cache_state_.linear_state_ids = {7, 8};
+  params.cache_state_.linear_state_read_ids = {3, 4};
   LlmModelParams device_params = params.to(torch::Device(torch::kCPU));
-  EXPECT_EQ(device_params.embedding.linear_state_read_ids,
+  EXPECT_EQ(device_params.cache_state_.linear_state_read_ids,
             std::vector<int32_t>({3, 4}));
-  EXPECT_TRUE(torch::equal(device_params.embedding.linear_state_read_indices,
+  EXPECT_TRUE(torch::equal(device_params.cache_state_.linear_state_read_indices,
                            torch::tensor({3, 4}, torch::kInt32)));
-  device_params.clear_linear_attention_state();
-  EXPECT_TRUE(device_params.embedding.linear_state_ids.empty());
-  EXPECT_TRUE(device_params.embedding.linear_state_read_ids.empty());
-  EXPECT_FALSE(device_params.embedding.linear_state_indices.defined());
-  EXPECT_FALSE(device_params.embedding.linear_state_read_indices.defined());
+  device_params.cache_state_.clear_linear_attention_state();
+  EXPECT_TRUE(device_params.cache_state_.linear_state_ids.empty());
+  EXPECT_TRUE(device_params.cache_state_.linear_state_read_ids.empty());
+  EXPECT_FALSE(device_params.cache_state_.linear_state_indices.defined());
+  EXPECT_FALSE(device_params.cache_state_.linear_state_read_indices.defined());
 }
 
 namespace {
@@ -858,7 +857,7 @@ TEST(BatchPackedInputTest, NativeVlmDecodeKeepsDomainWithoutVisionData) {
   const auto prepared =
       lazy_input.to(torch::Device(torch::kCPU), torch::kFloat32);
   EXPECT_TRUE(prepared.input_params.meta.batch_forward_type.is_decode());
-  EXPECT_FALSE(prepared.input_params.multimodal.mm_data.valid());
+  EXPECT_FALSE(prepared.mm_data_.valid());
   EXPECT_TRUE(torch::equal(prepared.token_ids.cpu(), source.token_ids));
   LlmForwardInput llm_input;
   DiTForwardInput dit_input;
@@ -866,25 +865,6 @@ TEST(BatchPackedInputTest, NativeVlmDecodeKeepsDomainWithoutVisionData) {
   EXPECT_FALSE(dit_input.from_packed_proto(payload));
   payload.mutable_payload()->at(10) = 1;
   EXPECT_FALSE(lazy_input.from_packed_proto(payload));
-}
-
-TEST(BatchPackedInputTest, BorrowedExecutionViewUpdatesNativeMetadata) {
-  static_assert(!std::is_copy_constructible_v<LlmForwardInput>);
-  static_assert(!std::is_copy_constructible_v<VlmForwardInput>);
-  static_assert(!std::is_copy_constructible_v<LlmModelParams>);
-  static_assert(!std::is_copy_constructible_v<VlmModelParams>);
-  static_assert(!std::is_default_constructible_v<ModelParamsView>);
-  LlmModelParams owner;
-  owner.attention.host.kv_seq_lens = {2};
-  ModelParamsView view(owner);
-  EXPECT_EQ(view.attention.host.kv_seq_lens.data(),
-            owner.attention.host.kv_seq_lens.data());
-  view.attention.host.kv_seq_lens[0] = 7;
-  EXPECT_EQ(owner.attention.host.kv_seq_lens[0], 7);
-  view.graph.input_tokens_override = torch::tensor({13}, torch::kInt32);
-  EXPECT_TRUE(torch::equal(owner.graph.input_tokens_override,
-                           torch::tensor({13}, torch::kInt32)));
-  EXPECT_FALSE(view.has_multimodal());
 }
 
 TEST(BatchPackedInputTest, NativeDiTPackedProtoRejectsMalformedPayloads) {
@@ -1164,7 +1144,7 @@ TEST(BatchPackedInputTest, NativeVlmSharedMemoryRetainsVisionAfterOverwrite) {
         torch::Device(torch::kCPU),
         InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE);
     source.token_ids = torch::tensor({91, 92}, torch::kInt32);
-    source.input_params.multimodal.deep_stacks.clear();
+    source.input_params.embedding.deep_stacks_.clear();
     ASSERT_TRUE(writer.input_write(source));
   }
   const auto prepared =
@@ -1177,7 +1157,7 @@ TEST(BatchPackedInputTest,
   const auto snapshot_view = [] {
     VlmModelParams owner;
     owner.attention.host.kv_seq_lens = {2};
-    owner.multimodal.deep_stacks = {torch::tensor({1.0F, 3.0F})};
+    owner.embedding.deep_stacks_ = {torch::tensor(/*values=*/{1.0F, 3.0F})};
     ModelParamsView borrowed(owner);
     auto retained = borrowed.clone().view();
     borrowed.attention.host.kv_seq_lens[0] = 9;
@@ -1185,9 +1165,8 @@ TEST(BatchPackedInputTest,
   }();
   EXPECT_EQ(snapshot_view.attention.host.kv_seq_lens,
             (std::vector<int32_t>{2}));
-  EXPECT_TRUE(snapshot_view.has_multimodal());
-  ASSERT_EQ(snapshot_view.multimodal().deep_stacks.size(), 1u);
-  EXPECT_TRUE(torch::equal(snapshot_view.multimodal().deep_stacks[0],
+  ASSERT_EQ(snapshot_view.embedding.deep_stacks_.size(), 1u);
+  EXPECT_TRUE(torch::equal(snapshot_view.embedding.deep_stacks_[0],
                            torch::tensor({1.0F, 3.0F})));
 }
 
@@ -1195,9 +1174,6 @@ TEST(BatchPackedInputTest, LlmSnapshotTransferMovesSpecExecutionTensors) {
   LlmModelParams owner;
   ModelParamsView params(owner);
   const torch::Tensor values = torch::tensor({1, 2}, torch::kInt32);
-  params.embedding.mtp_bootstrap_embeddings = values;
-  params.embedding.extra_token_ids = {3};
-  params.embedding.mtp_bootstrap_row_idxes = {4};
   params.graph.expanded_kv_seq_lens = values;
   params.graph.expanded_block_tables = values;
   params.graph.expanded_paged_kv_indptr = values;
@@ -1215,10 +1191,9 @@ TEST(BatchPackedInputTest, LlmSnapshotTransferMovesSpecExecutionTensors) {
   params.mtp_topk_state = MtpTopkState::from_tensor(values);
 
   const torch::Device target_device("meta");
-  ModelParamsView converted = params.clone().to(target_device).view();
+  ModelParamsView converted = params.clone().view().to(target_device).view();
 
   const std::vector<torch::Tensor> transferred_tensors = {
-      converted.embedding.mtp_bootstrap_embeddings,
       converted.graph.expanded_kv_seq_lens,
       converted.graph.expanded_block_tables,
       converted.graph.expanded_paged_kv_indptr,
@@ -1236,12 +1211,8 @@ TEST(BatchPackedInputTest, LlmSnapshotTransferMovesSpecExecutionTensors) {
   }
   ASSERT_NE(converted.mtp_topk_state, nullptr);
   EXPECT_EQ(converted.mtp_topk_state->device(), target_device);
-  EXPECT_FALSE(converted.has_multimodal());
   EXPECT_TRUE(converted.graph.spec_verify_source_addresses_stable);
   EXPECT_TRUE(converted.graph.spec_verify_static_graph_tasks_prepared);
-  EXPECT_EQ(converted.embedding.extra_token_ids, (std::vector<int32_t>{3}));
-  EXPECT_EQ(converted.embedding.mtp_bootstrap_row_idxes,
-            (std::vector<int32_t>{4}));
   EXPECT_EQ(converted.num_accepted_tokens_host, (std::vector<int64_t>{6}));
   ASSERT_EQ(converted.multi_block_tables.size(), 1u);
   EXPECT_TRUE(converted.multi_block_tables[0].device().is_cpu());
@@ -1254,25 +1225,26 @@ TEST(BatchPackedInputTest, LlmSnapshotTransferMovesSpecExecutionTensors) {
 
 TEST(BatchPackedInputTest, VlmDraftConversionExcludesTargetOnlyState) {
   auto target = make_vlm_transport_input();
-  target.input_params.embedding.linear_state_ids = {17};
-  target.input_params.embedding.linear_state_indices =
+  target.input_params.cache_state_.linear_state_ids = {17};
+  target.input_params.cache_state_.linear_state_indices =
       torch::tensor({17}, torch::kInt32);
-  target.input_params.embedding.linear_state_read_ids = {17};
-  target.input_params.embedding.linear_state_read_indices =
+  target.input_params.cache_state_.linear_state_read_ids = {17};
+  target.input_params.cache_state_.linear_state_read_indices =
       torch::tensor({17}, torch::kInt32);
-  target.input_params.linear_state_validity_mask = {0};
+  target.input_params.cache_state_.linear_state_validity_mask = {0};
   auto draft = make_llm_draft_input(target);
   EXPECT_TRUE(torch::equal(draft.token_ids, target.token_ids));
   EXPECT_TRUE(torch::equal(draft.positions, target.positions));
-  EXPECT_TRUE(draft.input_params.embedding.linear_state_ids.empty());
-  EXPECT_FALSE(draft.input_params.embedding.linear_state_indices.defined());
-  EXPECT_TRUE(draft.input_params.embedding.linear_state_read_ids.empty());
+  EXPECT_TRUE(draft.input_params.cache_state_.linear_state_ids.empty());
+  EXPECT_FALSE(draft.input_params.cache_state_.linear_state_indices.defined());
+  EXPECT_TRUE(draft.input_params.cache_state_.linear_state_read_ids.empty());
   EXPECT_FALSE(
-      draft.input_params.embedding.linear_state_read_indices.defined());
-  EXPECT_TRUE(draft.input_params.linear_state_validity_mask.empty());
+      draft.input_params.cache_state_.linear_state_read_indices.defined());
+  EXPECT_TRUE(
+      draft.input_params.cache_state_.linear_state_validity_mask.empty());
   draft.input_params.attention.host.kv_seq_lens[0] = 9;
   EXPECT_EQ(target.input_params.attention.host.kv_seq_lens[0], 2);
-  EXPECT_EQ(target.input_params.embedding.linear_state_ids,
+  EXPECT_EQ(target.input_params.cache_state_.linear_state_ids,
             (std::vector<int32_t>{17}));
   expect_vlm_transport_input(target);
 }

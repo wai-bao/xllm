@@ -320,7 +320,8 @@ TEST_F(EplbWorkerOptionsTest, ModelImplementationFollowsTargetAndDraftOptions) {
       EXPECT_EQ(input.token_ids.numel(), 3);
       EXPECT_EQ(input.token_ids.device(), device);
       EXPECT_EQ(input.positions.numel(), 3);
-      EXPECT_EQ(input.input_params.embedding.linear_state_indices.numel(), 3);
+      EXPECT_EQ(input.input_params.cache_state_.linear_state_indices.numel(),
+                3);
       EXPECT_EQ(batch.num_reqs, is_python ? 0 : 2);
       EXPECT_EQ(batch.num_tokens, is_python ? 3 : 2);
       EXPECT_EQ(batch.num_scheduled_tokens.empty(), is_python);

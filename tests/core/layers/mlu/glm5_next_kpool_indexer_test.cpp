@@ -1077,8 +1077,9 @@ TEST(Glm5NextKPoolIndexerTest,
   params.attention.host.kv_seq_lens = {7, 10};
   params.attention.host.block_tables =
       torch::tensor({{2, 1}, {3, 0}}, torch::kInt32);
-  params.embedding.linear_state_indices = torch::tensor({1, 2}, torch::kInt32);
-  params.linear_state_validity_mask = {1, 1};
+  params.cache_state_.linear_state_indices =
+      torch::tensor(/*values=*/{1, 2}, /*options=*/torch::kInt32);
+  params.cache_state_.linear_state_validity_mask = {1, 1};
   const auto context = make_decode_batch_context(input);
   DecodeBuildBuffers buffers;
   const std::vector<int32_t> query_lens{6, 3};

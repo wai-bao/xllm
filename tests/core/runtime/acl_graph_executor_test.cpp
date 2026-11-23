@@ -127,7 +127,7 @@ TEST(AclGraphStaticGraphTaskSignatureTest,
      BuildsSameSignatureFromCaptureAndSignal) {
   ModelParamsView params = ModelInputSnapshot(LlmModelParams()).view();
   params.parallel.query_start_loc = {0, 5};
-  params.embedding.linear_state_ids = {7};
+  params.cache_state_.linear_state_ids = {7};
   params.num_accepted_tokens_host = {4};
   const SpecVerifyGraphTaskSignal signal{
       .linear_state_id = 7,
@@ -886,12 +886,12 @@ TEST_F(AclGraphExecutorTest, BatchInputCarriesLinearStateIds) {
   ASSERT_NE(expected_embedding_id, expected_linear_state_id);
 
   auto forward_input = batch->prepare_forward_input(model_args_, nullptr);
-  EXPECT_EQ(forward_input.input_params.embedding.linear_state_ids,
+  EXPECT_EQ(forward_input.input_params.cache_state_.linear_state_ids,
             std::vector<int32_t>{expected_linear_state_id});
-  EXPECT_EQ(forward_input.input_params.embedding.embedding_ids,
+  EXPECT_EQ(forward_input.speculative_.embedding_ids_,
             std::vector<int32_t>{expected_embedding_id});
 
-  forward_input.input_params.linear_state_validity_mask = {1};
+  forward_input.input_params.cache_state_.linear_state_validity_mask = {1};
   forward_input = forward_input.to(*device_, torch::kFloat32);
   npu::GraphPersistentParam persistent_param(model_args_, *device_, options_);
   const auto& cache = first_full_attention_cache(kv_caches_);
@@ -906,9 +906,9 @@ TEST_F(AclGraphExecutorTest, BatchInputCarriesLinearStateIds) {
   ASSERT_TRUE(params_for_capture.has_value());
   EXPECT_EQ(params_for_capture->meta.num_sequences, 2);
   EXPECT_EQ(
-      params_for_capture->embedding.linear_state_ids,
+      params_for_capture->cache_state_.linear_state_ids,
       std::vector<int32_t>({expected_linear_state_id, kPaddingLinearStateId}));
-  EXPECT_EQ(params_for_capture->linear_state_validity_mask,
+  EXPECT_EQ(params_for_capture->cache_state_.linear_state_validity_mask,
             (std::vector<int64_t>{1, 0}));
 }
 
@@ -1112,13 +1112,14 @@ TEST_P(HybridSpecVerifyPaddingTest, MetadataCoversBucketPadding) {
       torch::zeros({kActualNumTokens}, int_options);
   params.attention.device.block_tables =
       torch::zeros({kNumSequences, 2}, int_options);
-  params.embedding.linear_state_ids = {1, 2, 3, 4};
-  params.embedding.linear_state_indices =
-      torch::tensor(params.embedding.linear_state_ids, int_options);
-  params.embedding.linear_state_read_ids = {5, 6, 7, 8};
-  params.embedding.linear_state_read_indices =
-      torch::tensor(params.embedding.linear_state_read_ids, int_options);
-  params.linear_state_validity_mask.assign(kNumSequences, 1);
+  params.cache_state_.linear_state_ids = {1, 2, 3, 4};
+  params.cache_state_.linear_state_indices =
+      torch::tensor(params.cache_state_.linear_state_ids, int_options);
+  params.cache_state_.linear_state_read_ids = {5, 6, 7, 8};
+  params.cache_state_.linear_state_read_indices =
+      torch::tensor(params.cache_state_.linear_state_read_ids, int_options);
+  params.cache_state_.linear_state_validity_mask.assign(kNumSequences,
+                                                        /*value=*/1);
   // Hybrid spec verify consumes token-wise expanded metadata: one row per
   // (sequence, draft token) with kv_seq_lens growing inside each sequence.
   constexpr int64_t kKvLen = 20;
@@ -1153,15 +1154,17 @@ TEST_P(HybridSpecVerifyPaddingTest, MetadataCoversBucketPadding) {
       static_cast<size_t>(kMetadataRows), kSpecWidth);
   expected_query_lengths.back() =
       static_cast<int32_t>(kBucketNumTokens - (kMetadataRows - 1) * kSpecWidth);
-  EXPECT_EQ(capture_params->embedding.linear_state_ids, expected_state_ids);
-  EXPECT_EQ(capture_params->linear_state_validity_mask, expected_validity);
-  EXPECT_TRUE(torch::equal(capture_params->embedding.linear_state_indices.cpu(),
-                           torch::tensor(expected_state_ids, torch::kInt32)));
+  EXPECT_EQ(capture_params->cache_state_.linear_state_ids, expected_state_ids);
+  EXPECT_EQ(capture_params->cache_state_.linear_state_validity_mask,
+            expected_validity);
+  EXPECT_TRUE(torch::equal(
+      capture_params->cache_state_.linear_state_indices.cpu(),
+      torch::tensor(expected_state_ids, /*options=*/torch::kInt32)));
   std::vector<int32_t> expected_read_ids = {5, 6, 7, 8};
   expected_read_ids.resize(static_cast<size_t>(kMetadataRows),
                            kPaddingLinearStateId);
   EXPECT_TRUE(
-      torch::equal(capture_params->embedding.linear_state_read_indices.cpu(),
+      torch::equal(capture_params->cache_state_.linear_state_read_indices.cpu(),
                    torch::tensor(expected_read_ids, torch::kInt32)));
   EXPECT_EQ(capture_params->attention.host.q_seq_lens, expected_query_lengths);
   EXPECT_TRUE(
@@ -1214,7 +1217,8 @@ TEST(AclGraphPersistentParamTest,
       torch::zeros({1, kActiveBlockTableWidth}, int_options);
   params.attention.device.q_cu_seq_lens =
       torch::tensor({0, kSpecWidth}, int_options);
-  params.embedding.linear_state_indices = torch::tensor({1}, int_options);
+  params.cache_state_.linear_state_indices =
+      torch::tensor(/*values=*/{1}, int_options);
   params.num_accepted_tokens = torch::tensor({1}, int_options);
   params.graph.expanded_kv_seq_lens =
       torch::tensor({15, 16, 17, 18, 19, 20}, int_options);
@@ -1366,17 +1370,18 @@ TEST(DSparkWorkerInputTest, InvalidatesTargetAttentionAndRecurrentMetadata) {
   LlmModelParams params;
   params.attn_metadata = std::make_shared<layer::AttentionMetadata>();
   params.multi_block_tables.resize(3);
-  params.embedding.linear_state_ids = {4};
-  params.embedding.linear_state_indices = torch::tensor({4}, torch::kInt32);
-  params.linear_state_validity_mask = {1};
+  params.cache_state_.linear_state_ids = {4};
+  params.cache_state_.linear_state_indices =
+      torch::tensor(/*values=*/{4}, /*options=*/torch::kInt32);
+  params.cache_state_.linear_state_validity_mask = {1};
 
   dflash_detail::invalidate_draft_model_geometry(params);
 
   EXPECT_EQ(params.attn_metadata, nullptr);
   EXPECT_EQ(params.multi_block_tables.size(), 3);
-  EXPECT_TRUE(params.embedding.linear_state_ids.empty());
-  EXPECT_FALSE(params.embedding.linear_state_indices.defined());
-  EXPECT_TRUE(params.linear_state_validity_mask.empty());
+  EXPECT_TRUE(params.cache_state_.linear_state_ids.empty());
+  EXPECT_FALSE(params.cache_state_.linear_state_indices.defined());
+  EXPECT_TRUE(params.cache_state_.linear_state_validity_mask.empty());
 }
 
 TEST(DSparkWorkerInputTest, ScalesPaddedAndRawDpTokenCountsTogether) {
@@ -1463,7 +1468,9 @@ TEST(AclGraphPersistentParamTest, SpecVerifyGraphUpdateSupportsRuntimeBatch) {
   const std::vector<AttentionInputView::PackedIntInput> extra_int_inputs = {
       {&token_values, &token_ids_host, &token_ids},
       {&position_values, &position_ids_host, &positions},
-      {&linear_state_indices, nullptr, &params.embedding.linear_state_indices},
+      {&linear_state_indices,
+       nullptr,
+       &params.cache_state_.linear_state_indices},
       {&accepted_tokens, nullptr, &params.num_accepted_tokens},
       {&expanded_kv_seq_lens, nullptr, &params.graph.expanded_kv_seq_lens},
       {&expanded_block_tables, nullptr, &expanded_block_tables_flat}};

@@ -59,6 +59,21 @@ class PackedForwardInput;
 class LlmForwardInput;
 constexpr int32_t kUnknownPackedSampleCount = -1;
 
+class SpeculativeInput final {
+ public:
+  std::vector<int32_t> embedding_ids_;
+
+  // chunked prefill case of speculative decoding
+  // extra token ids for each sequence, and -1 for last chunk
+  std::vector<int32_t> extra_token_ids_;
+
+  // Pending PD handoff bootstrap rows for the first MTP decode step.
+  std::vector<int32_t> mtp_bootstrap_sequence_indices_;
+  torch::Tensor mtp_bootstrap_embeddings_;
+
+  SpeculativeInput to(const torch::Device& device) const;
+};
+
 namespace detail {
 
 constexpr uint64_t kForwardInputBufferAlignment = 16;
@@ -123,29 +138,6 @@ struct ForwardInputBufferPlan {
       total += entry.aligned_bytes;
     }
     return total;
-  }
-
-  torch::Tensor build_host_buffer(uint64_t total_bytes) const {
-    auto buffer = torch::empty({static_cast<int64_t>(total_bytes)},
-                               torch::TensorOptions()
-                                   .dtype(torch::kUInt8)
-                                   .device(torch::kCPU)
-                                   .pinned_memory(true));
-    auto* base = static_cast<char*>(buffer.data_ptr());
-    for (const auto& entry : entries) {
-      const uint64_t bytes = static_cast<uint64_t>(
-          entry.host_tensor.numel() * entry.host_tensor.element_size());
-      if (bytes == 0) {
-        continue;
-      }
-      std::memcpy(base + entry.offset, entry.host_tensor.data_ptr(), bytes);
-      if (entry.aligned_bytes > bytes) {
-        std::memset(base + entry.offset + bytes,
-                    0,
-                    static_cast<size_t>(entry.aligned_bytes - bytes));
-      }
-    }
-    return buffer;
   }
 
   void bind_device_views(const torch::Tensor& device_buffer,
@@ -228,15 +220,6 @@ inline torch::Tensor normalize_positions_for_device(
   return positions;
 }
 
-template <typename Params>
-inline void clear_contiguous_input_buffer_tensor_targets(Params& params) {
-  params.embedding.input_embedding = torch::Tensor();
-  params.embedding.linear_state_indices = torch::Tensor();
-  params.embedding.mtp_bootstrap_embeddings = torch::Tensor();
-  params.graph.attn_mask = torch::Tensor();
-  params.graph.tiling_data = torch::Tensor();
-}
-
 template <typename Attention>
 inline bool add_attention_to_plan(const Attention& source,
                                   Attention& target,
@@ -271,20 +254,6 @@ inline bool add_attention_to_plan(const Attention& source,
                   &target.device.ring_cur_seqlen) &&
          plan.add(source.device.ring_cache_seqlen,
                   &target.device.ring_cache_seqlen);
-}
-
-template <typename Params>
-inline bool add_model_tensors_to_plan(const Params& source,
-                                      Params& target,
-                                      ForwardInputBufferPlan& plan) {
-  return plan.add(source.embedding.input_embedding,
-                  &target.embedding.input_embedding) &&
-         plan.add(source.embedding.linear_state_indices,
-                  &target.embedding.linear_state_indices) &&
-         plan.add(source.embedding.mtp_bootstrap_embeddings,
-                  &target.embedding.mtp_bootstrap_embeddings) &&
-         plan.add(source.graph.attn_mask, &target.graph.attn_mask) &&
-         plan.add(source.graph.tiling_data, &target.graph.tiling_data);
 }
 
 }  // namespace detail
@@ -370,150 +339,10 @@ class LlmForwardInput final {
   bool from_packed_attachment(const proto::PackedForwardInput& metadata,
                               const butil::IOBuf& attachment);
 
-  LlmForwardInput clone() const {
-    LlmForwardInput inputs;
-    inputs.runtime = runtime;
-    copy_non_runtime_metadata_to(inputs);
-    inputs.token_ids = token_ids;
-    inputs.positions = positions;
-    inputs.token_ids_host = token_ids_host;
-    inputs.positions_host = positions_host;
-    inputs.input_params = input_params.clone();
-    inputs.sampling_params = sampling_params;
-    inputs.json_object_errors = json_object_errors;
-    return inputs;
-  }
+  LlmForwardInput clone() const;
 
   LlmForwardInput to(const torch::Device& device,
-                     torch::ScalarType dtype) const {
-    if (runtime.device_tensors_ready) {
-      return clone();
-    }
-
-    if (runtime.input_host_buffer_has_layout) {
-      LlmForwardInput buffer_inputs;
-      const bool materialize_device_buffer =
-          ::xllm::ExecutionConfig::get_instance()
-              .use_contiguous_input_buffer() &&
-          detail::supports_contiguous_forward_input_buffer(device);
-      if (detail::unpack_from_input_host_buffer(
-              *this, device, dtype, buffer_inputs, materialize_device_buffer)) {
-        if (buffer_inputs.runtime.device_tensors_ready) {
-          return buffer_inputs;
-        }
-        return buffer_inputs.to(device, dtype);
-      }
-    }
-
-    if (::xllm::ExecutionConfig::get_instance().use_contiguous_input_buffer() &&
-        detail::supports_contiguous_forward_input_buffer(device)) {
-      LlmForwardInput contiguous_inputs;
-      if (to_contiguous_input_buffer(device, contiguous_inputs)) {
-        return contiguous_inputs;
-      }
-    }
-
-    LlmForwardInput inputs;
-    set_host_views(inputs);
-    const torch::Tensor& source_token_ids =
-        inputs.token_ids_host.defined() ? inputs.token_ids_host : token_ids;
-    const torch::Tensor& source_positions =
-        inputs.positions_host.defined() ? inputs.positions_host : positions;
-    inputs.token_ids = safe_to(source_token_ids, device, true);
-    inputs.positions = detail::normalize_positions_for_device(
-        safe_to(source_positions, device, true));
-    inputs.input_params = input_params.to(device);
-    inputs.sampling_params = sampling_params.to(device, dtype);
-    copy_metadata_to(inputs);
-    inputs.runtime.input_host_buffer = runtime.input_host_buffer;
-    inputs.runtime.device_input_buffer = runtime.device_input_buffer;
-    inputs.runtime.input_host_buffer_has_layout =
-        runtime.input_host_buffer_has_layout;
-    inputs.runtime.device_tensors_ready = true;
-    inputs.runtime.kv_slot_layout = runtime.kv_slot_layout;
-    return inputs;
-  }
-
-  bool to_contiguous_input_buffer(const torch::Device& device,
-                                  LlmForwardInput& inputs) const {
-    copy_metadata_to(inputs);
-    set_host_views(inputs);
-
-    const LlmModelParams& source_params = input_params;
-    if (missing_required_host_views(inputs)) {
-      return false;
-    }
-
-    inputs.input_params = source_params.clone();
-    detail::clear_contiguous_input_buffer_tensor_targets(inputs.input_params);
-
-    inputs.sampling_params = sampling_params;
-
-    torch::Tensor positions_for_device =
-        detail::normalize_positions_for_device(inputs.positions_host);
-
-    detail::ForwardInputBufferPlan plan;
-    if (!plan.add(inputs.token_ids_host, &inputs.token_ids) ||
-        !plan.add(positions_for_device, &inputs.positions)) {
-      return false;
-    }
-
-    if (!detail::add_attention_to_plan(
-            source_params.attention, inputs.input_params.attention, plan) ||
-        !detail::add_model_tensors_to_plan(
-            source_params, inputs.input_params, plan)) {
-      return false;
-    }
-
-    if (!detail::add_sampling_to_plan(
-            sampling_params, inputs.sampling_params, plan)) {
-      return false;
-    }
-
-    const uint64_t total_bytes = plan.prepare_layout();
-    if (total_bytes > 0) {
-      inputs.runtime.input_host_buffer = plan.build_host_buffer(total_bytes);
-      inputs.runtime.device_input_buffer =
-          safe_to(inputs.runtime.input_host_buffer,
-                  torch::TensorOptions().dtype(torch::kUInt8).device(device),
-                  true);
-      plan.bind_device_views(inputs.runtime.device_input_buffer, device);
-    }
-
-    inputs.runtime.device_tensors_ready = true;
-    inputs.runtime.input_host_buffer_has_layout = false;
-    return true;
-  }
-
-  void copy_metadata_to(LlmForwardInput& inputs) const {
-    copy_non_runtime_metadata_to(inputs);
-    inputs.runtime.kv_slot_layout = runtime.kv_slot_layout;
-    inputs.runtime.metadata_ready_event = runtime.metadata_ready_event;
-    inputs.runtime.retained_device_tensors = runtime.retained_device_tensors;
-  }
-
-  void copy_non_runtime_metadata_to(LlmForwardInput& inputs) const {
-    inputs.transfer_kv_infos = transfer_kv_infos;
-    inputs.input_host_sample_count = input_host_sample_count;
-    inputs.skip_sampling_for_logits_only = skip_sampling_for_logits_only;
-    inputs.return_selected_hidden = return_selected_hidden;
-    inputs.sample_sequence_ids = sample_sequence_ids;
-    inputs.sample_prior_output_rows = sample_prior_output_rows;
-    inputs.json_object_states = json_object_states;
-    inputs.json_object_state_snapshots = json_object_state_snapshots;
-  }
-
-  void set_host_views(LlmForwardInput& inputs) const {
-    inputs.token_ids_host =
-        token_ids_host.defined() ? token_ids_host : cpu_view(token_ids);
-    inputs.positions_host =
-        positions_host.defined() ? positions_host : cpu_view(positions);
-  }
-
-  bool missing_required_host_views(const LlmForwardInput& inputs) const {
-    return (token_ids.defined() && !inputs.token_ids_host.defined()) ||
-           (positions.defined() && !inputs.positions_host.defined());
-  }
+                     torch::ScalarType dtype) const;
 
   const torch::Tensor& host_token_ids() const {
     return token_ids_host.defined() ? token_ids_host : token_ids;
@@ -523,13 +352,6 @@ class LlmForwardInput final {
     return positions_host.defined() ? positions_host : positions;
   }
 
-  static torch::Tensor cpu_view(const torch::Tensor& tensor) {
-    if (tensor.defined() && tensor.device().is_cpu()) {
-      return tensor;
-    }
-    return torch::Tensor();
-  }
-
   // flatten token ids
   torch::Tensor token_ids;
   // flatten positions
@@ -537,6 +359,8 @@ class LlmForwardInput final {
   torch::Tensor token_ids_host;
   torch::Tensor positions_host;
   mutable LlmModelParams input_params;
+  SpeculativeInput speculative_;
+  std::vector<std::string> request_ids;
   SamplingParameters sampling_params;
   std::vector<std::string> sample_sequence_ids;
   std::vector<int32_t> sample_prior_output_rows;

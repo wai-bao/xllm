@@ -85,11 +85,13 @@ void apply_reference(StateSnapshot& states,
   if (reads_distinct_state) {
     return;
   }
-  for (size_t row = 0; row < params.embedding.linear_state_ids.size(); ++row) {
-    const int32_t write_id = params.embedding.linear_state_ids[row];
-    const int32_t read_id = params.embedding.linear_state_read_ids.empty()
-                                ? write_id
-                                : params.embedding.linear_state_read_ids[row];
+  for (size_t row = 0; row < params.cache_state_.linear_state_ids.size();
+       ++row) {
+    const int32_t write_id = params.cache_state_.linear_state_ids[row];
+    const int32_t read_id =
+        params.cache_state_.linear_state_read_ids.empty()
+            ? write_id
+            : params.cache_state_.linear_state_read_ids[row];
     if (write_id == 0 || read_id == write_id) {
       continue;
     }
@@ -210,10 +212,10 @@ class LifecycleWorker final : public LLMWorkerImpl {
     snapshots_.push_back(clone_states(states_));
     advance_state(
         states_,
-        input.input_params.embedding.linear_state_ids.front(),
-        input.input_params.embedding.linear_state_read_ids.empty()
-            ? input.input_params.embedding.linear_state_ids.front()
-            : input.input_params.embedding.linear_state_read_ids.front(),
+        input.input_params.cache_state_.linear_state_ids.front(),
+        input.input_params.cache_state_.linear_state_read_ids.empty()
+            ? input.input_params.cache_state_.linear_state_ids.front()
+            : input.input_params.cache_state_.linear_state_read_ids.front(),
         stride_);
     if (prepare_sampling) {
       prepare_sampling();
@@ -284,14 +286,14 @@ class NpuLinearStateLifecycleTest
     input.input_params.attention.host.q_seq_lens.assign(rows, 1);
     input.input_params.attention.host.kv_cache_tokens_nums =
         std::move(cached_tokens);
-    input.input_params.embedding.linear_state_ids = std::move(write_ids);
-    input.input_params.embedding.linear_state_read_ids = std::move(read_ids);
+    input.input_params.cache_state_.linear_state_ids = std::move(write_ids);
+    input.input_params.cache_state_.linear_state_read_ids = std::move(read_ids);
     LlmForwardInput processed;
     worker_->prepare_input(input, processed);
-    EXPECT_EQ(processed.input_params.embedding.linear_state_ids,
-              input.input_params.embedding.linear_state_ids);
-    EXPECT_EQ(processed.input_params.embedding.linear_state_read_ids,
-              input.input_params.embedding.linear_state_read_ids);
+    EXPECT_EQ(processed.input_params.cache_state_.linear_state_ids,
+              input.input_params.cache_state_.linear_state_ids);
+    EXPECT_EQ(processed.input_params.cache_state_.linear_state_read_ids,
+              input.input_params.cache_state_.linear_state_read_ids);
     return processed;
   }
 
@@ -300,13 +302,14 @@ class NpuLinearStateLifecycleTest
         reference_, input.input_params, stride_, reads_distinct_state_);
     expected_.push_back(clone_states(reference_));
     worker_->run(input);
-    EXPECT_EQ(input.input_params.linear_state_validity_mask, expected_mask);
+    EXPECT_EQ(input.input_params.cache_state_.linear_state_validity_mask,
+              expected_mask);
     advance_state(
         reference_,
-        input.input_params.embedding.linear_state_ids.front(),
-        input.input_params.embedding.linear_state_read_ids.empty()
-            ? input.input_params.embedding.linear_state_ids.front()
-            : input.input_params.embedding.linear_state_read_ids.front(),
+        input.input_params.cache_state_.linear_state_ids.front(),
+        input.input_params.cache_state_.linear_state_read_ids.empty()
+            ? input.input_params.cache_state_.linear_state_ids.front()
+            : input.input_params.cache_state_.linear_state_read_ids.front(),
         stride_);
   }
 
@@ -414,7 +417,8 @@ TEST_P(NpuLinearStateLifecycleTest, PreparesExpandedSpeculativeRows) {
                                   {1, 3},
                                   {2048, 0},
                                   /*forward_type=*/BatchForwardType::DECODE);
-  input.input_params.linear_state_validity_mask = {1, 1, 1, 0, 0, 0};
+  input.input_params.cache_state_.linear_state_validity_mask = {
+      1, 1, 1, 0, 0, 0};
   worker_->prepare_state(input.input_params);
   run(input, {1, 1, 1, 0, 0, 0});
   verify();
@@ -422,8 +426,8 @@ TEST_P(NpuLinearStateLifecycleTest, PreparesExpandedSpeculativeRows) {
 
 TEST_P(NpuLinearStateLifecycleTest, EmptyShardDoesNotTouchCache) {
   LlmModelParams params;
-  params.embedding.linear_state_ids = {2};
-  params.embedding.linear_state_read_ids = {2};
+  params.cache_state_.linear_state_ids = {2};
+  params.cache_state_.linear_state_read_ids = {2};
   worker_->prepare_state(params);
   verify();
 }

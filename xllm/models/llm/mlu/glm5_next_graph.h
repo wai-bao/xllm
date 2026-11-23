@@ -37,9 +37,9 @@ inline void Glm5NextGraphMetadataState::prepare(const torch::Tensor& positions,
                                                 ModelParamsView& params) {
   const auto& attention = params.attention.device;
   const size_t graph_rows = attention.kv_seq_lens.numel();
-  if (!params.embedding.linear_state_ids.empty() &&
-      params.embedding.linear_state_ids.size() != graph_rows) {
-    params.embedding.linear_state_ids.resize(
+  if (!params.cache_state_.linear_state_ids.empty() &&
+      params.cache_state_.linear_state_ids.size() != graph_rows) {
+    params.cache_state_.linear_state_ids.resize(
         graph_rows, static_cast<int32_t>(kPaddingLinearStateId));
   }
   if (!metadata_) {

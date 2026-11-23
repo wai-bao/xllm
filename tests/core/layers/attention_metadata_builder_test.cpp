@@ -41,9 +41,10 @@ ModelParamsView make_params() {
   params.attention.device.q_cu_seq_lens = torch::tensor({1, 2, 3}, options);
   params.attention.device.kv_cache_tokens_nums =
       torch::tensor({7, 0, 5}, options);
-  params.embedding.linear_state_ids = {4, 2, 9};
-  params.embedding.linear_state_indices = torch::tensor({4, 2, 9}, options);
-  params.linear_state_validity_mask = {0, 1, 0};
+  params.cache_state_.linear_state_ids = {4, 2, 9};
+  params.cache_state_.linear_state_indices =
+      torch::tensor(/*values=*/{4, 2, 9}, options);
+  params.cache_state_.linear_state_validity_mask = {0, 1, 0};
   return params;
 }
 
@@ -154,10 +155,11 @@ TEST(AttentionMetadataBuilderTest, MaterializesCanonicalInitialStateMask) {
 
 TEST(AttentionMetadataBuilderTest, DoesNotDeriveValidityFromContextOrSlot) {
   ModelParamsView params = make_params();
-  params.embedding.linear_state_indices = torch::tensor({0, 0, 0}, torch::kInt);
+  params.cache_state_.linear_state_indices =
+      torch::tensor(/*values=*/{0, 0, 0}, /*options=*/torch::kInt);
   params.attention.device.kv_cache_tokens_nums =
       torch::tensor({9, 0, 11}, torch::kInt);
-  params.linear_state_validity_mask = {0, 1, 0};
+  params.cache_state_.linear_state_validity_mask = {0, 1, 0};
 
   AttentionMetadata metadata =
       AttentionMetadataBuilder::build(params, /*enable_mla=*/false);
@@ -187,8 +189,10 @@ TEST(AttentionMetadataBuilderTest, SkipsInitialStateMaterializationOnRequest) {
       params, /*enable_mla=*/false, {}, std::nullopt, build_options);
 
   EXPECT_FALSE(metadata.has_initial_states.defined());
-  EXPECT_EQ(params.linear_state_validity_mask, std::vector<int64_t>({0, 1, 0}));
-  EXPECT_EQ(params.embedding.linear_state_ids, std::vector<int32_t>({4, 2, 9}));
+  EXPECT_EQ(params.cache_state_.linear_state_validity_mask,
+            (std::vector<int64_t>{0, 1, 0}));
+  EXPECT_EQ(params.cache_state_.linear_state_ids,
+            (std::vector<int32_t>{4, 2, 9}));
 }
 
 TEST(AttentionMetadataBuilderTest, DecodeDoesNotMaterializeInitialStateMask) {
@@ -203,10 +207,10 @@ TEST(AttentionMetadataBuilderTest, DecodeDoesNotMaterializeInitialStateMask) {
 
 TEST(AttentionMetadataBuilderTest, IgnoresTransportIdsWithoutLinearStateOps) {
   ModelParamsView params = make_params();
-  params.embedding.linear_state_ids = {-1, -1, -1};
-  params.embedding.linear_state_indices =
+  params.cache_state_.linear_state_ids = {-1, -1, -1};
+  params.cache_state_.linear_state_indices =
       torch::tensor({-1, -1, -1}, torch::kInt);
-  params.linear_state_validity_mask.clear();
+  params.cache_state_.linear_state_validity_mask.clear();
 
   AttentionMetadata metadata =
       AttentionMetadataBuilder::build(params, /*enable_mla=*/false);

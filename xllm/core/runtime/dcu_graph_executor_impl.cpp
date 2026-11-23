@@ -780,7 +780,8 @@ DcuStream DcuGraphExecutorImpl::get_capture_stream(
 ModelOutput DcuGraphExecutorImpl::run(const torch::Tensor& tokens,
                                       const torch::Tensor& positions,
                                       std::vector<KVCache>& kv_caches,
-                                      const ModelParamsView& params) {
+                                      const ModelParamsView& params,
+                                      MMBatchData* /*mm_data*/) {
   return run_impl(model_, tokens, positions, kv_caches, params);
 }
 

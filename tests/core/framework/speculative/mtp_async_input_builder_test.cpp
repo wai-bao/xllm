@@ -453,9 +453,10 @@ TEST(MtpAsyncInputBuilderTest, PybindViewExposesLinearStateReadAndWriteSlots) {
   metadata->is_dummy = true;
 
   ModelParamsView params = ModelInputSnapshot(LlmModelParams()).view();
-  params.embedding.linear_state_ids = {3, 7};
-  params.embedding.linear_state_indices = torch::tensor({3, 7}, torch::kInt);
-  params.embedding.linear_state_read_ids = {2, 6};
+  params.cache_state_.linear_state_ids = {3, 7};
+  params.cache_state_.linear_state_indices =
+      torch::tensor(/*values=*/{3, 7}, /*options=*/torch::kInt);
+  params.cache_state_.linear_state_read_ids = {2, 6};
   params.meta.batch_forward_type = BatchForwardType::PREFILL;
 
   py::object py_metadata =

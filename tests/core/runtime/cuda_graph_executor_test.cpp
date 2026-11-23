@@ -509,8 +509,9 @@ TEST(CudaGraphExecutorTest, DecodeMetadataFastPathUpdatesLinearStateIndices) {
   torch::Tensor tokens = torch::tensor({10, 11}, iopt);
   torch::Tensor positions = torch::tensor({20, 21}, iopt);
   ModelParamsView params = make_multi_sequence_decode_params(device);
-  params.embedding.linear_state_ids = {8, 6};
-  params.embedding.linear_state_indices = torch::tensor({8, 6}, iopt);
+  params.cache_state_.linear_state_ids = {8, 6};
+  params.cache_state_.linear_state_indices =
+      torch::tensor(/*values=*/{8, 6}, iopt);
   std::vector<KVCache> kv = MakeKvCaches(device,
                                          /*num_pages=*/16,
                                          /*page_size=*/1,
@@ -530,7 +531,7 @@ TEST(CudaGraphExecutorTest, DecodeMetadataFastPathUpdatesLinearStateIndices) {
   EXPECT_TRUE(torch::equal(
       persistent.persistent_linear_state_indices(/*actual_batch_size=*/2).cpu(),
       torch::tensor({8, 6}, torch::dtype(torch::kInt32))));
-  EXPECT_TRUE(torch::equal(updated->embedding.linear_state_indices.cpu(),
+  EXPECT_TRUE(torch::equal(updated->cache_state_.linear_state_indices.cpu(),
                            torch::tensor({8, 6}, torch::dtype(torch::kInt32))));
 }
 

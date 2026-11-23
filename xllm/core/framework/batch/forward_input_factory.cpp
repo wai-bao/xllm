@@ -178,11 +178,11 @@ void ForwardInputFactory<Input>::prepare_rank_inputs(
     state.dp_is_decode[dp_rank] =
         current_forward_type.is_decode() && meta.q_max_seq_len == 1;
 
-    const auto& embedding = input.input_params.embedding;
-    if (dp_batch_embedding_ids_[dp_rank] != embedding.embedding_ids ||
-        dp_batch_request_ids_[dp_rank] != embedding.request_ids) {
-      dp_batch_embedding_ids_[dp_rank] = embedding.embedding_ids;
-      dp_batch_request_ids_[dp_rank] = embedding.request_ids;
+    const auto& speculative = input.speculative_;
+    if (dp_batch_embedding_ids_[dp_rank] != speculative.embedding_ids_ ||
+        dp_batch_request_ids_[dp_rank] != input.request_ids) {
+      dp_batch_embedding_ids_[dp_rank] = speculative.embedding_ids_;
+      dp_batch_request_ids_[dp_rank] = input.request_ids;
       ++dp_batch_generations_[dp_rank];
     }
   }

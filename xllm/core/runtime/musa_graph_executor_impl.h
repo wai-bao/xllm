@@ -378,7 +378,8 @@ class MusaGraphExecutorImpl final : public ExecutorImpl {
   ModelOutput run(const torch::Tensor& tokens,
                   const torch::Tensor& positions,
                   std::vector<KVCache>& kv_caches,
-                  const ModelParamsView& params) override;
+                  const ModelParamsView& params,
+                  MMBatchData* mm_data = nullptr) override;
 
   // Return current graph executor memory usage in bytes (including persistent
   // parameters). Exposed for tests and diagnostics.

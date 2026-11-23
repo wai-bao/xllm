@@ -188,8 +188,8 @@ class HybridConv1dMockLM final : public CausalLM {
           params.meta.q_max_seq_len > 1;
       const std::vector<int64_t> empty_host_args;
       const std::vector<int64_t> cache_indices(
-          params.embedding.linear_state_ids.begin(),
-          params.embedding.linear_state_ids.end());
+          params.cache_state_.linear_state_ids.begin(),
+          params.cache_state_.linear_state_ids.end());
       const auto& nat_ref =
           is_target_verify ? params.num_accepted_tokens_host : empty_host_args;
 
@@ -635,8 +635,9 @@ class AclGraphTaskUpdateTest : public ::testing::Test {
 
     fi.input_params.attention.host.q_seq_lens.assign(
         static_cast<size_t>(num_sequences), num_spec_tokens);
-    fi.input_params.linear_state_validity_mask = build_linear_state_mask(
-        fi.input_params.attention.host.kv_cache_tokens_nums, num_sequences);
+    fi.input_params.cache_state_.linear_state_validity_mask =
+        build_linear_state_mask(
+            fi.input_params.attention.host.kv_cache_tokens_nums, num_sequences);
 
     fi.input_params.num_accepted_tokens_host.assign(
         static_cast<size_t>(num_sequences), 1);
@@ -760,9 +761,9 @@ TEST_F(AclGraphTaskUpdateTest, CaptureReplayVsEagerDecodeBranch) {
     auto input = batch->prepare_forward_input(model_args_, nullptr);
     input = input.to(*device_, kDtype);
     populate_query_start_loc(input.input_params);
-    const auto original_ids = input.input_params.embedding.linear_state_ids;
+    const auto original_ids = input.input_params.cache_state_.linear_state_ids;
     const auto original_device_ids =
-        input.input_params.embedding.linear_state_indices.clone();
+        input.input_params.cache_state_.linear_state_indices.clone();
 
     auto kv_eager = create_hybrid_kv_caches();
     kv_eager[0].get_conv_cache().normal_();
@@ -791,9 +792,9 @@ TEST_F(AclGraphTaskUpdateTest, CaptureReplayVsEagerDecodeBranch) {
                                   /*atol=*/1e-2));
       EXPECT_TRUE(torch::equal(kv_eager[0].get_conv_cache().slice(0, 1),
                                kv_graph[0].get_conv_cache().slice(0, 1)));
-      EXPECT_EQ(input.input_params.embedding.linear_state_ids, original_ids);
+      EXPECT_EQ(input.input_params.cache_state_.linear_state_ids, original_ids);
       EXPECT_TRUE(
-          torch::equal(input.input_params.embedding.linear_state_indices,
+          torch::equal(input.input_params.cache_state_.linear_state_indices,
                        original_device_ids));
       input.token_ids.add_(1);
       input.positions.add_(1);
@@ -1011,8 +1012,8 @@ TEST_F(AclGraphTaskUpdateTest,
   fi2 = fi2.to(*device_, kDtype);
   populate_query_start_loc(fi2.input_params);
 
-  EXPECT_NE(fi1.input_params.embedding.linear_state_ids,
-            fi2.input_params.embedding.linear_state_ids)
+  EXPECT_NE(fi1.input_params.cache_state_.linear_state_ids,
+            fi2.input_params.cache_state_.linear_state_ids)
       << "linear_state_ids (cache_indices) must differ between runs";
 
   auto out1_saved = out1.hidden_states.clone();
@@ -1117,7 +1118,7 @@ TEST_F(AclGraphTaskUpdateTest, StaticMtpPrepareReplaysFiaSpecVerifyWidths) {
     ASSERT_EQ(expanded_kv_seq_lens.size(), static_cast<size_t>(spec_width));
     const SpecVerifyGraphTaskSignal signal{
         .linear_state_id =
-            forward_input.input_params.embedding.linear_state_ids.front(),
+            forward_input.input_params.cache_state_.linear_state_ids.front(),
         .num_accepted_tokens =
             forward_input.input_params.num_accepted_tokens_host.front(),
         .spec_width = spec_width,
