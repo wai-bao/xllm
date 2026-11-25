@@ -35,9 +35,6 @@ class CollectiveCommunicatorBase {
 
   virtual const ParallelArgs* parallel_args() = 0;
 
-  int get_global_rank() const { return global_rank_; }
-  int get_world_size() const { return world_size_; }
-
  protected:
   int global_rank_;
   int world_size_;

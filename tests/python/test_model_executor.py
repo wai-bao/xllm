@@ -1296,13 +1296,13 @@ class TestBindKvCaches:
 
 
 @pytest.mark.parametrize(
-    ("model_type", "is_draft", "speculative_tokens", "decoding_tokens"),
+    ("model_type", "is_draft", "speculative_tokens"),
     [
-        ("glm_moe_dsa", False, 1, 1),
-        ("glm_moe_dsa", False, 0, 3),
-        ("glm_moe_dsa_mtp", True, 0, 1),
-        ("deepseek_v4", False, 0, 1),
-        ("deepseek_v4", False, 1, 1),
+        ("glm_moe_dsa", False, 1),
+        ("glm_moe_dsa", False, 0),
+        ("glm_moe_dsa_mtp", True, 0),
+        ("deepseek_v4", False, 0),
+        ("deepseek_v4", False, 1),
     ],
 )
 @pytest.mark.parametrize("kv_split", [0, 1, 2])
@@ -1310,7 +1310,6 @@ def test_cp_admission_preserves_model_specific_kv_support(
     model_type: str,
     is_draft: bool,
     speculative_tokens: int,
-    decoding_tokens: int,
     kv_split: int,
 ) -> None:
     config = {

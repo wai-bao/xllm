@@ -34,13 +34,6 @@ inline bool is_npu(const torch::Tensor& tensor) {
   return tensor.device().is_privateuseone();
 }
 
-torch::Tensor flatten_for_scatter_gather(std::vector<torch::Tensor>& tensors) {
-  auto& t = tensors[0];
-  std::vector<int64_t> sizes{static_cast<int64_t>(tensors.size())};
-  sizes.insert(sizes.end(), t.sizes().begin(), t.sizes().end());
-  return torch::empty(sizes, t.options());
-}
-
 HcclDataType to_hccl_data_type(const torch::Tensor& input) {
   const auto type = input.scalar_type();
   switch (type) {

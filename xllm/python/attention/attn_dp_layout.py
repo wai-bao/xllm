@@ -17,15 +17,12 @@
 The target path keeps ``q_a_proj`` and ``kv_a_proj_with_mqa`` replicated while
 sharding the head-dependent weights. This module describes the logical tensor
 layouts at C2 (Q heads), C3 (attention latent), and C4 (O reduction). It is a
-CPU-testable reference and deliberately contains no process-group calls.
+CPU-testable shape contract and deliberately contains no process-group calls.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
-
-import torch
 
 
 @dataclass(frozen=True)
@@ -63,103 +60,6 @@ class AttnDpLayout:
         replica, hence each owner receives two weight shards.
         """
         return self.owner_heads if self.owner_heads is not None else self.local_heads
-
-    def _validate_rank_tensors(
-        self,
-        tensors: Sequence[torch.Tensor],
-        expected_rank: int,
-        expected_shape: tuple[int, ...] | None = None,
-        name: str = "tensor",
-    ) -> None:
-        if len(tensors) != self.world_size:
-            raise ValueError(f"{name} needs {self.world_size} rank tensors, got {len(tensors)}")
-        for rank, tensor in enumerate(tensors):
-            if tensor.ndim != expected_rank:
-                raise ValueError(f"{name}[{rank}] must have rank {expected_rank}, got {tensor.ndim}")
-            if expected_shape is not None and tuple(tensor.shape) != expected_shape:
-                raise ValueError(f"{name}[{rank}] must have shape {expected_shape}, got {tuple(tensor.shape)}")
-
-    def c2_q_heads_to_owners(
-        self,
-        q_heads_by_rank: Sequence[torch.Tensor],
-        local_tokens: int,
-    ) -> tuple[torch.Tensor, ...]:
-        """Assemble each owner's complete Q heads from head-sharded ranks.
-
-        Each source rank owns ``[global_tokens, local_heads, q_head_dim]`` and
-        has already produced the Q heads for every global token. The result for
-        owner ``r`` is ``[local_tokens, num_heads, q_head_dim]`` containing only
-        that owner's token rows.
-        """
-
-        if local_tokens <= 0:
-            raise ValueError(f"local_tokens must be positive, got {local_tokens}")
-        global_tokens = local_tokens * self.world_size
-        expected_shape = (global_tokens, self.local_heads, self.q_head_dim)
-        self._validate_rank_tensors(q_heads_by_rank, 3, expected_shape, "q_heads_by_rank")
-        return tuple(
-            torch.cat(
-                [q_heads[owner * local_tokens : (owner + 1) * local_tokens] for q_heads in q_heads_by_rank],
-                dim=1,
-            )
-            for owner in range(self.world_size)
-        )
-
-    def c3_attention_to_weight_ranks(
-        self,
-        attention_by_owner: Sequence[torch.Tensor],
-        local_tokens: int,
-    ) -> tuple[torch.Tensor, ...]:
-        """Pack complete owner attention outputs for head-sharded weights.
-
-        Each owner supplies ``[local_tokens, num_heads, kv_lora_rank]``. The
-        result for weight rank ``r`` is ``[global_tokens, local_heads,
-        kv_lora_rank]`` in owner-rank order.
-        """
-
-        if local_tokens <= 0:
-            raise ValueError(f"local_tokens must be positive, got {local_tokens}")
-        expected_shape = (local_tokens, self.num_heads, self.kv_lora_rank)
-        self._validate_rank_tensors(attention_by_owner, 3, expected_shape, "attention_by_owner")
-        return tuple(
-            torch.cat(
-                [
-                    attention[:, rank * self.local_heads : (rank + 1) * self.local_heads]
-                    for attention in attention_by_owner
-                ],
-                dim=0,
-            )
-            for rank in range(self.world_size)
-        )
-
-    def c4_o_partials_to_owners(
-        self,
-        o_partials_by_rank: Sequence[torch.Tensor],
-        local_tokens: int,
-    ) -> tuple[torch.Tensor, ...]:
-        """Reduce full-token O partials and return each owner's token rows."""
-
-        if local_tokens <= 0:
-            raise ValueError(f"local_tokens must be positive, got {local_tokens}")
-        global_tokens = local_tokens * self.world_size
-        expected_shape = (global_tokens, self.hidden_size)
-        self._validate_rank_tensors(o_partials_by_rank, 2, expected_shape, "o_partials_by_rank")
-        reduced = torch.stack(tuple(o_partials_by_rank), dim=0).sum(dim=0)
-        return tuple(reduced[owner * local_tokens : (owner + 1) * local_tokens] for owner in range(self.world_size))
-
-    def c4_o_partials_to_global(
-        self,
-        o_partials_by_rank: Sequence[torch.Tensor],
-        local_tokens: int,
-    ) -> torch.Tensor:
-        """Reference C4 AllReduce result with global token rows retained."""
-
-        if local_tokens <= 0:
-            raise ValueError(f"local_tokens must be positive, got {local_tokens}")
-        global_tokens = local_tokens * self.world_size
-        expected_shape = (global_tokens, self.hidden_size)
-        self._validate_rank_tensors(o_partials_by_rank, 2, expected_shape, "o_partials_by_rank")
-        return torch.stack(tuple(o_partials_by_rank), dim=0).sum(dim=0)
 
 
 __all__ = ["AttnDpLayout"]
