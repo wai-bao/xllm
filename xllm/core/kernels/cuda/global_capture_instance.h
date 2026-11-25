@@ -55,17 +55,12 @@ class GlobalCaptureInstance {
     // No lock needed - thread-local instance
     return is_capturing_;
   }
-  // Get current graph (for use in hooks)
-  at::cuda::CUDAGraph* get_current_graph() { return current_graph_.get(); }
 
  private:
   // Constructor and destructor must be defined in .cpp where PiecewiseGraphs
   // is complete
   GlobalCaptureInstance();
   ~GlobalCaptureInstance();
-
-  // Helper: cleanup state
-  void cleanup_capture_state();
 
   // Internal versions without locking
   void temporarily_end_graph_locked();

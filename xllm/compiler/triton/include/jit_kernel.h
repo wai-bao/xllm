@@ -66,20 +66,6 @@ class JITKernel final {
 
   void set_autotune(bool on, std::vector<LaunchCfg> space = {});
 
-  template <typename... Args>
-  void autotune(void* stream, Grid g, Args&&... args) {
-    ensure_signature();
-    ArgPack pack;
-    SpecList specs;
-    size_t idx = 0;
-    (process_one(std::forward<Args>(args), pack, specs, sig_, idx), ...);
-    if (kAppendGlobalScratch) {
-      pack.push<void*>(nullptr);
-      pack.push<void*>(nullptr);
-    }
-    autotune_impl(stream, g, pack, specs);
-  }
-
  private:
   explicit JITKernel(std::string py_path, std::string fn_name);
 

@@ -21,13 +21,13 @@ limitations under the License.
 #include <cmath>
 
 #include "core/kv_cache/storage/kv_cache.h"
+#include "core/util/free_port.h"
 #include "framework/model/model_args.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "framework/state_dict/state_dict.h"
 #include "layers/mlu/tests_utils.h"
 #include "platform/device.h"
 #include "platform/platform.h"
-#include "util/net.h"
 
 namespace xllm {
 namespace layer {

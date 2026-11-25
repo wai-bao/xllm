@@ -91,16 +91,6 @@ void EtcdClient::add_watch(const std::string& key_prefix,
   watchers_[key_prefix] = {std::move(watcher), callback};
 }
 
-void EtcdClient::remove_watch(const std::string& key_prefix) {
-  std::lock_guard<std::mutex> lock(watchers_mutex_);
-
-  auto it = watchers_.find(key_prefix);
-  if (it != watchers_.end()) {
-    it->second.watcher->Cancel();
-    watchers_.erase(it);
-  }
-}
-
 void EtcdClient::stop_watch() {
   std::lock_guard<std::mutex> lock(watchers_mutex_);
 

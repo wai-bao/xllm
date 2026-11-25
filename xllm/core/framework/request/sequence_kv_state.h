@@ -138,13 +138,6 @@ class KVCacheState {
   void set_transfer_kv_info(TransferKVInfo&& info);
   std::optional<TransferKVInfo>& transfer_kv_info();
 
-  uint32_t pushed_local_block_count() const {
-    return pushed_local_block_count_;
-  }
-  void set_pushed_local_block_count(uint32_t n) {
-    pushed_local_block_count_ = n;
-  }
-
   size_t next_transfer_block_idx() const;
   void advance_transfer_block_idx(size_t idx);
 
@@ -190,10 +183,6 @@ class KVCacheState {
 
   // Pre-grow cache insert cursor per block type. See num_cached_blocks() above.
   std::map<BlockType, size_t> num_cached_blocks_;
-
-  // Number of local KV blocks already pushed to the decode instance.
-  // Used for incremental push in chunked prefill + PD disagg mode.
-  uint32_t pushed_local_block_count_ = 0;
 };
 
 }  // namespace xllm

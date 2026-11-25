@@ -182,8 +182,6 @@ bool enqueue_stream_dependency(const torch::Device& device,
 
 }  // namespace
 
-bool is_stream_capturing() { return is_current_stream_capturing(); }
-
 void bind_tvmffi_stream(const torch::Device& device) {
   if (!is_torch_device(device)) {
     return;
@@ -269,14 +267,6 @@ void sync_ffi_stream_for_preparation(const torch::Device& device) {
   }
   c10::musa::MUSAGuard device_guard(device.index());
   get_or_create_tvmffi_stream(device.index()).synchronize();
-}
-
-void sync_graph_preparation_stage(const torch::Device& device) {
-  if (!s_force_ffi_preparation_sync) {
-    return;
-  }
-  sync_current_stream_for_preparation(device);
-  sync_ffi_stream_for_preparation(device);
 }
 
 TvmffiPreparationSyncGuard::TvmffiPreparationSyncGuard()
@@ -871,8 +861,6 @@ void end_ffi_alloc_replay() {
   g_ffi_alloc_state.replay_idx = 0;
   g_ffi_alloc_state.mode = FfiAllocMode::kPassthrough;
 }
-
-FfiAllocMode get_ffi_alloc_mode() { return g_ffi_alloc_state.mode; }
 
 void bind_tvmffi_stream_to_current_torch_stream(const torch::Device& device) {
   if (is_torch_device(device)) {

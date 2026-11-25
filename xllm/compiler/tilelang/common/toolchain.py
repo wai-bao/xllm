@@ -89,19 +89,6 @@ def sha256_file(path: str | Path) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def git_head(path: str | Path) -> str:
-    repo_path = str(Path(path).resolve())
-    result = subprocess.run(
-        ["git", "-c", f"safe.directory={repo_path}", "-C", repo_path, "rev-parse", "HEAD"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip()
-
-
 def find_required_executable(name: str) -> str:
     executable = shutil.which(name)
     if not executable:

@@ -865,11 +865,9 @@ TEST(TransportCodecTest,
       ForwardType::RAW_OUTPUT,
       /*rank=*/0);
   bool writer_is_creator = false;
-  SharedMemoryTransport writer(
-      name, /*size=*/4096, writer_is_creator, ForwardType::RAW_OUTPUT);
+  SharedMemoryTransport writer(name, /*size=*/4096, writer_is_creator);
   bool reader_is_creator = false;
-  SharedMemoryTransport reader(
-      name, /*size=*/4096, reader_is_creator, ForwardType::RAW_OUTPUT);
+  SharedMemoryTransport reader(name, /*size=*/4096, reader_is_creator);
   constexpr int64_t kLargeRoundCount = (int64_t{1} << 33) + 7;
   const std::vector<SpeculativeTokenStats> stats{
       {1, 3, 1}, {0, 0, 1}, {2, 7, kLargeRoundCount}};

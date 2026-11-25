@@ -34,12 +34,6 @@ GlobalCaptureInstance& GlobalCaptureInstance::get_instance() {
 GlobalCaptureInstance::GlobalCaptureInstance() = default;
 GlobalCaptureInstance::~GlobalCaptureInstance() = default;
 
-void GlobalCaptureInstance::cleanup_capture_state() {
-  is_capturing_ = false;
-  current_graph_.reset();
-  current_piecewise_graph_.reset();
-}
-
 void GlobalCaptureInstance::begin_capture(const at::cuda::MempoolId_t& pool) {
   CHECK(!is_capturing_) << "Already capturing, call end_capture() first";
 

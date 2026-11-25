@@ -67,12 +67,6 @@ class SharedVMMAllocator {
   void switch_to_new_virtual_space();
 
   /**
-   * @brief Reset the allocation pointer to the beginning (deprecated).
-   * Use switch_to_new_virtual_space() instead to avoid address conflicts.
-   */
-  void reset_allocation_pointer();
-
-  /**
    * @brief Allocate memory from the VMM buffer.
    * @param size The size of memory to allocate.
    * @return Pointer to the allocated memory.
@@ -126,13 +120,6 @@ class SharedVMMAllocator {
    * @param new_size The minimum required mapped size.
    */
   void extend_mapping(size_t new_size);
-
-  /**
-   * @brief Map physical memory to a virtual address space.
-   * @param space The virtual space to map to.
-   * @param start_handle_idx Start index in handles_ to map from.
-   */
-  void map_physical_to_virtual(VirtualSpace& space, size_t start_handle_idx);
 
   /**
    * @brief Get the granularity size for physical memory pages.

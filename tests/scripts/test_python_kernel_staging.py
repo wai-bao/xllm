@@ -23,7 +23,7 @@ import unittest
 from pathlib import Path
 from types import ModuleType
 
-from scripts.build_support.utils import load_setup_module as _load_setup_module
+from tests.scripts.setup_test_utils import load_setup_module as _load_setup_module
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

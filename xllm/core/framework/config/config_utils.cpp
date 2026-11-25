@@ -136,22 +136,6 @@ nlohmann::ordered_json build_startup_config_json() {
 
 }  // namespace
 
-JsonReader load_json_file(const std::string& config_path) {
-  JsonReader reader;
-  if (!config_path.empty()) {
-    reader.parse(config_path);
-  }
-  return reader;
-}
-
-JsonReader parse_json_string(std::string_view config_json) {
-  JsonReader reader;
-  if (!config_json.empty()) {
-    reader.parse_text(std::string(config_json));
-  }
-  return reader;
-}
-
 bool is_flag_specified(const char* flag_name) {
   google::CommandLineFlagInfo flag_info;
   if (!google::GetCommandLineFlagInfo(flag_name, &flag_info)) {

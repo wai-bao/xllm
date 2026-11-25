@@ -453,13 +453,13 @@ void WorkerServer::prepare_shm(
     string name = SharedMemoryTransport::create_unique_name(
         name_prefix, dp_group, ForwardType::RAW_INPUT, parallel_args.rank());
     input_shm_manager = std::make_unique<SharedMemoryTransport>(
-        name, options.input_shm_size(), is_creator, ForwardType::RAW_INPUT);
+        name, options.input_shm_size(), is_creator);
     LOG(INFO) << "Create input shared memory manager with name: " << name;
 
     name = SharedMemoryTransport::create_unique_name(
         name_prefix, dp_group, ForwardType::RAW_OUTPUT, parallel_args.rank());
     output_shm_manager = std::make_unique<SharedMemoryTransport>(
-        name, options.output_shm_size(), is_creator, ForwardType::RAW_OUTPUT);
+        name, options.output_shm_size(), is_creator);
     LOG(INFO) << "Create output shared memory manager with name: " << name;
   }
 }

@@ -141,7 +141,7 @@ class BatchGroupFixture final {
       managers_.emplace_back(std::make_unique<BlockManagerImpl>(
           make_block_options(sequences_per_rank, prompt_tokens)));
       Batch& batch = batches_[rank];
-      batch.reserve(sequences_per_rank, /*group_count=*/0);
+      batch.reserve(sequences_per_rank, /*input_embedding_count=*/0);
       const size_t prefill_count = workload == Workload::PREFILL
                                        ? sequences_per_rank
                                        : (workload == Workload::MIXED ? 1 : 0);

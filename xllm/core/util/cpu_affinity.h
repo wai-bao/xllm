@@ -52,8 +52,6 @@ class CpuAffinity final {
 
   int32_t next_cpu_core();
 
-  size_t total_cpu_cores() { return cpu_cores_.size(); }
-
  private:
   std::mutex mu_;
   std::vector<int32_t> cpu_cores_;

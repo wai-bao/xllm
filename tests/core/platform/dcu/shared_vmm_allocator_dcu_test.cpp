@@ -126,31 +126,6 @@ TEST(SharedVMMAllocatorDcuTest, ResetAllocationPointerReusesSameAddress) {
   ASSERT_EQ(allocator.current_offset(), granularity * 2);
   ASSERT_EQ(allocator.mapped_size(), granularity * 2);
   ASSERT_EQ(allocator.high_water_mark(), granularity * 2);
-
-  const std::size_t mapped_before_reset = allocator.mapped_size();
-  const std::size_t high_water_before_reset = allocator.high_water_mark();
-
-  allocator.reset_allocation_pointer();
-
-  EXPECT_EQ(allocator.current_offset(), 0u);
-  EXPECT_EQ(allocator.mapped_size(), mapped_before_reset);
-  EXPECT_EQ(allocator.high_water_mark(), high_water_before_reset);
-
-  void* third = allocator.allocate(64);
-  ASSERT_NE(third, nullptr);
-
-  EXPECT_EQ(third, first);
-  EXPECT_EQ(allocator.current_offset(), granularity);
-  EXPECT_EQ(allocator.mapped_size(), mapped_before_reset);
-  EXPECT_EQ(allocator.high_water_mark(), high_water_before_reset);
-
-  void* fourth = allocator.allocate(64);
-  ASSERT_NE(fourth, nullptr);
-
-  EXPECT_EQ(fourth, second);
-  EXPECT_EQ(allocator.current_offset(), granularity * 2);
-  EXPECT_EQ(allocator.mapped_size(), mapped_before_reset);
-  EXPECT_EQ(allocator.high_water_mark(), high_water_before_reset);
 }
 
 TEST(SharedVMMAllocatorDcuTest, SwitchToNewVirtualSpaceSharesPhysicalMemory) {

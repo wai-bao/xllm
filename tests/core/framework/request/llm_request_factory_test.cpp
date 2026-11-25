@@ -335,14 +335,11 @@ TEST_F(LLMRequestFactoryTest,
       HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
   const auto first_token_time = arrival_time + std::chrono::seconds(3);
   EXPECT_FALSE(request->record_server_first_token(first_token_time));
-  EXPECT_FALSE(request->server_ttft_seconds().has_value());
 
   Sequence& sequence = *request->sequences().back();
   sequence.kv_state().set_kv_cache_tokens_num(sequence.num_prompt_tokens());
   sequence.append_token(Token(kNonStopToken));
   EXPECT_TRUE(request->record_server_first_token(first_token_time));
-  ASSERT_TRUE(request->server_ttft_seconds().has_value());
-  EXPECT_DOUBLE_EQ(*request->server_ttft_seconds(), 3.0);
   EXPECT_DOUBLE_EQ(sequence.time_to_first_token_latency_seconds(), 0.0);
   EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
             sample_count + 1);
@@ -353,7 +350,6 @@ TEST_F(LLMRequestFactoryTest,
   other_sequence.append_token(Token(kNonStopToken));
   EXPECT_FALSE(request->record_server_first_token(first_token_time +
                                                   std::chrono::seconds(1)));
-  EXPECT_DOUBLE_EQ(*request->server_ttft_seconds(), 3.0);
   EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
             sample_count + 1);
 }
@@ -395,11 +391,9 @@ TEST_F(LLMRequestFactoryTest, ServerTtftRequiresAdmissionAndUncancelledOutput) {
 
   request->state().arrival_time.reset();
   EXPECT_FALSE(request->record_server_first_token());
-  EXPECT_FALSE(request->server_ttft_seconds().has_value());
   request->state().arrival_time = std::chrono::steady_clock::now();
   request->set_cancel();
   EXPECT_FALSE(request->record_server_first_token());
-  EXPECT_FALSE(request->server_ttft_seconds().has_value());
   EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
             sample_count);
 }

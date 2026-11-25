@@ -33,10 +33,5 @@ inline std::vector<ToolCallItem> parse(const std::string& text,
   return utils::parse_function_calls(text, tools, format);
 }
 
-inline bool has_calls(const std::string& text,
-                      const std::string& format = "qwen25") {
-  return utils::has_function_calls(text, format);
-}
-
 }  // namespace function_call
 }  // namespace xllm

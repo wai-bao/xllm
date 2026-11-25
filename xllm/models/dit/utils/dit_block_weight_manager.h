@@ -51,9 +51,6 @@ class BlockWeightLoader final {
   void copy_to_device_async(aclrtStream stream);
 
   size_t storage_size() const { return storage_size_; }
-  void* host_pinned_storage() const { return host_pinned_storage_; }
-  void set_layer_index(int32_t idx) { layer_index_ = idx; }
-  int32_t layer_index() const { return layer_index_; }
 
  private:
   void refresh_slot_views();
@@ -72,7 +69,6 @@ class BlockWeightLoader final {
   std::vector<torch::Tensor> slot_tensors_;
   std::shared_ptr<RollingWeightBuffer> rolling_buffer_ = nullptr;
   int32_t slot_index_ = -1;
-  int32_t layer_index_ = -1;
 };
 
 // Orchestrates streaming of block weights through N device-memory slots.
@@ -121,7 +117,6 @@ class DitRollingLoadManager final {
 
     for (int32_t i = 0; i < num_layers; ++i) {
       int32_t slot = i % num_slots_;
-      loaders_[i]->set_layer_index(i);
       loaders_[i]->set_rolling_buffer(buffer_, slot);
     }
 
@@ -175,28 +170,6 @@ class DitRollingLoadManager final {
       refilled_slots_[slot] = true;
     }
   }
-
-  bool ensure_model(std::vector<BlockWeightLoader*> loaders,
-                    std::shared_ptr<RollingWeightBuffer> buffer = nullptr,
-                    int32_t num_slots = 0) {
-    // Compare by content (first slot address), not by vector identity —
-    // get_block_weight_loaders() returns a new vector each call.
-    if (!loaders_.empty() && loaders.size() == loaders_.size() &&
-        loaders[0] == loaders_[0]) {
-      return false;
-    }
-    if (buffer) {
-      buffer_ = std::move(buffer);
-    }
-    if (num_slots > 0) {
-      num_slots_ = num_slots;
-    }
-    init(std::move(loaders), buffer_, num_slots_);
-    preload();
-    return true;
-  }
-
-  int32_t preload_count() const { return preload_count_; }
 
  private:
   static void destroy_events(std::vector<aclrtEvent>& events) {

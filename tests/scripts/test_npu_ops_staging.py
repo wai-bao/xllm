@@ -213,7 +213,7 @@ class NpuOpsStagingTest(unittest.TestCase):
             from pathlib import Path
             from unittest import mock
             from setuptools import Distribution
-            from scripts.build_support.utils import load_setup_module
+            from tests.scripts.setup_test_utils import load_setup_module
 
             setup = load_setup_module()
             setup.get_base_dir = lambda: sys.argv[1]

@@ -1,5 +1,4 @@
 import base64
-import importlib.util
 import os
 import platform
 import shlex
@@ -8,7 +7,6 @@ import subprocess
 import sys
 import sysconfig
 from pathlib import Path
-from types import ModuleType
 
 from scripts.build_support.env import set_npu_envs
 from scripts.logger import logger
@@ -17,15 +15,6 @@ _MOONCAKE_DEPENDENCIES_COMMAND = "bash scripts/build_support/install_dependencie
 _MOONCAKE_GO_BIN_DIR = "/usr/local/go/bin"
 _GO_DEFAULT_PROXY = "https://proxy.golang.org,direct"
 _MOONCAKE_GO_PROXY = "https://goproxy.cn|https://goproxy.io|direct"
-
-
-def load_setup_module() -> ModuleType:
-    """Import ``setup.py`` as a module; its side effects sit under __main__."""
-    setup_path = os.path.join(get_base_dir(), "setup.py")
-    spec = importlib.util.spec_from_file_location("xllm_setup", setup_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _b64(s: str) -> str:

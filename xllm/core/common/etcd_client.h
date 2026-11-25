@@ -41,8 +41,6 @@ class EtcdClient {
                  Callback callback,
                  bool recursive = true);
 
-  void remove_watch(const std::string& key_prefix);
-
   void stop_watch();
 
   bool register_instance(const std::string& key,

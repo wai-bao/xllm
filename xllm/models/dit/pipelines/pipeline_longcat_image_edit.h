@@ -392,8 +392,6 @@ class LongCatImageEditPipelineImpl : public torch::nn::Module {
     } else {
       img = img.clamp(0.0f, 255.0f);
     }
-    std::vector<torch::Tensor> pixel_values_list;
-    std::vector<torch::Tensor> image_grid_thw_list;
 
     std::vector<MMDataItem> mm_items;
 

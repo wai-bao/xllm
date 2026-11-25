@@ -254,7 +254,6 @@ class StreamCall : public Call {
 
   const Request& request() const { return *request_; }
   Response& response() { return *response_; }
-  ::google::protobuf::Closure* done() { return done_; }
 
  private:
   static void on_stream_stopped(std::shared_ptr<std::atomic<bool>> stopped) {

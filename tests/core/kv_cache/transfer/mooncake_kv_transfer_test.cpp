@@ -43,9 +43,9 @@ limitations under the License.
 #include "core/kv_cache/layout/kv_cache_shape.h"
 #include "core/kv_cache/transfer/kv_transfer.h"
 #include "core/kv_cache/transfer/virtual_kv_transfer_memory_provider.h"
+#include "core/util/free_port.h"
 #include "platform/device.h"
 #include "platform/platform.h"
-#include "util/net.h"
 #include "worker.pb.h"
 
 #define private public

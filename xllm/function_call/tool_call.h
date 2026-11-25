@@ -61,8 +61,6 @@ class StreamingParseResult final {
   StreamingParseResult(std::string text, std::vector<ToolCallItem> tool_calls)
       : normal_text(std::move(text)), calls(std::move(tool_calls)) {}
 
-  bool has_calls() const { return !calls.empty(); }
-
   void clear() {
     normal_text.clear();
     calls.clear();

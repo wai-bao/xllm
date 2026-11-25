@@ -207,24 +207,12 @@ class Platform:
         return cls.enum() == PlatformEnum.NPU
 
     @classmethod
-    def is_mlu(cls) -> bool:
-        return cls.enum() == PlatformEnum.MLU
-
-    @classmethod
-    def is_musa(cls) -> bool:
-        return cls.enum() == PlatformEnum.MUSA
-
-    @classmethod
     def is_dcu(cls) -> bool:
         return cls.enum() == PlatformEnum.DCU
 
     @classmethod
     def is_ilu(cls) -> bool:
         return cls.enum() == PlatformEnum.ILU
-
-    @classmethod
-    def is_cpu(cls) -> bool:
-        return cls.enum() == PlatformEnum.CPU
 
     @classmethod
     def device_type(cls) -> str:

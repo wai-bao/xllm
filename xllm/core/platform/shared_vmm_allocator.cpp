@@ -150,16 +150,6 @@ void SharedVMMAllocator::init(int32_t device_id, size_t reserve_size) {
            << " bytes (" << reserved_size_ / (1024 * 1024) << " MB)";
 }
 
-void SharedVMMAllocator::reset_allocation_pointer() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  size_t prev_offset = current_offset_;
-  current_offset_ = 0;
-  VLOG(20) << "SharedVMMAllocator::reset_allocation_pointer() called. "
-           << "Previous offset: " << prev_offset << " bytes, "
-           << "High water mark: " << high_water_mark_ << " bytes, "
-           << "Mapped size: " << mapped_size_ << " bytes";
-}
-
 void SharedVMMAllocator::switch_to_new_virtual_space() {
   std::lock_guard<std::mutex> lock(mutex_);
 
@@ -198,19 +188,6 @@ void SharedVMMAllocator::switch_to_new_virtual_space() {
            << ", physical memory mapped: " << new_space.mapped_size
            << " bytes, "
            << "Total virtual spaces: " << virtual_spaces_.size();
-}
-
-void SharedVMMAllocator::map_physical_to_virtual(VirtualSpace& space,
-                                                 size_t start_handle_idx) {
-  // This function is called with mutex_ held
-  size_t granularity = get_granularity();
-
-  for (size_t i = start_handle_idx; i < handles_.size(); ++i) {
-    VirPtr map_addr = add_offset(space.base_ptr, i * granularity);
-    vmm::map(map_addr, handles_[i], granularity, device_id_);
-  }
-
-  space.mapped_size = handles_.size() * granularity;
 }
 
 void* SharedVMMAllocator::allocate(size_t size) {

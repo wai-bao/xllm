@@ -16,18 +16,15 @@ limitations under the License.
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "core/runtime/forward_params.h"
 #include "core/transport/packed_forward_codec.h"
 #include "core/util/shared_memory_manager.h"
-#include "worker.pb.h"
 
 namespace xllm {
 class VlmForwardInput;
@@ -40,13 +37,7 @@ struct ControlMetadata {
   volatile uint64_t version;
 };
 
-struct PbMetadata {
-  uint64_t pb_size;
-};
-
 enum class ForwardType : int8_t {
-  PB_INPUT = 1,
-  PB_OUTPUT = 2,
   RAW_INPUT = 3,
   RAW_OUTPUT = 4,
 };
@@ -56,65 +47,15 @@ class SharedMemoryTransport final {
  public:
   explicit SharedMemoryTransport(const std::string& name,
                                  size_t size,
-                                 bool& is_creator,
-                                 ForwardType type);
+                                 bool& is_creator);
   ~SharedMemoryTransport();
 
   void* base_address() const { return segment_.base_address(); }
   int64_t size() const { return segment_.size(); }
-  std::string name() const { return segment_.name(); }
   static std::string create_unique_name(const std::string& prefix,
                                         int dp_group,
                                         ForwardType forward_type,
                                         int rank);
-
-  template <typename PbType>
-  bool pb_write(const PbType* pb_data) {
-    size_t data_size = pb_data->ByteSizeLong();
-    if (data_size + sizeof(ControlMetadata) + sizeof(PbMetadata) > size()) {
-      LOG(ERROR) << "pb size overflow, data_size: " << data_size
-                 << ", shm size: " << size();
-      return false;
-    }
-
-    auto metadata = reinterpret_cast<PbMetadata*>(metadata_addr_);
-    metadata->pb_size = data_size;
-
-    auto data_ptr =
-        reinterpret_cast<char*>(metadata_addr_) + sizeof(PbMetadata);
-    if (!pb_data->SerializeToArray(data_ptr, data_size)) {
-      LOG(ERROR) << "Failed to serialize protobuf data to shared memory";
-      return false;
-    }
-
-    std::atomic_thread_fence(std::memory_order_release);
-    control_ptr_->version = ++last_version_;
-
-    return true;
-  };
-
-  template <typename PbType>
-  bool pb_read(PbType& pb_data) {
-    while (true) {
-      if (control_ptr_->version != last_version_) {
-        last_version_ = control_ptr_->version;
-        break;
-      }
-      std::this_thread::sleep_for(
-          std::chrono::nanoseconds(kNumWaitNanoseconds));
-    }
-
-    auto metadata = reinterpret_cast<PbMetadata*>(metadata_addr_);
-    auto data_ptr =
-        reinterpret_cast<char*>(metadata_addr_) + sizeof(PbMetadata);
-    size_t pb_size = metadata->pb_size;
-    if (!pb_data.ParseFromArray(data_ptr, pb_size)) {
-      LOG(ERROR) << "Failed to parse pb data from shared memory";
-      return false;
-    }
-
-    return true;
-  };
 
   bool input_write(const DiTForwardInput& input);
   bool input_read(DiTForwardInput& input);
@@ -167,9 +108,7 @@ class SharedMemoryTransport final {
 
   SharedMemoryManager segment_;
   std::atomic<bool> input_read_stopped_{false};
-  ForwardType forward_type_;
   uint64_t last_version_ = 0;
-  void* metadata_addr_ = nullptr;
   ControlMetadata* control_ptr_ = nullptr;
   std::unique_ptr<Stream> stream_ = nullptr;
 };

@@ -29,33 +29,6 @@ TEST(EplbUtilsTest, UsesWorkerNumWhenEpCoversAllWorkers) {
             34);
 }
 
-TEST(EplbUtilsTest, MapsWorkerRanksDirectlyToEpRanks) {
-  const int32_t worker_num = 8;
-  const int32_t eplb_device_num = 8;
-
-  EXPECT_EQ(eplb::eplb_rank_from_worker_rank(0, worker_num, eplb_device_num),
-            0);
-  EXPECT_EQ(eplb::eplb_rank_from_worker_rank(1, worker_num, eplb_device_num),
-            1);
-  EXPECT_EQ(eplb::eplb_rank_from_worker_rank(2, worker_num, eplb_device_num),
-            2);
-  EXPECT_EQ(eplb::eplb_rank_from_worker_rank(7, worker_num, eplb_device_num),
-            7);
-}
-
-TEST(EplbUtilsTest, CountsOnlyCrossDeviceExpertTransfers) {
-  const std::vector<int64_t> previous = {0, 1, 2, 3, 4, 5};
-  const std::vector<int64_t> local_reorder = {1, 0, 3, 2, 5, 4};
-  EXPECT_EQ(eplb::count_cross_device_migrations(
-                previous, local_reorder, /*device_experts_num=*/2),
-            0);
-
-  const std::vector<int64_t> cross_device = {2, 1, 4, 3, 0, 5};
-  EXPECT_EQ(eplb::count_cross_device_migrations(
-                previous, cross_device, /*device_experts_num=*/2),
-            3);
-}
-
 TEST(EplbUtilsTest, BuildsGlobalDecodeMaskForEveryDpRank) {
   const std::vector<torch::Tensor> local_masks = {
       torch::tensor({true, false}, torch::kBool),

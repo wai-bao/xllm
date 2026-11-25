@@ -92,9 +92,6 @@ is_tma_supported = False
 
 
 class _SharedMemory(Enum):
-    ADA = 101376
-    AMPERE = 166912
-    HOPPER = 232448
     DEFAULT = 102400
 
     @classmethod

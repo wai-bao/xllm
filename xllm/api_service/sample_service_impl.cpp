@@ -110,12 +110,6 @@ std::string get_finish_reason(const SequenceOutput& output) {
                                      : kEmptyLogprobsFinishReason;
 }
 
-uint32_t get_requested_logprobs(const proto::SampleRequest& request) {
-  return request.has_logprobs()
-             ? request.logprobs()
-             : sample_service_internal::kDefaultSampleLogprobs;
-}
-
 Status get_rate_limit_status(const GenerationMaster& master) {
   return master.get_rate_limiter()->acquire();
 }

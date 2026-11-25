@@ -81,22 +81,6 @@ class _ChromeTraceFormatter:
         event["args"] = {"name": name}
         self._metadata.append(event)
 
-    def emit_tid(self, name, pid, tid):
-        """Adds a thread metadata event to the trace.
-
-        Args:
-          name:  The thread name as a string.
-          pid:  Identifier of the process as an integer.
-          tid:  Identifier of the thread as an integer.
-        """
-        event = {}
-        event["name"] = "thread_name"
-        event["ph"] = "M"
-        event["pid"] = pid
-        event["tid"] = tid
-        event["args"] = {"name": name}
-        self._metadata.append(event)
-
     def emit_region(
         self,
         timestamp: int,
@@ -121,149 +105,6 @@ class _ChromeTraceFormatter:
         event = self._create_event("X", category, name, pid, tid, timestamp)
         event["dur"] = duration
         event["args"] = args
-        self._events.append(event)
-
-    def emit_obj_create(
-        self,
-        category: str,
-        name: str,
-        timestamp: int,
-        pid: int,
-        tid: int,
-        object_id: int,
-    ) -> None:
-        """Adds an object creation event to the trace.
-
-        Args:
-          category: The event category as a string.
-          name:  The event name as a string.
-          timestamp:  The timestamp of this event as a long integer.
-          pid:  Identifier of the process generating this event as an integer.
-          tid:  Identifier of the thread generating this event as an integer.
-          object_id: Identifier of the object as an integer.
-        """
-        event = self._create_event("N", category, name, pid, tid, timestamp)
-        event["id"] = object_id
-        self._events.append(event)
-
-    def emit_obj_delete(
-        self,
-        category: str,
-        name: str,
-        timestamp: int,
-        pid: int,
-        tid: int,
-        object_id: int,
-    ) -> None:
-        """Adds an object deletion event to the trace.
-
-        Args:
-          category: The event category as a string.
-          name:  The event name as a string.
-          timestamp:  The timestamp of this event as a long integer.
-          pid:  Identifier of the process generating this event as an integer.
-          tid:  Identifier of the thread generating this event as an integer.
-          object_id: Identifier of the object as an integer.
-        """
-        event = self._create_event("D", category, name, pid, tid, timestamp)
-        event["id"] = object_id
-        self._events.append(event)
-
-    def emit_obj_snapshot(
-        self,
-        category: str,
-        name: str,
-        timestamp: int,
-        pid: int,
-        tid: int,
-        object_id: int,
-        snapshot: dict[str, Any],
-    ) -> None:
-        """Adds an object snapshot event to the trace.
-
-        Args:
-          category: The event category as a string.
-          name:  The event name as a string.
-          timestamp:  The timestamp of this event as a long integer.
-          pid:  Identifier of the process generating this event as an integer.
-          tid:  Identifier of the thread generating this event as an integer.
-          object_id: Identifier of the object as an integer.
-          snapshot:  A JSON-compatible representation of the object.
-        """
-        event = self._create_event("O", category, name, pid, tid, timestamp)
-        event["id"] = object_id
-        event["args"] = {"snapshot": snapshot}
-        self._events.append(event)
-
-    def emit_flow_start(self, name: str, timestamp: int, pid: int, tid: int, flow_id: int) -> None:
-        """Adds a flow start event to the trace.
-
-        When matched with a flow end event (with the same 'flow_id') this will
-        cause the trace viewer to draw an arrow between the start and end events.
-
-        Args:
-          name:  The event name as a string.
-          timestamp:  The timestamp of this event as a long integer.
-          pid:  Identifier of the process generating this event as an integer.
-          tid:  Identifier of the thread generating this event as an integer.
-          flow_id: Identifier of the flow as an integer.
-        """
-        event = self._create_event("s", "DataFlow", name, pid, tid, timestamp)
-        event["id"] = flow_id
-        self._events.append(event)
-
-    def emit_flow_end(self, name: str, timestamp: int, pid: int, tid: int, flow_id: int) -> None:
-        """Adds a flow end event to the trace.
-
-        When matched with a flow start event (with the same 'flow_id') this will
-        cause the trace viewer to draw an arrow between the start and end events.
-
-        Args:
-          name:  The event name as a string.
-          timestamp:  The timestamp of this event as a long integer.
-          pid:  Identifier of the process generating this event as an integer.
-          tid:  Identifier of the thread generating this event as an integer.
-          flow_id: Identifier of the flow as an integer.
-        """
-        event = self._create_event("t", "DataFlow", name, pid, tid, timestamp)
-        event["id"] = flow_id
-        self._events.append(event)
-
-    def emit_counter(
-        self,
-        category: str,
-        name: str,
-        pid: int,
-        timestamp: int,
-        counter: str,
-        value: int,
-    ) -> None:
-        """Emits a record for a single counter.
-
-        Args:
-          category: The event category as a string.
-          name:  The event name as a string.
-          pid:  Identifier of the process generating this event as an integer.
-          timestamp:  The timestamp of this event as a long integer.
-          counter: Name of the counter as a string.
-          value:  Value of the counter as an integer.
-        """
-        event = self._create_event("C", category, name, pid, 0, timestamp)
-        event["args"] = {counter: value}
-        self._events.append(event)
-
-    def emit_counters(self, category, name, pid, timestamp, counters):
-        """Emits a counter record for the dictionary 'counters'.
-
-        Args:
-          category: The event category as a string.
-          name:  The event name as a string.
-          pid:  Identifier of the process generating this event as an integer.
-          timestamp:  The timestamp of this event as a long integer.
-          counters: Dictionary of counter values.
-        """
-        event = self._create_event("C", category, name, pid, 0, timestamp)
-        event["args"] = counters.copy()
         self._events.append(event)
 
     def format_to_string(self, pretty: bool = False) -> str:
@@ -303,8 +144,6 @@ class Timeline:
         self._device_pids = {}  # device id -> trace pid for marker.
         self._memory_pids = {}  # device id -> trace pid for memory.
         self._kernel_pids = {}  # device id -> trace pid for kernel.
-        self._next_flow_id = 0
-        self._flow_starts = {}  # tensor_name -> (timestamp, pid, tid)
 
     def parse_log(self, log_file_path: str) -> list:
         import json
@@ -327,12 +166,6 @@ class Timeline:
         pid = self._next_pid
         self._next_pid += 1
         return pid
-
-    def _alloc_flow_id(self) -> int:
-        """Allocate a flow Id."""
-        flow_id = self._next_flow_id
-        self._next_flow_id += 1
-        return flow_id
 
     def _emit_marker(self, stats: dict, pid: int) -> None:
         """Generates a Chrome Trace event to show marker event.
@@ -415,19 +248,7 @@ class Timeline:
             else:
                 logger.warning(f"Unsupported AscendKind {dev_stats['AscendKind']}")
 
-    def _get_marker_end(self, deviceId: int, stat_id: int) -> dict:
-        """Get the end marker stats."""
-        for dev_stats in self._step_stats:
-            if "MARKER" not in dev_stats["AscendKind"]:
-                continue
-            if dev_stats["flag"] == 32 or dev_stats["flag"] == 4:  # mstxRangeEnd
-                cur_deviceId = dev_stats["deviceId"]
-                cur_id = dev_stats["id"]
-                if cur_deviceId == deviceId and cur_id == stat_id:
-                    return dev_stats
-        return None
-
-    def _show_marker(self, show_flow: bool = False) -> None:
+    def _show_marker(self) -> None:
         """Visualize the marker activity."""
         for dev_stats in self._step_stats:
             if "MARKER" in dev_stats["AscendKind"]:
@@ -438,7 +259,6 @@ class Timeline:
                 start_time = dev_stats["timestamp"]
                 stats_id = dev_stats["id"]
                 end_time = 0
-                # end_marker_stat = self._get_marker_end(deviceId, stats_id)
                 for end_ts in self._marker_end_ts[stats_id]:
                     cur_deviceId, cur_end_time = end_ts
                     if cur_deviceId == deviceId:

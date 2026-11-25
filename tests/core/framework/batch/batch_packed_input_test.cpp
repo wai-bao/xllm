@@ -89,8 +89,7 @@ void expect_input_read_cancellation(const std::string& suffix) {
   const std::string name =
       "shm_input_cancel_" + std::to_string(getpid()) + "_" + suffix;
   bool is_creator = false;
-  SharedMemoryTransport reader(
-      name, /*size=*/1 << 20, is_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport reader(name, /*size=*/1 << 20, is_creator);
   auto read_input = [&reader]() {
     Input input;
     if constexpr (std::is_same_v<Input, DiTForwardInput>) {
@@ -114,12 +113,9 @@ TEST(SharedMemoryShutdownTest, CancellationDoesNotPublishOrConsumeInput) {
   ScopedContiguousInputBuffer contiguous_input_buffer(/*enabled=*/false);
   const std::string name = "shm_input_local_stop_" + std::to_string(getpid());
   bool is_creator = false;
-  SharedMemoryTransport writer(
-      name, /*size=*/1 << 20, is_creator, ForwardType::RAW_INPUT);
-  SharedMemoryTransport stopped_reader(
-      name, /*size=*/1 << 20, is_creator, ForwardType::RAW_INPUT);
-  SharedMemoryTransport active_reader(
-      name, /*size=*/1 << 20, is_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport writer(name, /*size=*/1 << 20, is_creator);
+  SharedMemoryTransport stopped_reader(name, /*size=*/1 << 20, is_creator);
+  SharedMemoryTransport active_reader(name, /*size=*/1 << 20, is_creator);
   stopped_reader.stop_input_read();
   DiTForwardInput source;
   source.model_params.batch_size = 1;
@@ -302,13 +298,11 @@ TYPED_TEST(NoncontiguousSharedMemoryInputTest,
             ForwardType::RAW_INPUT,
             /*rank=*/0);
         bool is_creator = false;
-        SharedMemoryTransport writer(
-            shm_name, /*size=*/1 << 20, is_creator, ForwardType::RAW_INPUT);
+        SharedMemoryTransport writer(shm_name, /*size=*/1 << 20, is_creator);
         bool is_reader_creator = false;
         SharedMemoryTransport reader(shm_name,
                                      /*size=*/1 << 20,
-                                     is_reader_creator,
-                                     ForwardType::RAW_INPUT);
+                                     is_reader_creator);
         ASSERT_TRUE(writer.input_write(source));
         ASSERT_TRUE(reader.input_read(retained, device, policy));
         // Check ownership before unmapping so a regression fails safely.
@@ -479,13 +473,11 @@ TEST(BatchPackedInputTest, MaterializedShmReadRebindsTaggedTensorArena) {
     bool is_creator = false;
     SharedMemoryTransport writer_manager(shm_name,
                                          /*size=*/1 << 20,
-                                         is_creator,
-                                         ForwardType::RAW_INPUT);
+                                         is_creator);
     bool is_reader_creator = false;
     SharedMemoryTransport reader_manager(shm_name,
                                          /*size=*/1 << 20,
-                                         is_reader_creator,
-                                         ForwardType::RAW_INPUT);
+                                         is_reader_creator);
     ASSERT_TRUE(writer_manager.input_write(source));
     reader_manager.input_read(
         materialized_input,
@@ -617,7 +609,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
   std::vector<Sequence*> sequences = {&seq, &second_sequence};
   std::vector<uint32_t> budgets = {4, 4};
   const BatchInputData batch_input_data{
-      sequences, {}, budgets, {}, {}, 1, BatchForwardType::DECODE};
+      sequences, budgets, {}, {}, 1, BatchForwardType::DECODE};
   ForwardInputBuilder builder(batch_input_data, nullptr);
 
   LlmForwardInput input = builder.build_forward_input();
@@ -1019,7 +1011,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackRestoresDoSample) {
   std::vector<Sequence*> sequences = {&seq};
   std::vector<uint32_t> budgets = {4};
   const BatchInputData batch_input_data{
-      sequences, {}, budgets, {}, {}, 1, BatchForwardType::DECODE};
+      sequences, budgets, {}, {}, 1, BatchForwardType::DECODE};
   ForwardInputBuilder builder(batch_input_data, nullptr);
 
   LlmForwardInput input = builder.build_forward_input();
@@ -1152,11 +1144,9 @@ TEST(BatchPackedInputTest, NativeVlmSharedMemoryRetainsVisionAfterOverwrite) {
                                                   ForwardType::RAW_INPUT,
                                                   /*rank=*/0);
     bool is_creator = false;
-    SharedMemoryTransport writer(
-        shm_name, /*size=*/1 << 20, is_creator, ForwardType::RAW_INPUT);
+    SharedMemoryTransport writer(shm_name, /*size=*/1 << 20, is_creator);
     bool is_reader_creator = false;
-    SharedMemoryTransport reader(
-        shm_name, /*size=*/1 << 20, is_reader_creator, ForwardType::RAW_INPUT);
+    SharedMemoryTransport reader(shm_name, /*size=*/1 << 20, is_reader_creator);
     auto source = make_vlm_transport_input();
     ASSERT_TRUE(writer.input_write(source));
     reader.input_read(
@@ -1563,7 +1553,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyToPreservesJsonMetadata) {
   std::vector<Sequence*> sequences = {&sequence};
   std::vector<uint32_t> allowed_max_tokens = {4};
   const BatchInputData batch_input_data{
-      sequences, {}, allowed_max_tokens, {}, {}, 2, BatchForwardType::DECODE};
+      sequences, allowed_max_tokens, {}, {}, 2, BatchForwardType::DECODE};
   ForwardInputBuilder builder(batch_input_data, nullptr);
   LlmForwardInput input = builder.build_forward_input();
 

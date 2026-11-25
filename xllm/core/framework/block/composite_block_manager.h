@@ -122,8 +122,6 @@ class CompositeBlockManager final {
 
   void reserve_virtual_memory_padding_blocks();
 
-  size_t num_sub_managers() const { return leaves_.size(); }
-
  private:
   friend class BlockManagerPoolTestPeer;
 

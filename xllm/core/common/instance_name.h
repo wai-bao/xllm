@@ -31,8 +31,6 @@ class InstanceName {
     name_hash_ = std::to_string(std::hash<std::string>{}(name_));
   }
 
-  std::string get_name() const { return name_; }
-
   std::string get_name_hash() const { return name_hash_; }
 
  private:

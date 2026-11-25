@@ -224,7 +224,7 @@ TEST_F(Glm45DetectorTest, OnlyNormalText) {
   EXPECT_EQ(result.normal_text,
             "This is a regular text without any tool calls.");
   EXPECT_EQ(result.calls.size(), 0);
-  EXPECT_FALSE(result.has_calls());
+  EXPECT_TRUE(result.calls.empty());
 }
 
 // Test empty string input
@@ -235,7 +235,7 @@ TEST_F(Glm45DetectorTest, EmptyStringInput) {
 
   EXPECT_EQ(result.normal_text, "");
   EXPECT_EQ(result.calls.size(), 0);
-  EXPECT_FALSE(result.has_calls());
+  EXPECT_TRUE(result.calls.empty());
 }
 
 // Test whitespace-only input

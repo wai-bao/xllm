@@ -204,37 +204,6 @@ class QuantArgs final {
                        });
   }
 
-  static bool matches_module_target(const std::string& module_name,
-                                    const std::string& target,
-                                    bool match_prefix = true) {
-    // Legacy ignore entries preserve exact-match precedence.
-    if (!match_prefix && target == module_name) {
-      return true;
-    }
-    if (target.starts_with("re:") && (match_prefix || target.size() > 3)) {
-      try {
-        const std::regex pattern(target.substr(3));
-        return match_prefix
-                   ? std::regex_search(module_name,
-                                       pattern,
-                                       std::regex_constants::match_continuous)
-                   : std::regex_match(module_name, pattern);
-      } catch (const std::regex_error&) {
-        return false;
-      }
-    }
-    return target == module_name;
-  }
-
-  static bool matches_any_target(const std::string& module_name,
-                                 const std::vector<std::string>& targets) {
-    return std::any_of(targets.begin(),
-                       targets.end(),
-                       [&module_name](const std::string& target) {
-                         return matches_module_target(module_name, target);
-                       });
-  }
-
   bool matches_any_target_cached(
       const std::string& module_name,
       const std::vector<std::string>& targets) const {
@@ -287,12 +256,6 @@ class QuantArgs final {
       local_args.preserve_smooth() = false;
     }
     return local_args;
-  }
-
-  // check if weights can be fused
-  bool can_be_fused() const {
-    // can't fuse quantized weights if desc_act is true
-    return quant_method().empty() || !desc_act();
   }
 
   // Query quant type by full tensor key.

@@ -160,8 +160,6 @@ class RankGenerator final {
     return group;
   }
 
-  int32_t get_world_size() const { return world_size_; }
-
  private:
   std::vector<std::vector<int32_t>> get_ranks(
       const std::string& group_query,

@@ -296,7 +296,6 @@ void GenerateRecommendations(
   std::cout << "SM120 FP8 GEMM Optimization Recommendations" << std::endl;
   std::cout << std::string(80, '=') << std::endl;
 
-  std::vector<std::string> recommendations;
   std::vector<std::string> issues;
 
   for (const auto& [shape, results] : all_results) {
@@ -336,14 +335,6 @@ void GenerateRecommendations(
               << "%)";
           issues.push_back(oss.str());
         }
-      }
-    }
-
-    // Check if swap_ab strategy is effective
-    for (const auto& r : results) {
-      if (xllm::kernel::cuda::is_sm120_swap_ab_kernel(r.kernel)) {
-        // For swap_ab configurations, check if they are better than
-        // non-swap_ab versions. This needs to be verified in actual tests.
       }
     }
   }

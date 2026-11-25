@@ -184,17 +184,6 @@ std::vector<ToolCallItem> parse_function_calls(
   }
 }
 
-bool has_function_calls(const std::string& text,
-                        const std::string& parser_type) {
-  try {
-    FunctionCallParser parser({}, parser_type);
-    return parser.has_tool_call(text);
-  } catch (const std::exception& e) {
-    LOG(ERROR) << "Error checking function calls: " << e.what();
-    return false;
-  }
-}
-
 StreamingParseResult parse_streaming_increment(
     const std::string& new_text,
     const std::vector<JsonTool>& tools,

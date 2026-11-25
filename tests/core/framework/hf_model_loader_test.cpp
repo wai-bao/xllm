@@ -42,6 +42,7 @@ limitations under the License.
 #include "core/platform/platform.h"
 #include "core/runtime/options.h"
 #include "core/util/json_reader.h"
+#include "core/util/json_test_utils.h"
 #include "core/util/utils.h"
 #include "models/model_registry.h"
 
@@ -172,7 +173,7 @@ TEST_F(HFModelLoaderBackendTest, VlmBackendKeepsTextOnlyCheckpointTextOnly) {
 
 TEST(HFModelLoaderTest, Qwen35DenseBackendAwareModelTypeSelection) {
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "architectures": ["Qwen3_5ForConditionalGeneration"],
       "image_token_id": 248056,
@@ -196,7 +197,7 @@ TEST(HFModelLoaderTest, Qwen35DenseBackendAwareModelTypeSelection) {
 
 TEST(HFModelLoaderTest, Qwen35MoeBackendAwareModelTypeSelection) {
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "architectures": ["Qwen3_5MoeForConditionalGeneration"],
       "image_token_id": 248056,
@@ -226,7 +227,7 @@ TEST(HFModelLoaderTest, Glm5NextRootArgsLoadNativeMluFields) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "glm5_next",
       "text_config": {
@@ -268,7 +269,7 @@ TEST(HFModelLoaderTest, Qwen35MoeRootTypeHasCausalModelFactory) {
 
 TEST(HFModelLoaderTest, LoadCompressedTensorsFp8StaticConfig) {
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "quantization_config": {
         "config_groups": {
@@ -306,7 +307,7 @@ TEST(HFModelLoaderTest, LoadCompressedTensorsFp8StaticConfig) {
 
 TEST(HFModelLoaderTest, KeepLegacyFp8ConfigUnchanged) {
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "quantization_config": {
         "activation_scheme": "static",
@@ -354,7 +355,7 @@ TEST(HFModelLoaderTest, Glm5NextNativeMtpUsesAppendedLayer) {
   auto loader = ModelRegistry::get_model_args_loader("glm5_next");
   ASSERT_NE(loader, nullptr);
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json({
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json({
     "model_type": "glm5_next",
     "text_config": {
       "num_hidden_layers": 45,
@@ -411,7 +412,7 @@ TEST(HFModelLoaderTest, Glm5NextExportedMtpKeepsNativeKeys) {
   auto loader = ModelRegistry::get_model_args_loader("glm5_next_mtp");
   ASSERT_NE(loader, nullptr);
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json({
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json({
     "model_type": "glm5_next_mtp",
     "text_config": {
       "num_hidden_layers": 1,
@@ -484,7 +485,7 @@ TEST(HFModelLoaderTest, Glm5NextMtpEngineAndWorkerMatchExportedCacheLayout) {
   auto loader = ModelRegistry::get_model_args_loader("glm5_next");
   ASSERT_NE(loader, nullptr);
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json({
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json({
     "model_type": "glm5_next",
     "text_config": {
       "num_hidden_layers": 45,
@@ -519,7 +520,7 @@ TEST(HFModelLoaderTest, Glm5NextMtpEngineAndWorkerMatchExportedCacheLayout) {
                                     /*is_python_model=*/false);
 
   JsonReader exported_reader;
-  ASSERT_TRUE(exported_reader.parse_text(R"json({
+  ASSERT_TRUE(parse_json_text(exported_reader, /*text=*/R"json({
     "model_type": "glm5_next_mtp",
     "text_config": {
       "num_hidden_layers": 1,
@@ -608,7 +609,7 @@ TEST(HFModelLoaderTest, Glm5DSparkSpeculatorsArgsPreserveMlaGeometry) {
   ModelArgsLoader loader = ModelRegistry::get_model_args_loader("glm5_dspark");
   ASSERT_NE(loader, nullptr);
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json({
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json({
     "architectures": ["Glm5DSparkForCausalLM"],
     "speculators_model_type": "dspark",
     "dtype": "bfloat16",
@@ -654,7 +655,7 @@ TEST(HFModelLoaderTest, Qwen3DSparkFieldsFromTorchConfig) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "qwen3",
       "markov_rank": 256,
@@ -676,7 +677,7 @@ TEST(HFModelLoaderTest, Qwen3DSparkPreservesSlidingWindowVisibility) {
     ModelArgsLoader loader = ModelRegistry::get_model_args_loader(model_type);
     ASSERT_NE(loader, nullptr);
     JsonReader reader;
-    ASSERT_TRUE(reader.parse_text(R"json({
+    ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json({
       "speculators_model_type": "dspark",
       "sliding_window_non_causal": true,
       "transformer_layer_config": {
@@ -697,7 +698,7 @@ TEST(HFModelLoaderTest, Qwen38DSparkPreservesYarnGeometry) {
   auto loader = ModelRegistry::get_model_args_loader("qwen3");
   ASSERT_NE(loader, nullptr);
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "qwen3",
       "hidden_size": 5120,
@@ -731,7 +732,7 @@ TEST(HFModelLoaderTest, Qwen3DFlash2AcceptsArrayEosTokenIds) {
     ASSERT_NE(loader, nullptr);
 
     JsonReader reader;
-    ASSERT_TRUE(reader.parse_text(R"json(
+    ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
       {
         "model_type": "qwen3",
         "eos_token_id": [154820, 154827, 154829],
@@ -763,7 +764,7 @@ TEST(HFModelLoaderTest, Qwen3DFlash2ReadsFlatBlockGeometry) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "qwen3",
       "block_size": 5,
@@ -787,7 +788,7 @@ TEST(HFModelLoaderTest, GlmMoeDsaMtpPreservesLayerTypeMetadata) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "glm_moe_dsa_mtp",
       "num_hidden_layers": 1,
@@ -809,7 +810,7 @@ TEST(HFModelLoaderTest, DeepseekV4DSparkModelArgsFrom0731Config) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "deepseek_v4",
       "hidden_size": 4096,
@@ -837,7 +838,7 @@ TEST(HFModelLoaderTest, DeepseekV41ModelArgsFromConfig) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "deepseek_v41",
       "text_config": {
@@ -861,7 +862,7 @@ TEST(HFModelLoaderDeathTest, DeepseekV41RejectsMismatchedSwaWindow) {
   auto loader = ModelRegistry::get_model_args_loader("deepseek_v41");
   ASSERT_NE(loader, nullptr);
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "deepseek_v41",
       "text_config": {
@@ -886,7 +887,7 @@ TEST(HFModelLoaderTest, Qwen35MtpModelArgsFromDenseConfig) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "qwen3_5",
       "text_config": {
@@ -916,7 +917,7 @@ TEST(HFModelLoaderTest, Qwen35MtpModelArgsFromMoeConfig) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "qwen3_5_moe",
       "text_config": {
@@ -951,14 +952,14 @@ TEST(HFModelLoaderTest,
     for (const int32_t mtp_layers : {1, 2}) {
       SCOPED_TRACE(mtp_layers);
       JsonReader reader;
-      ASSERT_TRUE(reader.parse_text(
-          R"json({"text_config": {
+      ASSERT_TRUE(parse_json_text(reader,
+                                  R"json({"text_config": {
             "num_hidden_layers": 4,
             "full_attention_interval": 4,
             "layer_types": ["linear_attention", "linear_attention",
                             "linear_attention", "full_attention"],
             "mtp_num_hidden_layers": )json" +
-          std::to_string(mtp_layers) + "}}"));
+                                      std::to_string(mtp_layers) + "}}"));
       ModelArgs args;
       ASSERT_TRUE(loader(reader, &args));
       ASSERT_TRUE(has_linear_attention_layers(args));
@@ -1056,7 +1057,7 @@ TEST(HFModelLoaderTest, Phi3Mini4KConfigPreservesLogicalDimensions) {
   ModelArgsLoader loader = ModelRegistry::get_model_args_loader("phi3");
   ASSERT_NE(loader, nullptr);
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "phi3",
       "torch_dtype": "bfloat16",
@@ -1106,7 +1107,7 @@ TEST(HFModelLoaderTest, Phi3DerivesAbsentKvHeadsAndDisablesNullWindow) {
   ModelArgsLoader loader = ModelRegistry::get_model_args_loader("phi3");
   ASSERT_NE(loader, nullptr);
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "phi3",
       "hidden_size": 512,
@@ -1144,7 +1145,7 @@ TEST(HFModelLoaderTest, Phi3RejectsInvalidDimensionsAndUnsupportedSemantics) {
        }) {
     SCOPED_TRACE(config);
     JsonReader reader;
-    ASSERT_TRUE(reader.parse_text(config));
+    ASSERT_TRUE(parse_json_text(reader, config));
     ModelArgs args;
     EXPECT_FALSE(loader(reader, &args));
   }
@@ -1157,7 +1158,7 @@ TEST(HFModelLoaderTest, MiMoMtpModelArgsFromExportedConfig) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "mimo_mtp",
       "num_hidden_layers": 1,
@@ -1192,7 +1193,8 @@ TEST(HFModelLoaderTest, MiMoMtpModelArgsDefaults) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json({ "model_type": "mimo_mtp" })json"));
+  ASSERT_TRUE(parse_json_text(
+      reader, /*text=*/R"json({ "model_type": "mimo_mtp" })json"));
 
   ModelArgs args;
   ASSERT_TRUE(loader(reader, &args));
@@ -1213,7 +1215,7 @@ TEST(HFModelLoaderTest, Rwkv7ModelArgsFromConvertedConfig) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "rwkv7",
       "torch_dtype": "float16",
@@ -1312,7 +1314,7 @@ TEST(HFModelLoaderTest, LoadCompressedTensorsInt8Scheme) {
   for (const TestCase& test_case : test_cases) {
     SCOPED_TRACE(test_case.name);
     JsonReader reader;
-    ASSERT_TRUE(reader.parse_text(test_case.config));
+    ASSERT_TRUE(parse_json_text(reader, test_case.config));
 
     QuantArgs quant_args;
     EXPECT_EQ(load_quant_cfg(reader, quant_args), test_case.is_w8a8_dynamic);
@@ -1346,7 +1348,7 @@ TEST(HFModelLoaderTest, LoadCompressedTensorsWithoutSmooth) {
     }}
   }})json";
   std::string text = config;
-  ASSERT_TRUE(reader.parse_text(text));
+  ASSERT_TRUE(parse_json_text(reader, text));
   QuantArgs args;
   ASSERT_TRUE(load_quant_cfg(reader, args));
   EXPECT_EQ(args.quant_method(), "compressed-tensors");
@@ -1356,7 +1358,7 @@ TEST(HFModelLoaderTest, LoadCompressedTensorsWithoutSmooth) {
   EXPECT_TRUE(args.is_sym());
   EXPECT_TRUE(args.should_ignore_module("model.layers.0.mlp.gate"));
   text.replace(text.find("\"channel\""), 9, "\"group\"");
-  ASSERT_TRUE(reader.parse_text(text));
+  ASSERT_TRUE(parse_json_text(reader, text));
   EXPECT_FALSE(load_quant_cfg(reader, args));
 }
 
@@ -1374,7 +1376,8 @@ TEST(HFModelLoaderTest, LoadCompressedTensorsPreservedSmooth) {
       config["config_groups"]["group_0"][target]["preserve_smooth"] = true;
       SCOPED_TRACE(key + ": " + config.dump());
       JsonReader reader;
-      ASSERT_TRUE(reader.parse_text(nlohmann::json({{key, config}}).dump()));
+      ASSERT_TRUE(
+          parse_json_text(reader, nlohmann::json({{key, config}}).dump()));
       QuantArgs args;
       EXPECT_EQ(load_quant_cfg(reader, args), target == "weights");
       if (target == "weights") {
@@ -1388,7 +1391,7 @@ TEST(HFModelLoaderTest, LoadCompressedTensorsPreservedSmooth) {
 TEST(HFModelLoaderTest, LoadCompressedTensorsConfigAlias) {
   for (const std::string& key : {"quantization_config", "compression_config"}) {
     JsonReader reader;
-    ASSERT_TRUE(reader.parse_text("{\"" + key + R"json(": {
+    ASSERT_TRUE(parse_json_text(reader, "{\"" + key + R"json(": {
       "quant_method": "compressed-tensors",
       "ignore": ["lm_head"],
       "config_groups": {"group_0": {
@@ -1428,8 +1431,8 @@ TEST(HFModelLoaderTest, RejectUnsupportedCompressedTensorsScheme) {
     config.merge_patch(patch);
     SCOPED_TRACE(config.dump());
     JsonReader reader;
-    ASSERT_TRUE(reader.parse_text(
-        nlohmann::json({{"quantization_config", config}}).dump()));
+    ASSERT_TRUE(parse_json_text(
+        reader, nlohmann::json({{"quantization_config", config}}).dump()));
     QuantArgs args;
     EXPECT_FALSE(load_quant_cfg(reader, args));
   }
@@ -1493,7 +1496,7 @@ TEST(HFModelLoaderTest, Qwen3Eagle3LayersToCaptureFromAuxList) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "qwen3_eagle3",
       "eagle_aux_hidden_state_layer_ids": [2, 32, 61]
@@ -1512,7 +1515,7 @@ TEST(HFModelLoaderTest, Qwen3Eagle3LayersToCaptureDefaultsEmpty) {
   ASSERT_NE(loader, nullptr);
 
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(R"json(
+  ASSERT_TRUE(parse_json_text(reader, /*text=*/R"json(
     {
       "model_type": "qwen3_eagle3"
     }
@@ -1587,7 +1590,7 @@ nlohmann::json mixed_quant_config() {
 
 TEST(HFModelLoaderTest, LoadCompressedTensorsMixedPrecision) {
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(mixed_quant_config().dump()));
+  ASSERT_TRUE(parse_json_text(reader, mixed_quant_config().dump()));
 
   QuantArgs args;
   ASSERT_TRUE(load_quant_cfg(reader, args));
@@ -1630,7 +1633,7 @@ TEST(HFModelLoaderTest, ValidateMixedPrecisionModuleSelection) {
     config["quantization_config"]["config_groups"]["experts_w4a8"]["targets"] =
         {target};
     JsonReader reader;
-    ASSERT_TRUE(reader.parse_text(config.dump()));
+    ASSERT_TRUE(parse_json_text(reader, config.dump()));
     QuantArgs args;
     ASSERT_TRUE(load_quant_cfg(reader, args));
     EXPECT_EQ(args.for_module("model.layers.3.mlp.experts.0.gate_proj").bits(),
@@ -1657,7 +1660,7 @@ TEST(HFModelLoaderTest, ResolveGroupsIndependentlyOfNamesAndSmooth) {
         groups["attention"]["weights"]["preserve_smooth"] = dense_smooth;
         groups["routed"]["weights"]["preserve_smooth"] = expert_smooth;
         JsonReader reader;
-        ASSERT_TRUE(reader.parse_text(config.dump()));
+        ASSERT_TRUE(parse_json_text(reader, config.dump()));
         QuantArgs args;
         ASSERT_TRUE(load_quant_cfg(reader, args));
         const auto dense = args.for_module("model.layers.3.self_attn.o_proj");
@@ -1678,7 +1681,7 @@ TEST(HFModelLoaderTest, SingleGroupDefaultsWithoutSmooth) {
   groups.erase("experts_w4a8");
   groups["dense_w8a8"]["weights"].erase("preserve_smooth");
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(config.dump()));
+  ASSERT_TRUE(parse_json_text(reader, config.dump()));
   QuantArgs args;
   ASSERT_TRUE(load_quant_cfg(reader, args));
   const auto local = args.for_module("model.layers.3.self_attn.o_proj");
@@ -1698,7 +1701,7 @@ TEST(HFModelLoaderTest, SameBitwidthHasLayerSpecificSmooth) {
   groups["layer_zero"]["weights"]["preserve_smooth"] = false;
   groups["dense_w8a8"]["targets"] = {"model.layers.1.self_attn.o_proj"};
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(config.dump()));
+  ASSERT_TRUE(parse_json_text(reader, config.dump()));
   QuantArgs args;
   ASSERT_TRUE(load_quant_cfg(reader, args));
   EXPECT_FALSE(
@@ -1712,13 +1715,13 @@ TEST(HFModelLoaderDeathTest, ConflictingGroupsFailUnlessIgnored) {
   auto& groups = config["quantization_config"]["config_groups"];
   groups["duplicate"] = groups["dense_w8a8"];
   JsonReader reader;
-  ASSERT_TRUE(reader.parse_text(config.dump()));
+  ASSERT_TRUE(parse_json_text(reader, config.dump()));
   QuantArgs args;
   ASSERT_TRUE(load_quant_cfg(reader, args));
   EXPECT_TRUE(
       args.for_module("model.layers.3.self_attn.o_proj").preserve_smooth());
   groups["duplicate"]["weights"]["preserve_smooth"] = false;
-  ASSERT_TRUE(reader.parse_text(config.dump()));
+  ASSERT_TRUE(parse_json_text(reader, config.dump()));
   ASSERT_TRUE(load_quant_cfg(reader, args));
   EXPECT_DEATH(args.for_module("model.layers.3.self_attn.o_proj"),
                "Conflicting");
@@ -1734,7 +1737,7 @@ TEST(HFModelLoaderTest, RejectMixedPrecisionMalformedRegex) {
     config["quantization_config"]["config_groups"][group]["targets"] = {
         "re:*("};
     JsonReader reader;
-    ASSERT_TRUE(reader.parse_text(config.dump()));
+    ASSERT_TRUE(parse_json_text(reader, config.dump()));
     QuantArgs args;
     EXPECT_FALSE(load_quant_cfg(reader, args));
   }

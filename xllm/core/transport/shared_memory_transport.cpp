@@ -15,7 +15,9 @@ limitations under the License.
 
 #include "core/transport/shared_memory_transport.h"
 
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "core/framework/config/execution_config.h"
 #include "core/platform/stream.h"
@@ -24,11 +26,9 @@ limitations under the License.
 namespace xllm {
 SharedMemoryTransport::SharedMemoryTransport(const std::string& name,
                                              size_t size,
-                                             bool& is_creator,
-                                             ForwardType type)
-    : segment_(name, size, is_creator), forward_type_(type) {
+                                             bool& is_creator)
+    : segment_(name, size, is_creator) {
   control_ptr_ = static_cast<ControlMetadata*>(base_address());
-  metadata_addr_ = static_cast<char*>(base_address()) + sizeof(ControlMetadata);
   if (::xllm::ExecutionConfig::get_instance().use_contiguous_input_buffer()) {
     stream_ = std::make_unique<Stream>();
   }
@@ -41,14 +41,10 @@ std::string SharedMemoryTransport::create_unique_name(const std::string& prefix,
                                                       ForwardType forward_type,
                                                       int rank) {
   std::string filename = prefix;
-  if (forward_type == ForwardType::PB_INPUT ||
-      forward_type == ForwardType::RAW_INPUT) {
+  if (forward_type == ForwardType::RAW_INPUT) {
     filename += "_dpg_" + std::to_string(dp_group) + "_input";
-  } else if (forward_type == ForwardType::PB_OUTPUT ||
-             forward_type == ForwardType::RAW_OUTPUT) {
+  } else if (forward_type == ForwardType::RAW_OUTPUT) {
     filename += "_rank_" + std::to_string(rank) + "_output";
-  } else {
-    // TODO: support more type later
   }
 
   return filename;

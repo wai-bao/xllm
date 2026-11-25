@@ -41,7 +41,7 @@ ShmChannel::ShmChannel(int32_t dp_group,
     auto name = SharedMemoryTransport::create_unique_name(
         name_prefix, dp_group, ForwardType::RAW_INPUT, rank);
     input_shm_manager_ = std::make_unique<SharedMemoryTransport>(
-        name, options.input_shm_size(), is_creator, ForwardType::RAW_INPUT);
+        name, options.input_shm_size(), is_creator);
     LOG(INFO) << "Create input shared memory manager with name: " << name
               << " and size: " << options.input_shm_size();
   }
@@ -49,7 +49,7 @@ ShmChannel::ShmChannel(int32_t dp_group,
   auto name = SharedMemoryTransport::create_unique_name(
       name_prefix, dp_group, ForwardType::RAW_OUTPUT, rank);
   output_shm_manager_ = std::make_unique<SharedMemoryTransport>(
-      name, options.output_shm_size(), is_creator, ForwardType::RAW_OUTPUT);
+      name, options.output_shm_size(), is_creator);
   LOG(INFO) << "Create output shared memory manager with name: " << name
             << " and size: " << options.output_shm_size();
 }

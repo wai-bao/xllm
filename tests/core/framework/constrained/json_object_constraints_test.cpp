@@ -41,7 +41,7 @@ TEST(JsonObjectConstraintsTest, AdvancesStatesWithReorderedTokenRows) {
   EXPECT_TRUE(violations.empty());
   EXPECT_EQ(states[0].snapshot().token_ids, std::vector<int32_t>({0}));
   EXPECT_EQ(states[1].snapshot().token_ids, std::vector<int32_t>({0, 1}));
-  EXPECT_TRUE(states[1].is_complete());
+  EXPECT_TRUE(states[1].accept_token(/*stop=*/5));
   EXPECT_FALSE(states[2].initialized());
   EXPECT_TRUE(states[3].snapshot().token_ids.empty());
 }
@@ -94,8 +94,8 @@ TEST(JsonObjectConstraintsTest, StopsAtFirstNegativeSpeculativeToken) {
       apply_json_constraints(states, accepted_tokens, /*token_ids=*/{0, 1});
 
   EXPECT_TRUE(violations.empty());
-  EXPECT_TRUE(states[0].is_complete());
   EXPECT_EQ(states[0].snapshot().token_ids, std::vector<int32_t>({0, 1}));
+  EXPECT_TRUE(states[0].accept_token(/*stop=*/2));
   EXPECT_TRUE(states[1].initialized());
   EXPECT_TRUE(states[1].snapshot().token_ids.empty());
 }
@@ -118,8 +118,8 @@ TEST(JsonObjectConstraintsTest, ReportsInvalidOneDimensionalToken) {
   EXPECT_EQ(violations[0].token_id, 1);
   EXPECT_EQ(violations[0].committed_tokens, 0);
   EXPECT_EQ(violations[0].state_fingerprint, expected_fingerprint);
-  EXPECT_TRUE(states[0].is_complete());
   EXPECT_EQ(states[0].snapshot().token_ids, std::vector<int32_t>({0, 1}));
+  EXPECT_TRUE(states[0].accept_token(/*stop=*/2));
   EXPECT_FALSE(states[1].initialized());
 }
 
@@ -147,8 +147,8 @@ TEST(JsonObjectConstraintsTest,
   EXPECT_EQ(violations[0].committed_tokens, 2);
   EXPECT_EQ(violations[0].state_fingerprint, expected_fingerprint);
   EXPECT_FALSE(states[0].initialized());
-  EXPECT_TRUE(states[1].is_complete());
   EXPECT_EQ(states[1].snapshot().token_ids, std::vector<int32_t>({0, 1}));
+  EXPECT_TRUE(states[1].accept_token(/*stop=*/5));
 }
 
 }  // namespace

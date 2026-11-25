@@ -57,9 +57,7 @@ class JsonObjectGrammarState final {
   bool accept_piece(std::string_view piece);
 
   bool is_valid() const { return valid_; }
-  bool is_complete() const { return valid_ && root_complete_; }
   bool in_reasoning() const { return reasoning_phase_; }
-  bool reasoning_enabled() const { return reasoning_enabled_; }
   bool initialized() const { return grammar_ != nullptr; }
   const JsonObjectGrammar* grammar() const { return grammar_; }
   JsonObjectGrammarSnapshot snapshot() const;

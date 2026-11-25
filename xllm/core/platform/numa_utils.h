@@ -54,18 +54,5 @@ int32_t bind_process_to_numa_node(int32_t numa_node);
  */
 int32_t bind_thread_to_numa_node(int32_t numa_node);
 
-/**
- * @brief Get the NUMA node ID of the current process
- * @return The NUMA node ID, or -1 if unable to determine
- */
-int32_t get_current_numa_node();
-
-/**
- * @brief Get list of CPU cores for a given NUMA node
- * @param numa_node The NUMA node ID
- * @return Vector of CPU core IDs belonging to the NUMA node
- */
-std::vector<int32_t> get_numa_node_cpus(int32_t numa_node);
-
 }  // namespace numa
 }  // namespace xllm

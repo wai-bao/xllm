@@ -16,8 +16,7 @@
 
 Source matrices use [output, input] order: Q then K then V, or gate then up.
 The production Phi-3 loader and checkpoint tests share this contract. It does
-not validate attention semantics or support KV head replication. Unrelated
-manifest entries are allowed and are not checked.
+not validate attention semantics or support KV head replication.
 """
 
 from __future__ import annotations
@@ -123,36 +122,6 @@ def _validate_tp(config: Phi3CheckpointConfig, name: str, tp_size: int) -> None:
     for field, value in dimensions:
         if value % tp_size:
             raise ValueError(f"{name}: {field}={value} must be divisible by tp_size={tp_size}")
-
-
-def validate_phi3_manifest(
-    config: Mapping[str, object], manifest: Mapping[str, object], *, tp_size: int = 1
-) -> Phi3CheckpointConfig:
-    """Validate config, all target manifest shapes, and evenly divisible TP.
-
-    Manifest entries have the form ``{full_weight_key: {"shape": [rows, cols]}}``.
-    Shape dimensions must be positive integers. Other descriptor fields (e.g.
-    safetensors dtype/data_offsets) and unrelated weights are not validated.
-    Raises ValueError with the complete target key for bad shapes or TP.
-    """
-    dimensions = parse_phi3_config(config)
-    if not isinstance(manifest, Mapping):
-        raise ValueError("manifest must be a JSON object mapping weight keys to descriptors")
-    for name, expected in expected_phi3_shapes(dimensions).items():
-        if name not in manifest:
-            raise ValueError(f"{name}: missing weight in manifest")
-        descriptor = manifest[name]
-        if not isinstance(descriptor, Mapping):
-            raise ValueError(f"{name}: descriptor must be an object with shape {list(expected)}")
-        shape = descriptor.get("shape")
-        if not isinstance(shape, (list, tuple)) or len(shape) != 2:
-            raise ValueError(f"{name}: expected shape {list(expected)}, got {shape!r}")
-        for dimension in shape:
-            _positive_int(dimension, f"{name}: shape dimension")
-        if tuple(shape) != expected:
-            raise ValueError(f"{name}: expected shape {list(expected)}, got {list(shape)}")
-        _validate_tp(dimensions, name, tp_size)
-    return dimensions
 
 
 def shard_phi3_fused_weight(

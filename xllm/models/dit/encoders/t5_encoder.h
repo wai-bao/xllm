@@ -240,36 +240,6 @@ class T5LayerFFNImpl : public torch::nn::Module {
 };
 TORCH_MODULE(T5LayerFFN);
 
-std::pair<std::unordered_set<int64_t>, torch::Tensor>
-find_pruneable_heads_and_indices(
-    const std::vector<int64_t>& heads,
-    int64_t n_heads,
-    int64_t head_size,
-    const std::unordered_set<int64_t>& already_pruned_heads,
-    torch::ScalarType dtype = torch::kBFloat16) {
-  std::unordered_set<int64_t> heads_to_prune;
-  for (int64_t h : heads) {
-    if (already_pruned_heads.find(h) == already_pruned_heads.end()) {
-      heads_to_prune.insert(h);
-    }
-  }
-  torch::Tensor mask = torch::ones({n_heads, head_size}, dtype);
-
-  for (int64_t head : heads_to_prune) {
-    int64_t adjusted_head = head;
-    for (int64_t pruned : already_pruned_heads) {
-      if (pruned < head) {
-        adjusted_head--;
-      }
-    }
-    mask[adjusted_head] = 0.0f;
-  }
-  mask = mask.view(-1).contiguous().eq(1.0f);
-  torch::Tensor index = torch::arange(mask.numel(), torch::kLong).index({mask});
-
-  return {heads_to_prune, index};
-}
-
 class T5AttentionImpl : public torch::nn::Module {
  public:
   T5AttentionImpl(const ModelContext& context,
@@ -636,10 +606,6 @@ class T5EncoderModelImpl : public torch::nn::Module {
 
   torch::nn::Embedding& get_input_embeddings() { return embed_tokens_; }
 
-  void set_input_embeddings(const torch::nn::Embedding& new_embeddings) {
-    embed_tokens_ = new_embeddings;
-  }
-
   torch::Tensor forward(const torch::Tensor& input_ids) {
     auto options = torch::TensorOptions()
                        .dtype(torch::typeMetaToScalarType(input_ids.dtype()))
@@ -651,8 +617,6 @@ class T5EncoderModelImpl : public torch::nn::Module {
     int64_t seq_length = input_shape[1];
     torch::Tensor causal_mask;
     causal_mask = torch::Tensor();
-    std::vector<torch::Tensor> all_hidden_states;
-    std::vector<torch::Tensor> all_attentions;
     torch::Tensor position_bias = torch::Tensor();
     for (size_t i = 0; i < layers_.size(); ++i) {
       torch::Tensor layer_head_mask = torch::Tensor();

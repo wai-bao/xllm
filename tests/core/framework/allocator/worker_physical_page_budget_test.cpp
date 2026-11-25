@@ -34,7 +34,7 @@ TEST(WorkerPhysicalPageBudgetTest, RangeReservationIsAtomicAndIsolated) {
 
   EXPECT_FALSE(budget.try_reserve(1, 3, 3));
   EXPECT_EQ(budget.min_free_pages(1, 3), 2);
-  EXPECT_EQ(budget.used_pages(), std::vector<size_t>({0, 6, 6, 0}));
+  EXPECT_EQ(budget.free_pages_snapshot(), (std::vector<size_t>{8, 2, 2, 8}));
 }
 
 TEST(WorkerPhysicalPageBudgetTest,
@@ -43,7 +43,7 @@ TEST(WorkerPhysicalPageBudgetTest,
   ASSERT_TRUE(budget.try_reserve(0, 1, 7));
 
   EXPECT_FALSE(budget.try_reserve(std::vector<size_t>{2, 4, 11}));
-  EXPECT_EQ(budget.used_pages(), std::vector<size_t>({7, 0, 0}));
+  EXPECT_EQ(budget.free_pages_snapshot(), (std::vector<size_t>{3, 10, 10}));
 
   EXPECT_TRUE(budget.try_reserve(std::vector<size_t>{2, 4, 10}));
   EXPECT_EQ(budget.free_pages_snapshot(), std::vector<size_t>({1, 6, 0}));
@@ -59,7 +59,7 @@ TEST(WorkerPhysicalPageBudgetTest, ReleaseSaturatesAndSnapshotIsIndependent) {
   budget.release(0, 2, 10);
   EXPECT_EQ(budget.free_pages_snapshot(), std::vector<size_t>({4, 4}));
   budget.release(std::vector<size_t>{1, 1, 1});
-  EXPECT_EQ(budget.used_pages(), std::vector<size_t>({0, 0}));
+  EXPECT_EQ(budget.free_pages_snapshot(), (std::vector<size_t>{4, 4}));
 }
 
 TEST(WorkerPhysicalPageBudgetTest, InvalidReservationsDoNotMutateState) {
@@ -68,7 +68,7 @@ TEST(WorkerPhysicalPageBudgetTest, InvalidReservationsDoNotMutateState) {
   EXPECT_FALSE(budget.try_reserve(-1, 1, 1));
   EXPECT_FALSE(budget.try_reserve(1, 3, 1));
   EXPECT_FALSE(budget.try_reserve(std::vector<size_t>{1}));
-  EXPECT_EQ(budget.used_pages(), std::vector<size_t>({0, 0}));
+  EXPECT_EQ(budget.free_pages_snapshot(), (std::vector<size_t>{4, 4}));
   EXPECT_EQ(budget.free_pages(-1), 0);
   EXPECT_EQ(budget.free_pages(2), 0);
 }

@@ -173,7 +173,7 @@ class _HyperHead(nn.Module):
 
 @pytest.mark.parametrize("model_type", ["glm", "mtp"])
 def test_model_records_each_event_after_its_layer(model_type: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    def _concat_hidden(embed: torch.Tensor, carried: torch.Tensor, *norm_args: object) -> torch.Tensor:
+    def _concat_hidden(embed: torch.Tensor, carried: torch.Tensor) -> torch.Tensor:
         return torch.cat((embed, carried), dim=-1)
 
     # This test tracks layer completion; normalization stays outside its scope.

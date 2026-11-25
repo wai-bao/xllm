@@ -25,7 +25,6 @@ cc_library(
     shared_memory_manager.h
     slice.h
     spin_lock.h
-    spin_rw_lock.h
     tensor_codec.h
     tensor_helper.h
     tensor_options.h

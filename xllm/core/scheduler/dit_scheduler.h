@@ -102,10 +102,6 @@ class DiTDynamicBatchScheduler : public DiTScheduler {
     return pending_requests_.load(std::memory_order_relaxed);
   }
 
-  std::vector<std::shared_ptr<DiTRequest>> get_running_requests() {
-    return running_requests_;
-  }
-
  protected:
   const Options options_;
 

@@ -25,17 +25,12 @@ limitations under the License.
 #include <cstddef>
 #include <cstring>
 #include <memory>
-#include <mutex>
 #include <sstream>
-#include <unordered_set>
 
 namespace xllm {
 namespace net {
 
 namespace {
-
-std::mutex g_port_mutex;
-std::unordered_set<int> g_allocated_port_map;
 
 std::string to_ip_addr(const sockaddr_in& addr) {
   char ip[INET_ADDRSTRLEN]{'\0'};
@@ -130,40 +125,6 @@ std::string get_route_ip(const std::string& remote_addr) {
 
   LOG(ERROR) << "No local route found for remote address " << remote_addr;
   return "";
-}
-
-int get_local_free_port() {
-  std::lock_guard<std::mutex> lock(g_port_mutex);
-  int port = 0;
-  do {
-    port = 0;
-    struct sockaddr_in addr;
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-      return -1;
-    }
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-    if (bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
-      ::close(fd);
-      return -1;
-    }
-    socklen_t len = sizeof(addr);
-    if (getsockname(fd, reinterpret_cast<struct sockaddr*>(&addr), &len) ==
-        -1) {
-      ::close(fd);
-      return -1;
-    }
-    port = ntohs(addr.sin_port);
-
-    ::close(fd);
-  } while (g_allocated_port_map.find(port) != g_allocated_port_map.end());
-
-  g_allocated_port_map.insert(port);
-
-  return port;
 }
 
 uint64_t convert_ip_port_to_uint64(const std::string& ip, uint16_t port) {

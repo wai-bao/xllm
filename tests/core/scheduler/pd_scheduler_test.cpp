@@ -1752,8 +1752,6 @@ TEST(PDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   const int64_t server_ttft_count =
       HISTOGRAM_server_time_to_first_token_latency_milliseconds.count();
   service.before_first_generation_ack = [&] {
-    EXPECT_FALSE(local_healthy->server_ttft_seconds().has_value());
-    EXPECT_FALSE(remote_healthy->server_ttft_seconds().has_value());
     EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
               server_ttft_count);
   };
@@ -1774,10 +1772,6 @@ TEST(PDSchedulerTest, PendingReleaseDoesNotDelayFirstGeneration) {
   std::shared_ptr<Request> queued;
   if (status == std::future_status::ready) {
     prefill.drain_request_releases();
-    EXPECT_TRUE(local_healthy->server_ttft_seconds().has_value());
-    if (local_healthy->server_ttft_seconds().has_value()) {
-      EXPECT_GE(*local_healthy->server_ttft_seconds(), 3.0);
-    }
     EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
               server_ttft_count + 1);
     EXPECT_FALSE(remote_healthy->record_server_first_token());
@@ -1838,7 +1832,6 @@ TEST(PDSchedulerTest, FailedFirstGenerationDoesNotRecordServerTtft) {
   prefill.prefill_send_first_generation();
   prefill.wait_prefill_completion();
   prefill.wait_notifications();
-  EXPECT_FALSE(request->server_ttft_seconds().has_value());
   EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
             server_ttft_count);
   EXPECT_EQ(prefill_engine.block_manager_pool()->num_used_blocks()[0], 0u);

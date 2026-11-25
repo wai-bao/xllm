@@ -162,11 +162,9 @@ TYPED_TEST(SharedMemoryFullLeaseInputTest,
   std::replace(name.begin(), name.end(), '/', '_');
   bool is_creator = false;
   constexpr size_t kSegmentBytes = 1 << 20;
-  SharedMemoryTransport writer(
-      name, kSegmentBytes, is_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport writer(name, kSegmentBytes, is_creator);
   ASSERT_TRUE(is_creator);
-  SharedMemoryTransport reader(
-      name, kSegmentBytes, is_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport reader(name, kSegmentBytes, is_creator);
   ASSERT_FALSE(is_creator);
   TypeParam source = make_input<TypeParam>({});
   source.input_params.embedding.full_block_slot_rows = {
@@ -273,11 +271,9 @@ TYPED_TEST(SharedMemoryInputTest,
   std::replace(name.begin(), name.end(), '/', '_');
   bool is_creator = false;
   constexpr size_t kSegmentBytes = 1 << 20;
-  SharedMemoryTransport writer(
-      name, kSegmentBytes, is_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport writer(name, kSegmentBytes, is_creator);
   ASSERT_TRUE(is_creator);
-  SharedMemoryTransport reader(
-      name, kSegmentBytes, is_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport reader(name, kSegmentBytes, is_creator);
   ASSERT_FALSE(is_creator);
   const LayerOffsets expected = make_sparse_role_offsets();
   TypeParam source = make_input<TypeParam>(expected);
@@ -363,10 +359,8 @@ TEST_F(VlmSharedMemoryInputTest,
   const auto expected = torch::arange(12, torch::kFloat32).reshape({3, 4});
   const std::string name = "/xllm_visual_input_" + std::to_string(getpid());
   bool creator = false;
-  SharedMemoryTransport writer(
-      name, /*size=*/1 << 20, creator, ForwardType::RAW_INPUT);
-  SharedMemoryTransport reader(
-      name, /*size=*/1 << 20, creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport writer(name, /*size=*/1 << 20, creator);
+  SharedMemoryTransport reader(name, /*size=*/1 << 20, creator);
   {
     VlmForwardInput source = make_input<VlmForwardInput>({});
     auto pixels = expected.clone();

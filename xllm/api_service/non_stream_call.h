@@ -136,7 +136,6 @@ class NonStreamCall : public Call {
 
   const Request& request() const { return *request_; }
   Response& response() { return *response_; }
-  ::google::protobuf::Closure* done() { return done_; }
 
  private:
   ::google::protobuf::Closure* done_;

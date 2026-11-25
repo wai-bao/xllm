@@ -22,23 +22,6 @@ namespace xllm {
 TensorProtoBuilder::TensorProtoBuilder(bool use_binary_encoding)
     : use_binary_encoding_(use_binary_encoding) {};
 
-bool TensorProtoBuilder::build_repeated_tensor(
-    const std::vector<torch::Tensor>& in_tensors,
-    google::protobuf::RepeatedPtrField<xllm::proto::Tensor>& out_tensors,
-    std::string& binary_payload) {
-  for (const auto& in_tensor : in_tensors) {
-    CHECK(in_tensor.is_contiguous())
-        << "Internal Error: only support contiguous mm_embedding";
-
-    xllm::proto::Tensor* out_tensor = out_tensors.Add();
-
-    if (!build_tensor(in_tensor, *out_tensor, binary_payload)) {
-      return false;
-    }
-  }
-  return true;
-}
-
 bool TensorProtoBuilder::build_tensor(const torch::Tensor& in_tensor,
                                       xllm::proto::Tensor& out_tensor,
                                       std::string& binary_payload) {

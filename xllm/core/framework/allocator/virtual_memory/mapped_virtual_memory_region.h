@@ -63,17 +63,11 @@ class MappedVirtualMemoryRegion final {
   // Returns true on success
   bool map_with_page_ids(const std::vector<page_id_t>& page_ids);
 
-  // Check whether this region owns a reservation of externally selected pages.
-  bool is_using_preallocated_pages() const { return use_preallocated_pages_; }
-
   inline size_t size() const noexcept { return size_; }
   inline size_t page_size() const noexcept { return page_size_; }
   inline VirPtr vaddr() const noexcept { return vaddr_; }
 
   inline const torch::Device& device() const noexcept { return dev_; }
-
-  // Non-owning base virtual address.
-  inline VirPtr get_base_ptr() const noexcept { return vaddr_; }
 
   // Get the pool page_id for a mapped page-aligned byte offset.
   // Returns -1 if the offset is invalid or has no transferred page mapping.

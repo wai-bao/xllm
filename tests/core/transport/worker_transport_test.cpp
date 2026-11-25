@@ -110,8 +110,8 @@ class WorkerTransportTest : public ::testing::Test {
         ForwardType::RAW_OUTPUT,
         /*rank=*/1);
     bool is_creator = true;
-    writer_ = std::make_unique<SharedMemoryTransport>(
-        name, kOutputBytes, is_creator, ForwardType::RAW_OUTPUT);
+    writer_ =
+        std::make_unique<SharedMemoryTransport>(name, kOutputBytes, is_creator);
     ASSERT_FALSE(is_creator);
   }
 
@@ -133,8 +133,8 @@ class WorkerTransportTest : public ::testing::Test {
         /*dp_group=*/0,
         ForwardType::RAW_OUTPUT,
         /*rank=*/0);
-    writer_ = std::make_unique<SharedMemoryTransport>(
-        name, kOutputBytes, is_creator, ForwardType::RAW_OUTPUT);
+    writer_ =
+        std::make_unique<SharedMemoryTransport>(name, kOutputBytes, is_creator);
     channel_ = std::make_unique<WorkerTransport>(
         address_, /*rank=*/0, /*dp_local_tp_size=*/2, options_);
   }
@@ -150,10 +150,10 @@ class WorkerTransportTest : public ::testing::Test {
         SharedMemoryTransport::can_write_input(input, segment_size - 1));
     EXPECT_FALSE(SharedMemoryTransport::can_write_input(input, 0));
     bool is_creator = false;
-    SharedMemoryTransport writer(writer_->name() + "_input_capacity",
-                                 segment_size,
-                                 is_creator,
-                                 ForwardType::RAW_INPUT);
+    SharedMemoryTransport writer(
+        "xllm_" + net::extract_port(address_) + "_input_capacity",
+        segment_size,
+        is_creator);
     ASSERT_TRUE(is_creator);
     EXPECT_TRUE(writer.input_write(input));
   }
@@ -196,8 +196,7 @@ class WorkerTransportTest : public ::testing::Test {
         ForwardType::RAW_INPUT,
         /*rank=*/0);
     bool is_creator = true;
-    SharedMemoryTransport input_reader(
-        name, kInputBytes, is_creator, ForwardType::RAW_INPUT);
+    SharedMemoryTransport input_reader(name, kInputBytes, is_creator);
     ASSERT_FALSE(is_creator);
     EXPECT_EQ(static_cast<const ControlMetadata*>(input_reader.base_address())
                   ->version,
@@ -307,8 +306,7 @@ TEST_F(WorkerTransportTest, InputWriteFailureFallsBackBeforePublishingRequest) {
       ForwardType::RAW_INPUT,
       /*rank=*/0);
   bool is_creator = true;
-  SharedMemoryTransport input_reader(
-      name, kSmallInputBytes, is_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport input_reader(name, kSmallInputBytes, is_creator);
   ASSERT_FALSE(is_creator);
   EXPECT_EQ(
       static_cast<const ControlMetadata*>(input_reader.base_address())->version,

@@ -255,8 +255,13 @@ class BatchSpeculativeStatsTest : public ::testing::Test {
     BlockManager::Options options;
     options.num_blocks(8).block_size(16);
     manager_ = std::make_unique<BlockManagerImpl>(options);
-    stopping_checker_.set_max_generated_tokens(8);
-    stopping_checker_.set_eos_token(100);
+    stopping_checker_ = StoppingChecker(
+        /*max_generated_tokens=*/8,
+        /*max_context_len=*/0,
+        /*eos_token=*/100,
+        /*ignore_eos=*/false,
+        /*stop_tokens=*/{},
+        /*stop_sequences=*/{});
     request_stats_ = std::make_shared<SpeculativeTokenStats>();
   }
 
@@ -557,7 +562,6 @@ TEST(BatchTest, ConsumesRestoreRequirementWhenBuildingInput) {
   EXPECT_EQ(input.input_params.meta.batch_id, batch.batch_id());
   EXPECT_TRUE(input.input_params.meta.requires_host_restore);
   sequence.append_token(Token(/*id=*/5));
-  batch.refresh_forward_type();
   EXPECT_FALSE(batch.prepare_forward_input(ModelArgs())
                    .input_params.meta.requires_host_restore);
 }
@@ -1739,7 +1743,7 @@ TEST(BatchTest, ChunkedPDTransferUsesStepWindow) {
   std::vector<Sequence*> sequences = {&seq};
   std::vector<uint32_t> budgets = {8};
   const BatchInputData batch_input_data{
-      sequences, {}, budgets, {}, {}, 0, BatchForwardType::PREFILL};
+      sequences, budgets, {}, {}, 0, BatchForwardType::PREFILL};
   ForwardInputBuilder builder(batch_input_data, nullptr);
 
   LlmForwardInput input = builder.build_forward_input();
@@ -1794,7 +1798,7 @@ TEST(BatchTest, PrefixCacheTransferIgnoresKvCacheCursor) {
   std::vector<Sequence*> sequences = {&seq};
   std::vector<uint32_t> budgets = {2};
   const BatchInputData batch_input_data{
-      sequences, {}, budgets, {}, {}, 0, BatchForwardType::PREFILL};
+      sequences, budgets, {}, {}, 0, BatchForwardType::PREFILL};
   ForwardInputBuilder builder(batch_input_data, nullptr);
 
   LlmForwardInput input = builder.build_forward_input();
@@ -1847,7 +1851,7 @@ TEST(BatchTest, ForwardInputPreservesTransferInfoAndBatchId) {
   std::vector<Sequence*> sequences = {&seq};
   std::vector<uint32_t> budgets = {8};
   const BatchInputData batch_input_data{
-      sequences, {}, budgets, {}, {}, batch_id, BatchForwardType::PREFILL};
+      sequences, budgets, {}, {}, batch_id, BatchForwardType::PREFILL};
   ForwardInputBuilder builder(batch_input_data, nullptr);
 
   LlmForwardInput input = builder.build_forward_input();
@@ -1902,7 +1906,7 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
   std::vector<Sequence*> sequences = {&seq};
   std::vector<uint32_t> budgets = {4};
   const BatchInputData batch_input_data{
-      sequences, {}, budgets, {}, {}, batch_id, BatchForwardType::PREFILL};
+      sequences, budgets, {}, {}, batch_id, BatchForwardType::PREFILL};
   ForwardInputBuilder builder(batch_input_data, nullptr);
 
   LlmForwardInput input = builder.build_forward_input();
@@ -1922,11 +1926,9 @@ TEST(BatchTest, ForwardInputPackedRoundTripPreservesTransportFields) {
                                                 /*dp_group=*/0,
                                                 ForwardType::RAW_INPUT,
                                                 /*rank=*/0);
-  SharedMemoryTransport writer_manager(
-      shm_name, 1 << 20, is_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport writer_manager(shm_name, 1 << 20, is_creator);
   bool is_reader_creator = false;
-  SharedMemoryTransport reader_manager(
-      shm_name, 1 << 20, is_reader_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport reader_manager(shm_name, 1 << 20, is_reader_creator);
 
   ASSERT_TRUE(writer_manager.input_write(input));
 
@@ -1992,13 +1994,11 @@ TEST(BatchTest, NativeDiTShmRoundTripOwnsTensorSourcesAcrossSegmentOverwrite) {
     bool is_creator = false;
     SharedMemoryTransport writer_manager(shm_name,
                                          /*size=*/1 << 20,
-                                         is_creator,
-                                         ForwardType::RAW_INPUT);
+                                         is_creator);
     bool is_reader_creator = false;
     SharedMemoryTransport reader_manager(shm_name,
                                          /*size=*/1 << 20,
-                                         is_reader_creator,
-                                         ForwardType::RAW_INPUT);
+                                         is_reader_creator);
     ASSERT_TRUE(writer_manager.input_write(input));
     reader_manager.input_read(round_trip);
 
@@ -2111,11 +2111,9 @@ TEST(BatchTest, ForwardOutputShmRoundTripPreservesJsonObjectErrors) {
                                                 /*dp_group=*/0,
                                                 ForwardType::RAW_OUTPUT,
                                                 /*rank=*/0);
-  SharedMemoryTransport writer_manager(
-      shm_name, 1 << 20, is_creator, ForwardType::RAW_OUTPUT);
+  SharedMemoryTransport writer_manager(shm_name, 1 << 20, is_creator);
   bool is_reader_creator = false;
-  SharedMemoryTransport reader_manager(
-      shm_name, 1 << 20, is_reader_creator, ForwardType::RAW_OUTPUT);
+  SharedMemoryTransport reader_manager(shm_name, 1 << 20, is_reader_creator);
   const torch::Tensor next_tokens =
       torch::tensor({{30, 31, -1}, {40, 41, 42}}, torch::kInt64);
   const std::vector<SpeculativeTokenStats> speculative_token_stats = {{1, 3},
@@ -2244,7 +2242,6 @@ TEST(BatchTest, SampleRequestKeepsThreadedForwardBuilderOffsetsStable) {
   ThreadPool thread_pool(2);
   ModelArgs args;
   const BatchInputData batch_input_data{sequences,
-                                        {},
                                         allowed_max_tokens,
                                         input_embeddings_vec,
                                         mm_data_vec,
@@ -2301,7 +2298,6 @@ TEST(BatchTest, ThreadedMropeIgnoresEmptyTailPartitions) {
   args.rope_scaling_rope_type("mrope");
   ThreadPool thread_pool(kThreadCount);
   const BatchInputData batch_input_data{sequences,
-                                        {},
                                         allowed_max_tokens,
                                         input_embeddings,
                                         mm_data,
@@ -2368,7 +2364,6 @@ TEST(BatchTest, DecodeEmbeddingAndLinearStateIdsAreIndependentSlots) {
   ModelArgs args;
   args.layer_types({"linear_attention"});
   const BatchInputData batch_input_data{sequences,
-                                        {},
                                         allowed_max_tokens,
                                         input_embeddings_vec,
                                         mm_data_vec,
@@ -2429,7 +2424,6 @@ TEST(BatchTest, SharedArenaPublishesLinearGroupSlotsForReadAndWriteStates) {
   ModelArgs args;
   args.layer_types({"linear_attention", "full_attention"});
   const BatchInputData batch_input_data{sequences,
-                                        {},
                                         allowed_max_tokens,
                                         input_embeddings_vec,
                                         mm_data_vec,
@@ -3334,11 +3328,9 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateIds) {
                                                 /*dp_group=*/0,
                                                 ForwardType::RAW_INPUT,
                                                 /*rank=*/0);
-  SharedMemoryTransport writer_manager(
-      shm_name, 1 << 20, is_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport writer_manager(shm_name, 1 << 20, is_creator);
   bool is_reader_creator = false;
-  SharedMemoryTransport reader_manager(
-      shm_name, 1 << 20, is_reader_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport reader_manager(shm_name, 1 << 20, is_reader_creator);
   ASSERT_TRUE(writer_manager.input_write(forward_input));
 
   LlmForwardInput from_shm;
@@ -3395,11 +3387,9 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesEmptyRankTensors) {
                                                 /*dp_group=*/0,
                                                 ForwardType::RAW_INPUT,
                                                 /*rank=*/0);
-  SharedMemoryTransport writer_manager(
-      shm_name, 1 << 20, is_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport writer_manager(shm_name, 1 << 20, is_creator);
   bool is_reader_creator = false;
-  SharedMemoryTransport reader_manager(
-      shm_name, 1 << 20, is_reader_creator, ForwardType::RAW_INPUT);
+  SharedMemoryTransport reader_manager(shm_name, 1 << 20, is_reader_creator);
   ASSERT_TRUE(writer_manager.input_write(forward_input));
 
   LlmForwardInput from_shm;
@@ -3647,7 +3637,6 @@ TEST_P(BatchOutputActionTest, CommitSkipsCancelledPendingTarget) {
   auto request = make_request(/*enable_schedule_overlap=*/true);
   Batch batch;
   batch.add(request->sequences().front().get());
-  batch.add(request->sequence_group());
   (void)batch.prepare_forward_input(ModelArgs(), nullptr);
 
   apply_output(batch, BatchOutputAction::RESERVE_PENDING, /*token_id=*/-1);

@@ -131,11 +131,5 @@ bool try_map(VirPtr& vir_ptr,
 void unmap(VirPtr& vir_ptr, size_t aligned_size);
 void unmap(VirPtr& vir_ptr, size_t aligned_size, size_t granularity_size);
 
-// unmap a single contiguous chunk that was mapped by ONE map() call covering
-// the whole `size` (as opposed to per-granularity-page mapping). On NPU this
-// issues a single aclrtUnmapMem at the base address; on other platforms it is
-// equivalent to a single cuMemUnmap/cnMemUnmap/... of the whole range.
-void unmap_chunk(VirPtr& vir_ptr, size_t size);
-
 }  // namespace vmm
 }  // namespace xllm

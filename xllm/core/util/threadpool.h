@@ -42,8 +42,7 @@ namespace xllm {
 // and replaces them with one condvar wakeup at `wait()` time.
 //
 // Designed for the schedule-then-wait pattern where the caller knows the
-// exact task count up front. For inline split-and-join the
-// `MPMCThreadPool::parallel_for` primitive is more convenient.
+// exact task count up front.
 //
 // Usage:
 //   TaskGroup group(num_tasks);
@@ -210,61 +209,6 @@ class MPMCThreadPool final {
 
   // Schedule a runnable on the global queue. Any idle worker may pick it up.
   void schedule(Runnable runnable);
-
-  // Parallel-for primitive. Splits `[0, total)` into chunks of at most
-  // `grain` elements each, dispatches each chunk to a worker thread, and
-  // blocks until all chunks complete. Rethrows the first exception captured
-  // by any chunk.
-  //
-  // `body(begin, end)` is called with sub-ranges where `end - begin <=
-  // grain` (the last chunk may be smaller). The same `body` is invoked
-  // concurrently from multiple worker threads, so it must be safe to call
-  // for distinct sub-ranges in parallel — typically `body` reads/writes
-  // disjoint elements of caller-owned buffers.
-  //
-  // Adaptive concurrency:
-  //   * Task count is `ceil(total / grain)` capped by `size()`, so a larger
-  //     pool can absorb more work without changing call sites.
-  //   * When only a single chunk would result (or `total <= grain`), the
-  //     work runs inline on the calling thread to avoid pool wakeup
-  //     overhead. This makes `parallel_for` safe to call unconditionally
-  //     from hot paths even for small `total`.
-  template <typename Body>
-  void parallel_for(size_t total, size_t grain, Body body) {
-    if (total == 0) {
-      return;
-    }
-    if (grain == 0) {
-      grain = 1;
-    }
-    const size_t pool_size = threads_.size();
-    size_t num_tasks = (total + grain - 1) / grain;
-    if (pool_size > 0) {
-      num_tasks = std::min(num_tasks, pool_size);
-    }
-    if (num_tasks <= 1 || pool_size == 0) {
-      // Single chunk (or no workers): run inline. Saves a pool wakeup
-      // and a BlockingCounter cycle on the small-batch fast path.
-      body(static_cast<size_t>(0), total);
-      return;
-    }
-    const size_t chunk = (total + num_tasks - 1) / num_tasks;
-    // After picking `chunk = ceil(total / num_tasks)`, the *effective*
-    // number of non-empty sub-ranges is `ceil(total / chunk)`, which can
-    // be strictly less than `num_tasks` when `total` does not divide
-    // evenly. Using the effective count avoids scheduling empty trailing
-    // tasks (which would still bump the BlockingCounter and incur a pool
-    // round-trip for nothing).
-    const size_t effective_tasks = (total + chunk - 1) / chunk;
-
-    TaskGroup group(static_cast<int32_t>(effective_tasks));
-    for (size_t t = 0; t < effective_tasks; ++t) {
-      const size_t begin = t * chunk;
-      const size_t end = std::min(begin + chunk, total);
-      schedule(group.wrap([&body, begin, end]() { body(begin, end); }));
-    }
-    group.wait();
-  }
 
   bool empty() {
     if (global_queue_.size_approx() != 0) {

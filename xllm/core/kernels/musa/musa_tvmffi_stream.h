@@ -37,13 +37,9 @@ inline bool is_torch_device(const torch::Device& device) {
 
 void bind_tvmffi_stream(const torch::Device& device);
 
-bool is_stream_capturing();
-
 void sync_current_stream(const torch::Device& device);
 
 void sync_ffi_stream(const torch::Device& device);
-
-void sync_graph_preparation_stage(const torch::Device& device);
 
 class TvmffiPreparationSyncGuard final {
  public:
@@ -181,8 +177,6 @@ std::vector<torch::Tensor> end_ffi_alloc_record();
 void begin_ffi_alloc_replay(const std::vector<torch::Tensor>* recorded);
 
 void end_ffi_alloc_replay();
-
-FfiAllocMode get_ffi_alloc_mode();
 
 void bind_tvmffi_stream_to_current_torch_stream(const torch::Device& device);
 }  // namespace xllm::kernel::musa

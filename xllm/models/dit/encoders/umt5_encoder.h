@@ -188,10 +188,6 @@ class UMT5EncoderModelImpl final : public torch::nn::Module {
 
   torch::nn::Embedding& get_input_embeddings() { return embed_tokens_; }
 
-  void set_input_embeddings(const torch::nn::Embedding& new_embeddings) {
-    embed_tokens_ = new_embeddings;
-  }
-
   torch::Tensor forward(
       const torch::Tensor& input_ids,
       const std::optional<torch::Tensor>& attention_mask = std::nullopt) {

@@ -24,7 +24,7 @@ from unittest import mock
 
 from setuptools import Command, Distribution
 
-from scripts.build_support.utils import load_setup_module as _load_setup_module
+from tests.scripts.setup_test_utils import load_setup_module as _load_setup_module
 
 
 class BuildCommandsTest(unittest.TestCase):

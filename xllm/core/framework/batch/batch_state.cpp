@@ -19,13 +19,10 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
-#include <algorithm>
-#include <numeric>
 #include <utility>
 
 #include "core/framework/batch/forward_input_builder.h"
 #include "core/framework/config/kv_cache_config.h"
-#include "core/framework/config/parallel_config.h"
 #include "core/framework/model/model_args.h"
 
 namespace xllm {
@@ -85,80 +82,33 @@ void BatchState::update_forward_type(Sequence* sequence) {
   }
 }
 
-void BatchState::reserve(size_t sequence_count, size_t group_count) {
-  reserve(sequence_count, group_count, sequence_count);
-}
-
-void BatchState::reserve(size_t sequence_count,
-                         size_t group_count,
-                         size_t input_embedding_count) {
+void BatchState::reserve(size_t sequence_count, size_t input_embedding_count) {
   sequence_plan_.reserve(sequence_count);
   host_restore_leases_.reserve(sequence_count);
   input_embeddings_vec_.reserve(input_embedding_count);
-  sequence_groups_.reserve(group_count);
 }
 
-void BatchState::add(SequencesGroup* sequence_group) {
-  CHECK(sequence_group != nullptr);
-  CHECK(!sequence_group->sequences().empty());
-  set_batch_id();
-  sequence_groups_.emplace_back(sequence_group);
-}
-
-void BatchState::refresh_forward_type(const std::vector<Sequence*>& sequences) {
-  batch_forward_type_ = BatchForwardType();
-  for (auto* sequence : sequences) {
-    update_forward_type(sequence);
-  }
-}
-
-size_t BatchState::num_group_sequences() const {
-  size_t count = 0;
-  for (const auto* group : sequence_groups_) {
-    count += group->sequences().size();
-  }
-  return count;
-}
-
-std::vector<Sequence*> BatchState::group_sequences() const {
-  std::vector<Sequence*> sequences;
-  sequences.reserve(num_group_sequences());
-  for (const auto* group : sequence_groups_) {
-    for (const auto& sequence : group->sequences()) {
-      sequences.emplace_back(sequence.get());
-    }
-  }
-  return sequences;
-}
-
-BatchInputData BatchState::input_data(const BatchSequencePlan& plan) {
+BatchInputData BatchState::prepare_batch_input() {
   if (KVCacheConfig::get_instance().enable_vmm_kvcache()) {
     std::vector<Block> retained_blocks;
     size_t block_count = 0;
-    for (auto* sequence : plan.sequences()) {
+    for (auto* sequence : sequence_plan_.sequences()) {
       block_count += sequence->kv_state().num_blocks(BlockType::KV);
     }
     retained_blocks.reserve(block_count);
-    for (auto* sequence : plan.sequences()) {
+    for (auto* sequence : sequence_plan_.sequences()) {
       const auto blocks = sequence->kv_state().blocks(BlockType::KV);
       retained_blocks.insert(
           retained_blocks.end(), blocks.begin(), blocks.end());
     }
     vmm_kv_blocks_ = std::move(retained_blocks);
   }
-  return {plan.sequences(),
-          sequence_groups_,
-          plan.budgets(),
+  return {sequence_plan_.sequences(),
+          sequence_plan_.budgets(),
           input_embeddings_vec_,
           mm_data_vec_,
           batch_id_,
           batch_forward_type_};
-}
-
-BatchInputData BatchState::prepare_batch_input() {
-  CHECK(sequence_groups_.empty() || !sequence_plan_.empty())
-      << "Sequence input requires scheduled sequences";
-  return input_data(sequence_plan_);
 }
 
 template <typename Input>

@@ -345,7 +345,7 @@ bool try_map(VirPtr& vir_ptr,
   accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   ret = cuMemSetAccess(vir_ptr, granularity_size, &accessDesc, 1);
   if (ret != 0) {
-    unmap_chunk(vir_ptr, granularity_size);
+    unmap(vir_ptr, granularity_size);
     return check_allocation_result(ret,
                                    "Failed to set memory access permissions",
                                    device_id,
@@ -365,7 +365,7 @@ bool try_map(VirPtr& vir_ptr,
   accessDesc.flags = MU_MEM_ACCESS_FLAGS_PROT_READWRITE;
   ret = muMemSetAccess(vir_ptr, granularity_size, &accessDesc, 1);
   if (ret != 0) {
-    unmap_chunk(vir_ptr, granularity_size);
+    unmap(vir_ptr, granularity_size);
     return check_allocation_result(ret,
                                    "Failed to set memory access permissions",
                                    device_id,
@@ -385,7 +385,7 @@ bool try_map(VirPtr& vir_ptr,
   accessDesc.flags = hipMemAccessFlagsProtReadWrite;
   ret = hipMemSetAccess(vir_ptr, granularity_size, &accessDesc, 1);
   if (ret != 0) {
-    unmap_chunk(vir_ptr, granularity_size);
+    unmap(vir_ptr, granularity_size);
     return check_allocation_result(ret,
                                    "Failed to set memory access permissions",
                                    device_id,
@@ -435,21 +435,6 @@ void unmap(VirPtr& vir_ptr, size_t aligned_size, size_t granularity_size) {
   int ret = 0;
   ret = muMemUnmap(vir_ptr, aligned_size);
   CHECK_EQ(ret, 0) << "Failed to unmap virtual memory from physical memory";
-#endif
-}
-
-void unmap_chunk(VirPtr& vir_ptr, size_t size) {
-#if defined(USE_NPU)
-  // NPU: the chunk was mapped by a single aclrtMapMem covering `size`, so one
-  // aclrtUnmapMem at the base address unmaps the whole chunk (unlike unmap(),
-  // which unmaps per 2MB page as mapped by the virtual memory path).
-  (void)size;
-  int32_t ret = aclrtUnmapMem(reinterpret_cast<void*>(vir_ptr));
-  CHECK_EQ(ret, 0) << "Failed to unmap virtual memory chunk";
-#else
-  // Other backends unmap the whole [vir_ptr, vir_ptr + size) range in a single
-  // driver call, identical to unmap(); reuse it.
-  unmap(vir_ptr, size);
 #endif
 }
 

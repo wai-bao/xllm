@@ -2,17 +2,10 @@
 """Shared device test lifecycle; suites own shapes, references and tolerances."""
 
 import argparse
-import subprocess
 import sys
-from pathlib import Path
 
 import torch
 from xllm_kernel.numerics.suite import OperationSuite
-
-
-def check_suite(suite: OperationSuite, implementation: str, mode: str) -> None:
-    """Give each implementation/mode its own immutable worker and graph policy."""
-    subprocess.run([sys.executable, str(Path(__file__).resolve()), suite.operation, implementation, mode], check=True)
 
 
 def _check_suite(suite: OperationSuite, implementation: str, mode: str) -> None:

@@ -74,10 +74,10 @@ class SharedMemoryOutputTest : public ::testing::Test {
         prefix, /*dp_group=*/0, ForwardType::RAW_OUTPUT, /*rank=*/0);
     bool is_creator = false;
     writer_ = std::make_unique<SharedMemoryTransport>(
-        name, kSegmentBytes, is_creator, ForwardType::RAW_OUTPUT);
+        name, kSegmentBytes, is_creator);
     ASSERT_TRUE(is_creator);
     reader_ = std::make_unique<SharedMemoryTransport>(
-        name, kSegmentBytes, is_creator, ForwardType::RAW_OUTPUT);
+        name, kSegmentBytes, is_creator);
     ASSERT_FALSE(is_creator);
   }
 

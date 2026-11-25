@@ -27,11 +27,11 @@ limitations under the License.
 #include <thread>
 #include <vector>
 
+#include "core/util/free_port.h"
 #include "framework/parallel_state/process_group.h"
 #include "layers/mlu/dcp_indexer_candidate.h"
 #include "platform/device.h"
 #include "platform/platform.h"
-#include "util/net.h"
 
 namespace xllm::layer {
 namespace {

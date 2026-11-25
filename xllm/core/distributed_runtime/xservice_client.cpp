@@ -56,18 +56,6 @@ static std::unordered_map<xllm_service::proto::InstanceType, std::string>
         {xllm_service::proto::InstanceType::MIX, "XLLM:MIX:"},
 };
 
-std::string parse_instance_name(const std::string& name) {
-  if (name.empty()) return "";
-  // Validate the format of instance name
-  // The format is `ip:port` currently.
-  auto pos = name.find(':');
-  if (pos == std::string::npos) {
-    // only offer the port, we need to fill the ip address
-    return xllm::net::get_local_ip_addr() + ":" + name;
-  }
-  return name;
-}
-
 bool check_instance_name(const std::string& name) {
   std::vector<std::string> addr = absl::StrSplit(name, ':');
   // Now only support `ip:port` format

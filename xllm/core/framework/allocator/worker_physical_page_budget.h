@@ -48,7 +48,6 @@ class WorkerPhysicalPageBudget final {
   size_t free_pages(int32_t worker) const;
   size_t min_free_pages(int32_t start_worker, int32_t end_worker) const;
   std::vector<size_t> free_pages_snapshot() const;
-  const std::vector<size_t>& used_pages() const { return used_pages_; }
 
  private:
   bool is_valid_range(int32_t start_worker, int32_t end_worker) const;

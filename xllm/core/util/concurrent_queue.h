@@ -16,17 +16,12 @@ limitations under the License.
 
 #pragma once
 
+#include <absl/base/thread_annotations.h>
 #include <absl/synchronization/mutex.h>
 #include <absl/types/optional.h>
 
 #include <optional>
 #include <queue>
-
-#if __has_attribute(guarded_by)
-#define GUARDED_BY(x) __attribute__((guarded_by(x)))
-#else
-#define GUARDED_BY(x)
-#endif
 
 namespace xllm {
 
@@ -90,29 +85,6 @@ class ConcurrentQueue {
     return absl::nullopt;
   }
 
-  absl::optional<T> try_pop() {
-    absl::MutexLock lock(&mutex_);
-    if (queue_.empty()) {
-      return std::nullopt;
-    }
-    T value = std::move(queue_.front());
-    queue_.pop();
-    return value;
-  }
-
-  // Non-blocking pop into an output reference. Avoids constructing an
-  // `absl::optional<T>` for move-only `T` (e.g. `folly::Function<void()>`).
-  // Returns true if an element was popped, false if the queue was empty.
-  bool try_pop(T& out) {
-    absl::MutexLock lock(&mutex_);
-    if (queue_.empty()) {
-      return false;
-    }
-    out = std::move(queue_.front());
-    queue_.pop();
-    return true;
-  }
-
   // return the size of the queue
   size_t size() {
     absl::MutexLock lock(&mutex_);
@@ -127,7 +99,7 @@ class ConcurrentQueue {
 
  private:
   // the underlying queue
-  std::queue<T> queue_ GUARDED_BY(mutex_);
+  ABSL_GUARDED_BY(mutex_) std::queue<T> queue_;
   // mutex lock for the queue
   absl::Mutex mutex_;
 

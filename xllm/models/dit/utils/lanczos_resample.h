@@ -26,12 +26,4 @@ void resize_8bpc(const uint8_t* src,
                  int32_t dst_h,
                  uint8_t* dst);
 
-void resize_f32(const float* src,
-                int32_t src_w,
-                int32_t src_h,
-                int32_t channels,
-                int32_t dst_w,
-                int32_t dst_h,
-                float* dst);
-
 }  // namespace lanczos

@@ -1112,7 +1112,6 @@ TEST(ContinuousSchedulerTest, EmptyOverlapOutputPreservesLatencyClock) {
     // consuming a delayed overlap output.
     scheduler.process_batch_output_test();
     scheduler.process_batch_output_test();
-    EXPECT_FALSE(request->server_ttft_seconds().has_value());
     EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
               server_ttft_count);
     EXPECT_EQ(HISTOGRAM_time_to_first_token_latency_milliseconds.count(),
@@ -1126,8 +1125,6 @@ TEST(ContinuousSchedulerTest, EmptyOverlapOutputPreservesLatencyClock) {
     ASSERT_TRUE(sequence->is_first_token());
     ASSERT_EQ(sequence->generated_tokens_since_latency(), 1u);
     scheduler.process_batch_output_test();
-    ASSERT_TRUE(request->server_ttft_seconds().has_value());
-    EXPECT_GE(*request->server_ttft_seconds(), 10.0);
     EXPECT_EQ(HISTOGRAM_server_time_to_first_token_latency_milliseconds.count(),
               server_ttft_count + 1);
     EXPECT_EQ(HISTOGRAM_time_to_first_token_latency_milliseconds.count(),

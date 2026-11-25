@@ -563,11 +563,9 @@ void expect_deferred_input_rebuilds_owned_host_views() {
         "worker_deferred_input_" + std::to_string(getpid()) + "_" +
         ::testing::UnitTest::GetInstance()->current_test_info()->name();
     bool is_creator = false;
-    SharedMemoryTransport writer(
-        name, /*size=*/1 << 20, is_creator, ForwardType::RAW_INPUT);
+    SharedMemoryTransport writer(name, /*size=*/1 << 20, is_creator);
     ASSERT_TRUE(is_creator);
-    SharedMemoryTransport reader(
-        name, /*size=*/1 << 20, is_creator, ForwardType::RAW_INPUT);
+    SharedMemoryTransport reader(name, /*size=*/1 << 20, is_creator);
     ASSERT_FALSE(is_creator);
     Input source;
     source.token_ids = expected_tokens;
@@ -625,16 +623,12 @@ TEST(WorkerServiceShutdownTest, JoinsIdleShmPollingThreadForEveryBackend) {
     const std::string prefix =
         "worker_shutdown_" + std::to_string(getpid()) + "_" + backend;
     bool is_creator = false;
-    auto input =
-        std::make_unique<SharedMemoryTransport>(prefix + "_input",
-                                                /*size=*/1 << 20,
-                                                is_creator,
-                                                ForwardType::RAW_INPUT);
-    auto output =
-        std::make_unique<SharedMemoryTransport>(prefix + "_output",
-                                                /*size=*/1 << 20,
-                                                is_creator,
-                                                ForwardType::RAW_OUTPUT);
+    auto input = std::make_unique<SharedMemoryTransport>(prefix + "_input",
+                                                         /*size=*/1 << 20,
+                                                         is_creator);
+    auto output = std::make_unique<SharedMemoryTransport>(prefix + "_output",
+                                                          /*size=*/1 << 20,
+                                                          is_creator);
     service->create_polling_shm_thread(std::move(input), std::move(output));
     // No input is ever published: destruction must cancel the read and join,
     // including when shutdown races with the polling thread's first read.

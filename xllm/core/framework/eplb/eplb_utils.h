@@ -49,20 +49,6 @@ inline int32_t local_physical_experts_num(int32_t num_logical_experts,
   return num_logical_experts / eplb_device_num + redundant_experts_num;
 }
 
-inline int32_t eplb_rank_from_worker_rank(int32_t worker_rank,
-                                          int32_t worker_num,
-                                          int32_t eplb_device_num) {
-  CHECK_GE(worker_rank, 0) << "EPLB worker_rank must be non-negative.";
-  CHECK_LT(worker_rank, worker_num)
-      << "EPLB worker_rank out of range, worker_rank=" << worker_rank
-      << ", worker_num=" << worker_num;
-  CHECK_GT(eplb_device_num, 0) << "EPLB device_num must be positive.";
-  CHECK_EQ(worker_num, eplb_device_num)
-      << "EPLB currently requires worker_num == device_num, got worker_num="
-      << worker_num << ", device_num=" << eplb_device_num;
-  return worker_rank;
-}
-
 inline torch::Tensor build_global_decode_token_mask(
     const std::vector<torch::Tensor>& local_masks,
     const std::vector<int32_t>& dp_token_counts) {
@@ -99,33 +85,6 @@ inline torch::Tensor expand_decode_token_mask(
   }
   return flat_mask.repeat_interleave(/*repeats=*/tokens_per_row, /*dim=*/0)
       .contiguous();
-}
-
-inline int32_t count_cross_device_migrations(
-    const std::vector<int64_t>& previous_assignment,
-    const std::vector<int64_t>& next_assignment,
-    int32_t device_experts_num) {
-  CHECK_GT(device_experts_num, 0);
-  CHECK_EQ(previous_assignment.size(), next_assignment.size());
-  CHECK_EQ(previous_assignment.size() % static_cast<size_t>(device_experts_num),
-           0);
-  int32_t migration_count = 0;
-  for (size_t slot = 0; slot < next_assignment.size(); ++slot) {
-    const size_t device = slot / static_cast<size_t>(device_experts_num);
-    const size_t device_begin =
-        device * static_cast<size_t>(device_experts_num);
-    const size_t device_end =
-        device_begin + static_cast<size_t>(device_experts_num);
-    const int64_t target_expert = next_assignment[slot];
-    const bool resident =
-        std::find(previous_assignment.begin() + device_begin,
-                  previous_assignment.begin() + device_end,
-                  target_expert) != previous_assignment.begin() + device_end;
-    if (!resident) {
-      ++migration_count;
-    }
-  }
-  return migration_count;
 }
 
 }  // namespace eplb

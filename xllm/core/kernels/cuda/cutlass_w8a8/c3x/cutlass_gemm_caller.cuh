@@ -36,7 +36,6 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
-#include "core/math.hpp"
 #include "cutlass_extensions/common.hpp"
 // clang-format on
 

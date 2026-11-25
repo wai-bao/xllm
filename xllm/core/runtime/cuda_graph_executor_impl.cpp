@@ -1169,10 +1169,6 @@ CudaGraphExecutorImpl::get_graph_memory_usage_stats() {
   return stats;
 }
 
-size_t CudaGraphExecutorImpl::get_graph_memory_usage_bytes() {
-  return get_graph_memory_usage_stats().executor_total_bytes;
-}
-
 void CudaGraphExecutorImpl::log_graph_memory_after_capture() {
   const auto stats = get_graph_memory_usage_stats();
   const size_t executor_total_bytes = stats.executor_total_bytes;

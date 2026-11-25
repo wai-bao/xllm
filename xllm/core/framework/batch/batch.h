@@ -41,11 +41,8 @@ class Batch final {
   Batch() = default;
 
   BatchInputType input_type() const;
-  void reserve(size_t sequence_count, size_t group_count);
   // Reserve only the number of sequences that carry input embeddings.
-  void reserve(size_t sequence_count,
-               size_t group_count,
-               size_t input_embedding_count);
+  void reserve(size_t sequence_count, size_t input_embedding_count);
 
   explicit Batch(Sequence* sequence);
   explicit Batch(const std::vector<Sequence*>& sequences);
@@ -54,16 +51,6 @@ class Batch final {
            uint32_t allowed_max_token = std::numeric_limits<uint32_t>::max());
 
   void add(const std::vector<Sequence*>& sequences);
-
-  void add(SequencesGroup* sequence_group);
-
-  const std::vector<SequencesGroup*>& sequence_groups() const {
-    return state_.sequence_groups();
-  }
-
-  void update_forward_type(Sequence* sequence);
-
-  void refresh_forward_type();
 
   void set_batch_id() { state_.set_batch_id(); }
 
@@ -74,10 +61,6 @@ class Batch final {
   // Logical execution rows.
   size_t size() const;
   bool empty() const { return state_.empty(); }
-  size_t num_groups() const { return state_.sequence_groups().size(); }
-  const BatchSequencePlan& sequence_plan() const {
-    return state_.sequence_plan();
-  }
 
   Sequence* operator[](size_t index) const;
 

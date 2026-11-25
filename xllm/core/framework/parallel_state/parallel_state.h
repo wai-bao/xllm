@@ -42,9 +42,6 @@ struct ReduceAsyncCtx {
   c10::intrusive_ptr<c10d::Work> work;
 };
 
-std::optional<ParallelArgs> get_dp_attn_parallel_args(
-    const ParallelArgs& parallel_args);
-
 torch::Tensor gather(const torch::Tensor& input,
                      ProcessGroup* process_group,
                      int32_t dim = -1);
@@ -83,15 +80,8 @@ std::function<torch::Tensor()> all_to_all_4D(const torch::Tensor& input,
 
 // Create a process group where each process has a single device
 // devices: list of devices to create process groups on.
-std::vector<std::unique_ptr<ProcessGroup>> create_npu_process_groups(
-    const std::vector<torch::Device>& devices);
-
 // Create process groups for local (single-node) scenarios
 // Supports GPU (CUDA/MLU) and NPU, including single-device case
 // Parse port from options.master_node_addr() to support multiple instances
-std::vector<std::unique_ptr<ProcessGroup>> create_local_process_groups(
-    const std::vector<torch::Device>& devices,
-    const runtime::Options& options);
-
 }  // namespace parallel_state
 }  // namespace xllm

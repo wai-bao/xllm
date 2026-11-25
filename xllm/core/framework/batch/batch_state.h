@@ -37,13 +37,9 @@ constexpr uint64_t UNINITIALIZED_BATCH_ID = 0x0;
 // maintains scheduling invariants and forward resources across model domains.
 class BatchState final {
  public:
-  void reserve(size_t sequence_count, size_t group_count);
   // Reserve only the number of sequences that carry input embeddings.
-  void reserve(size_t sequence_count,
-               size_t group_count,
-               size_t input_embedding_count);
+  void reserve(size_t sequence_count, size_t input_embedding_count);
   void add(Sequence* sequence, uint32_t token_budget);
-  void add(SequencesGroup* group);
   void set_batch_id() {
     static std::atomic<uint64_t> next_batch_id{1};
     while (batch_id_ == UNINITIALIZED_BATCH_ID) {
@@ -53,20 +49,8 @@ class BatchState final {
   uint64_t batch_id() const { return batch_id_; }
 
   void require_host_restore() { requires_host_restore_ = true; }
-  bool empty() const {
-    return sequence_plan_.empty() && sequence_groups_.empty();
-  }
-  BatchSequencePlan& sequence_plan() { return sequence_plan_; }
+  bool empty() const { return sequence_plan_.empty(); }
   const BatchSequencePlan& sequence_plan() const { return sequence_plan_; }
-  const std::vector<SequencesGroup*>& sequence_groups() const {
-    return sequence_groups_;
-  }
-
-  void update_forward_type(Sequence* sequence);
-  void refresh_forward_type(const std::vector<Sequence*>& sequences);
-  std::vector<Sequence*> group_sequences() const;
-  size_t num_group_sequences() const;
-  BatchInputData input_data(const BatchSequencePlan& plan);
   // Prepare the final sequence view before domain output handlers capture
   // their targets. Build methods may then advance KV state.
   BatchInputData prepare_batch_input();
@@ -78,9 +62,9 @@ class BatchState final {
                             SharedKVMappingTracker* mapping_tracker = nullptr);
 
  private:
+  void update_forward_type(Sequence* sequence);
   void retain_host_restore_blocks(Sequence& sequence);
   BatchSequencePlan sequence_plan_;
-  std::vector<SequencesGroup*> sequence_groups_;
   std::vector<torch::Tensor> input_embeddings_vec_;
   std::vector<MMData> mm_data_vec_;
   // A cancelled sequence may release its own aliases before its pending

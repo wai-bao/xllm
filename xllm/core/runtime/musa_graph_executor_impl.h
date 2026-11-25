@@ -380,10 +380,6 @@ class MusaGraphExecutorImpl final : public ExecutorImpl {
                   std::vector<KVCache>& kv_caches,
                   const ModelParamsView& params) override;
 
-  // Return current graph executor memory usage in bytes (including persistent
-  // parameters). Exposed for tests and diagnostics.
-  size_t get_graph_memory_usage_bytes();
-
   static std::optional<std::pair<torch::Tensor, torch::Tensor>>
   find_first_full_attention_cache(const std::vector<KVCache>& kv_caches);
 

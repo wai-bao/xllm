@@ -30,6 +30,7 @@ limitations under the License.
 #include <sched.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <fstream>
@@ -80,26 +81,19 @@ int32_t get_numa_node_from_sysfs(const std::string& backend,
   return -1;
 }
 
-bool build_cpu_set_for_numa_node(int32_t numa_node,
-                                 cpu_set_t* cpu_set,
-                                 int32_t* nr_cpus) {
-  if (cpu_set == nullptr || nr_cpus == nullptr) {
-    return false;
-  }
-
-  CPU_ZERO(cpu_set);
-  *nr_cpus = 0;
+int32_t build_cpu_set_for_numa_node(int32_t numa_node, cpu_set_t& cpu_set) {
+  CPU_ZERO(&cpu_set);
 
   struct bitmask* node_cpu_mask = numa_allocate_cpumask();
   if (node_cpu_mask == nullptr) {
     LOG(ERROR) << "Failed to allocate CPU mask for NUMA node " << numa_node;
-    return false;
+    return 0;
   }
 
   if (numa_node_to_cpus(numa_node, node_cpu_mask) < 0) {
     LOG(ERROR) << "Failed to query CPUs for NUMA node " << numa_node;
     numa_free_cpumask(node_cpu_mask);
-    return false;
+    return 0;
   }
 
   cpu_set_t current_affinity;
@@ -111,24 +105,22 @@ bool build_cpu_set_for_numa_node(int32_t numa_node,
                  << strerror(errno) << ". Falling back to NUMA node CPU list.";
   }
 
-  const int32_t nr_possible_cpus = numa_num_possible_cpus();
-  for (int32_t cpu = 0; cpu < nr_possible_cpus; ++cpu) {
+  int32_t nr_cpus = 0;
+  const int32_t cpu_limit = std::min(numa_num_possible_cpus(), CPU_SETSIZE);
+  for (int32_t cpu = 0; cpu < cpu_limit; ++cpu) {
     if (!numa_bitmask_isbitset(node_cpu_mask, cpu)) {
-      continue;
-    }
-    if (cpu >= CPU_SETSIZE) {
       continue;
     }
     if (has_affinity_constraint && !CPU_ISSET(cpu, &current_affinity)) {
       continue;
     }
 
-    CPU_SET(cpu, cpu_set);
-    ++(*nr_cpus);
+    CPU_SET(cpu, &cpu_set);
+    ++nr_cpus;
   }
 
   numa_free_cpumask(node_cpu_mask);
-  return (*nr_cpus > 0);
+  return nr_cpus;
 }
 
 void apply_process_memory_policy(int32_t numa_node) {
@@ -249,8 +241,8 @@ int32_t bind_process_to_numa_node(int32_t numa_node) {
   }
 
   cpu_set_t cpu_set;
-  int32_t nr_cpus = 0;
-  if (!build_cpu_set_for_numa_node(numa_node, &cpu_set, &nr_cpus)) {
+  const int32_t nr_cpus = build_cpu_set_for_numa_node(numa_node, cpu_set);
+  if (nr_cpus == 0) {
     LOG(ERROR) << "No CPUs available on NUMA node " << numa_node
                << " after applying affinity constraints";
     return -1;
@@ -286,8 +278,8 @@ int32_t bind_thread_to_numa_node(int32_t numa_node) {
   }
 
   cpu_set_t cpu_set;
-  int32_t nr_cpus = 0;
-  if (!build_cpu_set_for_numa_node(numa_node, &cpu_set, &nr_cpus)) {
+  const int32_t nr_cpus = build_cpu_set_for_numa_node(numa_node, cpu_set);
+  if (nr_cpus == 0) {
     LOG(ERROR) << "No CPUs available on NUMA node " << numa_node
                << " after applying affinity constraints";
     return -1;
@@ -305,48 +297,6 @@ int32_t bind_thread_to_numa_node(int32_t numa_node) {
             << " with " << nr_cpus << " CPUs";
 
   return 0;
-}
-
-int32_t get_current_numa_node() {
-  if (!is_numa_available()) {
-    return -1;
-  }
-
-  int32_t cpu = sched_getcpu();
-  if (cpu < 0) {
-    LOG(WARNING) << "Failed to get current CPU";
-    return -1;
-  }
-
-  return numa_node_of_cpu(cpu);
-}
-
-std::vector<int32_t> get_numa_node_cpus(int32_t numa_node) {
-  std::vector<int32_t> cpus;
-
-  if (!is_numa_available()) {
-    return cpus;
-  }
-
-  int32_t num_nodes = get_num_numa_nodes();
-  if (numa_node < 0 || numa_node >= num_nodes) {
-    LOG(ERROR) << "Invalid NUMA node " << numa_node;
-    return cpus;
-  }
-
-  cpu_set_t cpu_set;
-  int32_t nr_cpus = 0;
-  if (!build_cpu_set_for_numa_node(numa_node, &cpu_set, &nr_cpus)) {
-    return cpus;
-  }
-
-  for (int32_t cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-    if (CPU_ISSET(cpu, &cpu_set)) {
-      cpus.push_back(cpu);
-    }
-  }
-
-  return cpus;
 }
 
 }  // namespace numa

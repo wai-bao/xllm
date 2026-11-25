@@ -66,28 +66,6 @@ torch::Tensor assemble_gathered(const torch::Tensor& stacked_tensor,
 
 }  // namespace
 
-std::optional<ParallelArgs> get_dp_attn_parallel_args(
-    const ParallelArgs& parallel_args) {
-  if (parallel_args.dp_size() <= 1) {
-    return std::nullopt;
-  }
-
-  // tp=1 in each dp group
-  if (parallel_args.dp_size() == parallel_args.world_size()) {
-    return ParallelArgs(0,  // local rank
-                        1,  // world_size
-                        nullptr,
-                        nullptr,
-                        parallel_args.dp_size());
-  }
-
-  return ParallelArgs(parallel_args.dp_local_process_group_->rank(),
-                      parallel_args.dp_local_process_group_->world_size(),
-                      parallel_args.dp_local_process_group_,
-                      nullptr,
-                      parallel_args.dp_size());
-}
-
 torch::Tensor gather(const torch::Tensor& input,
                      ProcessGroup* process_group,
                      int32_t dim) {
@@ -413,82 +391,6 @@ std::function<torch::Tensor()> all_to_all_4D(const torch::Tensor& input,
                 "all_to_all_4D: only (scatter_idx,gather_idx)=(2,1) or (1,2) "
                 "are supported");
   }
-}
-
-std::vector<std::unique_ptr<ProcessGroup>> create_npu_process_groups(
-    const std::vector<torch::Device>& devices) {
-#if defined(USE_NPU)
-  CHECK(!devices.empty()) << "devices should not be empty";
-
-  std::vector<int> device_idxs;
-  device_idxs.reserve(devices.size());
-  for (const auto& device : devices) {
-    device_idxs.push_back(device.index());
-  }
-
-  std::vector<HcclComm> comms(devices.size());
-  const int32_t world_size = static_cast<int32_t>(devices.size());
-  HCCLCHECK(HcclCommInitAll(world_size, device_idxs.data(), comms.data()));
-
-  std::vector<std::unique_ptr<ProcessGroup>> process_groups;
-  process_groups.reserve(devices.size());
-  for (int32_t i = 0; i < world_size; ++i) {
-    process_groups.emplace_back(std::make_unique<ProcessGroupImpl>(
-        /*rank=*/i, world_size, devices[i], comms[i]));
-  }
-
-  return process_groups;
-#else
-  LOG(FATAL) << "non-NPU device is not supported";
-#endif
-}
-
-std::vector<std::unique_ptr<ProcessGroup>> create_local_process_groups(
-    const std::vector<torch::Device>& devices,
-    const runtime::Options& options) {
-  CHECK(!devices.empty()) << "devices should not be empty";
-  const int32_t world_size = static_cast<int32_t>(devices.size());
-
-  std::vector<std::unique_ptr<ProcessGroup>> process_groups;
-  process_groups.reserve(devices.size());
-
-#if defined(USE_NPU)
-  std::vector<HcclComm> comms(devices.size());
-  for (int32_t i = 0; i < world_size; ++i) {
-    process_groups.emplace_back(std::make_unique<ProcessGroupImpl>(
-        /*rank=*/i, world_size, devices[i], comms[i]));
-  }
-#elif defined(USE_CUDA) || defined(USE_MLU) || defined(USE_ILU) || \
-    defined(USE_DCU)
-  // For GPU: use create_process_group with localhost
-  // Parse port from options.master_node_addr() to support multiple instances
-  std::string host;
-  int port;
-
-  // Parse port from options.master_node_addr()
-  // Note: master_node_addr always has a default value (127.0.0.1:19888)
-  net::parse_host_port_from_addr(
-      options.master_node_addr().value(), host, port);
-
-  // Override host to localhost for local communication
-  host = "127.0.0.1";
-
-  for (int32_t i = 0; i < world_size; ++i) {
-    process_groups.emplace_back(create_process_group(
-        /*rank=*/i,
-        /*world_size=*/world_size,
-        /*rank_size=*/world_size,
-        /*port=*/port,
-        /*trans=*/false,
-        host,
-        /*group_name=*/"local_tp_group",
-        devices[i]));
-  }
-#else
-  LOG(FATAL) << "Unsupported device type for create_local_process_groups";
-#endif
-
-  return process_groups;
 }
 
 }  // namespace parallel_state

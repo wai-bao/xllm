@@ -45,24 +45,6 @@ class HealthCheckManager {
     return is_healthy_.load(std::memory_order_acquire);
   }
 
-  // Set cluster health status to unhealthy
-  void set_unhealthy(const std::string& reason = "") {
-    {
-      std::lock_guard<std::mutex> lock(reason_mutex_);
-      unhealthy_reason_ = reason;
-    }
-    is_healthy_.store(false, std::memory_order_release);
-  }
-
-  // Set cluster health status to healthy
-  void set_healthy() {
-    is_healthy_.store(true, std::memory_order_release);
-    {
-      std::lock_guard<std::mutex> lock(reason_mutex_);
-      unhealthy_reason_.clear();
-    }
-  }
-
   // Get the reason for unhealthy status
   std::string unhealthy_reason() const {
     std::lock_guard<std::mutex> lock(reason_mutex_);

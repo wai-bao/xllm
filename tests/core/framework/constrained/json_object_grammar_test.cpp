@@ -108,7 +108,7 @@ TEST(JsonObjectGrammarTest, AcceptsNestedValuesAndEscapes) {
 
   EXPECT_TRUE(state.accept_piece("{\"a\":[true, {\"b\":\"x\\n"));
   EXPECT_TRUE(state.accept_piece("\"}]}"));
-  EXPECT_TRUE(state.is_complete());
+  EXPECT_TRUE(can_accept_token(state, /*stop=*/24));
   EXPECT_TRUE(accepts_piece(state, " "));
   EXPECT_FALSE(accepts_piece(state, "x"));
 }
@@ -137,7 +137,7 @@ TEST(JsonObjectGrammarTest, SupportsNumbersLiteralsAndWhitespace) {
   JsonObjectGrammarState state = grammar.initial_state();
 
   EXPECT_TRUE(state.accept_piece("{ \"a\": -1.2e+2, \"b\": null}"));
-  EXPECT_TRUE(state.is_complete());
+  EXPECT_TRUE(can_accept_token(state, /*stop=*/24));
 
   state = grammar.initial_state();
   EXPECT_TRUE(state.accept_piece("{\"a\":0}"));
@@ -154,9 +154,9 @@ TEST(JsonObjectGrammarTest, TemporaryAdvanceDoesNotCommitState) {
   const uint64_t fingerprint = state.fingerprint();
   EXPECT_FALSE(accepts_piece(state, "]"));
   EXPECT_EQ(state.fingerprint(), fingerprint);
-  EXPECT_FALSE(state.is_complete());
+  EXPECT_FALSE(can_accept_token(state, /*stop=*/24));
   EXPECT_TRUE(state.accept_piece("\"a\":1}"));
-  EXPECT_TRUE(state.is_complete());
+  EXPECT_TRUE(can_accept_token(state, /*stop=*/24));
 }
 
 TEST(JsonObjectGrammarTest, SnapshotRestoresCommittedState) {

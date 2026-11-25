@@ -1570,8 +1570,6 @@ MusaGraphExecutorImpl::get_graph_memory_usage_stats() {
   return GraphMemoryUsageStats{};
 }
 
-size_t MusaGraphExecutorImpl::get_graph_memory_usage_bytes() { return 0; }
-
 void MusaGraphExecutorImpl::log_graph_memory_after_capture() {}
 
 // Get graph memory pool id for capture. When VMM is enabled, uses per-shape

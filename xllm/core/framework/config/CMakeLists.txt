@@ -4,7 +4,6 @@ cc_library(
   NAME
     config
   HDRS
-    batch_sizes.h
     config_input.h
     config_utils.h
     kv_cache_config.h
@@ -25,7 +24,6 @@ cc_library(
     service_config.h
     speculative_config.h
   SRCS
-    batch_sizes.cpp
     config_input.cpp
     config_utils.cpp
     kv_cache_config.cpp

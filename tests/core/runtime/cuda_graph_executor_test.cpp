@@ -1186,7 +1186,8 @@ TEST(CudaGraphExecutorTest, GraphVmmPoolMemoryReuseAcrossMultiShape) {
       auto out = exec->run(tokens, positions, kv, params).hidden_states;
       (void)out;
       torch::cuda::synchronize();
-      memory_usage_bytes.push_back(exec->get_graph_memory_usage_bytes());
+      memory_usage_bytes.push_back(
+          exec->get_graph_memory_usage_stats().executor_total_bytes);
     }
     return memory_usage_bytes;
   };

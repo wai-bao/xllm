@@ -26,10 +26,6 @@ class TensorProtoBuilder {
  public:
   TensorProtoBuilder(bool use_binary_encoding);
   ~TensorProtoBuilder() = default;
-  bool build_repeated_tensor(
-      const std::vector<torch::Tensor>& in_tensors,
-      google::protobuf::RepeatedPtrField<xllm::proto::Tensor>& out_tensors,
-      std::string& binary_payload);
   bool build_tensor(const torch::Tensor& in_tensor,
                     xllm::proto::Tensor& out_tensor,
                     std::string& binary_payload);

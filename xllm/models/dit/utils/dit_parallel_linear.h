@@ -116,15 +116,6 @@ struct TpOptions {
   }
   int64_t tp_rank() const { return process_group ? process_group->rank() : 0; }
 
-  static TpOptions col(ProcessGroup* pg, bool gather_output = false) {
-    return TpOptions(
-        /*column_parallel=*/true, gather_output, /*need_scatter=*/false, pg);
-  }
-  static TpOptions row(ProcessGroup* pg, bool gather_output = true) {
-    return TpOptions(
-        /*column_parallel=*/false, gather_output, /*need_scatter=*/false, pg);
-  }
-
   void validate() const {
     CHECK(tp_size() > 0) << "TpOptions: tp_size must be > 0, got " << tp_size();
     CHECK(tp_rank() >= 0 && tp_rank() < tp_size())
@@ -213,10 +204,6 @@ class DiTParallelLinearImpl : public torch::nn::Module {
     } else {
       linear_->verify_loaded_weights(prefix);
     }
-  }
-
-  torch::Tensor get_weight() const {
-    return has_tp_weights() ? tp_weight_ : torch::Tensor();
   }
 
  private:
