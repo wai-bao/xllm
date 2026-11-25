@@ -35,11 +35,9 @@ class DiagonalGaussianDistribution final {
     logvar_ = torch::clamp(logvar_, -30.0f, 20.0f);
 
     std_ = torch::exp(0.5f * logvar_);
-    var_ = torch::exp(logvar_);
 
     if (deterministic_) {
       std_.fill_(0.0f);
-      var_.fill_(0.0f);
     }
   }
 
@@ -57,49 +55,15 @@ class DiagonalGaussianDistribution final {
            std_ * randn_tensor(shape, generator, mean_.options(), noise_type);
   }
 
-  torch::Tensor kl(const std::optional<DiagonalGaussianDistribution>& other =
-                       std::nullopt) const {
-    if (deterministic_) {
-      return torch::tensor(0.0f, mean_.options());
-    }
-
-    if (!other.has_value()) {
-      return 0.5f * torch::sum(torch::pow(mean_, 2) + var_ - 1.0f - logvar_,
-                               {1, 2, 3});
-    } else {
-      const auto& other_dist = other.value();
-      return 0.5f * torch::sum(torch::pow(mean_ - other_dist.mean_, 2) /
-                                       other_dist.var_ +
-                                   var_ / other_dist.var_ - 1.0f - logvar_ +
-                                   other_dist.logvar_,
-                               {1, 2, 3});
-    }
-  }
-
-  torch::Tensor nll(const torch::Tensor& sample,
-                    const std::vector<int64_t>& dims = {1, 2, 3}) const {
-    if (deterministic_) {
-      return torch::tensor(0.0f, mean_.options());
-    }
-    const float logtwopi = std::log(2.0f * M_PI);
-    return 0.5f *
-           torch::sum(logtwopi + logvar_ + torch::pow(sample - mean_, 2) / var_,
-                      dims);
-  }
-
   torch::Tensor mode() const { return mean_; }
 
   const torch::Tensor& mean() const { return mean_; }
-  const torch::Tensor& std() const { return std_; }
-  const torch::Tensor& var() const { return var_; }
-  const torch::Tensor& logvar() const { return logvar_; }
 
  private:
   torch::Tensor parameters_;
   torch::Tensor mean_;
   torch::Tensor logvar_;
   torch::Tensor std_;
-  torch::Tensor var_;
   bool deterministic_;
 };
 

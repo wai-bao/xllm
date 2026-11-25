@@ -233,7 +233,7 @@ class FluxSingleAttentionImpl : public torch::nn::Module {
 
   torch::Tensor forward(const torch::Tensor& hidden_states,
                         const torch::Tensor& image_rotary_emb) {
-    int64_t batch_size, channel, height, width;
+    int64_t batch_size;
     batch_size = hidden_states.size(0);
 
     auto qkv = fused_qkv_->forward(hidden_states);

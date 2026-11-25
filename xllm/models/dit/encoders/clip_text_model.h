@@ -366,8 +366,6 @@ class CLIPEncoderImpl : public torch::nn::Module {
     bool output_attentions = false;
     c10::optional<torch::Tensor> attention_mask = c10::nullopt;
     c10::optional<torch::Tensor> head_mask = c10::nullopt;
-    std::vector<torch::Tensor> all_hidden_states;
-    std::vector<torch::Tensor> all_attentions;
     std::vector<torch::Tensor> encoder_states;
 
     auto hidden_states = embeddings;

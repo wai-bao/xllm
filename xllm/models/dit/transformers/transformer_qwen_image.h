@@ -370,28 +370,6 @@ class TimestepsImpl final : public torch::nn::Module {
 };
 TORCH_MODULE(Timesteps);
 
-// TODO: a factory function that provides activation functions based on string
-// input
-std::function<torch::Tensor(const torch::Tensor&)> get_activation(
-    const std::string& act_fn) {
-  if (act_fn == "silu") {
-    return [](const torch::Tensor& x) { return torch::silu(x); };
-  } else if (act_fn == "relu") {
-    return [](const torch::Tensor& x) { return torch::relu(x); };
-  } else if (act_fn == "gelu") {
-    return [](const torch::Tensor& x) { return torch::gelu(x); };
-  } else if (act_fn == "tanh") {
-    return [](const torch::Tensor& x) { return torch::tanh(x); };
-  } else if (act_fn == "sigmoid") {
-    return [](const torch::Tensor& x) { return torch::sigmoid(x); };
-  } else if (act_fn == "none" || act_fn.empty()) {
-    return [](const torch::Tensor& x) { return x; };
-  } else {
-    LOG(FATAL) << "Unsupported activation function: " << act_fn;
-    return [](const torch::Tensor& x) { return x; };
-  }
-}
-
 class TimestepEmbeddingImpl final : public torch::nn::Module {
  public:
   TimestepEmbeddingImpl(const ModelContext& context,
@@ -1250,7 +1228,6 @@ class QwenEmbedRopeImpl : public torch::nn::Module {
   bool scale_rope_;
   torch::Tensor pos_freqs_;
   torch::Tensor neg_freqs_;
-  std::unordered_map<std::string, torch::Tensor> rope_cache_;
 };
 
 TORCH_MODULE(QwenEmbedRope);
@@ -1264,25 +1241,6 @@ class QwenEmbedRopeWithCacheImpl : public QwenEmbedRopeImpl {
       : QwenEmbedRopeImpl(context, theta, axes_dim, scale_rope) {}
 
  private:
-  torch::Tensor _compute_video_freqs_cached(int64_t frame,
-                                            int64_t height,
-                                            int64_t width,
-                                            int64_t idx,
-                                            torch::Device device) {
-    std::string key = std::to_string(idx) + "_" + std::to_string(height) + "_" +
-                      std::to_string(width);
-
-    auto it = rope_cache_.find(key);
-    if (it != rope_cache_.end()) {
-      return it->second;
-    } else {
-      auto result = _compute_video_freqs(frame, height, width, idx, device);
-      rope_cache_[key] = result;
-      return result;
-    }
-  }
-
-  std::unordered_map<std::string, torch::Tensor> rope_cache_;
 };
 TORCH_MODULE(QwenEmbedRopeWithCache);
 
@@ -1296,7 +1254,6 @@ class QwenEmbedLayer3DRopeImpl : public torch::nn::Module {
     auto pos_index = torch::arange(4096);
     auto neg_index = torch::arange(4096).flip(0) * -1 - 1;
 
-    std::vector<torch::Tensor> pos_freqs_parts;
     pos_freqs_ = torch::cat({rope_params(pos_index, axes_dim[0], theta),
                              rope_params(pos_index, axes_dim[1], theta),
                              rope_params(pos_index, axes_dim[2], theta)},
@@ -1998,63 +1955,6 @@ class QwenImageTransformerBlockImpl : public torch::nn::Module {
     // Text MLP
     txt_mlp_ =
         register_module("txt_mlp", qwenimage::FeedForward(context, dim, dim));
-  }
-
-  std::pair<torch::Tensor, torch::Tensor> _modulate(
-      const torch::Tensor& x,
-      const torch::Tensor& mod_params,
-      const torch::Tensor& index = torch::Tensor()) {
-    // x: b l d, shift: b d, scale: b d, gate: b d
-    auto chunks = mod_params.chunk(3, -1);
-    auto shift = chunks[0];
-    auto scale = chunks[1];
-    auto gate = chunks[2];
-
-    torch::Tensor shift_result, scale_result, gate_result;
-
-    if (index.defined()) {
-      // Assuming mod_params batch dim is 2*actual_batch (chunked into 2 parts)
-      // So shift, scale, gate have shape [2*actual_batch, d]
-      int64_t actual_batch = shift.size(0) / 2;
-
-      // Split into two parts
-      auto shift_0 = shift.slice(0, 0, actual_batch);
-      auto shift_1 = shift.slice(0, actual_batch, shift.size(0));
-
-      auto scale_0 = scale.slice(0, 0, actual_batch);
-      auto scale_1 = scale.slice(0, actual_batch, scale.size(0));
-
-      auto gate_0 = gate.slice(0, 0, actual_batch);
-      auto gate_1 = gate.slice(0, actual_batch, gate.size(0));
-
-      // index: [b, l] where b is actual batch size
-      // Expand to [b, l, 1] to match feature dimension
-      auto index_expanded = index.unsqueeze(-1);  // [b, l, 1]
-
-      // Expand chunks to [b, 1, d] then broadcast to [b, l, d]
-      auto shift_0_exp = shift_0.unsqueeze(1);  // [b, 1, d]
-      auto shift_1_exp = shift_1.unsqueeze(1);  // [b, 1, d]
-      auto scale_0_exp = scale_0.unsqueeze(1);
-      auto scale_1_exp = scale_1.unsqueeze(1);
-      auto gate_0_exp = gate_0.unsqueeze(1);
-      auto gate_1_exp = gate_1.unsqueeze(1);
-
-      // Use torch::where to select based on index
-      shift_result =
-          torch::where(index_expanded == 0, shift_0_exp, shift_1_exp);
-      scale_result =
-          torch::where(index_expanded == 0, scale_0_exp, scale_1_exp);
-      gate_result = torch::where(index_expanded == 0, gate_0_exp, gate_1_exp);
-    } else {
-      shift_result = shift.unsqueeze(1);
-      scale_result = scale.unsqueeze(1);
-      gate_result = gate.unsqueeze(1);
-    }
-
-    // Apply modulation: x * (1 + scale_result) + shift_result
-    auto modulated_x = x * (1 + scale_result) + shift_result;
-
-    return {modulated_x, gate_result};
   }
 
   std::tuple<torch::Tensor, torch::Tensor> forward(

@@ -1451,11 +1451,6 @@ class QwenImageDecoder3dImpl : public torch::nn::Module {
     conv_out_->verify_loaded_weights("conv_out.");
   }
 
-  std::vector<std::shared_ptr<Module>> get_modules() const {
-    std::vector<std::shared_ptr<Module>> module = modules();
-    return module;
-  }
-
  private:
   int64_t dim_, z_dim_;
   std::vector<int64_t> dim_mult_;

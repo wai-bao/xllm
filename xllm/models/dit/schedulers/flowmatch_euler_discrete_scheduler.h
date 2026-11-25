@@ -282,10 +282,7 @@ class FlowMatchEulerDiscreteSchedulerImpl : public xllm::dit::Scheduler {
     return prev_sample;
   }
 
-  std::optional<int> step_index() const { return step_index_; }
-  std::optional<int> begin_index() const { return begin_index_; }
   const torch::Tensor& timesteps() const override { return timesteps_; }
-  const torch::Tensor& sigmas() const { return sigmas_; }
   int size() const { return num_train_timesteps_; }
 
  private:

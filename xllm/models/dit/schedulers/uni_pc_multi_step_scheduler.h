@@ -311,45 +311,7 @@ class UniPCMultistepSchedulerImpl final : public xllm::dit::Scheduler {
     return prev_sample.to(input_dtype);
   }
 
-  torch::Tensor scale_model_input(const torch::Tensor& sample) {
-    return sample;
-  }
-
-  torch::Tensor add_noise(const torch::Tensor& original_samples,
-                          const torch::Tensor& noise,
-                          const torch::Tensor& timesteps) {
-    torch::Tensor sigmas =
-        sigmas_.to(original_samples.device()).to(original_samples.dtype());
-    torch::Tensor schedule_timesteps = timesteps_.to(original_samples.device());
-    torch::Tensor ts = timesteps.to(original_samples.device());
-
-    std::vector<int64_t> step_indices;
-    if (!begin_index_.has_value()) {
-      for (int64_t i = 0; i < ts.size(0); ++i) {
-        step_indices.emplace_back(
-            index_for_timestep(ts[i], schedule_timesteps));
-      }
-    } else if (step_index_.has_value()) {
-      step_indices = std::vector<int64_t>(ts.size(0), step_index_.value());
-    } else {
-      step_indices = std::vector<int64_t>(ts.size(0), begin_index_.value());
-    }
-
-    torch::Tensor sigma_indices = torch::tensor(
-        step_indices, torch::dtype(torch::kLong).device(sigmas.device()));
-    torch::Tensor sigma = sigmas.index_select(0, sigma_indices).flatten();
-    while (sigma.dim() < original_samples.dim()) {
-      sigma = sigma.unsqueeze(-1);
-    }
-
-    auto [alpha_t, sigma_t] = sigma_to_alpha_sigma_t(sigma);
-    return alpha_t * original_samples + sigma_t * noise;
-  }
-
-  std::optional<int64_t> step_index() const { return step_index_; }
-  std::optional<int64_t> begin_index() const { return begin_index_; }
   const torch::Tensor& timesteps() const override { return timesteps_; }
-  const torch::Tensor& sigmas() const { return sigmas_; }
   int64_t size() const { return num_train_timesteps_; }
 
  private:
