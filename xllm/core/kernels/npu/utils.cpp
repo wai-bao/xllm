@@ -89,16 +89,6 @@ void check_tensor(const torch::Tensor& t,
   }
 }
 
-void check_tensor_shapes_equal(const torch::Tensor& a,
-                               const torch::Tensor& b,
-                               const std::string& func_name) {
-  if (a.sizes() != b.sizes()) {
-    LOG(ERROR) << func_name << ": tensor shapes do not match. "
-               << "a shape: " << a.sizes() << ", b shape: " << b.sizes();
-    LOG(FATAL) << func_name << ": tensor shapes do not match";
-  }
-}
-
 torch::Tensor expand_kv_heads(const torch::Tensor& tensor,
                               int64_t num_heads,
                               int64_t num_kv_heads) {

@@ -34,9 +34,6 @@ void create_acltensor(aclTensor** tensor, const torch::Tensor& tensor_data);
 void check_tensor(const torch::Tensor& t,
                   const std::string& name,
                   const std::string& func_name = "");
-void check_tensor_shapes_equal(const torch::Tensor& a,
-                               const torch::Tensor& b,
-                               const std::string& func_name = "");
 torch::Tensor expand_kv_heads(const torch::Tensor& tensor,
                               int64_t num_heads,
                               int64_t num_kv_heads);

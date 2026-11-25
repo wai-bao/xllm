@@ -69,7 +69,6 @@ def tmo_fused_post_conv_prep_kernel(
 
     HK: tl.constexpr = H * K
     ones_col = tl.full((1, BK), 1, dtype=tl.float32)
-    ones_raw = tl.full((BK, 1), 1, dtype=tl.float32)
     offs_k = tl.arange(0, BK)  # [BK]
     offs_v = tl.arange(0, BV)  # [BV]
     offs_A_dt = tl.arange(0, HV)  # [HV]

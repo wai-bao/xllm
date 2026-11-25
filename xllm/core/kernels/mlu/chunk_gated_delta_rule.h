@@ -53,16 +53,6 @@ class ChunkGatedDeltaRuleImpl : public torch::nn::Module {
     return (a + b - 1) / b;
   }
 
-  static void* get_ptr_or_null(const torch::Tensor& tensor) {
-    return tensor.numel() > 0 ? tensor.data_ptr() : nullptr;
-  }
-
-  static void* get_ptr_or_null(const std::optional<torch::Tensor>& tensor) {
-    return tensor.has_value() && tensor.value().numel() > 0
-               ? tensor.value().data_ptr()
-               : nullptr;
-  }
-
   cnrtDim3_t compute_grid_dim(int64_t total_chunks) const;
 
   torch::Tensor prepare_lens(const torch::Tensor& cu_seqlens) const;

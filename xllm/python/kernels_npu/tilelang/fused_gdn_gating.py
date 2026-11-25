@@ -15,7 +15,6 @@ from .utils import detect_vec_core_num
 DEFAULT_NUM_HEADS = 32
 DEFAULT_DTYPE = "bf16"
 DEFAULT_MAX_BATCH = 262144
-DEFAULT_MAX_HEADS = 128
 REF_CHECK_NUM_BATCHES = 16
 REF_CHECK_NUM_HEADS = (1, 16, 32, 48, 64, 128)
 MAX_VEC_CORE_NUM = detect_vec_core_num()

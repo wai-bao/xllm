@@ -120,7 +120,6 @@ def build_fused_gdn_gating_kernel(
             ub_tensor_dim = _align_count_to_vector_bytes(num_heads, acc_dtype)
     compare_select_mask_bytes = (ub_tensor_dim + 7) // 8
     multi_count = rows_per_iter * ub_tensor_dim
-    multi_cmp_mask = rows_per_iter * compare_select_mask_bytes
 
     @T.prim_func
     def fused_gdn_gating_kernel(

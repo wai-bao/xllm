@@ -237,7 +237,6 @@ def _causal_conv1d_update_kernel_npu_tiled_v2(
             )
             acc += current_x.to(tl.float32) * current_w
 
-            old0 = col0
             old1 = col1
             old2 = col2
             old3 = col3

@@ -22,8 +22,6 @@ import torch
 import triton
 import triton.language as tl
 
-BT_LIST = [8, 16, 32, 64, 128]
-
 
 # @triton.autotune(
 #     configs=[

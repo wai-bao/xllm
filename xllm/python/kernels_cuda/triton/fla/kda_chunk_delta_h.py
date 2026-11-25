@@ -17,7 +17,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import os
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import triton
