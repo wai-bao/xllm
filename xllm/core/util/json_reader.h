@@ -41,9 +41,6 @@ class JsonReader {
   // parse the json file, return true if success
   bool parse(const std::string& json_file_path);
 
-  // parse json content from a string, return true if success
-  bool parse_text(const std::string& json_text);
-
   // check if the json contains the key, key can be nested with dot notation
   bool contains(const std::string& key) const;
 
@@ -106,9 +103,6 @@ class JsonReader {
 
   nlohmann::json data() const { return data_; }
 
-  // Mutable access to the parsed document, for in-place rewrites that avoid a
-  // dump()/parse_text() round-trip. The reader keeps no derived state, so
-  // resolve()/value() see mutations immediately.
   nlohmann::json& mutable_data() { return data_; }
 
  private:

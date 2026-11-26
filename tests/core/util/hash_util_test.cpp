@@ -103,13 +103,5 @@ TEST(HashUtilTest, ComparesAllKeyBytesAndSupportsCacheLookup) {
   EXPECT_EQ(cache.end(), cache.find(hash_string("content", /*seed=*/43)));
 }
 
-TEST(HashUtilTest, LeavesUnsetKeysAndPrefixHashesZeroInitialized) {
-  PrefixHash prefix{};
-  EXPECT_EQ(XXH3Key(), XXH3Key(prefix.data()));
-  EXPECT_TRUE(is_zero_prefix_hash(prefix));
-  prefix.back() = 1;
-  EXPECT_FALSE(is_zero_prefix_hash(prefix));
-}
-
 }  // namespace
 }  // namespace xllm

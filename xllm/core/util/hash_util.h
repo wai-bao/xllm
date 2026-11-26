@@ -45,16 +45,6 @@ class XXH3Key final {
     std::memcpy(data, input_data, sizeof(data));
   }
 
-  std::string debug_string() const {
-    std::string result;
-    result.reserve(sizeof(data) * 4);
-    for (uint8_t byte : data) {
-      result += std::to_string(static_cast<int64_t>(byte));
-      result += ' ';
-    }
-    return result;
-  }
-
   // Unset keys are deterministic all-zero values, rejectable downstream.
   uint8_t data[XXH3_128BITS_HASH_VALUE_LEN]{};
 };
@@ -78,11 +68,5 @@ XXH3Key hash_bytes(const void* data, size_t size, uint64_t seed);
 XXH3Key hash_string(std::string_view value, uint64_t seed);
 
 using PrefixHash = std::array<uint8_t, XXH3_128BITS_HASH_VALUE_LEN>;
-
-inline bool is_zero_prefix_hash(const PrefixHash& prefix_hash) {
-  return std::all_of(prefix_hash.begin(), prefix_hash.end(), [](uint8_t value) {
-    return value == 0;
-  });
-}
 
 }  // namespace xllm

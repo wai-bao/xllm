@@ -36,21 +36,38 @@ limitations under the License.
 #include "core/framework/config/parallel_config.h"
 #include "core/framework/config/scheduler_config.h"
 #include "core/framework/config/service_config.h"
+#include "core/util/json_test_utils.h"
 
 namespace xllm {
 namespace {
+
+xllm::JsonReader parse_json_string(std::string_view json) {
+  xllm::JsonReader reader;
+  if (!json.empty()) {
+    parse_json_text(reader, std::string(json));
+  }
+  return reader;
+}
+
+xllm::JsonReader load_json_file(const std::string& path) {
+  xllm::JsonReader reader;
+  if (!path.empty()) {
+    reader.parse(path);
+  }
+  return reader;
+}
 
 TEST(ServiceConfigTest, CpuAffinityJsonAndCommandLineOverride) {
   google::FlagSaver flag_saver;
   ServiceConfig config;
   EXPECT_TRUE(config.enable_cpu_affinity());
   config.from_json(
-      config::parse_json_string(R"({"cpu_affinity":"[[0,1],[2,3]]"})"));
+      parse_json_string(/*json=*/R"({"cpu_affinity":"[[0,1],[2,3]]"})"));
   EXPECT_EQ(config.cpu_affinity_for_rank(1, 2), (std::vector<int32_t>{2, 3}));
   google::SetCommandLineOption("enable_cpu_affinity", "false");
   config.from_flags();
   config.from_json(
-      config::parse_json_string(R"({"enable_cpu_affinity":true})"));
+      parse_json_string(/*json=*/R"({"enable_cpu_affinity":true})"));
   EXPECT_FALSE(config.enable_cpu_affinity());
   EXPECT_TRUE(config.cpu_affinity_for_rank(1, 2).empty());
 }
@@ -79,7 +96,7 @@ inline constexpr std::string_view kMalformedConfig = R"json({
 TEST(ExecutionConfigTest, EnablesDsaMultiStreamFromJson) {
   google::FlagSaver flag_saver;
   JsonReader json_config =
-      config::parse_json_string(R"json({"enable_dsa_multi_stream":true})json");
+      parse_json_string(/*json=*/R"json({"enable_dsa_multi_stream":true})json");
   ExecutionConfig execution_config;
 
   execution_config.from_json(json_config);
@@ -89,9 +106,10 @@ TEST(ExecutionConfigTest, EnablesDsaMultiStreamFromJson) {
 
 TEST(ExecutionConfigTest, DsaMultiStreamCommandLineFlagOverridesJson) {
   google::FlagSaver flag_saver;
-  google::SetCommandLineOption("enable_dsa_multi_stream", "true");
-  const JsonReader json_config =
-      config::parse_json_string(R"json({"enable_dsa_multi_stream":false})json");
+  google::SetCommandLineOption(/*flag_name=*/"enable_dsa_multi_stream",
+                               /*value=*/"true");
+  const JsonReader json_config = parse_json_string(
+      /*json=*/R"json({"enable_dsa_multi_stream":false})json");
   ExecutionConfig execution_config;
 
   execution_config.from_flags();
@@ -120,10 +138,10 @@ TEST(ExecutionConfigTest, AttnDpDefaultsOffAndSupportsJson) {
   EXPECT_FALSE(execution_config.enable_attn_dp_weight_sharding());
   nlohmann::ordered_json serialized = nlohmann::ordered_json::object();
   execution_config.append_config_json(serialized);
-  EXPECT_FALSE(serialized.contains("enable_attn_dp_weight_sharding"));
+  EXPECT_FALSE(serialized.contains(/*key=*/"enable_attn_dp_weight_sharding"));
 
-  const JsonReader json_config = config::parse_json_string(
-      R"json({"enable_attn_dp_weight_sharding":true})json");
+  const JsonReader json_config = parse_json_string(
+      /*json=*/R"json({"enable_attn_dp_weight_sharding":true})json");
   execution_config.from_json(json_config);
   EXPECT_TRUE(execution_config.enable_attn_dp_weight_sharding());
   execution_config.append_config_json(serialized);
@@ -132,11 +150,12 @@ TEST(ExecutionConfigTest, AttnDpDefaultsOffAndSupportsJson) {
 
 TEST(ExecutionConfigTest, AttnDpCommandLineFlagOverridesJson) {
   google::FlagSaver flag_saver;
-  google::SetCommandLineOption("enable_attn_dp_weight_sharding", "true");
+  google::SetCommandLineOption(
+      /*flag_name=*/"enable_attn_dp_weight_sharding", /*value=*/"true");
   ExecutionConfig execution_config;
   execution_config.from_flags();
-  const JsonReader json_config = config::parse_json_string(
-      R"json({"enable_attn_dp_weight_sharding":false})json");
+  const JsonReader json_config = parse_json_string(
+      /*json=*/R"json({"enable_attn_dp_weight_sharding":false})json");
   execution_config.from_json(json_config);
   EXPECT_TRUE(execution_config.enable_attn_dp_weight_sharding());
 }
@@ -439,7 +458,7 @@ TEST(ModelConfigValidationTest, AcceptsGlmPythonMtpWithSpeculativeTokens) {
 }
 
 TEST(ConfigJsonTest, FromJsonUsesParsedOverrides) {
-  const JsonReader json = config::parse_json_string(kInlineConfig);
+  const JsonReader json = parse_json_string(kInlineConfig);
   ConfigFlagGuard flag_guard;
   const std::string old_python_model_path = FLAGS_python_model_path;
 
@@ -509,7 +528,7 @@ TEST(KVCacheConfigTest, ElasticDefaultsRemainImplicitInSerializedConfig) {
 
 TEST(KVCacheConfigTest, ReadsAndExportsElasticMemoryOptionsFromJson) {
   google::FlagSaver flag_saver;
-  const JsonReader json = config::parse_json_string(
+  const JsonReader json = parse_json_string(
       R"json({"vmm_elastic":false,"vmm_memory_reserve_bytes":67108864})json");
   KVCacheConfig config;
   config.from_json(json);
@@ -524,11 +543,12 @@ TEST(KVCacheConfigTest, ReadsAndExportsElasticMemoryOptionsFromJson) {
 
 TEST(KVCacheConfigTest, ElasticCommandLineOptionsOverrideJson) {
   google::FlagSaver flag_saver;
-  google::SetCommandLineOption("vmm_elastic", "false");
-  google::SetCommandLineOption("vmm_memory_reserve_bytes", "2048");
+  google::SetCommandLineOption(/*flag_name=*/"vmm_elastic", /*value=*/"false");
+  google::SetCommandLineOption(/*flag_name=*/"vmm_memory_reserve_bytes",
+                               /*value=*/"2048");
   KVCacheConfig config;
   config.from_flags();
-  const JsonReader json = config::parse_json_string(
+  const JsonReader json = parse_json_string(
       R"json({"vmm_elastic":true,"vmm_memory_reserve_bytes":4096})json");
   config.from_json(json);
   EXPECT_FALSE(config.vmm_elastic());
@@ -559,8 +579,8 @@ TEST(KVCacheConfigTest, StartupTimeoutRoundTripsThroughJson) {
   {
     google::FlagSaver flag_saver;
     KVCacheConfig config;
-    config.from_json(config::parse_json_string(
-        R"json({"vmm_startup_timeout_ms":45000})json"));
+    config.from_json(parse_json_string(
+        /*json=*/R"json({"vmm_startup_timeout_ms":45000})json"));
     config.validate();
     EXPECT_EQ(config.vmm_startup_timeout_ms(), 45000);
     config.append_config_json(serialized);
@@ -571,20 +591,21 @@ TEST(KVCacheConfigTest, StartupTimeoutRoundTripsThroughJson) {
   google::FlagSaver flag_saver;
   KVCacheConfig restored;
   restored.from_flags();
-  restored.from_json(config::parse_json_string(serialized.dump()));
+  restored.from_json(parse_json_string(serialized.dump()));
   restored.validate();
   EXPECT_EQ(restored.vmm_startup_timeout_ms(), 45000);
 }
 
 TEST(KVCacheConfigTest, ExplicitDefaultStartupTimeoutOverridesJson) {
   google::FlagSaver flag_saver;
-  ASSERT_FALSE(
-      google::SetCommandLineOption("vmm_startup_timeout_ms", "120000").empty());
+  ASSERT_FALSE(google::SetCommandLineOption(
+                   /*flag_name=*/"vmm_startup_timeout_ms", /*value=*/"120000")
+                   .empty());
   KVCacheConfig config;
   config.from_flags();
   EXPECT_EQ(config.vmm_startup_timeout_ms(), 120000);
-  config.from_json(
-      config::parse_json_string(R"json({"vmm_startup_timeout_ms":45000})json"));
+  config.from_json(parse_json_string(
+      /*json=*/R"json({"vmm_startup_timeout_ms":45000})json"));
   config.validate();
   EXPECT_EQ(config.vmm_startup_timeout_ms(), 120000);
 }
@@ -720,8 +741,8 @@ TEST(KVCacheConfigValidationTest, RejectsUnsupportedIndexerCacheDtypes) {
 
 TEST(ConfigJsonTest, ParallelConfigHandlesKvSplitSize) {
   CpSizeFlagGuard flag_guard;
-  const JsonReader json = config::parse_json_string(
-      R"json({"cp_size": 1, "kv_split_size": 2})json");
+  const JsonReader json = parse_json_string(
+      /*json=*/R"json({"cp_size": 1, "kv_split_size": 2})json");
   ParallelConfig parallel_config;
   parallel_config.from_json(json);
 
@@ -735,12 +756,13 @@ TEST(KVCacheStoreConfigTest, ReadsAndExportsRdmaDevices) {
   EXPECT_TRUE(default_config.store_rdma_devices().empty());
   const std::vector<std::string>& option_names =
       KVCacheStoreConfig::option_category().option_names;
-  EXPECT_NE(
-      std::find(option_names.begin(), option_names.end(), "store_rdma_devices"),
-      option_names.end());
+  EXPECT_NE(std::find(option_names.begin(),
+                      option_names.end(),
+                      /*value=*/"store_rdma_devices"),
+            option_names.end());
 
-  JsonReader json_config = config::parse_json_string(
-      R"json({"store_rdma_devices":"mlx5_0,mlx5_1"})json");
+  JsonReader json_config = parse_json_string(
+      /*json=*/R"json({"store_rdma_devices":"mlx5_0,mlx5_1"})json");
   KVCacheStoreConfig config;
   config.from_json(json_config);
   EXPECT_EQ(config.store_rdma_devices(), "mlx5_0,mlx5_1");
@@ -794,8 +816,9 @@ TEST(ConfigJsonTest, BlockDraftKvWarmupDefaultsAndJsonRoundTrip) {
       google::FlagSaver limit_flag_saver;
       ExecutionConfig loaded_config;
       loaded_config.from_flags();
-      loaded_config.from_json(config::parse_json_string(nlohmann::ordered_json{
-          {"block_draft_graph_warmup_max_kv_len", limit}}.dump()));
+      loaded_config.from_json(parse_json_string(nlohmann::ordered_json{
+          {"block_draft_graph_warmup_max_kv_len",
+           limit}}.dump()));
       EXPECT_EQ(loaded_config.block_draft_graph_warmup_max_kv_len(), limit);
       loaded_config.append_config_json(exported);
     }
@@ -804,7 +827,7 @@ TEST(ConfigJsonTest, BlockDraftKvWarmupDefaultsAndJsonRoundTrip) {
     google::FlagSaver restored_flag_saver;
     ExecutionConfig restored_config;
     restored_config.from_flags();
-    restored_config.from_json(config::parse_json_string(exported.dump()));
+    restored_config.from_json(parse_json_string(exported.dump()));
     EXPECT_EQ(restored_config.block_draft_graph_warmup_max_kv_len(), limit);
   }
 }
@@ -816,7 +839,7 @@ TEST(ConfigJsonTest, BlockDraftKvWarmupCommandLineOverridesJson) {
                    .empty());
   ExecutionConfig execution_config;
   execution_config.from_flags();
-  execution_config.from_json(config::parse_json_string(
+  execution_config.from_json(parse_json_string(
       R"json({"block_draft_graph_warmup_max_kv_len":-1})json"));
   EXPECT_EQ(execution_config.block_draft_graph_warmup_max_kv_len(), 32768);
 }
@@ -831,7 +854,7 @@ TEST(ConfigJsonTest, LoadJsonFileReadsConfigFixture) {
   const std::filesystem::path config_path = config_test_file_path();
   ASSERT_TRUE(std::filesystem::exists(config_path)) << config_path;
 
-  const JsonReader json = config::load_json_file(config_path.string());
+  const JsonReader json = load_json_file(config_path.string());
 
   KVCacheConfig kv_cache_config;
   kv_cache_config.from_flags();
@@ -964,14 +987,16 @@ TEST(ConfigPrecedenceTest, CommandLineFlagOverridesJson) {
 
   // Simulate `--block_size=64 --max_tokens_per_batch=2048 --model_impl=native`.
   google::SetCommandLineOption("block_size", "64");
-  google::SetCommandLineOption("max_memory_utilization", "0.7");
-  google::SetCommandLineOption("max_tokens_per_batch", "2048");
-  google::SetCommandLineOption("model_impl", "native");
+  google::SetCommandLineOption(/*flag_name=*/"max_memory_utilization",
+                               /*value=*/"0.7");
+  google::SetCommandLineOption(/*flag_name=*/"max_tokens_per_batch",
+                               /*value=*/"2048");
+  google::SetCommandLineOption(/*flag_name=*/"model_impl", /*value=*/"native");
 
   // kInlineConfig sets block_size=16, max_memory_utilization=0.5,
   // max_tokens_per_batch=8192, and model_impl="py": all conflict with the
   // command-line values above.
-  const JsonReader json = config::parse_json_string(kInlineConfig);
+  const JsonReader json = parse_json_string(kInlineConfig);
 
   KVCacheConfig kv_cache_config;
   kv_cache_config.from_flags();
@@ -1003,10 +1028,10 @@ TEST(ConfigPrecedenceTest, JsonOverridesDefaultWhenFlagUnspecified) {
   // None of these flags are specified on the command line, so JSON must win
   // over the compiled-in defaults.
   ASSERT_FALSE(config::is_flag_specified("block_size"));
-  ASSERT_FALSE(config::is_flag_specified("enable_prefix_cache"));
-  ASSERT_FALSE(config::is_flag_specified("max_seqs_per_batch"));
+  ASSERT_FALSE(config::is_flag_specified(/*flag_name=*/"enable_prefix_cache"));
+  ASSERT_FALSE(config::is_flag_specified(/*flag_name=*/"max_seqs_per_batch"));
 
-  const JsonReader json = config::parse_json_string(kInlineConfig);
+  const JsonReader json = parse_json_string(kInlineConfig);
 
   KVCacheConfig kv_cache_config;
   kv_cache_config.from_flags();
@@ -1026,7 +1051,7 @@ TEST(ConfigPrecedenceTest, JsonOverridesDefaultWhenFlagUnspecified) {
 TEST(ConfigPrecedenceTest, OmitsDefaultMemoryUtilizationFromSerializedConfig) {
   google::FlagSaver flag_saver;
   KVCacheConfig kv_cache_config;
-  const JsonReader json = config::parse_json_string(R"json({})json");
+  const JsonReader json = parse_json_string(/*json=*/R"json({})json");
 
   kv_cache_config.from_flags();
   kv_cache_config.from_json(json);
@@ -1043,7 +1068,7 @@ TEST(ConfigPrecedenceTest, PreservesZeroMemoryUtilizationOnRoundTrip) {
     KVCacheConfig kv_cache_config;
     kv_cache_config.from_flags();
     kv_cache_config.from_json(
-        config::parse_json_string(R"json({"max_memory_utilization":0})json"));
+        parse_json_string(/*json=*/R"json({"max_memory_utilization":0})json"));
     kv_cache_config.append_config_json(serialized);
   }
 
@@ -1051,7 +1076,7 @@ TEST(ConfigPrecedenceTest, PreservesZeroMemoryUtilizationOnRoundTrip) {
   google::FlagSaver flag_saver;
   KVCacheConfig restored;
   restored.from_flags();
-  restored.from_json(config::parse_json_string(serialized.dump()));
+  restored.from_json(parse_json_string(serialized.dump()));
   EXPECT_DOUBLE_EQ(restored.max_memory_utilization(), 0.0);
 }
 
@@ -1067,7 +1092,7 @@ TEST(ConfigPrecedenceTest, KeepsDefaultWhenNeitherCliNorJson) {
 
   // kUpdatedConfig only carries block_size and max_tokens_per_batch, so
   // unrelated properties fall back to their defaults.
-  const JsonReader json = config::parse_json_string(kUpdatedConfig);
+  const JsonReader json = parse_json_string(kUpdatedConfig);
 
   KVCacheConfig kv_cache_config;
   kv_cache_config.from_flags();
@@ -1119,7 +1144,7 @@ TEST(VirtualMemoryConfigTest, JsonLoadsAndExportsIndependentMemoryModes) {
       SCOPED_TRACE(nlohmann::json({{"enable_vmm_kvcache", enable_kvcache},
                                    {"enable_vmm_weights", enable_weights}})
                        .dump());
-      const JsonReader json = config::parse_json_string(
+      const JsonReader json = parse_json_string(
           nlohmann::json(
               {{"enable_vmm_kvcache", enable_kvcache},
                {"enable_vmm_weights", enable_weights},
@@ -1150,7 +1175,7 @@ TEST(VirtualMemoryConfigTest, JsonLoadsAndExportsIndependentMemoryModes) {
           exported.at("worker_memory_master_node_addr").get<std::string>(),
           "192.0.2.1:19889");
       EXPECT_FALSE(exported.contains("enable_virtual_memory"));
-      EXPECT_FALSE(exported.contains("enable_xtensor"));
+      EXPECT_FALSE(exported.contains(/*key=*/"enable_xtensor"));
       EXPECT_FALSE(exported.contains("xtensor_master_node_addr"));
       EXPECT_FALSE(exported.contains("virtual_memory_master_node_addr"));
     }
@@ -1159,7 +1184,7 @@ TEST(VirtualMemoryConfigTest, JsonLoadsAndExportsIndependentMemoryModes) {
 
 TEST(VirtualMemoryConfigTest, JsonPreservesExplicitFalseAndEmptyValues) {
   google::FlagSaver flag_saver;
-  const JsonReader json = config::parse_json_string(R"json({
+  const JsonReader json = parse_json_string(/*json=*/R"json({
     "enable_vmm_kvcache": false,
     "enable_vmm_weights": false,
     "worker_memory_master_node_addr": ""
@@ -1190,9 +1215,10 @@ TEST(VirtualMemoryConfigTest, CommandLineOptionsOverrideJsonIndependently) {
                        "enable_vmm_weights", enable_weights ? "true" : "false")
                        .empty());
       ASSERT_FALSE(google::SetCommandLineOption(
-                       "worker_memory_master_node_addr", "192.0.2.2:19889")
+                       /*flag_name=*/"worker_memory_master_node_addr",
+                       /*value=*/"192.0.2.2:19889")
                        .empty());
-      const JsonReader json = config::parse_json_string(
+      const JsonReader json = parse_json_string(
           nlohmann::json(
               {{"enable_vmm_kvcache", !enable_kvcache},
                {"enable_vmm_weights", !enable_weights},

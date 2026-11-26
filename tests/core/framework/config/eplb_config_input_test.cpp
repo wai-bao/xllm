@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/config/config_input.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/util/json_reader.h"
+#include "core/util/json_test_utils.h"
 
 namespace xllm {
 namespace {
@@ -56,7 +57,7 @@ void parse_flags(std::vector<std::string> arguments) {
 
 JsonReader parse_json(std::string_view text) {
   JsonReader reader;
-  EXPECT_TRUE(reader.parse_text(std::string(text)));
+  EXPECT_TRUE(parse_json_text(reader, std::string(text)));
   return reader;
 }
 

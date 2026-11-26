@@ -61,7 +61,6 @@ class WeightAllocation final {
   void* base_ptr() const { return base_ptr_; }
   size_t current_offset() const { return current_offset_; }
   bool is_fragmented() const { return region_ != nullptr; }
-  MappedVirtualMemoryRegion* region() const { return region_.get(); }
   const std::vector<WeightSegment>& segments() const { return segments_; }
 
  private:
