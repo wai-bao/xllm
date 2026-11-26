@@ -72,7 +72,6 @@ BatchGroup BatchBuilder::build(const std::vector<Sequence*>& sequences,
   for (int32_t rank = 0; rank < dp_size_; ++rank) {
     batches[rank].reserve(
         sequence_counts[rank],
-        /*group_count=*/0,
         embedding_counts.empty() ? 0 : embedding_counts[rank]);
   }
   for (size_t i = 0; i < sequences.size(); ++i) {

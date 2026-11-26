@@ -98,7 +98,6 @@ TEST(SamplingInputBuilderTest, MergeOffsetsSelectedRows) {
   SamplingInputBuilder second;
   second.append(&params, 0);
   first.merge(std::move(second), /*token_offset=*/4);
-  EXPECT_EQ(first.selected_token_indices(), (std::vector<int32_t>{1, 3, 4}));
   const auto sampling = first.build();
   EXPECT_TRUE(torch::equal(sampling.logits_indices(),
                            torch::tensor({1, 3, 4}, torch::kInt)));
@@ -160,7 +159,7 @@ TEST(BatchFactoryTest, PreservesRankLocalSequenceOrderAndBudgets) {
   EXPECT_NE(batches[0].batch_id(), batches[8].batch_id());
 }
 
-TEST(BatchStateTest, MixedForwardTypeSurvivesAdditionalStagesAndRefreshes) {
+TEST(BatchStateTest, MixedForwardTypeSurvivesAdditionalStages) {
   auto prefill = make_request(/*rank=*/0);
   auto decode = make_request(/*rank=*/0);
   auto chunked = make_request(/*rank=*/0);
@@ -170,32 +169,11 @@ TEST(BatchStateTest, MixedForwardTypeSurvivesAdditionalStagesAndRefreshes) {
   decode_sequence->kv_state().set_kv_cache_tokens_num(/*num=*/3);
   chunked_sequence->kv_state().set_kv_cache_tokens_num(/*num=*/1);
   BatchState state;
-  state.reserve(/*sequence_count=*/3, /*group_count=*/0);
   state.add(prefill_sequence, /*token_budget=*/3);
   EXPECT_TRUE(state.prepare_batch_input().forward_type.is_prefill());
   state.add(decode_sequence, /*token_budget=*/1);
   EXPECT_TRUE(state.prepare_batch_input().forward_type.is_mixed());
   state.add(chunked_sequence, /*token_budget=*/2);
-  EXPECT_TRUE(state.prepare_batch_input().forward_type.is_mixed());
-
-  // A reused batch must recompute its type after sequence KV state changes.
-  for (auto* sequence : state.sequence_plan().sequences()) {
-    sequence->kv_state().set_kv_cache_tokens_num(/*num=*/0);
-  }
-  state.refresh_forward_type(state.sequence_plan().sequences());
-  EXPECT_TRUE(state.prepare_batch_input().forward_type.is_prefill());
-  for (auto* sequence : state.sequence_plan().sequences()) {
-    sequence->kv_state().set_kv_cache_tokens_num(/*num=*/1);
-  }
-  state.refresh_forward_type(state.sequence_plan().sequences());
-  EXPECT_TRUE(state.prepare_batch_input().forward_type.is_chunked_prefill());
-  for (auto* sequence : state.sequence_plan().sequences()) {
-    sequence->kv_state().set_kv_cache_tokens_num(/*num=*/3);
-  }
-  state.refresh_forward_type(state.sequence_plan().sequences());
-  EXPECT_TRUE(state.prepare_batch_input().forward_type.is_decode());
-  prefill_sequence->kv_state().set_kv_cache_tokens_num(/*num=*/0);
-  state.refresh_forward_type(state.sequence_plan().sequences());
   EXPECT_TRUE(state.prepare_batch_input().forward_type.is_mixed());
 }
 

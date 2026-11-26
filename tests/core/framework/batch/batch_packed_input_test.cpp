@@ -617,7 +617,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackPreservesLinearReadWriteIds) {
   std::vector<Sequence*> sequences = {&seq, &second_sequence};
   std::vector<uint32_t> budgets = {4, 4};
   const BatchInputData batch_input_data{
-      sequences, {}, budgets, {}, {}, 1, BatchForwardType::DECODE};
+      sequences, budgets, {}, {}, 1, BatchForwardType::DECODE};
   ForwardInputBuilder builder(batch_input_data, nullptr);
 
   LlmForwardInput input = builder.build_forward_input();
@@ -1019,7 +1019,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyUnpackRestoresDoSample) {
   std::vector<Sequence*> sequences = {&seq};
   std::vector<uint32_t> budgets = {4};
   const BatchInputData batch_input_data{
-      sequences, {}, budgets, {}, {}, 1, BatchForwardType::DECODE};
+      sequences, budgets, {}, {}, 1, BatchForwardType::DECODE};
   ForwardInputBuilder builder(batch_input_data, nullptr);
 
   LlmForwardInput input = builder.build_forward_input();
@@ -1563,7 +1563,7 @@ TEST(BatchPackedInputTest, PackedProtoLazyToPreservesJsonMetadata) {
   std::vector<Sequence*> sequences = {&sequence};
   std::vector<uint32_t> allowed_max_tokens = {4};
   const BatchInputData batch_input_data{
-      sequences, {}, allowed_max_tokens, {}, {}, 2, BatchForwardType::DECODE};
+      sequences, allowed_max_tokens, {}, {}, 2, BatchForwardType::DECODE};
   ForwardInputBuilder builder(batch_input_data, nullptr);
   LlmForwardInput input = builder.build_forward_input();
 

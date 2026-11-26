@@ -23,14 +23,8 @@ Batch::Batch(const std::vector<Sequence*>& sequences) { add(sequences); }
 
 BatchInputType Batch::input_type() const { return BatchInputType::SEQUENCE; }
 
-void Batch::reserve(size_t sequence_count, size_t group_count) {
-  state_.reserve(sequence_count, group_count);
-}
-
-void Batch::reserve(size_t sequence_count,
-                    size_t group_count,
-                    size_t input_embedding_count) {
-  state_.reserve(sequence_count, group_count, input_embedding_count);
+void Batch::reserve(size_t sequence_count, size_t input_embedding_count) {
+  state_.reserve(sequence_count, input_embedding_count);
 }
 
 void Batch::add(Sequence* sequence, uint32_t allowed_max_token) {
@@ -43,14 +37,6 @@ void Batch::add(const std::vector<Sequence*>& sequences) {
   }
 }
 
-void Batch::add(SequencesGroup* group) { state_.add(group); }
-void Batch::update_forward_type(Sequence* sequence) {
-  state_.update_forward_type(sequence);
-}
-void Batch::refresh_forward_type() {
-  state_.refresh_forward_type(get_sequences());
-}
-
 size_t Batch::size() const { return state_.sequence_plan().size(); }
 
 Sequence* Batch::operator[](size_t index) const {
@@ -61,10 +47,7 @@ std::vector<Sequence*> Batch::get_sequences() {
   return static_cast<const Batch&>(*this).get_sequences();
 }
 std::vector<Sequence*> Batch::get_sequences() const {
-  if (!state_.sequence_plan().empty()) {
-    return state_.sequence_plan().sequences();
-  }
-  return state_.group_sequences();
+  return state_.sequence_plan().sequences();
 }
 
 template <typename Input>

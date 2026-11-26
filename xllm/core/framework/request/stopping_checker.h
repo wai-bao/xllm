@@ -56,24 +56,13 @@ class StoppingChecker {
     return max_context_len_;
   }
 
-  inline void set_eos_token(int32_t eos_token) { eos_token_ = eos_token; }
-
   inline constexpr int32_t get_eos_token() const { return eos_token_; }
 
   inline void set_ignore_eos(bool ignore_eos) { ignore_eos_ = ignore_eos; }
 
   inline constexpr bool get_ignore_eos() const { return ignore_eos_; }
 
-  inline void set_stop_tokens(std::unordered_set<int32_t> tokens) {
-    stop_tokens_ = std::move(tokens);
-  }
-
   inline std::unordered_set<int32_t>& get_stop_tokens() { return stop_tokens_; }
-
-  inline void set_stop_sequences(std::vector<std::vector<int32_t>> sequences) {
-    stop_sequences_ = std::move(sequences);
-    stop_strings_.clear();
-  }
 
   inline std::vector<std::vector<int32_t>>& get_stop_sequences() {
     return stop_sequences_;

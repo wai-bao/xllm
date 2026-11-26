@@ -43,9 +43,6 @@ class SamplingInputBuilder final {
 
   size_t size() const { return selected_token_indices_.size(); }
   bool empty() const { return selected_token_indices_.empty(); }
-  const std::vector<int32_t>& selected_token_indices() const {
-    return selected_token_indices_;
-  }
 
  private:
   std::vector<const RequestSamplingParam*> params_;

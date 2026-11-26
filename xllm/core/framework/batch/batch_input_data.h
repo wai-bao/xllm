@@ -24,7 +24,6 @@ limitations under the License.
 #include "core/framework/model/model_params_view.h"
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/request/sequence.h"
-#include "core/framework/request/sequences_group.h"
 
 namespace xllm {
 
@@ -37,7 +36,6 @@ enum class BatchInputType : int8_t {
 // must outlive the builder. Builders may advance sequence execution state.
 struct BatchInputData {
   const std::vector<Sequence*>& sequences;
-  const std::vector<SequencesGroup*>& sequence_groups;
   const std::vector<uint32_t>& allowed_max_tokens;
   const std::vector<torch::Tensor>& input_embeddings;
   const std::vector<MMData>& mm_data;

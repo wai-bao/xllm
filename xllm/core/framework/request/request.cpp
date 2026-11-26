@@ -203,14 +203,6 @@ void Request::log_error_statistic(Status status) {
   }
 }
 
-size_t Request::total_num_blocks() {
-  size_t num = 0;
-  for (auto& seq : sequences()) {
-    num += seq->kv_state().num_blocks(BlockType::KV);
-  }
-  return num;
-}
-
 void Request::set_cancel() {
   cancelled_.store(true, std::memory_order_relaxed);
   for (const auto& seq : sequences()) {

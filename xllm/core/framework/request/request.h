@@ -59,8 +59,6 @@ class Request : public RequestBase {
   }
   bool expand_sequences(bool share_prefix = true);
 
-  SequencesGroup* sequence_group() { return sequences_group_.get(); }
-
   void set_cancel();
 
   bool cancelled() const { return cancelled_.load(std::memory_order_relaxed); }
@@ -75,8 +73,6 @@ class Request : public RequestBase {
   void handle_last_token();
 
   bool last_token_handled() const { return state_.handle_last_token_done; }
-
-  size_t total_num_blocks();
 
   void set_preempted() { state_.preempted = true; }
 
@@ -103,10 +99,6 @@ class Request : public RequestBase {
   // Returns true only when a new sample is recorded for a real generated token.
   bool record_server_first_token(std::chrono::steady_clock::time_point now =
                                      std::chrono::steady_clock::now());
-
-  std::optional<double> server_ttft_seconds() const {
-    return server_ttft_seconds_;
-  }
 
   std::optional<double> server_elapsed_seconds(
       std::chrono::steady_clock::time_point now =
