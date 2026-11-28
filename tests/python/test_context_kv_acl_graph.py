@@ -16,21 +16,39 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
 import torch
+from torch import nn
 
-from xllm.python.attention.backend import LayerCache
-from xllm.python.model_executor.runners.context_kv_acl_graph import ContextKvAclGraphRunner
+from xllm.python.attention.backend import AttentionBackend, LayerCache
+from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
+
+
+class _ContextProjection(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.context_projection_weight = torch.ones(2, 4)
+
+
+class _ContextModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = _ContextProjection()
+        self.write_context_kv = Mock(side_effect=lambda hidden, *_: hidden[:, :2].clone())
 
 
 @pytest.fixture
-def runner(monkeypatch: pytest.MonkeyPatch) -> ContextKvAclGraphRunner:
-    model = SimpleNamespace(
-        model=SimpleNamespace(context_projection_weight=torch.ones(2, 4)),
-        write_context_kv=Mock(side_effect=lambda hidden, *_: hidden[:, :2].clone()),
-    )
+def context_model() -> _ContextModel:
+    """Provide a context writer and its projection shape."""
+    return _ContextModel()
+
+
+@pytest.fixture
+def runner(monkeypatch: pytest.MonkeyPatch, context_model: _ContextModel) -> DecodeAclGraphRunner:
+    """Bind the decode runner to paired caches with mocked ACL capture."""
     monkeypatch.setattr(
         torch,
         "npu",
@@ -43,47 +61,57 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> ContextKvAclGraphRunner:
         ),
         raising=False,
     )
-    monkeypatch.setattr("xllm.python.model_executor.runners.context_kv_acl_graph._get_graph_pool", lambda: (0, 1))
-    result = ContextKvAclGraphRunner(model, torch.device("cpu"))
-    result.bind_kv_caches([LayerCache(torch.full((1, 16, 1, 2), 42.0), torch.full((1, 16, 1, 2), 43.0))])
+    monkeypatch.setattr("xllm.python.model_executor.runners.decode_acl_graph._get_graph_pool", lambda: (0, 1))
+    result = DecodeAclGraphRunner(
+        context_model.model, cast("AttentionBackend", Mock(spec=AttentionBackend)), torch.device("cpu"), 8, 32
+    )
+    result.bind_layer_caches([LayerCache(torch.full((1, 16, 1, 2), 42.0), torch.full((1, 16, 1, 2), 43.0))])
+    assert result.bind_context_kv(context_model)
     return result
 
 
-def test_startup_captures_all_prefix_buckets_once_without_writing_cache(runner: ContextKvAclGraphRunner) -> None:
-    runner.warmup(5)
-    calls = runner.model.write_context_kv.call_count
-    runner.warmup(5)
-    assert runner._buckets == [1, 2, 4, 8]
-    assert runner.model.write_context_kv.call_count == calls
-    for call in runner.model.write_context_kv.call_args_list:
+def test_startup_captures_all_prefix_buckets_once_without_writing_cache(
+    runner: DecodeAclGraphRunner, context_model: _ContextModel
+) -> None:
+    """Warm up every prefix bucket using slots that cannot write KV."""
+    runner.warmup_context_kv(5)
+    calls = context_model.write_context_kv.call_count
+    runner.warmup_context_kv(5)
+    assert runner._context_kv_buckets == [1, 2, 4, 8]
+    assert context_model.write_context_kv.call_count == calls
+    for call in context_model.write_context_kv.call_args_list:
         assert torch.all(call.args[2] == -1)
         assert call.args[4] is None
 
 
-def test_capture_uses_private_stream_and_orders_initialization_and_replay(runner: ContextKvAclGraphRunner) -> None:
+def test_capture_uses_private_stream_and_orders_initialization_and_replay(runner: DecodeAclGraphRunner) -> None:
+    """Order startup capture and caller replay on distinct streams."""
     caller_stream = torch.npu.current_stream()
-    runner.warmup(4)
-    capture_stream = runner._capture_stream
+    runner.warmup_context_kv(4)
+    capture_stream = runner._context_kv_capture_stream
     assert capture_stream is not caller_stream
     torch.npu.Stream.assert_called_once_with(device=runner.device)
     capture_stream.wait_stream.assert_called_once_with(caller_stream)
     caller_stream.wait_stream.assert_called_once_with(capture_stream)
     torch.npu.stream.assert_called_once_with(capture_stream)
     assert all(call.kwargs["stream"] is capture_stream for call in torch.npu.graph.call_args_list)
-    runner.warmup(8)
+    runner.warmup_context_kv(8)
     torch.npu.Stream.assert_called_once()
     assert capture_stream.wait_stream.call_count == 2
     assert caller_stream.wait_stream.call_count == 2
 
 
-def test_replay_changes_positions_and_masks_stale_tail_without_recapture(runner: ContextKvAclGraphRunner) -> None:
-    runner.warmup(4)
-    entry = runner._graphs[4]
-    runner.execute(torch.ones(4, 4), torch.arange(4), torch.arange(4, dtype=torch.int32))
+def test_replay_changes_positions_and_masks_stale_tail_without_recapture(
+    runner: DecodeAclGraphRunner, context_model: _ContextModel
+) -> None:
+    """Reuse captured addresses and invalidate stale slots on shrink."""
+    runner.warmup_context_kv(4)
+    entry = runner._context_kv_graphs[4]
+    runner.replay_context_kv(torch.ones(4, 4), torch.arange(4), torch.arange(4, dtype=torch.int32))
     capture_calls = torch.npu.graph.call_count
-    forward_calls = runner.model.write_context_kv.call_count
+    forward_calls = context_model.write_context_kv.call_count
     hidden = torch.full((3, 4), 7.0)
-    output = runner.execute(hidden, torch.tensor([8, 9, 10]), torch.tensor([7, -1, 9], dtype=torch.int32))
+    output = runner.replay_context_kv(hidden, torch.tensor([8, 9, 10]), torch.tensor([7, -1, 9], dtype=torch.int32))
     torch.testing.assert_close(entry.hidden[:3], hidden)
     torch.testing.assert_close(entry.positions, torch.tensor([8, 9, 10, 3], dtype=torch.int32))
     torch.testing.assert_close(entry.slots, torch.tensor([7, -1, 9, -1], dtype=torch.int32))
@@ -91,29 +119,34 @@ def test_replay_changes_positions_and_masks_stale_tail_without_recapture(runner:
     assert output.shape == (3, 2)
     assert entry.graph.replay.call_count == 2
     assert torch.npu.graph.call_count == capture_calls
-    assert runner.model.write_context_kv.call_count == forward_calls
+    assert context_model.write_context_kv.call_count == forward_calls
 
 
-def test_missing_startup_capture_is_not_a_runtime_fallback(runner: ContextKvAclGraphRunner) -> None:
+def test_missing_startup_capture_is_not_a_runtime_fallback(
+    runner: DecodeAclGraphRunner, context_model: _ContextModel
+) -> None:
+    """Reject replay before startup capture."""
     with pytest.raises(RuntimeError, match="startup warmup"):
-        runner.execute(torch.ones(1, 4), torch.ones(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32))
+        runner.replay_context_kv(torch.ones(1, 4), torch.ones(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32))
     torch.npu.graph.assert_not_called()
-    runner.model.write_context_kv.assert_not_called()
+    context_model.write_context_kv.assert_not_called()
 
 
-def test_declared_out_of_capacity_path_uses_eager_without_capture(runner: ContextKvAclGraphRunner) -> None:
-    runner.warmup(2)
+def test_declared_out_of_capacity_path_uses_eager_without_capture(runner: DecodeAclGraphRunner) -> None:
+    """Keep out-of-capacity execution on the existing eager path."""
+    runner.warmup_context_kv(2)
     capture_calls = torch.npu.graph.call_count
     hidden = torch.ones(3, 4)
-    output = runner.execute(hidden, torch.arange(3), torch.arange(3, dtype=torch.int32))
+    output = runner.replay_context_kv(hidden, torch.arange(3), torch.arange(3, dtype=torch.int32))
     assert output.shape == (3, 2)
     assert torch.npu.graph.call_count == capture_calls
-    assert runner.replays == 0
+    assert all(not context_graph.graph.replay.called for context_graph in runner._context_kv_graphs.values())
 
 
 @pytest.mark.parametrize("change", ["width", "rows", "dtype", "slot_dtype"])
-def test_invalid_inputs_fail_before_replay(runner: ContextKvAclGraphRunner, change: str) -> None:
-    runner.warmup(4)
+def test_invalid_inputs_fail_before_replay(runner: DecodeAclGraphRunner, change: str) -> None:
+    """Reject invalid layouts before issuing a graph replay."""
+    runner.warmup_context_kv(4)
     hidden, positions, slots = torch.ones(3, 4), torch.arange(3), torch.arange(3, dtype=torch.int32)
     if change == "width":
         hidden = torch.ones(3, 5)
@@ -124,15 +157,18 @@ def test_invalid_inputs_fail_before_replay(runner: ContextKvAclGraphRunner, chan
     else:
         slots = slots.long()
     with pytest.raises(ValueError):
-        runner.execute(hidden, positions, slots)
-    assert runner.replays == 0
+        runner.replay_context_kv(hidden, positions, slots)
+    assert all(not context_graph.graph.replay.called for context_graph in runner._context_kv_graphs.values())
 
 
-def test_cache_rebinding_is_rejected(runner: ContextKvAclGraphRunner) -> None:
-    old_key, old_value = runner._kv_caches[0]
-    runner.bind_kv_caches([LayerCache(old_key, old_value)])
+def test_cache_rebinding_is_rejected(runner: DecodeAclGraphRunner, context_model: _ContextModel) -> None:
+    """Reject replacement of captured cache addresses."""
+    old_key, old_value = runner._context_kv_caches[0]
+    runner.bind_layer_caches([LayerCache(old_key, old_value)])
+    assert runner.bind_context_kv(context_model)
+    runner.bind_layer_caches([LayerCache(old_key.clone(), old_value)])
     with pytest.raises(ValueError, match="bindings changed"):
-        runner.bind_kv_caches([LayerCache(old_key.clone(), old_value)])
+        runner.bind_context_kv(context_model)
 
 
 @pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires Ascend NPU")
@@ -171,16 +207,19 @@ def test_real_context_graph_matches_eager_and_preserves_masked_slots(
         )
         for _ in range(2)
     ]
-    graph_runner = ContextKvAclGraphRunner(model, torch.device("npu:0"))
-    graph_runner.bind_kv_caches([LayerCache(*cache) for cache in caches])
+    graph_runner = DecodeAclGraphRunner(
+        model.model, cast("AttentionBackend", Mock(spec=AttentionBackend)), torch.device("npu:0"), 4, 32
+    )
+    graph_runner.bind_layer_caches([LayerCache(*cache) for cache in caches])
+    assert graph_runner.bind_context_kv(model)
     # Service startup uses the default stream; serving can use a compute stream.
     # Both callers must initialize and replay without capturing on that stream.
     stream = torch.npu.default_stream("npu:0") if default_stream else torch.npu.Stream(device="npu:0")
     if stream != torch.npu.current_stream():
         stream.wait_stream(torch.npu.current_stream())
     with torch.npu.stream(stream):
-        graph_runner.warmup(4)
-        assert graph_runner._capture_stream != stream
+        graph_runner.warmup_context_kv(4)
+        assert graph_runner._context_kv_capture_stream != stream
         assert torch.npu.current_stream() == stream
         for keys, values in caches:
             assert torch.all(keys == 42).item()
@@ -192,10 +231,9 @@ def test_real_context_graph_matches_eager_and_preserves_masked_slots(
             slots[-1] = -1
             reference_caches = [(key.clone(), value.clone()) for key, value in caches]
             reference = model.write_context_kv(hidden, positions, slots, reference_caches, None)
-            actual = graph_runner.execute(hidden, positions, slots)
+            actual = graph_runner.replay_context_kv(hidden, positions, slots)
             torch.npu.synchronize()
             torch.testing.assert_close(actual, reference)
             for actual_pair, expected_pair in zip(caches, reference_caches):
                 for actual_cache, expected_cache in zip(actual_pair, expected_pair):
                     torch.testing.assert_close(actual_cache, expected_cache)
-    assert graph_runner.replays == 6

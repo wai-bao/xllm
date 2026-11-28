@@ -59,17 +59,3 @@ _DSPARK_DRAFT_MODEL_TYPES = ("DSparkDraftModel", "glm5_dspark", "deepseek_v4_dsp
 def is_dspark_draft_model(config: dict) -> bool:
     """Whether the config describes a DSpark block-diffusion draft."""
     return config.get("model_type", "") in _DSPARK_DRAFT_MODEL_TYPES
-
-
-# Block-diffusion drafts whose context-KV write goes through the shared
-# context_projection_weight + K/V cache layout the ContextKvAclGraphRunner
-# captures (DSpark Qwen/GLM5 and DFlash2 — see _independent_block_draft in
-# executor.py, upstream #2565). DeepSeek-V4 DSpark writes per-layer SWA caches
-# via main_proj instead (see DeepseekV4DSparkModel.write_context_kv), so it
-# must stay off that runner; DFlash runs eager.
-_CONTEXT_KV_DRAFT_MODEL_TYPES = ("DSparkDraftModel", "glm5_dspark", "DFlash2DraftModel")
-
-
-def uses_context_kv_projection(config: dict) -> bool:
-    """Whether the block-diffusion draft supports the shared context-KV projection."""
-    return config.get("model_type", "") in _CONTEXT_KV_DRAFT_MODEL_TYPES

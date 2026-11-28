@@ -137,8 +137,8 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
 
   pybind11::object& python_model() { return py_model_; }
   const pybind11::object& config_dict() const { return config_dict_; }
-  void set_context_kv_graph_runner(pybind11::object runner) {
-    context_kv_graph_runner_ = std::move(runner);
+  void set_context_kv_graph_replay(pybind11::object replay) {
+    context_kv_graph_replay_ = std::move(replay);
   }
   int64_t cp_size() const { return cp_size_; }
   int64_t kv_split_size() const { return kv_split_size_; }
@@ -181,7 +181,7 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
   pybind11::object py_model_;
   pybind11::object config_dict_;
   pybind11::object python_kv_caches_;
-  pybind11::object context_kv_graph_runner_;
+  pybind11::object context_kv_graph_replay_;
   std::unordered_map<int32_t, bool> last_prepare_expert_weight_ok_;
   c10::intrusive_ptr<c10d::Work> eplb_p2p_work_;
 

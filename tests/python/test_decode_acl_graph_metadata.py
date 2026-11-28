@@ -82,7 +82,7 @@ def executor(runner: DecodeAclGraphRunner) -> ModelExecutor:
     executor.model = runner.model
     executor._kv_bound = True
     executor._serving_acl_graph_logged = False
-    executor.context_kv_graph_runner = None
+    executor._context_kv_graph_replay = None
     executor.layerwise_split_size = 1
     executor.decode_graph_runner = runner
     executor.inductor_runner = None

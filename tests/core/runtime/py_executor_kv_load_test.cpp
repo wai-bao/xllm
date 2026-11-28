@@ -80,7 +80,7 @@ TEST(PyExecutorKVLoadTest, PrefillWaitsAtConsumersAndGraphKeepsCompositeFence) {
   scope["torch"] = py::module_::import("torch");
   const torch::Tensor ready = torch::zeros({3});
   scope["ready"] = py::cast(ready);
-  py::exec(R"PY(
+  py::exec(/*s=*/R"PY(
 import sys
 import types
 import unittest.mock
@@ -93,7 +93,6 @@ class TestModel:
 
 class TestExecutor:
     requires_input_batch_metadata = False
-    context_kv_graph_runner = None
     def __init__(self, model: object, config: dict, *args: object) -> None:
         self.supports_layerwise_kv_load = layerwise
         executor_configs.append(config.copy())

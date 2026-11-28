@@ -2192,13 +2192,15 @@ def test_executor_selects_dspark_acl_graph_with_dp(dp_size: int) -> None:
     assert runner.dp_size == dp_size
     assert runner.dp_rank == dp_size - 1
     assert runner.max_batch == min((5 + dp_size - 1) // dp_size, 2) * 6
-    assert executor.context_kv_graph_runner is not None
 
 
 def test_dflash2_leaf_uses_full_block_graph_and_verify_context_capacity() -> None:
     model = _FakeModel()
+    model.write_context_kv = MagicMock()
     config = {
         "model_type": "DFlash2DraftModel",
+        "is_draft_engine": True,
+        "is_block_diffusion_algorithm": True,
         "num_speculative_tokens": 7,
         "python_graph_backend": "aclgraph",
         "max_position_embeddings": 128,
@@ -2209,11 +2211,12 @@ def test_dflash2_leaf_uses_full_block_graph_and_verify_context_capacity() -> Non
         executor = ModelExecutor(model, config, max_seqs_per_batch=2)
     assert isinstance(executor.decode_graph_runner, DecodeAclGraphRunner)
     assert executor.decode_graph_runner.max_batch == 16
-    executor._kv_bound = True
+    cache = torch.empty(2, 4, 2, 64)
+    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
     tokens = torch.zeros(16, dtype=torch.int32)
     metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False, prepared_attention_state=None)
     with (
-        patch.object(executor.context_kv_graph_runner, "warmup") as warmup,
+        patch.object(executor.decode_graph_runner, "warmup_context_kv") as warmup,
         patch.object(executor.decode_graph_runner, "prepare_execution", return_value=None),
         patch.object(executor.eager_runner, "execute"),
     ):
@@ -2221,32 +2224,46 @@ def test_dflash2_leaf_uses_full_block_graph_and_verify_context_capacity() -> Non
     warmup.assert_called_once_with(16)
 
 
-def test_executor_warms_context_prefix_buckets_only_during_startup() -> None:
+@pytest.mark.parametrize(
+    ("is_draft", "block_diffusion", "uses_swa", "captures"),
+    [(True, True, False, True), (False, True, False, False), (True, False, False, False), (True, True, True, False)],
+)
+def test_executor_warms_context_prefix_buckets_only_during_startup(
+    *, is_draft: bool, block_diffusion: bool, uses_swa: bool, captures: bool
+) -> None:
+    """Admit startup capture using draft role, algorithm and cache layout."""
     config = {
         "model_type": "DSparkDraftModel",
+        "is_draft_engine": is_draft,
+        "is_block_diffusion_algorithm": block_diffusion,
         "num_speculative_tokens": 6,
         "python_graph_backend": "aclgraph",
         "max_position_embeddings": 128,
     }
     model = _FakeModel()
+    model.write_context_kv = MagicMock()
     with patch(
         "xllm.python.model_executor.executor._create_attention_backend", return_value=_GraphStubAttentionBackend()
     ):
         executor = ModelExecutor(model, config, max_seqs_per_batch=4)
     cache = torch.empty(2, 4, 2, 64)
-    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
+    layer_cache = LayerCache(None, None, swa=cache) if uses_swa else LayerCache(cache, cache)
+    replay = executor.bind_kv_caches([layer_cache, layer_cache])
+    assert (replay is not None) is captures
     tokens = torch.zeros(12, dtype=torch.int32)
     positions = torch.zeros_like(tokens)
     metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False, prepared_attention_state=None)
     with (
-        patch.object(executor.context_kv_graph_runner, "warmup") as warmup,
+        patch.object(executor.decode_graph_runner, "warmup_context_kv") as warmup,
         patch.object(executor.decode_graph_runner, "prepare_execution", return_value=None),
         patch.object(executor.eager_runner, "execute", return_value=torch.zeros(12, 4)),
     ):
         executor.execute(tokens, positions, metadata, is_graph_warmup=True)
-        warmup.assert_called_once_with(14)
         executor.execute(tokens, positions, metadata)
-    warmup.assert_called_once_with(14)
+    if captures:
+        warmup.assert_called_once_with(14)
+    else:
+        warmup.assert_not_called()
 
 
 @pytest.mark.parametrize("is_graph_warmup", [False, True])
@@ -2346,7 +2363,6 @@ def test_dflash_request_layout_keeps_eager_execution(graph_config: dict[str, obj
     ):
         executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=2)
     assert executor.decode_graph_runner is None
-    assert executor.context_kv_graph_runner is None
     executor._kv_bound = True
     metadata = SimpleNamespace(
         is_prefill=False, is_chunked_prefill=False, decode_kv_per_request=True, decode_query_width=3

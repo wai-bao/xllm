@@ -44,13 +44,16 @@ from xllm.python.model_executor.runners.eager import EagerRunner
 from xllm.python.model_platform_support import (
     is_deepseek_v4_model,
     is_dspark_draft_model,
-    uses_context_kv_projection,
 )
 from xllm.python.platform import current_platform
 from xllm.python.registry import GLM5_NEXT_TARGET_FAMILY
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
+
+    _ContextKvReplay = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor | None]
 
 # Backend strings that mean "no graph execution" (matched case-insensitively).
 _DISABLED_GRAPH_BACKENDS = ("", "off", "none", "0")
@@ -364,9 +367,8 @@ class ModelExecutor:
             and config.get("is_mtp_algorithm", False)
             and config.get("model_type") != "qwen3_5_mtp"
         )
-        self._dspark_draft = is_dspark_draft_model(config)
-        num_decoding_tokens = num_speculative_tokens + int(not self._dspark_draft)
-        max_decode_rows_per_request = 2 if is_draft_tail_repair_required else num_decoding_tokens
+        self._decode_query_width = num_speculative_tokens + int(not is_dspark_draft_model(config))
+        max_decode_rows_per_request = 2 if is_draft_tail_repair_required else self._decode_query_width
         self.attention_backend = _create_attention_backend(
             first_attention,
             device,
@@ -389,7 +391,10 @@ class ModelExecutor:
             raise NotImplementedError("Python layerwise split is supported only for GLM5.2")
         self.decode_graph_runner: DecodeCudaGraphRunner | DecodeAclGraphRunner | None = None
         self._serving_acl_graph_logged = False
-        self.context_kv_graph_runner = None
+        self._context_kv_graph_replay: _ContextKvReplay | None = None
+        self._is_block_diffusion_draft = bool(
+            config.get("is_draft_engine") and config.get("is_block_diffusion_algorithm")
+        )
         self.inductor_runner = None
 
         if self.layerwise_split_size > 1 and graph_backend not in _DISABLED_GRAPH_BACKENDS:
@@ -399,10 +404,6 @@ class ModelExecutor:
             )
         dp_rank = int(config.get("dp_rank", 0))
         self.dp_size = dp_size
-        # DSpark drafts and DFlash2 write their own context-KV via the shared
-        # context_projection_weight (see uses_context_kv_projection); DFlash
-        # and DeepSeek-V4 DSpark do not.
-        self._independent_block_draft = uses_context_kv_projection(config)
         kv_split_size = int(config.get("kv_split_size", 0)) or cp_size
         vlm_mtp_capacity = bool(getattr(model, "supports_mtp_kv_capacity_graph", False))
         self._qwen_gdn = config.get("model_type") in ("qwen3_5_text", "qwen3_5_moe_text") or vlm_mtp_capacity
@@ -443,10 +444,6 @@ class ModelExecutor:
                 dp_rank,
             )
         elif graph_backend == "aclgraph":
-            if self._independent_block_draft:
-                from xllm.python.model_executor.runners.context_kv_acl_graph import ContextKvAclGraphRunner
-
-                self.context_kv_graph_runner = ContextKvAclGraphRunner(model, device)
             from xllm.python.model_executor.runners.decode_acl_graph import (
                 DecodeAclGraphRunner,
             )
@@ -515,13 +512,14 @@ class ModelExecutor:
             layer.fia_sparse_mode,
         )
 
-    def bind_kv_caches(self, kv_caches: list[LayerCacheInput]) -> None:
+    def bind_kv_caches(self, kv_caches: list[LayerCacheInput]) -> _ContextKvReplay | None:
+        """Bind layer caches and return the admitted context KV graph callback."""
         layer_caches = normalize_layer_caches(kv_caches)
         required_layers = max(layer.layer_id for layer in self.model.modules() if isinstance(layer, Attention)) + 1
         if len(layer_caches) < required_layers:
             raise ValueError("cache layer count does not match the model layer layout")
         if self._kv_bound:
-            return
+            return self._context_kv_graph_replay
         if self._requires_kpool_tail_cache:
             indexed_caches = [cache for cache in layer_caches if cache.index is not None]
             if not indexed_caches or any(cache.kpool_tail is None for cache in indexed_caches):
@@ -538,9 +536,12 @@ class ModelExecutor:
                     self.decode_graph_runner.warmup(parameter.device, parameter.dtype)
         if self.inductor_runner is not None:
             self.inductor_runner.bind_layer_caches(layer_caches)
-        if self.context_kv_graph_runner is not None:
-            self.context_kv_graph_runner.bind_kv_caches(layer_caches)
+        if self._is_block_diffusion_draft and self.decode_graph_runner is not None:
+            runner = self.decode_graph_runner
+            if not isinstance(runner, DecodeCudaGraphRunner) and runner.bind_context_kv(self.model):
+                self._context_kv_graph_replay = runner.replay_context_kv
         self._kv_bound = True
+        return self._context_kv_graph_replay
 
     @torch.inference_mode()
     def execute(
@@ -572,13 +573,13 @@ class ModelExecutor:
             )
         if not self._kv_bound:
             raise RuntimeError("KV caches are not bound")
-        if self.context_kv_graph_runner is not None and is_graph_warmup:
-            # Startup draft inputs have N physical query rows per request.
-            # Capture every accepted-row bucket up to the N+1 verify capacity,
-            # including prefixes not encountered in the synthetic warmup.
-            query_width = self.num_speculative_tokens + int(not self._dspark_draft)
+        if is_graph_warmup and self._context_kv_graph_replay is not None:
+            # Verify can accept one more row per request than a DSpark draft queries.
+            query_width = self._decode_query_width
             sequences = (input_ids.numel() + query_width - 1) // query_width
-            self.context_kv_graph_runner.warmup(sequences * (self.num_speculative_tokens + 1))
+            cast("DecodeAclGraphRunner", self.decode_graph_runner).warmup_context_kv(
+                sequences * (self.num_speculative_tokens + 1)
+            )
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
 
