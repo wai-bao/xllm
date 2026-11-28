@@ -226,9 +226,10 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   executor_config["is_draft_engine"] = options_.is_draft_engine();
   executor_config["is_mtp_algorithm"] =
       SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm());
-  executor_config["is_block_diffusion_algorithm"] =
+  const bool is_block_diffusion =
       SpeculativeConfig::is_block_diffusion_algorithm(
           options_.speculative_algorithm());
+  executor_config["is_block_diffusion_algorithm"] = is_block_diffusion;
   executor_config["requires_aux_hidden_capture"] =
       SpeculativeConfig::requires_aux_hidden_capture(
           options_.speculative_algorithm());
@@ -241,12 +242,8 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
       !options_.enable_offline_inference();
   executor_config["mm_encoder_graph_capture_shapes"] =
       options_.mm_encoder_graph_capture_shapes();
-  // The executor admits each block-diffusion phase against its graph backend.
-  if (Platform::is_npu() && options_.is_draft_engine() &&
-      SpeculativeConfig::is_block_diffusion_algorithm(
-          options_.speculative_algorithm()) &&
-      options_.enable_graph() && options_.num_speculative_tokens() > 0) {
-    executor_config["enable_graph"] = true;
+  if (Platform::is_npu() && options_.is_draft_engine() && is_block_diffusion) {
+    executor_config["enable_graph"] = options_.enable_graph();
   }
   py_executor_ = executor_module.attr("ModelExecutor")(
       py_causal_lm_->python_model(),

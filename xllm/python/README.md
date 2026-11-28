@@ -318,9 +318,9 @@ Python draft decode metadata keeps both prefill flags false, including for
 multi-token requests. The native metadata can retain kernel-routing flags;
 the Python metadata view removes that convention at the bridge. The input builder
 declares whether decode KV rows address tokens or requests, and the bridge
-exports that layout independently of model graph support. DFlash draft execution
-remains eager. Request admission uses Host query lengths and ends with Device
-tensor shapes, without reading Device query lengths back to the Host.
+exports that layout independently of model graph support. Request admission uses
+Host query lengths and ends with Device tensor shapes, without reading Device
+query lengths back to the Host.
 `DecodeAclGraphPreparation` resolves request query width, sequence count,
 padding and page capacity into a `RequestDecodeGraphLayout`. The runner has no
 causality mode: one instance can capture both KV row layouts, with buffer and

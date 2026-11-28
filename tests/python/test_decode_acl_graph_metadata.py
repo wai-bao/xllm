@@ -84,7 +84,6 @@ def executor(runner: DecodeAclGraphRunner) -> ModelExecutor:
     executor._layer_caches = [LayerCache(None, None)]
     executor._serving_acl_graph_logged = False
     executor._context_kv_graph_enabled = False
-    executor._eager_draft_attention = False
     executor.layerwise_split_size = 1
     executor.decode_graph_runner = runner
     executor.inductor_runner = None

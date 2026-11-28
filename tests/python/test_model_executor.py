@@ -2251,3 +2251,56 @@ class TestDecodeAclGraphWidthKeying:
         ) != DecodeAclGraphRunner._graph_key(
             16, False, None, kpool_query_lens=runner._padded_kpool_query_lens(four, 16, 16)
         )
+
+
+@pytest.mark.parametrize(
+    ("model_type", "query_width"), [("DFlashDraftModel", 3), ("DFlash2DraftModel", 3), ("DSparkDraftModel", 2)]
+)
+def test_block_diffusion_draft_replays_acl_graph(model_type: str, query_width: int) -> None:
+    config = {
+        "model_type": model_type,
+        "is_draft_engine": True,
+        "is_block_diffusion_algorithm": True,
+        "num_speculative_tokens": 2,
+        "max_position_embeddings": 128,
+        "enable_graph": True,
+        "python_graph_backend": "inductor",
+    }
+    with (
+        patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
+        patch("xllm.python.model_executor.executor.distributed.dcp_group", return_value=None),
+        patch(
+            "xllm.python.model_executor.executor._create_attention_backend", return_value=_GraphStubAttentionBackend()
+        ),
+    ):
+        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=2)
+    runner = executor.decode_graph_runner
+    assert isinstance(runner, DecodeAclGraphRunner)
+    cache = torch.empty(2, 4, 2, 64)
+    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
+    tokens = torch.arange(2 * query_width, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        is_prefill=False,
+        is_chunked_prefill=False,
+        decode_kv_per_request=True,
+        decode_query_width=query_width,
+        q_seq_lens=torch.full((2,), query_width, dtype=torch.int32),
+        q_cu_seq_lens_host_values=[query_width, 2 * query_width],
+        kv_seq_lens=torch.full((2,), query_width + 1, dtype=torch.int32),
+        kv_seq_lens_host_values=[query_width + 1] * 2,
+        block_table=torch.ones((2, 2), dtype=torch.int32),
+        slot_mapping=tokens,
+    )
+    expected = torch.ones(2 * query_width, 4)
+    with (
+        patch.object(runner, "warmup_context_kv") as warmup_context_kv,
+        patch.object(runner, "warmup", return_value=("request",)) as warmup,
+        patch.object(runner, "execute", return_value=expected) as replay,
+        patch.object(executor.eager_runner, "execute") as eager,
+    ):
+        assert executor.execute(tokens, tokens, metadata, is_graph_warmup=True) is expected
+    warmup_context_kv.assert_called_once_with(2)
+    layout = warmup.call_args.kwargs["preparation"].request_layout
+    assert layout.query_width == query_width
+    assert replay.call_args.kwargs["preparation"].request_layout is layout
+    eager.assert_not_called()

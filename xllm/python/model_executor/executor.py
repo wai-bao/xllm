@@ -150,7 +150,7 @@ def _create_attention_backend(
                 candidate_block_size=int(config.get("candidate_block_size", 8)),
                 max_model_len=serving_len,
                 quant_mode=quant_mode if quant_mode is not None else V41_QUANT_NONE,
-                graph_backend="off" if self._eager_draft_attention else graph_backend,
+                graph_backend=graph_backend,
             )
         from xllm.python.attention.dsa_attention import DsaAttentionBackend
 
@@ -305,14 +305,11 @@ class ModelExecutor:
                 raise NotImplementedError("Python DCP requires dp_size == 1 until DP-local KV groups are implemented")
         graph_backend = str(config.get("python_graph_backend", "off")).lower()
         if (
-            graph_backend in _DISABLED_GRAPH_BACKENDS
-            and config.get("enable_graph", False)
+            config.get("enable_graph", False)
             and current_platform.is_npu()
+            and (graph_backend in _DISABLED_GRAPH_BACKENDS or (is_draft and block_diffusion))
         ):
             graph_backend = "aclgraph"
-        self._eager_draft_attention = graph_backend == "aclgraph" and config.get("model_type") == "DFlashDraftModel"
-        if self._eager_draft_attention and not (is_draft and block_diffusion):
-            graph_backend = "off"
         if (
             current_platform.is_npu()
             and config.get("model_type") == "glm_moe_dsa_mtp"
@@ -613,9 +610,7 @@ class ModelExecutor:
         # record them through Python, and compilation must not retain a prior
         # step's synchronizer. Decode steps without a transfer can use graphs.
         graph_runner = (
-            self.decode_graph_runner
-            if layer_synchronizer is None and deepstack_input_embeds is None and not self._eager_draft_attention
-            else None
+            self.decode_graph_runner if layer_synchronizer is None and deepstack_input_embeds is None else None
         )
         if graph_runner is not None and (eplb is None or current_platform.is_npu()):
             from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner

@@ -359,25 +359,17 @@ py::dict PyCausalLM::build_config_dict(const ModelContext& context) const {
   // a derived member function, so pass it explicitly for the Python executor.
   d["cp_rank"] = cp_rank_;
   d["layerwise_split_rank"] = layerwise_split_rank_;
-  d["enable_dsa_multi_stream"] =
-      ExecutionConfig::get_instance().enable_dsa_multi_stream();
+  const ExecutionConfig& execution_config = ExecutionConfig::get_instance();
+  d["enable_dsa_multi_stream"] = execution_config.enable_dsa_multi_stream();
   const bool enable_attn_dp_weight_sharding =
-      ExecutionConfig::get_instance().enable_attn_dp_weight_sharding();
+      execution_config.enable_attn_dp_weight_sharding();
   CHECK(!enable_attn_dp_weight_sharding ||
         model_args_.model_type() == "glm_moe_dsa" ||
         model_args_.model_type() == "glm_moe_dsa_mtp")
       << "--enable_attn_dp_weight_sharding only supports Python GLM MLA models";
   d["enable_attn_dp_weight_sharding"] = enable_attn_dp_weight_sharding;
-  const bool requires_eager_execution =
-      model_args_.model_type() == "DFlashDraftModel" ||
-      model_args_.model_type() == "DFlash2DraftModel";
-  d["enable_graph"] = requires_eager_execution
-                          ? false
-                          : ExecutionConfig::get_instance().enable_graph();
-  d["python_graph_backend"] =
-      requires_eager_execution
-          ? std::string("off")
-          : ExecutionConfig::get_instance().python_graph_backend();
+  d["enable_graph"] = execution_config.enable_graph();
+  d["python_graph_backend"] = execution_config.python_graph_backend();
 #if defined(USE_NPU)
   const auto& flash_comm1_options = context.get_flash_comm1_options();
   d["enable_flashcomm1"] = flash_comm1_options.enable_flashcomm1;
