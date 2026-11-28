@@ -56,6 +56,25 @@ ModelOutput Executor::forward(const torch::Tensor& tokens,
   return impl_->run(tokens, positions, kv_caches, params);
 }
 
+std::optional<bool> ExecutorImpl::write_context_kv(
+    const torch::Tensor& /*target_hidden*/,
+    const torch::Tensor& /*positions*/,
+    const torch::Tensor& /*slots*/,
+    std::vector<KVCache>& /*kv_caches*/,
+    const ModelParamsView& /*params*/) {
+  return std::nullopt;
+}
+
+std::optional<bool> Executor::write_context_kv(
+    const torch::Tensor& target_hidden,
+    const torch::Tensor& positions,
+    const torch::Tensor& slots,
+    std::vector<KVCache>& kv_caches,
+    const ModelParamsView& params) {
+  return impl_->write_context_kv(
+      target_hidden, positions, slots, kv_caches, params);
+}
+
 void Executor::prepare_graph_input(const torch::Tensor& tokens,
                                    const torch::Tensor& positions,
                                    std::vector<KVCache>& kv_caches,

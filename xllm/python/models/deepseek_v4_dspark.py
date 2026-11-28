@@ -18,12 +18,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from xllm.python import distributed
-from xllm.python.attention.backend import LayerCacheInput, normalize_layer_caches
 from xllm.python.layers.layernorm import RMSNorm
 from xllm.python.layers.qlinear import QLinear
 from xllm.python.model_executor.forward_context import LayerSynchronizer
@@ -39,6 +38,9 @@ from xllm.python.models.deepseek_v4 import (
     _require_tensor,
 )
 from xllm.python.models.dspark import DSparkForCausalLMBase
+
+if TYPE_CHECKING:
+    from xllm.python.attention.backend import LayerCache
 
 
 class _DSparkQuantAwareLinear(QLinear):
@@ -128,15 +130,13 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
         target_hidden: torch.Tensor,
         positions: torch.Tensor,
         cache_slots: torch.Tensor,
-        kv_caches: list[LayerCacheInput],
+        kv_caches: list[LayerCache],
         layer_synchronizer: LayerSynchronizer | None,
     ) -> torch.Tensor | None:
-        if len(kv_caches) != self.cfg.n_layers:
+        if len(kv_caches) != len(self.layers):
             raise ValueError("DeepSeek-V4 DSpark cache/layer count mismatch")
-        if cache_slots.numel() != target_hidden.size(0):
-            raise ValueError("DeepSeek-V4 DSpark context slot count mismatch")
         expected_width = self.cfg.hidden_size * self.cfg.dspark_num_layers
-        if target_hidden.dim() != 2 or target_hidden.size(-1) != expected_width:
+        if target_hidden.size(-1) != expected_width:
             raise ValueError(
                 f"DeepSeek-V4 DSpark target hidden width must equal dspark_num_layers * hidden_size ({expected_width})"
             )
@@ -145,8 +145,7 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
         positions = positions.to(torch.int64).contiguous()
         cos_sin = self.rotary.cos_sin_cache.index_select(0, positions)
         cos, sin = _expand_half_rope_cos_sin(cos_sin)
-        layer_caches = normalize_layer_caches(kv_caches)
-        for layer_id, (layer, layer_cache) in enumerate(zip(self.layers, layer_caches, strict=True)):
+        for layer_id, (layer, layer_cache) in enumerate(zip(self.layers, kv_caches)):
             if layer_cache.swa is None:
                 raise RuntimeError(f"DeepSeek-V4 DSpark SWA cache is missing for layer {layer_id}")
             layer.write_context_kv(
@@ -199,22 +198,6 @@ class DeepseekV4DSparkForCausalLM(
         if self.cfg.tp_size > 1:
             logits = distributed.tp_all_gather(logits, dim=-1, world_size=self.cfg.tp_size)
         return logits
-
-    def write_context_kv(
-        self,
-        target_hidden: torch.Tensor,
-        positions: torch.Tensor,
-        cache_slots: torch.Tensor,
-        kv_caches: list[LayerCacheInput],
-        layer_synchronizer: LayerSynchronizer | None,
-    ) -> torch.Tensor | None:
-        return self.model.write_context_kv(
-            target_hidden,
-            positions,
-            cache_slots,
-            kv_caches,
-            layer_synchronizer,
-        )
 
     @staticmethod
     def _load_quant_aware_linear(

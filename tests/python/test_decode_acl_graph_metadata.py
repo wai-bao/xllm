@@ -22,6 +22,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from xllm.python.attention.backend import LayerCache
 from xllm.python.attention.paged_kv_metadata import build_row_aligned_paged_kv_metadata
 from xllm.python.model_executor.executor import ModelExecutor
 from xllm.python.model_executor.forward_context import AclGraphExecutionState
@@ -65,7 +66,7 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> DecodeAclGraphRunner:
     monkeypatch.setattr(torch.npu, "stream", lambda _: nullcontext(), raising=False)
     monkeypatch.setattr(runner, "_prepare_attention", Mock())
 
-    def capture(entry: AclGraphEntry, stream: object) -> None:
+    def capture(entry: AclGraphEntry) -> None:
         entry.graph = Mock()
         entry.static_output = torch.ones((entry.batch_size, 2))
 
@@ -80,9 +81,10 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> DecodeAclGraphRunner:
 def executor(runner: DecodeAclGraphRunner) -> ModelExecutor:
     executor = object.__new__(ModelExecutor)
     executor.model = runner.model
-    executor._kv_bound = True
+    executor._layer_caches = [LayerCache(None, None)]
     executor._serving_acl_graph_logged = False
-    executor._context_kv_graph_replay = None
+    executor._context_kv_graph_enabled = False
+    executor._eager_draft_attention = False
     executor.layerwise_split_size = 1
     executor.decode_graph_runner = runner
     executor.inductor_runner = None
@@ -236,7 +238,7 @@ def test_capture_preserves_live_checkpoints_on_success_and_failure(
     metadata.linear_state_indices = indices
     metadata.has_initial_state = torch.ones_like(indices, dtype=torch.bool)
 
-    def capture(entry: AclGraphEntry, _stream: object) -> None:
+    def capture(entry: AclGraphEntry) -> None:
         capture_indices = entry.static_metadata.linear_state_indices.long()
         assert not capture_indices.any()
         conv.index_fill_(0, capture_indices, -1)
@@ -268,13 +270,14 @@ def test_capture_passes_runner_error_mode_to_npu_graph(
     entry.static_mtp_topk_indices = None
     entry.execution_state = AclGraphExecutionState({})
     stream = Mock()
+    monkeypatch.setattr(runner, "_stream", stream)
     graph_context = Mock(return_value=nullcontext())
     monkeypatch.setattr(torch.npu, "NPUGraph", Mock(), raising=False)
     monkeypatch.setattr(torch.npu, "graph", graph_context, raising=False)
     monkeypatch.setattr(torch.npu, "synchronize", Mock(), raising=False)
     monkeypatch.setattr(runner, "_forward_static", Mock(return_value=torch.ones(3, 2)))
     with patch("xllm.python.model_executor.runners.acl_graph._get_graph_pool", return_value=(1, 2)):
-        AclGraphRunner._capture(runner, entry, stream)
+        AclGraphRunner._capture(runner, entry)
     assert graph_context.call_args.kwargs["capture_error_mode"] == mode
     assert graph_context.call_args.kwargs["stream"] is stream
 
@@ -375,7 +378,7 @@ def test_executor_uses_eager_when_decode_admission_returns_none(
 def test_executor_preserves_mtp_inputs_and_owned_outputs_with_metadata_reuse(
     runner: DecodeAclGraphRunner, executor: ModelExecutor, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def capture(entry: AclGraphEntry, stream: object) -> None:
+    def capture(entry: AclGraphEntry) -> None:
         entry.static_output = (
             torch.empty_like(entry.static_input_embedding),
             None,

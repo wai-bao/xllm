@@ -22,7 +22,6 @@ from typing import ClassVar
 import torch
 import torch.nn as nn
 
-from xllm.python.model_executor.forward_context import LayerSynchronizer
 from xllm.python.model_loader import (
     ParallelLoadContext,
     load_draft_lm_head_if_present,
@@ -108,19 +107,3 @@ class Qwen3DSparkForCausalLM(DSparkForCausalLMBase):
         rotation = self.model.adapt_weights_for_reference_model(reference_model_path)
         if rotation is not None:
             load_missing_draft_vocab_from_quarot_target(self, reference_model_path, rotation)
-
-    def write_context_kv(
-        self,
-        target_hidden: torch.Tensor,
-        positions: torch.Tensor,
-        cache_slots: torch.Tensor,
-        kv_caches: list[tuple[torch.Tensor | None, ...]],
-        layer_synchronizer: LayerSynchronizer | None,
-    ) -> torch.Tensor | None:
-        return self.model.write_context_kv(
-            target_hidden,
-            positions,
-            cache_slots,
-            kv_caches,
-            layer_synchronizer,
-        )

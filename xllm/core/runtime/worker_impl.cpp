@@ -95,6 +95,20 @@ limitations under the License.
 
 namespace xllm {
 
+bool WorkerImpl::write_context_kv(const torch::Tensor& target_hidden,
+                                  const torch::Tensor& positions,
+                                  const torch::Tensor& slots,
+                                  const ModelParamsView& params) {
+  if (const auto written = model_executor_->write_context_kv(
+          target_hidden, positions, slots, kv_caches_, params);
+      written.has_value()) {
+    return *written;
+  }
+  return model_
+      ->write_context_kv(target_hidden, positions, slots, kv_caches_, params)
+      .hidden_states.defined();
+}
+
 namespace {
 
 // Limit CPU thread contention while ranks load weights concurrently.

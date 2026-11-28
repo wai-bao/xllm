@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.nn as nn
@@ -39,6 +39,9 @@ from xllm.python.model_loader import (
 )
 from xllm.python.models.base import PyModelBase
 from xllm.python.models.qwen3 import Qwen3Config, Qwen3DecoderLayer, Qwen3Model
+
+if TYPE_CHECKING:
+    from xllm.python.attention.backend import LayerCache
 
 
 def _load_reference_quarot_rotation(
@@ -228,42 +231,16 @@ class DFlashQwen3Model(Qwen3Model):
         self._fused_kv_bias = torch.cat(kv_biases, dim=0).detach().contiguous() if has_bias else None
         self._k_norm_weights = torch.stack(k_norm_weights, dim=0).detach().float().view(self.cfg.n_layers, 1, 1, -1)
 
-    def _normalize_context_keys(self, keys: torch.Tensor) -> torch.Tensor:
-        if self._k_norm_weights is None:
-            raise RuntimeError("draft K-norm buffers are not initialized")
-        keys_fp32 = keys.float()
-        variance = keys_fp32.pow(2).mean(dim=-1, keepdim=True)
-        normalized = keys_fp32 * torch.rsqrt(variance + self.cfg.rms_norm_eps)
-        return (normalized * self._k_norm_weights).to(keys.dtype)
-
-    def _apply_context_rope(
-        self,
-        keys: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
-        num_layers, num_context, num_kv_heads, head_dim = keys.shape
-        flat_keys = keys.reshape(num_layers * num_context, num_kv_heads, head_dim)
-        repeated_positions = positions.to(torch.long).repeat(num_layers)
-        cache = self.rotary.cos_sin_cache.index_select(0, repeated_positions)
-        cos_half, sin_half = cache.chunk(2, dim=-1)
-        cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
-        sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
-        first, second = flat_keys.chunk(2, dim=-1)
-        rotated = torch.cat((-second, first), dim=-1)
-        return (flat_keys * cos + rotated * sin).view_as(keys)
-
     def write_context_kv(
         self,
         target_hidden: torch.Tensor,
         positions: torch.Tensor,
         cache_slots: torch.Tensor,
-        kv_caches: list[tuple[torch.Tensor | None, ...]],
+        kv_caches: list[LayerCache],
         layer_synchronizer: LayerSynchronizer | None,
     ) -> torch.Tensor | None:
         if len(kv_caches) != self.cfg.n_layers:
             raise ValueError("draft KV cache layer count mismatch")
-        if cache_slots.numel() != target_hidden.size(0):
-            raise ValueError("draft context cache slot count mismatch")
         if self._fused_kv_weight is None or self._k_norm_weights is None:
             raise RuntimeError("draft context KV buffers are not initialized")
 
@@ -282,14 +259,26 @@ class DFlashQwen3Model(Qwen3Model):
             num_kv_heads,
             self.cfg.head_dim,
         ).permute(2, 1, 0, 3, 4)
-        all_keys = self._apply_context_rope(
-            self._normalize_context_keys(all_kv[0]),
-            positions,
-        )
+        keys_fp32 = all_kv[0].float()
+        variance = keys_fp32.pow(2).mean(dim=-1, keepdim=True)
+        normalized = keys_fp32 * torch.rsqrt(variance + self.cfg.rms_norm_eps)
+        keys = (normalized * self._k_norm_weights).to(all_kv.dtype)
+        del keys_fp32, variance, normalized
+
+        flat_keys = keys.reshape(self.cfg.n_layers * num_context, num_kv_heads, self.cfg.head_dim)
+        repeated_positions = positions.to(torch.long).repeat(self.cfg.n_layers)
+        cos_sin = self.rotary.cos_sin_cache.index_select(0, repeated_positions)
+        cos_half, sin_half = cos_sin.chunk(2, dim=-1)
+        cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
+        sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
+        first, second = flat_keys.chunk(2, dim=-1)
+        rotated = torch.cat((-second, first), dim=-1)
+        all_keys = (flat_keys * cos + rotated * sin).view_as(keys)
+        del keys, flat_keys, repeated_positions, cos_sin, cos_half, sin_half, cos, sin, first, second, rotated
         all_values = all_kv[1].contiguous()
 
         for layer_id, cache in enumerate(kv_caches):
-            key_cache, value_cache = cache[0], cache[1]
+            key_cache, value_cache = cache.key, cache.value
             if key_cache is None or value_cache is None:
                 raise RuntimeError(f"draft KV cache is missing for layer {layer_id}")
             reshape_paged_cache(
@@ -299,9 +288,8 @@ class DFlashQwen3Model(Qwen3Model):
                 key_cache,
                 value_cache,
             )
-            if layer_synchronizer is not None:
-                if layer_synchronizer.record_event(layer_id) is False:
-                    return None
+            if layer_synchronizer is not None and layer_synchronizer.record_event(layer_id) is False:
+                return None
         return projected_hidden
 
     def load_weights(self, state_dicts: list, tp_rank: int, tp_size: int) -> ScopedWeightLoader:
@@ -353,19 +341,3 @@ class DFlashQwen3ForCausalLM(PyModelBase):
         rotation = self.model.adapt_weights_for_reference_model(reference_model_path)
         if rotation is not None:
             load_missing_draft_vocab_from_quarot_target(self, reference_model_path, rotation)
-
-    def write_context_kv(
-        self,
-        target_hidden: torch.Tensor,
-        positions: torch.Tensor,
-        cache_slots: torch.Tensor,
-        kv_caches: list[tuple[torch.Tensor | None, ...]],
-        layer_synchronizer: LayerSynchronizer | None,
-    ) -> torch.Tensor | None:
-        return self.model.write_context_kv(
-            target_hidden,
-            positions,
-            cache_slots,
-            kv_caches,
-            layer_synchronizer,
-        )

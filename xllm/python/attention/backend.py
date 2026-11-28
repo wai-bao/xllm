@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, fields
 from math import gcd, lcm
-from typing import TYPE_CHECKING, Literal, Protocol, TypeGuard
+from typing import TYPE_CHECKING, Protocol, TypeGuard
 
 import torch
 

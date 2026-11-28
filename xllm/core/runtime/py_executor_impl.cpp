@@ -55,6 +55,17 @@ namespace py = pybind11;
 namespace xllm {
 namespace {
 
+py::object python_layer_synchronizer(const ModelParamsView& params) {
+#if defined(USE_NPU)
+  if (const auto& synchronizer = params.parallel.layer_synchronizer) {
+    return py::cast(synchronizer);
+  }
+#else
+  (void)params;
+#endif
+  return py::none();
+}
+
 py::object mtp_topk_indices(const ModelParamsView& params) {
   if (params.mtp_topk_state != nullptr) {
     const auto tensor = params.mtp_topk_state->as_tensor();
@@ -230,14 +241,12 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
       !options_.enable_offline_inference();
   executor_config["mm_encoder_graph_capture_shapes"] =
       options_.mm_encoder_graph_capture_shapes();
-  // DFlash2 defaults to eager in the model config. Enable its independent
-  // full-block ACL runner when the worker requests graph execution.
-  const bool independent_block_graph =
-      Platform::is_npu() && args_.model_type() == "DFlash2DraftModel" &&
-      options_.enable_graph() && options_.num_speculative_tokens() > 0;
-  if (independent_block_graph) {
+  // The executor admits each block-diffusion phase against its graph backend.
+  if (Platform::is_npu() && options_.is_draft_engine() &&
+      SpeculativeConfig::is_block_diffusion_algorithm(
+          options_.speculative_algorithm()) &&
+      options_.enable_graph() && options_.num_speculative_tokens() > 0) {
     executor_config["enable_graph"] = true;
-    executor_config["python_graph_backend"] = "aclgraph";
   }
   py_executor_ = executor_module.attr("ModelExecutor")(
       py_causal_lm_->python_model(),
@@ -257,17 +266,32 @@ PyExecutorImpl::~PyExecutorImpl() {
   clear_python_object(py_executor_);
 }
 
-void PyExecutorImpl::bind_kv_caches(std::vector<KVCache>& kv_caches) {
-  const int64_t num_layers = static_cast<int64_t>(kv_caches.size());
-  if (!kv_bound_) {
-    py_causal_lm_->set_context_kv_graph_replay(py_executor_.attr(
-        /*key=*/"bind_kv_caches")(build_python_kv_caches(kv_caches)));
-    kv_bound_ = true;
-    kv_layer_count_ = num_layers;
-  } else {
-    CHECK_EQ(num_layers, kv_layer_count_)
-        << "KV cache layer count changed after initial bind";
+void PyExecutorImpl::bind_kv_caches(const std::vector<KVCache>& kv_caches) {
+  if (kv_bound_) {
+    return;
   }
+  py_executor_.attr(/*key=*/"bind_kv_caches")(
+      build_python_kv_caches(kv_caches));
+  kv_bound_ = true;
+}
+
+std::optional<bool> PyExecutorImpl::write_context_kv(
+    const torch::Tensor& target_hidden,
+    const torch::Tensor& positions,
+    const torch::Tensor& slots,
+    std::vector<KVCache>& kv_caches,
+    const ModelParamsView& params) {
+  torch::NoGradGuard no_grad;
+  py::gil_scoped_acquire gil;
+  PyCausalLM::set_active_instance(py_causal_lm_);
+  bind_kv_caches(kv_caches);
+  py::object output = py_executor_.attr(/*key=*/"write_context_kv")(
+      target_hidden,
+      positions,
+      slots,
+      python_layer_synchronizer(params),
+      params.meta.batch_forward_type.is_decode());
+  return !output.is_none();
 }
 
 void PyExecutorImpl::clear_multimodal_cache() {
@@ -473,13 +497,6 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                         .contiguous();
   }
 
-  py::object py_sync = py::none();
-#if defined(USE_NPU)
-  if (params.parallel.layer_synchronizer) {
-    py_sync = py::cast(params.parallel.layer_synchronizer);
-  }
-#endif
-
   py::object expert_load_data = optional_tensor(params.expert.expert_load_data);
   py::object eplb_decode_token_mask =
       optional_tensor(params.expert.eplb_decode_token_mask);
@@ -500,7 +517,7 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                    positions_arg,
                                    py_metadata,
                                    input_embedding,
-                                   py_sync,
+                                   python_layer_synchronizer(params),
                                    topk_indices,
                                    /*enable_graph=*/false,
                                    expert_load_data,

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -37,6 +38,9 @@ from xllm.python.model_loader import (
 from xllm.python.models.dspark import DSparkForCausalLMBase
 from xllm.python.models.qwen3_dflash import DFlashContextProjection, _load_reference_quarot_rotation
 from xllm.python.models.qwen3_dspark import Qwen3DSparkConfig
+
+if TYPE_CHECKING:
+    from xllm.python.attention.backend import LayerCache
 
 
 @dataclass
@@ -202,22 +206,18 @@ class Glm5DSparkModel(nn.Module):
         target_hidden: torch.Tensor,
         positions: torch.Tensor,
         cache_slots: torch.Tensor,
-        kv_caches: list[tuple[torch.Tensor | None, ...]],
+        kv_caches: list[LayerCache],
         layer_synchronizer: LayerSynchronizer | None,
     ) -> torch.Tensor | None:
-        if (
-            len(kv_caches) != self.cfg.n_layers
-            or positions.numel() != target_hidden.shape[0]
-            or cache_slots.shape != positions.shape
-        ):
-            raise ValueError("MLA context hidden, positions, slots and cache layers must agree")
+        if len(kv_caches) != len(self.layers):
+            raise ValueError("MLA draft KV cache layer count mismatch")
         hidden = self.context_norm(self.context_proj(target_hidden))
         cos, sin = gather_half_rope_cos_sin(self.rotary.cos_sin_cache, positions.to(torch.long))
         for layer, cache in zip(self.layers, kv_caches):
-            if cache[0] is None or cache[1] is None:
+            if cache.key is None or cache.value is None:
                 raise RuntimeError(f"MLA draft KV cache is missing for layer {layer.layer_id}")
             latent, rope = layer.self_attn.project_context(hidden, cos, sin)
-            reshape_paged_cache(cache_slots, latent, rope, cache[0], cache[1])
+            reshape_paged_cache(cache_slots, latent, rope, cache.key, cache.value)
             if layer_synchronizer is not None and layer_synchronizer.record_event(layer.layer_id) is False:
                 return None
         return hidden
@@ -270,13 +270,3 @@ class Glm5DSparkForCausalLM(DSparkForCausalLMBase):
         if rotation is not None:
             self.model.context_proj.apply_input_rotation(rotation)
             load_missing_draft_vocab_from_quarot_target(self, reference_model_path, rotation)
-
-    def write_context_kv(
-        self,
-        target_hidden: torch.Tensor,
-        positions: torch.Tensor,
-        cache_slots: torch.Tensor,
-        kv_caches: list[tuple[torch.Tensor | None, ...]],
-        layer_synchronizer: LayerSynchronizer | None,
-    ) -> torch.Tensor | None:
-        return self.model.write_context_kv(target_hidden, positions, cache_slots, kv_caches, layer_synchronizer)

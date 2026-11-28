@@ -335,7 +335,8 @@ are shared by runtime bucket selection and startup tiers; DP ranks capture
 model-wide tiers in the same order before their local shape. Token-row decode
 keeps its existing capacity tiers and startup-only capture rules. The existing
 `disable_graph_warmup` option skips synthetic startup warmup and retains lazy
-capture from real requests.
+capture from real requests. Context KV writes use eager execution for buckets
+that startup warmup did not capture.
 
 ## Adding an operator
 

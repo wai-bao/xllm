@@ -17,12 +17,14 @@
 from __future__ import annotations
 
 from functools import partial
+from typing import cast
 
 import pytest
 import torch
 import torch.nn as nn
 
 from xllm.python import registry
+from xllm.python.attention.backend import LayerCache
 from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
 from xllm.python.model_platform_support import is_deepseek_v4_model
 from xllm.python.models import deepseek_v4_dspark, deepseek_v32
@@ -30,6 +32,7 @@ from xllm.python.models.deepseek_v4 import DeepseekV4ForCausalLM
 from xllm.python.models.deepseek_v4_dspark import (
     DeepseekV4DSparkConfig,
     DeepseekV4DSparkForCausalLM,
+    DeepseekV4DSparkModel,
 )
 from xllm.python.registry import get_model_class
 
@@ -184,21 +187,21 @@ def test_dspark_confidence_head_is_biasless() -> None:
     assert model.confidence_head.proj.in_features == 10
 
 
-def test_dspark_writes_projected_context_to_every_layer() -> None:
-    model = DeepseekV4DSparkForCausalLM(_DSPARK_CONFIG)
+def test_dspark_writes_projected_context_to_every_layer(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = cast("DeepseekV4DSparkModel", DeepseekV4DSparkForCausalLM(_DSPARK_CONFIG).model)
     layers = nn.ModuleList([_ContextLayer() for _ in range(3)])
-    model.model.layers = layers
-    model.model.main_norm = nn.Identity()
-    model.model.main_proj.resolve_quant(False)
+    model.layers = layers
+    monkeypatch.setattr(model, "main_norm", nn.Identity())
+    model.main_proj.resolve_quant(False)
     with torch.no_grad():
-        model.model.main_proj.weight.zero_()
-        model.model.main_proj.weight[:, :8].copy_(torch.eye(8))
+        model.main_proj.weight.zero_()
+        model.main_proj.weight[:, :8].copy_(torch.eye(8))
 
     target_hidden = torch.arange(48, dtype=torch.float32).view(2, 24)
     positions = torch.tensor([1, 3])
     cache_slots = torch.tensor([2, 7])
     swa_caches = [torch.zeros(2, 4) for _ in range(3)]
-    kv_caches = [(None, None, None, None, None, swa) for swa in swa_caches]
+    kv_caches = [LayerCache(None, None, swa=swa) for swa in swa_caches]
     synchronizer = _LayerSynchronizer()
 
     projected = model.write_context_kv(
@@ -222,13 +225,13 @@ def test_dspark_writes_projected_context_to_every_layer() -> None:
         assert written_cache is swa_cache
 
 
-def test_dspark_stops_context_write_when_event_recording_fails() -> None:
-    model = DeepseekV4DSparkForCausalLM(_DSPARK_CONFIG)
+def test_dspark_stops_context_write_when_event_recording_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = cast("DeepseekV4DSparkModel", DeepseekV4DSparkForCausalLM(_DSPARK_CONFIG).model)
     layers = nn.ModuleList([_ContextLayer() for _ in range(3)])
-    model.model.layers = layers
-    model.model.main_norm = nn.Identity()
-    model.model.main_proj.resolve_quant(False)
-    kv_caches = [(None, None, None, None, None, torch.zeros(2, 4)) for _ in range(3)]
+    model.layers = layers
+    monkeypatch.setattr(model, "main_norm", nn.Identity())
+    model.main_proj.resolve_quant(False)
+    kv_caches = [LayerCache(None, None, swa=torch.zeros(2, 4)) for _ in range(3)]
     synchronizer = _LayerSynchronizer(failed_layer=1)
 
     result = model.write_context_kv(

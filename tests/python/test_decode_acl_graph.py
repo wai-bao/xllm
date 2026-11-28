@@ -798,9 +798,8 @@ def test_dspark_graph_is_cached_only_after_successful_capture() -> None:
     metadata = _non_causal_metadata(torch.zeros(1, 3, dtype=torch.int32))
     graph_key = _request_key(runner, input_ids, metadata, 2)
 
-    def capture_entry(entry: AclGraphEntry, stream: object) -> None:
+    def capture_entry(entry: AclGraphEntry) -> None:
         assert graph_key not in runner._graphs
-        assert stream is runner._stream
         entry.graph = object()
 
     with (
@@ -1308,7 +1307,7 @@ def test_capture_preserves_gdn_live_checkpoints(
     metadata = _metadata(indices)
     input_ids = torch.arange(indices.numel(), dtype=torch.int32)
 
-    def capture(entry: AclGraphEntry, stream: object) -> None:
+    def capture(entry: AclGraphEntry) -> None:
         selected = entry.static_metadata.linear_state_indices.long()
         checkpoints = (selected[:, None] * 8 + torch.arange(8)).reshape(-1)
         conv.index_fill_(0, selected, -1)
@@ -1357,7 +1356,7 @@ def test_shared_capture_only_writes_reserved_physical_scratch(capture_fails: boo
     input_ids = torch.arange(2, dtype=torch.int32)
     live_pages = arena[layout.slot_bytes :].clone()
 
-    def capture(entry: AclGraphEntry, _stream: object) -> None:
+    def capture(entry: AclGraphEntry) -> None:
         selected = entry.static_metadata.linear_state_indices
         conv_rows = layout.linear_state_indices(selected, role="conv").long()
         ssm_rows = layout.linear_state_indices(selected, role="ssm").long()
@@ -1476,7 +1475,7 @@ def test_capture_preserves_live_state_until_first_replay(
         output.copy_(values[: slots.numel()].repeat_interleave(width).view(-1, 1))
         return output
 
-    def capture(entry: AclGraphEntry, stream: object) -> None:
+    def capture(entry: AclGraphEntry) -> None:
         assert not entry.static_metadata.linear_state_indices.any()
         for _ in range(3):
             advance()

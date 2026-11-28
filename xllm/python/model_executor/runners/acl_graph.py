@@ -18,7 +18,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Literal
+from functools import cached_property
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -115,6 +116,7 @@ class StaticGraphAttentionMetadata:
 
 class AclGraphEntry:
     batch_size: int
+    graph: torch.npu.NPUGraph
     static_input_ids: torch.Tensor
     static_positions: torch.Tensor
     static_metadata: StaticGraphAttentionMetadata
@@ -351,12 +353,12 @@ class AclGraphRunner(BaseRunner):
     def _retain_graph_output(self, entry: AclGraphEntry, output: ModelExecutionOutput) -> ModelExecutionOutput:
         return output
 
-    def _capture(
-        self,
-        entry: AclGraphEntry,
-        stream: torch.npu.Stream,
-    ) -> None:
-        assert stream is not None
+    @cached_property
+    def _stream(self) -> torch.npu.Stream:
+        return torch.npu.Stream(device=self.device)
+
+    def _capture(self, entry: AclGraphEntry) -> None:
+        stream = self._stream
         logger.info(
             "Python ACL graph capture start: model=%s bucket=%d mtp_topk=%s",
             type(self.model).__name__,
@@ -381,16 +383,13 @@ class AclGraphRunner(BaseRunner):
             for _ in range(_CAPTURE_WARMUP_STEPS):
                 self._forward_static(entry)
         torch.npu.synchronize()
-        entry.graph = torch.npu.NPUGraph()
         capture_context = AclGraphCaptureContext(stream, [])
         context = replace(context, acl_graph=capture_context, layer_shared_cache=entry.layer_shared_cache)
+        entry.graph = torch.npu.NPUGraph()
         with (
             forward_context(context),
             torch.npu.graph(
-                entry.graph,
-                pool=_get_graph_pool(),
-                stream=stream,
-                capture_error_mode=self._capture_error_mode,
+                entry.graph, pool=_get_graph_pool(), stream=stream, capture_error_mode=self._capture_error_mode
             ),
         ):
             entry.static_output = self._forward_static(entry)

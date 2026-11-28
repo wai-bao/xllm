@@ -30,16 +30,13 @@ limitations under the License.
 
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/kernel_config.h"
-#include "core/framework/model/llm_model_params.h"
 #include "core/framework/model/model_args.h"
-#include "core/framework/model/model_params_view.h"
 #include "core/framework/model/model_type.h"
 #include "core/framework/model_context/model_context.h"
 #include "core/framework/model_loader/hf_model_args.h"
 #include "core/framework/parallel_state/parallel_args.h"
 #include "core/framework/parallel_state/process_group.h"
 #include "core/framework/quantization/quant_args.h"
-#include "core/kv_cache/storage/kv_cache.h"
 #include "core/util/scope_guard.h"
 
 namespace py = pybind11;
@@ -55,22 +52,16 @@ void register_bridge_test_model() {
   py::object module = module_type.attr("ModuleType")(kBridgeTestModule);
   py::dict module_dict =
       py::reinterpret_borrow<py::dict>(module.attr("__dict__"));
-  py::exec(R"(
+  const char* script = R"PY(
 class BridgeTestModel:
     def __init__(self, config):
-        self.last_caches = None
+        pass
 
     def eval(self):
         return self
 
-    def write_context_kv(self, target_hidden, positions, cache_slots, kv_caches, layer_synchronizer):
-        from xllm.python.attention.backend import normalize_layer_caches
-
-        self.last_caches = kv_caches
-        self.last_swa = normalize_layer_caches(kv_caches)[0].swa
-        return target_hidden
-)",
-           module_dict);
+)PY";
+  py::exec(script, module_dict);
 
   py::module_::import("sys").attr("modules")[kBridgeTestModule] = module;
   py::module_ registry = py::module_::import("xllm.python.registry");
@@ -371,39 +362,6 @@ TEST(PyCausalLMConfigBridgeTest, PreservesBlockDraftWindowEnablement) {
       python_config.attr("validate")();
     }
   }
-}
-
-TEST(PyCausalLMContextKVBridgeTest, PassesSwaCacheAsSixthPythonSlot) {
-  ModelContext context = make_bridge_model_context(kBridgeTestModelType);
-  PyCausalLM model(context);
-
-  DeepSeekV4KVCacheTensors cache_tensors;
-  cache_tensors.swa_cache =
-      torch::arange(8, torch::kFloat32).reshape({1, 2, 1, 4});
-  std::vector<KVCache> kv_caches;
-  kv_caches.emplace_back(cache_tensors);
-
-  torch::Tensor target_hidden = torch::ones({2, 4}, torch::kFloat32);
-  torch::Tensor positions = torch::tensor({0, 1}, torch::kLong);
-  torch::Tensor cache_slots = torch::tensor({0, 1}, torch::kLong);
-  LlmModelParams params_owner;
-  ModelParamsView input_params(params_owner);
-  ModelOutput output = model.write_context_kv(
-      target_hidden, positions, cache_slots, kv_caches, input_params);
-
-  ASSERT_TRUE(output.hidden_states.defined());
-  EXPECT_TRUE(torch::equal(output.hidden_states, target_hidden));
-
-  py::gil_scoped_acquire gil;
-  py::list python_caches = model.python_model().attr("last_caches");
-  ASSERT_EQ(py::len(python_caches), 1);
-  py::tuple layer_cache = python_caches[0].cast<py::tuple>();
-  ASSERT_EQ(py::len(layer_cache), 20);
-  py::object bridged_swa = model.python_model().attr("last_swa");
-  EXPECT_TRUE(bridged_swa.is(layer_cache[5]));
-  EXPECT_EQ(
-      bridged_swa.attr("data_ptr")().cast<std::uintptr_t>(),
-      reinterpret_cast<std::uintptr_t>(cache_tensors.swa_cache.data_ptr()));
 }
 
 }  // namespace

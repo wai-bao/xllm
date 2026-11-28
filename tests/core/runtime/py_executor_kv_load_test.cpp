@@ -80,7 +80,7 @@ TEST(PyExecutorKVLoadTest, PrefillWaitsAtConsumersAndGraphKeepsCompositeFence) {
   scope["torch"] = py::module_::import("torch");
   const torch::Tensor ready = torch::zeros({3});
   scope["ready"] = py::cast(ready);
-  py::exec(/*s=*/R"PY(
+  const char* script = R"PY(
 import sys
 import types
 import unittest.mock
@@ -127,8 +127,8 @@ patch = unittest.mock.patch.dict(sys.modules, {
     'xllm.python.model_executor.executor': executor_module,
 })
 patch.__enter__()
-)PY",
-           scope);
+)PY";
+  py::exec(script, scope);
   {
     const torch::Device device(torch::kCPU);
     ProcessGroup group(/*rank=*/0, /*world_size=*/1, device);

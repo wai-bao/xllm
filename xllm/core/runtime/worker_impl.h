@@ -121,6 +121,10 @@ class WorkerImpl {
                          std::shared_ptr<KVTransfer> transfer = nullptr);
   CausalLM* get_causal_lm() const { return model_.get(); }
   std::vector<KVCache>& kv_caches() { return kv_caches_; }
+  bool write_context_kv(const torch::Tensor& target_hidden,
+                        const torch::Tensor& positions,
+                        const torch::Tensor& slots,
+                        const ModelParamsView& params);
 
   virtual bool allocate_kv_cache_with_transfer(
       const KVCacheShape& kv_cache_shape);

@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from xllm.python import distributed, kernels
+from xllm.python.attention.backend import LayerCache
 from xllm.python.models import qwen3_dflash
 from xllm.python.models.qwen3 import Qwen3Model
 from xllm.python.models.qwen3_dflash import (
@@ -195,7 +196,7 @@ def test_context_projection_writes_each_layer_cache(monkeypatch: pytest.MonkeyPa
     synchronizer = Mock(record_event=Mock(side_effect=_record_event))
     hidden = torch.tensor([[2.0, 2.0], [2.0, -2.0]])
     positions, slots = torch.tensor([1, 2]), torch.tensor([3, 1], dtype=torch.int32)
-    projected = model.write_context_kv(hidden, positions, slots, caches, synchronizer)
+    projected = model.write_context_kv(hidden, positions, slots, [LayerCache(*cache) for cache in caches], synchronizer)
 
     expected_hidden = hidden / (4.0 + config.rms_norm_eps) ** 0.5
     torch.testing.assert_close(projected, expected_hidden)

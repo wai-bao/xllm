@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <torch/types.h>
 
+#include <optional>
+
 #include "core/framework/model_context/model_context.h"
 #include "core/kv_cache/storage/kv_cache.h"
 #include "framework/model/causal_lm.h"
@@ -42,6 +44,12 @@ class Executor final {
                       const torch::Tensor& positions,
                       std::vector<KVCache>& kv_caches,
                       const ModelParamsView& params);
+
+  std::optional<bool> write_context_kv(const torch::Tensor& target_hidden,
+                                       const torch::Tensor& positions,
+                                       const torch::Tensor& slots,
+                                       std::vector<KVCache>& kv_caches,
+                                       const ModelParamsView& params);
 
   void prepare_graph_input(const torch::Tensor& tokens,
                            const torch::Tensor& positions,

@@ -92,12 +92,6 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
                        const torch::Tensor& seleted_idxes,
                        torch::Tensor& out_hidden) override;
 
-  ModelOutput write_context_kv(const torch::Tensor& target_hidden,
-                               const torch::Tensor& positions,
-                               const torch::Tensor& device_cache_slots,
-                               std::vector<KVCache>& kv_caches,
-                               const ModelParamsView& input_params) override;
-
   DFlash2CandidateOutput dflash2_candidates(
       const torch::Tensor& hidden_states,
       const torch::Tensor& unary_logits,
@@ -137,17 +131,12 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
 
   pybind11::object& python_model() { return py_model_; }
   const pybind11::object& config_dict() const { return config_dict_; }
-  void set_context_kv_graph_replay(pybind11::object replay) {
-    context_kv_graph_replay_ = std::move(replay);
-  }
   int64_t cp_size() const { return cp_size_; }
   int64_t kv_split_size() const { return kv_split_size_; }
   int64_t kv_split_rank() const { return kv_split_rank_; }
 
  private:
   pybind11::dict build_config_dict(const ModelContext& context) const;
-  const pybind11::object& get_or_build_python_kv_caches(
-      std::vector<KVCache>& kv_caches);
 
   ModelArgs model_args_;
   std::string python_model_name_;
@@ -180,8 +169,6 @@ class __attribute__((visibility("hidden"))) PyCausalLM : public CausalVLM {
 
   pybind11::object py_model_;
   pybind11::object config_dict_;
-  pybind11::object python_kv_caches_;
-  pybind11::object context_kv_graph_replay_;
   std::unordered_map<int32_t, bool> last_prepare_expert_weight_ok_;
   c10::intrusive_ptr<c10d::Work> eplb_p2p_work_;
 

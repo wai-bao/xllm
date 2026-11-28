@@ -24,6 +24,7 @@ from xllm.python import distributed
 from xllm.python.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
+    LayerCache,
     LayerCacheInput,
     normalize_layer_caches,
 )
@@ -49,11 +50,9 @@ from xllm.python.platform import current_platform
 from xllm.python.registry import GLM5_NEXT_TARGET_FAMILY
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
-
-    _ContextKvReplay = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor | None]
 
 # Backend strings that mean "no graph execution" (matched case-insensitively).
 _DISABLED_GRAPH_BACKENDS = ("", "off", "none", "0")
@@ -151,7 +150,7 @@ def _create_attention_backend(
                 candidate_block_size=int(config.get("candidate_block_size", 8)),
                 max_model_len=serving_len,
                 quant_mode=quant_mode if quant_mode is not None else V41_QUANT_NONE,
-                graph_backend=graph_backend,
+                graph_backend="off" if self._eager_draft_attention else graph_backend,
             )
         from xllm.python.attention.dsa_attention import DsaAttentionBackend
 
@@ -274,16 +273,14 @@ class ModelExecutor:
         if configure_runtime is not None:
             configure_runtime(config)
         num_speculative_tokens = int(config.get("num_speculative_tokens", 0))
-        self.num_speculative_tokens = (
-            0
-            if config.get("is_draft_engine", False) and not config.get("is_block_diffusion_algorithm", False)
-            else num_speculative_tokens
+        is_draft = bool(config.get("is_draft_engine"))
+        block_diffusion = bool(config.get("is_block_diffusion_algorithm"))
+        self.num_speculative_tokens = 0 if is_draft and not block_diffusion else num_speculative_tokens
+        self.execution_model = cast("nn.Module", model.model)
+        self.supports_layerwise_kv_load = (
+            bool(getattr(self.execution_model, "supports_layerwise_kv_load", False)) and not is_draft
         )
-        self.execution_model = model.model
-        self.supports_layerwise_kv_load = bool(
-            getattr(self.execution_model, "supports_layerwise_kv_load", False)
-        ) and not config.get("is_draft_engine", False)
-        self._kv_bound = False
+        self._layer_caches: list[LayerCache] = []
         cp_size = int(config.get("cp_size", 1))
         cp_rank = int(config.get("cp_rank", 0))
         dp_size = int(config.get("dp_size", 1))
@@ -313,10 +310,8 @@ class ModelExecutor:
             and current_platform.is_npu()
         ):
             graph_backend = "aclgraph"
-        if graph_backend == "aclgraph" and config.get("model_type") == "DFlashDraftModel":
-            # Physical request-row metadata does not imply graph support.
-            # DFlash retains its eager execution path independently of layout.
-            logger.info("Python DFlash draft uses eager execution; ACL graph capture is unsupported")
+        self._eager_draft_attention = graph_backend == "aclgraph" and config.get("model_type") == "DFlashDraftModel"
+        if self._eager_draft_attention and not (is_draft and block_diffusion):
             graph_backend = "off"
         if (
             current_platform.is_npu()
@@ -363,12 +358,11 @@ class ModelExecutor:
         first_parameter = next(model.parameters())
         device = first_parameter.device
         is_draft_tail_repair_required = (
-            config.get("is_draft_engine", False)
-            and config.get("is_mtp_algorithm", False)
-            and config.get("model_type") != "qwen3_5_mtp"
+            is_draft and config.get("is_mtp_algorithm", False) and config.get("model_type") != "qwen3_5_mtp"
         )
-        self._decode_query_width = num_speculative_tokens + int(not is_dspark_draft_model(config))
-        max_decode_rows_per_request = 2 if is_draft_tail_repair_required else self._decode_query_width
+        max_decode_rows_per_request = (
+            2 if is_draft_tail_repair_required else num_speculative_tokens + int(not is_dspark_draft_model(config))
+        )
         self.attention_backend = _create_attention_backend(
             first_attention,
             device,
@@ -379,7 +373,7 @@ class ModelExecutor:
             quant_mode=cast("str", model.quant_mode) if config.get("model_type") == "deepseek_v41" else None,
         )
 
-        execution_model = model.model
+        execution_model = self.execution_model
         self.eager_runner = EagerRunner(execution_model, self.attention_backend, device)
         # Context-Parallel: shard prefill sequences across the CP group. Decode
         # stays on the non-CP path (CP is prefill-only, eager-only in v1).
@@ -391,10 +385,7 @@ class ModelExecutor:
             raise NotImplementedError("Python layerwise split is supported only for GLM5.2")
         self.decode_graph_runner: DecodeCudaGraphRunner | DecodeAclGraphRunner | None = None
         self._serving_acl_graph_logged = False
-        self._context_kv_graph_replay: _ContextKvReplay | None = None
-        self._is_block_diffusion_draft = bool(
-            config.get("is_draft_engine") and config.get("is_block_diffusion_algorithm")
-        )
+        self._context_kv_graph_enabled = is_draft and block_diffusion and graph_backend == "aclgraph"
         self.inductor_runner = None
 
         if self.layerwise_split_size > 1 and graph_backend not in _DISABLED_GRAPH_BACKENDS:
@@ -417,14 +408,14 @@ class ModelExecutor:
             (config.get("model_type") == "qwen3_5_text" or vlm_mtp_capacity)
             and bool(config.get("is_mtp_algorithm", False))
             and 1 <= self.num_speculative_tokens <= 16
-            and not config.get("is_draft_engine", False)
+            and not is_draft
             and config.get("task_type", "generate") == "generate"
             and qwen_mtp_parallel
         )
         self._qwen_mtp_draft = (
             config.get("model_type") == "qwen3_5_mtp"
             and bool(config.get("is_mtp_algorithm", False))
-            and config.get("is_draft_engine", False)
+            and is_draft
             and self.num_speculative_tokens == 0
             and config.get("task_type", "generate") == "generate"
             and qwen_mtp_parallel
@@ -471,7 +462,7 @@ class ModelExecutor:
                 dp_size,
                 dp_rank,
                 num_speculative_tokens=self.num_speculative_tokens,
-                is_spec_draft=bool(config.get("is_draft_engine", False)),
+                is_spec_draft=is_draft,
                 enable_mega_moe_token_mask=bool(config.get("enable_mega_moe", False)),
                 enable_graph_mode_decode_no_padding=bool(config.get("enable_graph_mode_decode_no_padding", False)),
                 # Keep VLM target's live-length TND attention: switching
@@ -512,14 +503,13 @@ class ModelExecutor:
             layer.fia_sparse_mode,
         )
 
-    def bind_kv_caches(self, kv_caches: list[LayerCacheInput]) -> _ContextKvReplay | None:
-        """Bind layer caches and return the admitted context KV graph callback."""
+    def bind_kv_caches(self, kv_caches: Sequence[LayerCacheInput]) -> None:
+        if self._layer_caches:
+            return
         layer_caches = normalize_layer_caches(kv_caches)
         required_layers = max(layer.layer_id for layer in self.model.modules() if isinstance(layer, Attention)) + 1
         if len(layer_caches) < required_layers:
             raise ValueError("cache layer count does not match the model layer layout")
-        if self._kv_bound:
-            return self._context_kv_graph_replay
         if self._requires_kpool_tail_cache:
             indexed_caches = [cache for cache in layer_caches if cache.index is not None]
             if not indexed_caches or any(cache.kpool_tail is None for cache in indexed_caches):
@@ -536,12 +526,27 @@ class ModelExecutor:
                     self.decode_graph_runner.warmup(parameter.device, parameter.dtype)
         if self.inductor_runner is not None:
             self.inductor_runner.bind_layer_caches(layer_caches)
-        if self._is_block_diffusion_draft and self.decode_graph_runner is not None:
-            runner = self.decode_graph_runner
-            if not isinstance(runner, DecodeCudaGraphRunner) and runner.bind_context_kv(self.model):
-                self._context_kv_graph_replay = runner.replay_context_kv
-        self._kv_bound = True
-        return self._context_kv_graph_replay
+        if self._context_kv_graph_enabled:
+            self._context_kv_graph_enabled = all(
+                cache.key is not None and cache.value is not None and cache.swa is None for cache in layer_caches
+            )
+        self._layer_caches = layer_caches
+
+    def write_context_kv(
+        self,
+        target_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        slots: torch.Tensor,
+        layer_synchronizer: LayerSynchronizer | None,
+        is_decode: bool,
+    ) -> torch.Tensor | None:
+        if is_decode and layer_synchronizer is None and self._context_kv_graph_enabled:
+            runner = cast("DecodeAclGraphRunner", self.decode_graph_runner)
+            result = runner.replay_context_kv(target_hidden, positions, slots)
+            if result is not None:
+                return result
+        write_context_kv = cast("Callable[..., torch.Tensor | None]", self.execution_model.write_context_kv)
+        return write_context_kv(target_hidden, positions, slots, self._layer_caches, layer_synchronizer)
 
     @torch.inference_mode()
     def execute(
@@ -571,15 +576,11 @@ class ModelExecutor:
                 positions,
                 input_batch_metadata,
             )
-        if not self._kv_bound:
+        if not self._layer_caches:
             raise RuntimeError("KV caches are not bound")
-        if is_graph_warmup and self._context_kv_graph_replay is not None:
-            # Verify can accept one more row per request than a DSpark draft queries.
-            query_width = self._decode_query_width
-            sequences = (input_ids.numel() + query_width - 1) // query_width
-            cast("DecodeAclGraphRunner", self.decode_graph_runner).warmup_context_kv(
-                sequences * (self.num_speculative_tokens + 1)
-            )
+        if is_graph_warmup and self._context_kv_graph_enabled:
+            runner = cast("DecodeAclGraphRunner", self.decode_graph_runner)
+            runner.warmup_context_kv(cast("torch.Tensor", metadata.q_seq_lens).numel())
         if self.layerwise_split_size > 1 and (metadata.is_prefill or metadata.is_chunked_prefill):
             raise NotImplementedError("Python GLM5.2 layerwise split is decode-only")
 
@@ -612,7 +613,9 @@ class ModelExecutor:
         # record them through Python, and compilation must not retain a prior
         # step's synchronizer. Decode steps without a transfer can use graphs.
         graph_runner = (
-            self.decode_graph_runner if layer_synchronizer is None and deepstack_input_embeds is None else None
+            self.decode_graph_runner
+            if layer_synchronizer is None and deepstack_input_embeds is None and not self._eager_draft_attention
+            else None
         )
         if graph_runner is not None and (eplb is None or current_platform.is_npu()):
             from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner

@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from xllm.python.attention.backend import LayerCache
 from xllm.python.model_executor.executor import ModelExecutor
 from xllm.python.model_executor.forward_context import EplbRuntimeState
 from xllm.python.model_executor.runners.decode_acl_graph import DecodeAclGraphRunner
@@ -40,9 +41,9 @@ def _graph_entry(runner: DecodeAclGraphRunner, state: EplbRuntimeState) -> Simpl
 
 def test_executor_forwards_worker_eplb_state_to_eager_runner() -> None:
     executor = object.__new__(ModelExecutor)
-    executor._context_kv_graph_replay = None
-    executor._kv_bound = True
-    executor.requires_input_batch_metadata = False
+    executor._context_kv_graph_enabled = False
+    executor._eager_draft_attention = False
+    executor._layer_caches = [LayerCache(None, None)]
     executor.layerwise_split_size = 1
     executor.decode_graph_runner = None
     executor.inductor_runner = None

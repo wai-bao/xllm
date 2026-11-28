@@ -41,7 +41,6 @@ limitations under the License.
 
 #if defined(USE_NPU)
 #include "core/framework/parallel_state/mega_moe_comm_resource.h"
-#include "platform/npu/npu_layer_synchronizer.h"
 #endif
 
 namespace py = pybind11;
@@ -325,18 +324,8 @@ PyCausalLM::PyCausalLM(const ModelContext& context,
 }
 
 PyCausalLM::~PyCausalLM() {
-  clear_python_object(context_kv_graph_replay_);
-  clear_python_object(python_kv_caches_);
   clear_python_object(py_model_);
   clear_python_object(config_dict_);
-}
-
-const py::object& PyCausalLM::get_or_build_python_kv_caches(
-    std::vector<KVCache>& kv_caches) {
-  if (!python_kv_caches_) {
-    python_kv_caches_ = build_python_kv_caches(kv_caches);
-  }
-  return python_kv_caches_;
 }
 
 py::dict PyCausalLM::build_config_dict(const ModelContext& context) const {
@@ -480,40 +469,6 @@ torch::Tensor PyCausalLM::logits(const torch::Tensor& hidden_states,
   }
   out_hidden = hidden_states;
   return logits(hidden_states, seleted_idxes);
-}
-
-ModelOutput PyCausalLM::write_context_kv(
-    const torch::Tensor& target_hidden,
-    const torch::Tensor& positions,
-    const torch::Tensor& device_cache_slots,
-    std::vector<KVCache>& kv_caches,
-    const ModelParamsView& input_params) {
-  torch::NoGradGuard no_grad;
-  py::gil_scoped_acquire gil;
-  py::object layer_synchronizer = py::none();
-#if defined(USE_NPU)
-  if (input_params.parallel.layer_synchronizer != nullptr) {
-    layer_synchronizer = py::cast(input_params.parallel.layer_synchronizer);
-  }
-#endif
-  const py::object& python_kv_caches = get_or_build_python_kv_caches(kv_caches);
-  set_active_instance(this);
-  if (context_kv_graph_replay_ && !context_kv_graph_replay_.is_none() &&
-      input_params.meta.batch_forward_type.is_decode() &&
-      layer_synchronizer.is_none()) {
-    py::object output =
-        context_kv_graph_replay_(target_hidden, positions, device_cache_slots);
-    return ModelOutput(output.cast<torch::Tensor>());
-  }
-  py::object output = py_model_.attr("write_context_kv")(target_hidden,
-                                                         positions,
-                                                         device_cache_slots,
-                                                         python_kv_caches,
-                                                         layer_synchronizer);
-  if (output.is_none()) {
-    return ModelOutput();
-  }
-  return ModelOutput(output.cast<torch::Tensor>());
 }
 
 DFlash2CandidateOutput PyCausalLM::dflash2_candidates(

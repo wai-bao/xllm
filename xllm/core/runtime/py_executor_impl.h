@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 #include "common/macros.h"
 #include "core/kv_cache/storage/kv_cache.h"
@@ -50,9 +51,15 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
                   std::vector<KVCache>& kv_caches,
                   const ModelParamsView& params) override;
 
+  std::optional<bool> write_context_kv(const torch::Tensor& target_hidden,
+                                       const torch::Tensor& positions,
+                                       const torch::Tensor& slots,
+                                       std::vector<KVCache>& kv_caches,
+                                       const ModelParamsView& params) override;
+
  private:
   // Caller holds the GIL.
-  void bind_kv_caches(std::vector<KVCache>& kv_caches);
+  void bind_kv_caches(const std::vector<KVCache>& kv_caches);
 
   PyCausalLM* py_causal_lm_;
   ModelArgs args_;
@@ -65,7 +72,6 @@ class __attribute__((visibility("hidden"))) PyExecutorImpl final
   bool supports_layerwise_kv_load_ = false;
   std::unique_ptr<EncoderCache> encoder_cache_;
   bool kv_bound_ = false;
-  int64_t kv_layer_count_ = 0;
 };
 
 REGISTER_EXECUTOR("python", PyExecutorImpl);

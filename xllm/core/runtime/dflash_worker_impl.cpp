@@ -548,7 +548,6 @@ std::vector<std::string> DFlashWorkerImpl::write_context_kv(
     const torch::Tensor& context_hidden,
     const torch::Tensor& positions_device,
     const torch::Tensor& new_cache_slots_device) {
-  CHECK(context_hidden.defined()) << "DFlash context hidden is undefined.";
   CHECK_EQ(context_hidden.dim(), 2) << "DFlash context hidden must be 2D.";
   CHECK_EQ(context_hidden.size(1), expected_context_hidden_size_)
       << "DFlash context hidden size must be hidden_size * "
@@ -590,19 +589,10 @@ std::vector<std::string> DFlashWorkerImpl::write_context_kv(
   }();
 #endif
 
-  ModelParamsView execution_params(input.input_params);
-  ModelOutput scatter_output =
-      draft_impl_->get_causal_lm()->write_context_kv(context_hidden,
-                                                     positions_device,
-                                                     new_cache_slots_device,
-                                                     draft_impl_->kv_caches(),
-                                                     execution_params);
-  // Model returns an empty ModelOutput (hidden_states undefined) when the
-  // per-layer NPULayerSynchronizer::record_event fails mid-scatter under
-  // PD-PUSH transfer. Fail fast instead of silently continuing: subsequent
-  // layers won't have been scattered and the PD transfer side would block
-  // forever waiting on the missing per-layer event.
-  CHECK(scatter_output.hidden_states.defined())
+  CHECK(draft_impl_->write_context_kv(context_hidden,
+                                      positions_device,
+                                      new_cache_slots_device,
+                                      ModelParamsView(input.input_params)))
       << "DFlash context-KV scatter failed (layer_synchronizer record_event "
          "returned false); PD-PUSH transfer would deadlock.";
 

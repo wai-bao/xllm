@@ -67,7 +67,7 @@ from xllm.python.model_executor.runners.eager import EagerRunner  # noqa: E402
 class StubAttentionBackend(AttentionBackend):
     """Minimal backend that records calls for assertion."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: object) -> None:
         self.init_kwargs = kwargs
         self._kv_caches: list[LayerCache] = []
         self._prepared = False
@@ -913,7 +913,7 @@ class TestDecodeAclGraphSpeculativeMetadata:
         graph_stream = MagicMock()
         runner._stream = graph_stream
 
-        def advance_state(entry: AclGraphEntry, _stream: object) -> None:
+        def advance_state(entry: AclGraphEntry) -> None:
             indices = entry.static_metadata.linear_state_indices.long()
             assert not indices.any()
             conv[indices] += 10
@@ -2084,7 +2084,7 @@ def test_layerwise_load_rejects_incompatible_execution_before_running(invalid: s
     model.model.layers = nn.ModuleList([nn.Identity(), nn.Identity()])
     with patch("xllm.python.model_executor.executor._create_attention_backend", return_value=StubAttentionBackend()):
         executor = ModelExecutor(model, {}, max_seqs_per_batch=2)
-    executor._kv_bound = True
+    executor.bind_kv_caches([LayerCache(None, None), LayerCache(None, None)])
     executor.eager_runner = MagicMock()
     metadata = SimpleNamespace(
         is_prefill=invalid != "decode",
@@ -2124,27 +2124,6 @@ def test_speculative_target_graph_capacity_expands_validation_tokens(dp_size: in
     ):
         executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=5, acl_graph_decode_batch_size_limit=4)
     assert executor.decode_graph_runner.max_batch == min((5 + dp_size - 1) // dp_size, 4) * 4
-
-
-@pytest.mark.parametrize("model_type", ["qwen3", "glm_moe_dsa"])
-@pytest.mark.parametrize("dp_size", [1, 2])
-def test_executor_binds_acl_graph_caches(model_type: str, dp_size: int) -> None:
-    config = {
-        "model_type": model_type,
-        "dp_size": dp_size,
-        "dp_rank": dp_size - 1,
-        "python_graph_backend": "aclgraph",
-        "max_position_embeddings": 128,
-    }
-    with patch(
-        "xllm.python.model_executor.executor._create_attention_backend", return_value=_GraphStubAttentionBackend()
-    ):
-        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=4 * dp_size)
-    assert executor.decode_graph_runner.dp_size == dp_size
-    cache = torch.empty(2, 4, 2, 64)
-    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
-    runner = executor.decode_graph_runner
-    assert len(runner.layer_caches) == 2
 
 
 @pytest.mark.parametrize("no_padding,expected", [(False, 32), (True, 24)])
@@ -2194,109 +2173,36 @@ def test_executor_selects_dspark_acl_graph_with_dp(dp_size: int) -> None:
     assert runner.max_batch == min((5 + dp_size - 1) // dp_size, 2) * 6
 
 
-def test_dflash2_leaf_uses_full_block_graph_and_verify_context_capacity() -> None:
-    model = _FakeModel()
-    model.write_context_kv = MagicMock()
+@pytest.mark.parametrize("layer_synchronized", [False, True])
+def test_context_kv_eager_fallback_keeps_cache_and_synchronizer(layer_synchronized: bool) -> None:
     config = {
-        "model_type": "DFlash2DraftModel",
         "is_draft_engine": True,
         "is_block_diffusion_algorithm": True,
-        "num_speculative_tokens": 7,
-        "python_graph_backend": "aclgraph",
-        "max_position_embeddings": 128,
-    }
-    with patch(
-        "xllm.python.model_executor.executor._create_attention_backend", return_value=_GraphStubAttentionBackend()
-    ):
-        executor = ModelExecutor(model, config, max_seqs_per_batch=2)
-    assert isinstance(executor.decode_graph_runner, DecodeAclGraphRunner)
-    assert executor.decode_graph_runner.max_batch == 16
-    cache = torch.empty(2, 4, 2, 64)
-    executor.bind_kv_caches([LayerCache(cache, cache), LayerCache(cache, cache)])
-    tokens = torch.zeros(16, dtype=torch.int32)
-    metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False, prepared_attention_state=None)
-    with (
-        patch.object(executor.decode_graph_runner, "warmup_context_kv") as warmup,
-        patch.object(executor.decode_graph_runner, "prepare_execution", return_value=None),
-        patch.object(executor.eager_runner, "execute"),
-    ):
-        executor.execute(tokens, tokens, metadata, is_graph_warmup=True)
-    warmup.assert_called_once_with(16)
-
-
-@pytest.mark.parametrize(
-    ("is_draft", "block_diffusion", "uses_swa", "captures"),
-    [(True, True, False, True), (False, True, False, False), (True, False, False, False), (True, True, True, False)],
-)
-def test_executor_warms_context_prefix_buckets_only_during_startup(
-    *, is_draft: bool, block_diffusion: bool, uses_swa: bool, captures: bool
-) -> None:
-    """Admit startup capture using draft role, algorithm and cache layout."""
-    config = {
-        "model_type": "DSparkDraftModel",
-        "is_draft_engine": is_draft,
-        "is_block_diffusion_algorithm": block_diffusion,
-        "num_speculative_tokens": 6,
-        "python_graph_backend": "aclgraph",
-        "max_position_embeddings": 128,
-    }
-    model = _FakeModel()
-    model.write_context_kv = MagicMock()
-    with patch(
-        "xllm.python.model_executor.executor._create_attention_backend", return_value=_GraphStubAttentionBackend()
-    ):
-        executor = ModelExecutor(model, config, max_seqs_per_batch=4)
-    cache = torch.empty(2, 4, 2, 64)
-    layer_cache = LayerCache(None, None, swa=cache) if uses_swa else LayerCache(cache, cache)
-    replay = executor.bind_kv_caches([layer_cache, layer_cache])
-    assert (replay is not None) is captures
-    tokens = torch.zeros(12, dtype=torch.int32)
-    positions = torch.zeros_like(tokens)
-    metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False, prepared_attention_state=None)
-    with (
-        patch.object(executor.decode_graph_runner, "warmup_context_kv") as warmup,
-        patch.object(executor.decode_graph_runner, "prepare_execution", return_value=None),
-        patch.object(executor.eager_runner, "execute", return_value=torch.zeros(12, 4)),
-    ):
-        executor.execute(tokens, positions, metadata, is_graph_warmup=True)
-        executor.execute(tokens, positions, metadata)
-    if captures:
-        warmup.assert_called_once_with(14)
-    else:
-        warmup.assert_not_called()
-
-
-@pytest.mark.parametrize("is_graph_warmup", [False, True])
-def test_executor_uses_block_draft_preparation_for_warmup_and_replay(is_graph_warmup: bool) -> None:
-    config = {
-        "model_type": "DSparkDraftModel",
         "num_speculative_tokens": 2,
         "python_graph_backend": "aclgraph",
         "max_position_embeddings": 128,
     }
     model = _FakeModel()
+    output = torch.zeros(1, 4)
+    model.model.write_context_kv = MagicMock(return_value=output)
     with patch(
         "xllm.python.model_executor.executor._create_attention_backend", return_value=_GraphStubAttentionBackend()
     ):
-        executor = ModelExecutor(model, config, max_seqs_per_batch=4)
-    executor._kv_bound = True
+        executor = ModelExecutor(model, config, max_seqs_per_batch=2)
+    cache = torch.empty(2, 4, 2, 64)
+    caches = [LayerCache(cache, cache), LayerCache(cache, cache)]
+    executor.bind_kv_caches(caches)
+    slots = torch.arange(1, dtype=torch.int32)
+    synchronizer = MagicMock() if layer_synchronized else None
     runner = executor.decode_graph_runner
     assert isinstance(runner, DecodeAclGraphRunner)
-    tokens = torch.arange(2, dtype=torch.int32)
-    metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False, prepared_attention_state=None)
-    graph_key = ("block-key",)
-    expected = torch.ones(2, 4)
-    with (
-        patch.object(runner, "prepare_execution", return_value=object()) as prepare,
-        patch.object(runner, "warmup", return_value=graph_key) as warmup,
-        patch.object(runner, "execute", return_value=expected) as execute,
-    ):
-        assert executor.execute(tokens, tokens, metadata, is_graph_warmup=is_graph_warmup) is expected
-    prepare.assert_called_once_with(tokens, metadata, None, None, is_graph_warmup=is_graph_warmup)
-    assert warmup.call_args.kwargs["preparation"] is prepare.return_value
-    assert warmup.call_args.kwargs["is_graph_warmup"] is is_graph_warmup
-    assert execute.call_args.kwargs["preparation"] is prepare.return_value
-    assert execute.call_args.kwargs["graph_key"] is graph_key
+    with patch.object(runner, "replay_context_kv", wraps=runner.replay_context_kv) as replay:
+        assert executor.write_context_kv(output, slots, slots, synchronizer, is_decode=True) is output
+    if layer_synchronized:
+        replay.assert_not_called()
+    else:
+        replay.assert_called_once()
+    model.model.write_context_kv.assert_called_once_with(output, slots, slots, caches, synchronizer)
 
 
 def test_eager_runner_skips_cp_for_empty_rank() -> None:
@@ -2345,30 +2251,3 @@ class TestDecodeAclGraphWidthKeying:
         ) != DecodeAclGraphRunner._graph_key(
             16, False, None, kpool_query_lens=runner._padded_kpool_query_lens(four, 16, 16)
         )
-
-
-@pytest.mark.parametrize("graph_config", [{"enable_graph": True}, {"python_graph_backend": "aclgraph"}])
-def test_dflash_request_layout_keeps_eager_execution(graph_config: dict[str, object]) -> None:
-    config = {
-        "model_type": "DFlashDraftModel",
-        "is_draft_engine": True,
-        "is_block_diffusion_algorithm": True,
-        "num_speculative_tokens": 2,
-        **graph_config,
-    }
-    with (
-        patch("xllm.python.model_executor.executor.current_platform.is_npu", return_value=True),
-        patch("xllm.python.model_executor.executor.distributed.dcp_group", return_value=None),
-        patch("xllm.python.model_executor.executor._create_attention_backend", return_value=StubAttentionBackend()),
-    ):
-        executor = ModelExecutor(_FakeModel(), config, max_seqs_per_batch=2)
-    assert executor.decode_graph_runner is None
-    executor._kv_bound = True
-    metadata = SimpleNamespace(
-        is_prefill=False, is_chunked_prefill=False, decode_kv_per_request=True, decode_query_width=3
-    )
-    tokens = torch.arange(6, dtype=torch.int32)
-    expected = torch.ones(6, 4)
-    with patch.object(executor.eager_runner, "execute", return_value=expected) as execute:
-        assert executor.execute(tokens, tokens, metadata, enable_graph=True) is expected
-    execute.assert_called_once()
