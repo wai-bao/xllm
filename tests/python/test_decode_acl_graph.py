@@ -17,6 +17,7 @@
 import os
 from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import Mock, patch
 
 import pytest
@@ -43,9 +44,7 @@ def _runner(
     num_speculative_tokens: int = 0,
     enable_graph_mode_decode_no_padding: bool = False,
     enable_mega_moe_token_mask: bool = False,
-    device_kv_lengths: bool = False,
-    kv_capacity_graphs: bool = False,
-    max_capture_tokens: int | None = None,
+    kv_capacity_length_source: Literal["host", "device"] | None = None,
 ) -> DecodeAclGraphRunner:
     attention_backend = SimpleNamespace(page_size=4, is_mla=False, create_graph_block_tables=lambda *_: ())
     return DecodeAclGraphRunner(
@@ -58,9 +57,7 @@ def _runner(
         num_speculative_tokens=num_speculative_tokens,
         enable_graph_mode_decode_no_padding=enable_graph_mode_decode_no_padding,
         enable_mega_moe_token_mask=enable_mega_moe_token_mask,
-        device_kv_lengths=device_kv_lengths,
-        kv_capacity_graphs=kv_capacity_graphs,
-        max_capture_tokens=max_capture_tokens,
+        kv_capacity_length_source=kv_capacity_length_source,
     )
 
 
@@ -129,7 +126,6 @@ def test_shared_gdn_verify_admission_uses_bound_model_capability() -> None:
     runner.attention_backend.supports_linear_spec_verify_graph = False
     runner.bind_layer_caches([LayerCache(key=None, value=None, conv=torch.empty(2, 1), ssm=torch.empty(2, 1))])
 
-    assert runner._model_owns_linear_spec_verify
     assert (
         runner.prepare_execution(torch.arange(4, dtype=torch.int32), _capacity_metadata(4, query_width=2)) is not None
     )
@@ -148,8 +144,7 @@ def test_decode_startup_captures_kv_capacities_from_short_metadata(device_kv_len
     runner = _runner(
         max_batch=4,
         max_model_len=512,
-        device_kv_lengths=device_kv_lengths,
-        kv_capacity_graphs=True,
+        kv_capacity_length_source="device" if device_kv_lengths else "host",
     )
     tokens = torch.arange(3, dtype=torch.int32)
     metadata = _capacity_metadata(3)
@@ -181,7 +176,11 @@ def test_decode_startup_captures_kv_capacities_from_short_metadata(device_kv_len
 def test_capacity_warmup_bounds_long_synthetic_lengths_without_mutating_source(
     device_kv_lengths: bool, query_width: int
 ) -> None:
-    runner = _runner(max_batch=8, max_model_len=65536, device_kv_lengths=device_kv_lengths, kv_capacity_graphs=True)
+    runner = _runner(
+        max_batch=8,
+        max_model_len=65536,
+        kv_capacity_length_source="device" if device_kv_lengths else "host",
+    )
     runner.attention_backend.page_size = 128
     metadata = _capacity_metadata(8, 2048, query_width, page_size=128)
     metadata.kv_cu_seq_lens = torch.arange(9, dtype=torch.int32) * 2048
@@ -225,7 +224,7 @@ def test_decode_startup_tracks_sparse_prefix_rows_and_expanded_verify_separately
         max_batch=160,
         num_speculative_tokens=4,
         enable_graph_mode_decode_no_padding=True,
-        device_kv_lengths=True,
+        kv_capacity_length_source="device",
     )
     runner._has_linear_cache = True
     runner._model_owns_linear_spec_verify = True
@@ -265,8 +264,7 @@ def test_admitted_decode_shape_still_rejects_missing_graph_variants(
     runner = _runner(
         max_batch=4,
         max_model_len=512,
-        device_kv_lengths=device_kv_lengths,
-        kv_capacity_graphs=True,
+        kv_capacity_length_source="device" if device_kv_lengths else "host",
     )
     tokens = torch.arange(4, dtype=torch.int32)
     metadata = _capacity_metadata(4)
@@ -293,7 +291,7 @@ def test_admitted_decode_shape_still_rejects_missing_graph_variants(
 
 
 def test_failed_decode_startup_capture_does_not_admit_shape() -> None:
-    runner = _runner(max_batch=4, max_model_len=512, device_kv_lengths=True)
+    runner = _runner(max_batch=4, max_model_len=512, kv_capacity_length_source="device")
     tokens = torch.arange(4, dtype=torch.int32)
     metadata = _capacity_metadata(4)
 
@@ -1165,7 +1163,7 @@ def test_device_length_graph_refreshes_only_consumed_inputs(device_type: str, us
     if device_type == "npu" and not torch.npu.is_available():
         pytest.skip("requires an NPU")
     device = torch.device(device_type)
-    runner = _runner(max_batch=8, max_model_len=32, device_kv_lengths=True)
+    runner = _runner(max_batch=8, max_model_len=32, kv_capacity_length_source="device")
     runner.attention_backend.prepare_metadata = Mock()
     tokens = torch.arange(8, dtype=torch.int64, device=device)
     metadata = _capacity_metadata(8, 12)
@@ -1206,7 +1204,7 @@ def test_device_length_graph_refreshes_only_consumed_inputs(device_type: str, us
 
 
 def test_decode_graph_replay_clears_stale_page_table_tail() -> None:
-    runner = _runner(max_batch=4, max_model_len=32, device_kv_lengths=True)
+    runner = _runner(max_batch=4, max_model_len=32, kv_capacity_length_source="device")
     runner.attention_backend.prepare_metadata = Mock()
     input_ids = torch.arange(4, dtype=torch.int32)
 
@@ -2023,7 +2021,8 @@ def test_decode_rejects_mismatched_linear_state_validity_mask() -> None:
 
 
 def test_capture_token_limit_bounds_graph_admission() -> None:
-    runner = _runner(max_batch=128, max_capture_tokens=16)
+    with patch.object(nn.Identity, "graph_capture_token_limit", 16, create=True):
+        runner = _runner(max_batch=128)
     with patch.object(runner, "_has_compatible_decode_metadata", return_value=True):
         for rows, expected in ((8, True), (16, True), (24, False)):
             metadata = _metadata(torch.arange(rows, dtype=torch.int32))

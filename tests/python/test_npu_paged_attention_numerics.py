@@ -93,7 +93,7 @@ def test_serial_fia_buffers_match_private_graphs(no_padding: bool, monkeypatch: 
             512,
             262144,
             enable_graph_mode_decode_no_padding=no_padding,
-            kv_capacity_graphs=shared,
+            kv_capacity_length_source="host" if shared else None,
         )
         if not shared:
             runner._serial_workspace_pool = None
@@ -1120,7 +1120,7 @@ def test_ordinary_draft_graph_reads_growing_kv_prefix(
         capacity,
         is_spec_draft=True,
         enable_graph_mode_decode_no_padding=True,
-        device_kv_lengths=True,
+        kv_capacity_length_source="device",
     )
     runner.bind_layer_caches(caches)
     tokens = torch.zeros(rows, dtype=torch.int32, device=device)

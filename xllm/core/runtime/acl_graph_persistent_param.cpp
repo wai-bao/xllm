@@ -31,10 +31,10 @@ limitations under the License.
 #include "core/common/constants.h"
 #include "core/common/global_flags.h"
 #include "core/framework/config/kernel_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
-#include "core/runtime/acl_graph_bucket_policy.h"
 #include "core/runtime/decode_graph_bucket.h"
 #include "core/util/utils.h"
 
@@ -55,41 +55,14 @@ namespace xllm::npu {
 namespace {
 constexpr int32_t kMlaGraphKvLenBucket = 2048;
 
-int64_t get_decode_graph_token_capacity(const runtime::Options& options) {
-  const int32_t num_decoding_tokens =
-      acl_graph_decode_tokens_per_sequence(options.num_speculative_tokens(),
-                                           options.speculative_algorithm(),
-                                           options.is_draft_engine());
-  return runtime::get_decode_graph_token_bucket(
-      static_cast<int64_t>(options.max_seqs_per_batch()) * num_decoding_tokens,
-      options.enable_graph_mode_decode_no_padding());
-}
-
-int64_t get_hybrid_metadata_capacity(const runtime::Options& options) {
-  const int64_t seq_capacity = options.max_seqs_per_batch();
-  const int32_t num_decoding_tokens =
-      acl_graph_decode_tokens_per_sequence(options.num_speculative_tokens(),
-                                           options.speculative_algorithm(),
-                                           options.is_draft_engine());
-  // Bucket padding rows still consume sequence-scoped metadata:
-  // 4 seqs x 5 tokens = 20 rows -> bucket 32 -> 7 metadata rows.
-  const int64_t bucketed_tokens = runtime::get_decode_graph_token_bucket(
-      seq_capacity * num_decoding_tokens,
-      options.enable_graph_mode_decode_no_padding());
-  const int64_t padded_seq_capacity =
-      (bucketed_tokens + num_decoding_tokens - 1) / num_decoding_tokens;
-  return std::max(seq_capacity, padded_seq_capacity);
-}
-
 float get_dp_ep_all2all_buffer_factor(int64_t length) {
-  const std::vector<std::pair<int64_t, float>> length_thresholds = {
+  static constexpr std::pair<int64_t, float> length_thresholds[] = {
       {1048576, 1.32f},
       {524288, 1.4f},
       {262144, 1.53f},
       {131072, 1.8f},
       {32768, 3.0f},
-      {8192, 5.2f},
-      {0, 8.0f}};
+      {8192, 5.2f}};
 
   for (const auto& threshold : length_thresholds) {
     if (length >= threshold.first) {
@@ -97,21 +70,6 @@ float get_dp_ep_all2all_buffer_factor(int64_t length) {
     }
   }
   return 8.0f;
-}
-
-int64_t get_dp_ep_padding_buffer_capacity(const ModelArgs& args,
-                                          const runtime::Options& options) {
-  const int64_t dp_size = std::max<int64_t>(options.dp_size(), 1);
-  const int64_t graph_capacity = get_decode_graph_token_capacity(options);
-  const int64_t topk = std::max<int64_t>(args.num_experts_per_tok(), 1);
-  const int64_t base_length = graph_capacity * topk;
-  const int64_t global_length = base_length * dp_size;
-  const float buffer_factor = get_dp_ep_all2all_buffer_factor(global_length);
-  const int64_t moe_buffer_capacity =
-      static_cast<int64_t>(std::ceil(base_length * buffer_factor));
-  const int64_t aligned_moe_buffer_capacity =
-      ((moe_buffer_capacity + dp_size - 1) / dp_size) * dp_size;
-  return std::max(graph_capacity * dp_size, aligned_moe_buffer_capacity);
 }
 
 }  // namespace
@@ -126,8 +84,7 @@ int32_t get_mla_capture_kv_seq_len_bucket(const ModelParamsView& params,
         capture_kv_len, util::max(params.parallel.dp_global_kv_max_seq_lens));
   } else {
     const auto& block_tables = params.attention.device.block_tables;
-    if (block_tables.defined() && block_tables.dim() >= 2 &&
-        block_tables.size(1) > 0) {
+    if (block_tables.defined() && block_tables.dim() >= 2) {
       capture_kv_len = std::max<int32_t>(
           capture_kv_len,
           static_cast<int32_t>(block_tables.size(1)) * block_size);
@@ -141,16 +98,22 @@ int32_t get_mla_capture_kv_seq_len_bucket(const ModelParamsView& params,
 GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
                                            const torch::Device& device,
                                            const runtime::Options& options,
-                                           bool need_update_attn_mask,
                                            bool is_hybrid_linear_attention,
                                            bool supports_mla_graph_kv_bucketing)
     : args_(args),
       device_(device),
       options_(options),
+      decode_query_len_(
+          SpeculativeConfig::decode_query_len(options.num_speculative_tokens(),
+                                              options.speculative_algorithm(),
+                                              options.is_draft_engine())),
+      max_graph_tokens_(runtime::get_decode_graph_token_bucket(
+          static_cast<int64_t>(options.max_seqs_per_batch()) *
+              decode_query_len_,
+          options.enable_graph_mode_decode_no_padding())),
       context_for_plan_(nullptr),
       custom_pa_op_for_plan_(nullptr),
       stream_for_plan_(nullptr),
-      need_update_attn_mask_(need_update_attn_mask),
       is_hybrid_linear_attention_(is_hybrid_linear_attention),
       supports_mla_graph_kv_bucketing_(supports_mla_graph_kv_bucketing) {
   // MLA graph KV bucketing uses a fixed capture plan and does not update the
@@ -161,16 +124,11 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
        args.model_type() != "glm_moe_dsa" && !supports_mla_graph_kv_bucketing_);
 
   const int64_t max_tokens_per_batch = options.max_tokens_per_batch();
-  // Graph-mode token capacity is narrower than max_tokens_per_batch: ACL graph
-  // only serves decode / spec-verify batches, so the relevant row upper bound
-  // comes from decode graph capacity instead.
-  const int64_t max_graph_tokens = get_decode_graph_token_capacity(options);
-  // Hybrid spec verify keeps sequence-scoped metadata (with bucket padding,
-  // see get_hybrid_metadata_capacity), while non-hybrid MTP expands every
-  // proposal token into its own decode metadata row.
-  const int64_t metadata_capacity = is_hybrid_linear_attention
-                                        ? get_hybrid_metadata_capacity(options)
-                                        : max_graph_tokens;
+  // Hybrid verification uses one metadata row per request, including padding.
+  const int64_t metadata_capacity =
+      is_hybrid_linear_attention
+          ? util::ceil_div<int64_t>(max_graph_tokens_, decode_query_len_)
+          : max_graph_tokens_;
 
   const int64_t max_seq_len = args_.max_position_embeddings();
 
@@ -178,8 +136,9 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
   persistent_tokens_ = torch::zeros({max_tokens_per_batch},
                                     torch::dtype(torch::kInt).device(device));
   if (::xllm::KernelConfig::get_instance().enable_mega_moe()) {
-    persistent_mega_active_mask_ = torch::zeros(
-        {max_graph_tokens}, torch::dtype(torch::kInt8).device(device));
+    persistent_mega_active_mask_ =
+        torch::zeros({max_graph_tokens_},
+                     torch::dtype(/*dtype=*/torch::kInt8).device(device));
   }
   persistent_positions_ = torch::zeros(
       {max_tokens_per_batch}, torch::dtype(torch::kInt).device(device));
@@ -228,7 +187,7 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
       torch::zeros({metadata_capacity, max_block_table_len},
                    torch::dtype(torch::kInt).device(device));
   persistent_expanded_block_tables_ =
-      torch::zeros({max_graph_tokens, max_block_table_len},
+      torch::zeros({max_graph_tokens_, max_block_table_len},
                    torch::dtype(torch::kInt).device(device));
 
   torch::Dtype dtype = util::parse_dtype(args.dtype(), device);
@@ -246,16 +205,16 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
   // mask is only consumed by decode / spec-verify graphs, so size it by graph
   // token capacity instead of the much larger max_tokens_per_batch prefill
   // budget.
-  if (need_update_attn_mask_) {
-    persistent_mask_ = torch::zeros({max_graph_tokens, max_seq_len},
+  if (is_hybrid_linear_attention_) {
+    persistent_mask_ = torch::zeros({max_graph_tokens_, max_seq_len},
                                     torch::dtype(dtype).device(device));
     persistent_mask_zero_template_ = torch::zeros(
-        {max_graph_tokens, max_seq_len}, torch::dtype(dtype).device(device));
+        {max_graph_tokens_, max_seq_len}, torch::dtype(dtype).device(device));
     const float mask_fill_value = (dtype == torch::kFloat16)
                                       ? -std::numeric_limits<float>::infinity()
                                       : -9984.0f;
     persistent_mask_fill_template_ =
-        torch::full({max_graph_tokens, max_seq_len},
+        torch::full({max_graph_tokens_, max_seq_len},
                     mask_fill_value,
                     torch::dtype(dtype).device(device));
   }
@@ -265,9 +224,18 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
   q_cu_seq_lens_ = torch::zeros({metadata_capacity + 1},
                                 torch::dtype(torch::kInt).device(device));
 
-  // Pre-allocate persistent dp/cp ep padding buffers with maximum capacity.
+  const int64_t dp_size = std::max<int64_t>(options.dp_size(), /*b=*/1);
+  const int64_t base_length =
+      max_graph_tokens_ *
+      std::max<int64_t>(args.num_experts_per_tok(), /*b=*/1);
+  const float buffer_factor =
+      get_dp_ep_all2all_buffer_factor(base_length * dp_size);
+  const int64_t moe_capacity =
+      static_cast<int64_t>(std::ceil(base_length * buffer_factor));
+  const int64_t aligned_moe_capacity =
+      util::ceil_div(moe_capacity, dp_size) * dp_size;
   const int64_t padding_buf_capacity =
-      get_dp_ep_padding_buffer_capacity(args, options);
+      std::max(max_graph_tokens_ * dp_size, aligned_moe_capacity);
   torch::TensorOptions int_opts = torch::dtype(torch::kInt32).device(device);
 
   persistent_dp_ep_padding_
@@ -286,23 +254,16 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
       .post_lmhead_gather_indices(
           torch::zeros({padding_buf_capacity}, int_opts));
 
-  // Do not need to create ATB context and custom paged attention operation
-  if (args_.head_dim() == 0) {
-    return;
+  if (need_update_attention_plan_ && args_.head_dim() != 0) {
+    initialize_paged_attention_plan_context(device);
   }
-
-  if (!need_update_attention_plan_) {
-    return;
-  }
-
-  initialize_paged_attention_plan_context(device);
 }
 
 namespace {
 // Copy src into a pre-allocated persistent buffer. The buffer must already be
 // large enough (allocated in GraphPersistentParam constructor).
 void copy_into_persistent(torch::Tensor& persistent, const torch::Tensor& src) {
-  if (!src.defined() || src.numel() == 0 || !persistent.defined()) {
+  if (!src.defined() || src.numel() == 0) {
     return;
   }
   CHECK_LE(src.size(0), persistent.size(0))
@@ -314,7 +275,7 @@ void copy_into_persistent(torch::Tensor& persistent, const torch::Tensor& src) {
 
 torch::Tensor slice_like_source(const torch::Tensor& persistent,
                                 const torch::Tensor& src) {
-  if (!src.defined() || src.numel() == 0 || !persistent.defined()) {
+  if (!src.defined() || src.numel() == 0) {
     return persistent;
   }
   return persistent.slice(/*dim=*/0, /*start=*/0, /*end=*/src.size(0));
@@ -324,8 +285,6 @@ int64_t get_graph_lm_head_index_length(const torch::Tensor& src,
                                        uint32_t padded_tokens,
                                        int32_t dp_size,
                                        bool enable_no_padding) {
-  CHECK(src.defined());
-  CHECK_GT(src.numel(), 0);
   if (dp_size > 1) {
     // DP padding lays out every shard at the graph width. Keep the lm-head
     // index view at that dense length even when the raw valid rows shrink.
@@ -471,10 +430,8 @@ void GraphPersistentParam::set_aux_hidden_states(const torch::Tensor& value) {
   }
   const uint32_t result_tokens = value.size(0);
   if (aux_hidden_states_.numel() == 0) {
-    const int64_t graph_token_capacity =
-        get_decode_graph_token_capacity(options_);
     auto shape = value.sizes().vec();
-    shape[0] = graph_token_capacity;
+    shape[0] = max_graph_tokens_;
     torch::Dtype dtype = util::parse_dtype(args_.dtype(), device_);
     if (args_.dtype() == "float" || args_.dtype() == "float32") {
       dtype = torch::kFloat32;
@@ -779,11 +736,7 @@ std::optional<Params> GraphPersistentParam::update(
                             ? params.meta.num_sequences
                             : params.meta.actual_num_sequences;
   } else if (params.meta.num_sequences != 0) {
-    const int32_t num_decoding_tokens =
-        acl_graph_decode_tokens_per_sequence(options_.num_speculative_tokens(),
-                                             options_.speculative_algorithm(),
-                                             options_.is_draft_engine());
-    actual_batch_size = actual_num_tokens / num_decoding_tokens;
+    actual_batch_size = actual_num_tokens / decode_query_len_;
   }
   const int32_t q_max_seq_len = std::max<int32_t>(params.meta.q_max_seq_len, 1);
   const int64_t padded_batch_size =
@@ -1066,8 +1019,37 @@ std::optional<Params> GraphPersistentParam::update(
 
   const bool use_expanded_spec_decode_attention =
       !params.graph.expanded_kv_seq_lens_vec.empty();
-  if (need_update_attn_mask_ && !is_target_verify) {
-    update_attention_mask(params);
+  if (is_hybrid_linear_attention_ && !is_target_verify) {
+    const auto& kv_seq_lens = params.attention.device.kv_seq_lens;
+    const int64_t num_decode_tokens = kv_seq_lens.size(/*dim=*/0);
+    const int64_t max_mask_kv_len = persistent_mask_.size(/*dim=*/1);
+    const int64_t mask_kv_len = params.meta.kv_max_seq_len > 0
+                                    ? params.meta.kv_max_seq_len
+                                    : max_mask_kv_len;
+    CHECK_LE(num_decode_tokens, persistent_mask_.size(/*dim=*/0));
+    CHECK_LE(mask_kv_len, max_mask_kv_len);
+
+    const auto int_options =
+        torch::TensorOptions().dtype(/*dtype=*/torch::kInt32).device(device_);
+    const auto positions = torch::arange(mask_kv_len, int_options)
+                               .unsqueeze(/*dim=*/0)
+                               .expand({num_decode_tokens, mask_kv_len});
+    const auto context_lens = kv_seq_lens.to(/*dtype=*/torch::kInt32)
+                                  .unsqueeze(/*dim=*/1)
+                                  .expand({num_decode_tokens, mask_kv_len});
+    const auto mask_condition = positions >= context_lens;
+    const auto zero_slice =
+        persistent_mask_zero_template_
+            .slice(/*dim=*/0, /*start=*/0, /*end=*/num_decode_tokens)
+            .slice(/*dim=*/1, /*start=*/0, /*end=*/mask_kv_len);
+    const auto fill_slice =
+        persistent_mask_fill_template_
+            .slice(/*dim=*/0, /*start=*/0, /*end=*/num_decode_tokens)
+            .slice(/*dim=*/1, /*start=*/0, /*end=*/mask_kv_len);
+    persistent_mask_.slice(/*dim=*/0, /*start=*/0, /*end=*/num_decode_tokens)
+        .slice(/*dim=*/1, /*start=*/0, /*end=*/mask_kv_len)
+        .copy_(torch::where(mask_condition, fill_slice, zero_slice),
+               /*non_blocking=*/true);
   }
 
   std::vector<int32_t> padded_kv_seq_lens_vec(
@@ -1322,7 +1304,7 @@ std::optional<Params> GraphPersistentParam::update(
     // not consume graph.attn_mask, so do not capture a stale persistent mask.
     if (is_target_verify) {
       graph_params->graph.attn_mask = torch::Tensor();
-    } else if (need_update_attn_mask_) {
+    } else if (is_hybrid_linear_attention_) {
       graph_params->graph.attn_mask = persistent_mask_.slice(
           /*dim=*/0, /*start=*/0, /*end=*/padded_num_tokens);
     }
@@ -1444,7 +1426,7 @@ void GraphPersistentParam::initialize_paged_attention_plan_context(
 
   atb::customize::CustomPagedAttentionParam pa_op_param;
   // default mask type is UNDEFINED, which means no mask is needed
-  if (need_update_attn_mask_) {
+  if (is_hybrid_linear_attention_) {
     pa_op_param.maskType =
         atb::infer::PagedAttentionParam::MaskType::MASK_TYPE_NORM;
   }
@@ -1792,8 +1774,7 @@ void GraphPersistentParam::plan_paged_attention_tiling(
                        static_cast<uint64_t>(head_dim_) * element_size;
 
   atb::VariantPack custom_variantPack;
-  // Conditionally include mask based on need_update_attn_mask_
-  if (need_update_attn_mask_) {
+  if (is_hybrid_linear_attention_) {
     atb::Tensor atb_mask = atb::at_tensor_to_atb_tensor(persistent_mask_);
     custom_variantPack.inTensors = {atb_query,
                                     atb_k_cache,
@@ -1803,7 +1784,6 @@ void GraphPersistentParam::plan_paged_attention_tiling(
                                     atb_mask,
                                     atb_tiling_data};
   } else {
-    // Skip mask when not needed
     custom_variantPack.inTensors = {atb_query,
                                     atb_k_cache,
                                     atb_v_cache,
@@ -1852,127 +1832,6 @@ void GraphPersistentParam::plan_paged_attention_tiling(
                          stream);
     CHECK_EQ(acl_status, ACL_SUCCESS)
         << "Failed to copy tiling buffer to device";
-  }
-}
-
-template <typename Params>
-void GraphPersistentParam::update_attention_mask(const Params& input_params) {
-  // update persistent_mask_ in-place
-  const int64_t batch_size = input_params.attention.device.kv_seq_lens.size(0);
-  const int64_t max_seq_len = input_params.meta.kv_max_seq_len > 0
-                                  ? input_params.meta.kv_max_seq_len
-                                  : args_.max_position_embeddings();
-
-  // persistent_mask_ is already initialized in constructor
-  // Check if size is sufficient
-  CHECK_LE(max_seq_len, persistent_mask_.size(1))
-      << "max_seq_len (" << max_seq_len << ") exceeds max_seq_len ("
-      << persistent_mask_.size(1) << ")";
-
-  // Check if q_max_seq_len > 1 (prefill mode, not decode mode)
-  bool chunked_prefill = input_params.meta.q_max_seq_len > 1;
-
-  // Calculate num_tokens: in chunked mode, sum of all q_len; in decode mode,
-  // batch_size
-  int64_t num_tokens = batch_size;  // Default for decode mode
-  if (chunked_prefill) {
-    CHECK_EQ(input_params.attention.host.q_seq_lens.size(), batch_size)
-        << "q_seq_lens_vec size ("
-        << input_params.attention.host.q_seq_lens.size() << ") != batch_size ("
-        << batch_size << ")";
-    num_tokens = std::accumulate(
-        input_params.attention.host.q_seq_lens.begin(),
-        input_params.attention.host.q_seq_lens.begin() + batch_size,
-        int64_t(0));
-  }
-
-  // Check if num_tokens is within bounds
-  CHECK_LE(num_tokens, persistent_mask_.size(0))
-      << "num_tokens (" << num_tokens
-      << ") exceeds graph attention-mask capacity (" << persistent_mask_.size(0)
-      << ")";
-
-  // Get slice for actual num_tokens (compatible with both chunked and
-  // non-chunked)
-  auto mask_slice =
-      persistent_mask_.slice(/*dim=*/0, /*start=*/0, /*end=*/num_tokens)
-          .slice(/*dim=*/1, /*start=*/0, /*end=*/max_seq_len);
-
-  CHECK(persistent_mask_zero_template_.defined() &&
-        persistent_mask_fill_template_.defined())
-      << "persistent mask templates must be initialized";
-
-  if (chunked_prefill) {
-    // Generate mask considering both q_seq_lens and kv_seq_lens
-    // For each sequence, generate mask with shape [q_len, kv_len]
-    // mask_slice is [num_tokens, max_seq_len], where num_tokens = sum of all
-    // q_len
-
-    // Check if kv_seq_lens_vec is available
-    CHECK_EQ(input_params.attention.host.kv_seq_lens.size(), batch_size)
-        << "kv_seq_lens_vec size ("
-        << input_params.attention.host.kv_seq_lens.size() << ") != batch_size ("
-        << batch_size << ")";
-
-    int64_t offset = 0;
-    for (int64_t i = 0; i < batch_size; i++) {
-      const int32_t q_len = input_params.attention.host.q_seq_lens[i];
-      const int32_t kv_len = input_params.attention.host.kv_seq_lens[i];
-
-      // For chunked mode, slice out q_len rows for this sequence
-      // mask_slice is [num_tokens, max_seq_len]
-      // Get [q_len, kv_len] slice from mask_slice[offset:offset+q_len, :kv_len]
-      auto seq_mask_slice =
-          mask_slice.slice(/*dim=*/0, /*start=*/offset, /*end=*/offset + q_len)
-              .slice(
-                  /*dim=*/1, /*start=*/0, /*end=*/kv_len);  // [q_len, kv_len]
-      auto seq_zero_slice = persistent_mask_zero_template_
-                                .slice(/*dim=*/0,
-                                       /*start=*/offset,
-                                       /*end=*/offset + q_len)
-                                .slice(/*dim=*/1, /*start=*/0, /*end=*/kv_len);
-      auto seq_fill_slice = persistent_mask_fill_template_
-                                .slice(/*dim=*/0,
-                                       /*start=*/offset,
-                                       /*end=*/offset + q_len)
-                                .slice(/*dim=*/1, /*start=*/0, /*end=*/kv_len);
-
-      // Generate mask for this sequence: [q_len, kv_len]
-      int32_t diagonal = kv_len - q_len;
-      auto int_options =
-          torch::TensorOptions().dtype(torch::kInt32).device(device_);
-      auto row = torch::arange(q_len, int_options).unsqueeze(1);
-      auto col = torch::arange(kv_len, int_options).unsqueeze(0);
-      auto bias = col > (row + diagonal);  // True positions need to be masked
-      seq_mask_slice.copy_(torch::where(bias, seq_fill_slice, seq_zero_slice),
-                           /*non_blocking=*/true);
-
-      // Update offset for next sequence
-      offset += q_len;
-    }
-  } else {
-    // Original logic: only consider kv_seq_lens (decode mode, q_len = 1 for
-    // all)
-    auto int_options =
-        torch::TensorOptions().dtype(torch::kInt32).device(device_);
-    auto positions = torch::arange(max_seq_len, int_options)
-                         .unsqueeze(0)
-                         .expand({batch_size, max_seq_len});
-
-    auto context_lens_expanded =
-        input_params.attention.device.kv_seq_lens.to(torch::kInt32)
-            .unsqueeze(1)
-            .expand({batch_size, max_seq_len});
-
-    auto mask_condition = positions >= context_lens_expanded;
-    auto zero_slice = persistent_mask_zero_template_
-                          .slice(/*dim=*/0, /*start=*/0, /*end=*/num_tokens)
-                          .slice(/*dim=*/1, /*start=*/0, /*end=*/max_seq_len);
-    auto fill_slice = persistent_mask_fill_template_
-                          .slice(/*dim=*/0, /*start=*/0, /*end=*/num_tokens)
-                          .slice(/*dim=*/1, /*start=*/0, /*end=*/max_seq_len);
-    mask_slice.copy_(torch::where(mask_condition, fill_slice, zero_slice),
-                     /*non_blocking=*/true);
   }
 }
 

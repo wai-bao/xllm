@@ -941,7 +941,6 @@ TEST(AclGraphPersistentParamTest,
     npu::GraphPersistentParam target(args,
                                      device,
                                      options,
-                                     /*need_update_attn_mask=*/false,
                                      /*is_hybrid_linear_attention=*/true);
     // 3 sequences x 3 tokens: exact mode needs 3 metadata rows; the padded
     // bucket has 16 tokens and needs 6 metadata rows.
@@ -1004,12 +1003,7 @@ TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
   options.is_draft_engine(false);
 
   const torch::Device device("npu:0");
-  ::xllm::npu::GraphPersistentParam persistent_param(
-      args,
-      device,
-      options,
-      /*need_update_attn_mask=*/false,
-      /*is_hybrid_linear_attention=*/false);
+  ::xllm::npu::GraphPersistentParam persistent_param(args, device, options);
   const int64_t expected_token_capacity =
       runtime::get_decode_graph_token_bucket(
           static_cast<int64_t>(options.max_seqs_per_batch()) *
@@ -1055,7 +1049,6 @@ TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
       args,
       device,
       options,
-      /*need_update_attn_mask=*/false,
       /*is_hybrid_linear_attention=*/true);
   // 10 seqs x 3 decoding tokens = 30 rows -> bucket 32 -> 11 metadata rows.
   EXPECT_EQ(hybrid_persistent_param.persistent_block_tables().size(0), 11);
@@ -1091,7 +1084,6 @@ TEST_P(HybridSpecVerifyPaddingTest, MetadataCoversBucketPadding) {
       args,
       device,
       options,
-      /*need_update_attn_mask=*/false,
       /*is_hybrid_linear_attention=*/true);
   EXPECT_EQ(persistent_param.persistent_block_tables().size(0), kMetadataRows);
   const torch::TensorOptions int_options =
@@ -1197,7 +1189,6 @@ TEST(AclGraphPersistentParamTest,
       args,
       device,
       options,
-      /*need_update_attn_mask=*/false,
       /*is_hybrid_linear_attention=*/true);
 
   ModelParamsView params = ModelInputSnapshot(LlmModelParams()).view();
@@ -1433,7 +1424,6 @@ TEST(AclGraphPersistentParamTest, SpecVerifyGraphUpdateSupportsRuntimeBatch) {
       args,
       device,
       options,
-      /*need_update_attn_mask=*/false,
       /*is_hybrid_linear_attention=*/true);
 
   ModelParamsView params = ModelInputSnapshot(LlmModelParams()).view();

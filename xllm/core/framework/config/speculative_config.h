@@ -48,6 +48,8 @@ class SpeculativeConfig final {
     return boost::iequals(algorithm, "DFlash2");
   }
 
+  static bool is_dflash_family(std::string_view algorithm);
+
   static bool is_dspark_algorithm(std::string_view algorithm) {
     return boost::iequals(algorithm, "DSpark");
   }
@@ -77,10 +79,11 @@ class SpeculativeConfig final {
   }
 
   // Drafts that generate a block of speculative tokens in one forward.
-  static bool is_block_diffusion_algorithm(std::string_view algorithm) {
-    return is_dflash_algorithm(algorithm) || is_dflash2_algorithm(algorithm) ||
-           is_dspark_algorithm(algorithm);
-  }
+  static bool is_block_diffusion_algorithm(std::string_view algorithm);
+
+  static int32_t decode_query_len(int32_t num_speculative_tokens,
+                                  std::string_view algorithm = {},
+                                  bool is_draft_engine = false);
 
   static std::optional<bool> chunked_block_diffusion(
       std::string_view algorithm,

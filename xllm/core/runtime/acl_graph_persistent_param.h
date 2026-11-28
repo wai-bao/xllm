@@ -66,7 +66,6 @@ class GraphPersistentParam final {
   GraphPersistentParam(const ModelArgs& args,
                        const torch::Device& device,
                        const runtime::Options& options,
-                       bool need_update_attn_mask = false,
                        bool is_hybrid_linear_attention = false,
                        bool supports_mla_graph_kv_bucketing = false);
 
@@ -178,10 +177,6 @@ class GraphPersistentParam final {
   // Initialize ATB context and custom paged attention operation.
   void initialize_paged_attention_plan_context(const torch::Device& device);
 
-  // Update attention mask efficiently from input parameters
-  template <typename Params>
-  void update_attention_mask(const Params& input_params);
-
   template <typename Params>
   void update_eplb_decode_token_mask(const Params& input_params,
                                      uint32_t padded_num_tokens);
@@ -208,6 +203,8 @@ class GraphPersistentParam final {
   const ModelArgs& args_;
   const torch::Device& device_;
   const runtime::Options& options_;
+  const int32_t decode_query_len_;
+  const int64_t max_graph_tokens_;
 
   // Persistent tensors
   torch::Tensor persistent_tokens_;
@@ -264,8 +261,6 @@ class GraphPersistentParam final {
   int32_t num_head_;
   int32_t head_dim_;
 
-  // Flag indicating whether attention mask needs to be updated
-  bool need_update_attn_mask_;
   // Flag indicating whether the model uses hybrid linear attention
   // (e.g., Qwen3.5/Next with gated delta net layers)
   bool is_hybrid_linear_attention_;

@@ -197,12 +197,10 @@ class AclGraphExecutorImpl final : public ExecutorImpl {
   // not own
   CausalLM* model_ = nullptr;
 
-  void initialize(bool need_update_attn_mask,
-                  bool is_hybrid_linear_attention,
-                  bool supports_mla_graph_kv_bucketing);
   ModelArgs args_;
   torch::Device device_;
   runtime::Options options_;
+  const int32_t decode_query_len_;
 
   struct GraphSlot {
     std::unique_ptr<GraphPersistentParam> persistent_param;

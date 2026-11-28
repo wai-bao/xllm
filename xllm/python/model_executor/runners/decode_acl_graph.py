@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import Literal, cast
 
 import torch
 import torch.distributed as dist
@@ -187,9 +187,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
         *,
         is_spec_draft: bool = False,
         enable_graph_mode_decode_no_padding: bool = False,
-        device_kv_lengths: bool = False,
-        kv_capacity_graphs: bool = False,
-        max_capture_tokens: int | None = None,
+        kv_capacity_length_source: Literal["host", "device"] | None = None,
     ) -> None:
         super().__init__(model, attention_backend, device)
         self.dp_size = dp_size
@@ -201,7 +199,7 @@ class DecodeAclGraphRunner(AclGraphRunner):
         self._windowed_decode = (
             not getattr(attention_backend, "is_mla", False) and block_draft_model_window_context(model) is not None
         )
-        self._max_capture_tokens = max_capture_tokens
+        self._max_capture_tokens = getattr(model, "graph_capture_token_limit", None)
         self._enable_decode_no_padding = enable_graph_mode_decode_no_padding
         # New exact shapes can arrive while native input preparation copies
         # the next batch on another thread. Only this thread captures the
@@ -212,10 +210,10 @@ class DecodeAclGraphRunner(AclGraphRunner):
         self._serial_buffers = AclGraphBufferPool(self.max_batch)
         # Token-row capacity graphs are captured at startup. Request-row
         # layouts retain lazy tiers and coordinate missing variants under DP.
-        self._kv_capacity_graphs = kv_capacity_graphs or device_kv_lengths
+        self._kv_capacity_graphs = kv_capacity_length_source is not None
         if self._kv_capacity_graphs and dp_size != 1:
             raise ValueError("KV-capacity ACL graphs require DP size one")
-        self._device_kv_lengths = device_kv_lengths
+        self._device_kv_lengths = kv_capacity_length_source == "device"
         self._has_index_cache = False
         self._has_linear_cache = False
         self._model_owns_linear_spec_verify = any(
@@ -331,25 +329,20 @@ class DecodeAclGraphRunner(AclGraphRunner):
         except RuntimeError:
             return None
         is_expanded_spec_verify = expanded_view is not None
-        if is_expanded_spec_verify and self._shared_kv_layout() is not None and not self._model_owns_linear_spec_verify:
+        if is_expanded_spec_verify:
+            if self._model_owns_linear_spec_verify:
+                query_lens = self._expanded_query_lens(metadata)
+                width = metadata.decode_query_width
+                if width is None or _uniform_span_width(query_lens) != width:
+                    return None
             # Shared KDA verification still uses a single state-index space.
-            # Model-owned GDN metadata supplies independent Conv/SSM rows.
-            return None
-        if (metadata.is_prefill or metadata.is_chunked_prefill) and not is_expanded_spec_verify:
-            return None
-        if is_expanded_spec_verify and self._model_owns_linear_spec_verify:
-            query_lens = self._expanded_query_lens(metadata)
-            if metadata.decode_query_width is None or _uniform_span_width(query_lens) != metadata.decode_query_width:
+            elif self._shared_kv_layout() is not None or (
+                self._has_linear_cache
+                and not self.attention_backend.is_mla
+                and not self.attention_backend.supports_linear_spec_verify_graph
+            ):
                 return None
-
-        # Linear verify requires a backend recurrent-state protocol.
-        if (
-            is_expanded_spec_verify
-            and not self.attention_backend.is_mla
-            and self._has_linear_cache
-            and not self.attention_backend.supports_linear_spec_verify_graph
-            and not self._model_owns_linear_spec_verify
-        ):
+        elif metadata.is_prefill or metadata.is_chunked_prefill:
             return None
 
         batch_size = input_ids.numel()

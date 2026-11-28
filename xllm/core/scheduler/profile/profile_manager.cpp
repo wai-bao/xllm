@@ -38,6 +38,7 @@ limitations under the License.
 #include "core/framework/config/service_config.h"
 #include "core/framework/request/request_state.h"
 #include "core/runtime/acl_graph_bucket_policy.h"
+#include "core/runtime/decode_graph_bucket.h"
 #include "core/scheduler/profile/graph_warmup.h"
 #include "core/util/utils.h"
 #include "platform/platform.h"

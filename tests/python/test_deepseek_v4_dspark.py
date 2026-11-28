@@ -24,7 +24,6 @@ import torch.nn as nn
 
 from xllm.python import registry
 from xllm.python.model_loader.module_loaders import load_w8a8_dynamic_projection
-from xllm.python.model_platform_support import is_deepseek_v4_model
 from xllm.python.models import deepseek_v4_dspark, deepseek_v32
 from xllm.python.models.deepseek_v4 import DeepseekV4ForCausalLM
 from xllm.python.models.deepseek_v4_dspark import (
@@ -127,9 +126,6 @@ class _LayerSynchronizer:
 def test_registry_resolves_deepseek_v4_dspark(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(registry.current_platform, "device_type", lambda: "npu")
     assert get_model_class("deepseek_v4_dspark") is DeepseekV4DSparkForCausalLM
-    assert is_deepseek_v4_model({"model_type": "deepseek_v4_dspark"})
-    assert is_deepseek_v4_model({"model_type": "deepseek_v4"})
-    assert is_deepseek_v4_model({"model_type": "glm_moe_dsa"}) is False
 
 
 def test_dspark_config_builds_only_draft_layers() -> None:

@@ -26,7 +26,6 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/common/types.h"
-#include "core/framework/config/model_config.h"
 #include "core/framework/model/model_type.h"
 #include "core/framework/sampling/sampler.h"
 #include "core/framework/sampling/sampling_params.h"
@@ -53,28 +52,6 @@ void DSparkWorkerImpl::apply_draft_model_overrides(ModelArgs& args) {
                         ? std::string(kDSparkGLM5DraftModelType)
                         : "DSparkDraftModel");
   }
-}
-
-bool DSparkWorkerImpl::init_model(const std::string& model_weights_path,
-                                  int32_t random_seed,
-                                  MasterStatus master_status) {
-  const bool result = DFlashWorkerImpl::init_model(
-      model_weights_path, random_seed, master_status);
-  if (draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
-    draft_needs_dummy_tokens_ =
-        prepare_for_draft().per_request &&
-        ModelConfig::is_python_model_impl(context_.get_model_impl());
-  }
-  return result;
-}
-
-DecodeExpansionOptions DSparkWorkerImpl::prepare_for_draft() const {
-  auto decode_options = DFlashWorkerImpl::prepare_for_draft();
-  decode_options.query_width = options_.num_speculative_tokens();
-  decode_options.per_request =
-      draft_impl_->context_.get_model_args().model_type() !=
-      "deepseek_v4_dspark";
-  return decode_options;
 }
 
 std::pair<torch::Tensor, torch::Tensor> DSparkWorkerImpl::run_decode_draft(

@@ -41,14 +41,12 @@ def _graph_entry(runner: DecodeAclGraphRunner, state: EplbRuntimeState) -> Simpl
 def test_executor_forwards_worker_eplb_state_to_eager_runner() -> None:
     executor = object.__new__(ModelExecutor)
     executor.context_kv_graph_runner = None
-    executor._kv_bound = True
     executor.requires_input_batch_metadata = False
     executor.layerwise_split_size = 1
     executor.decode_graph_runner = None
     executor.inductor_runner = None
     executor.eager_runner = MagicMock()
     executor.eager_runner.execute.return_value = torch.ones(1)
-    executor.requires_input_batch_metadata = False
     executor._eager_multimodal_prefill = False
 
     metadata = SimpleNamespace(is_prefill=False, is_chunked_prefill=False)

@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/framework/multimodal/mm_data.h"
 #include "core/framework/multimodal/mm_visitor.h"
 #include "core/framework/multimodal/multimodal_utils.h"
+#include "core/framework/speculative/mtp_async_state.h"
 #include "core/framework/speculative/spec_verify.h"
 #include "core/layers/common/attention_metadata.h"
 #include "core/layers/common/attention_metadata_builder.h"
@@ -201,7 +202,8 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   executor_config["instance_role"] = options_.instance_role().to_string();
   executor_config["task_type"] = options_.task_type();
   executor_config["max_encoder_cache_size"] = options_.max_encoder_cache_size();
-  executor_config["num_speculative_tokens"] = options_.num_speculative_tokens();
+  const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+  executor_config["num_speculative_tokens"] = num_speculative_tokens;
   executor_config["engine_type"] = SpeculativeConfig::uses_ssm_engine(
                                        options_.draft_model_path().value_or(""),
                                        options_.speculative_algorithm(),
@@ -213,14 +215,7 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
   executor_config["enable_schedule_overlap"] =
       options_.enable_schedule_overlap();
   executor_config["is_draft_engine"] = options_.is_draft_engine();
-  executor_config["is_mtp_algorithm"] =
-      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm());
-  executor_config["is_block_diffusion_algorithm"] =
-      SpeculativeConfig::is_block_diffusion_algorithm(
-          options_.speculative_algorithm());
-  executor_config["requires_aux_hidden_capture"] =
-      SpeculativeConfig::requires_aux_hidden_capture(
-          options_.speculative_algorithm());
+  executor_config["speculative_algorithm"] = options_.speculative_algorithm();
   executor_config["enable_graph_mode_decode_no_padding"] =
       options_.enable_graph_mode_decode_no_padding();
   // Offline vision graph capture remains unsupported. Keep this policy local
@@ -232,18 +227,29 @@ PyExecutorImpl::PyExecutorImpl(CausalLM* model,
       options_.mm_encoder_graph_capture_shapes();
   // DFlash2 defaults to eager in the model config. Enable its independent
   // full-block ACL runner when the worker requests graph execution.
-  const bool independent_block_graph =
-      Platform::is_npu() && args_.model_type() == "DFlash2DraftModel" &&
-      options_.enable_graph() && options_.num_speculative_tokens() > 0;
-  if (independent_block_graph) {
+  if (Platform::is_npu() && args_.model_type() == "DFlash2DraftModel" &&
+      options_.enable_graph() && num_speculative_tokens > 0) {
     executor_config["enable_graph"] = true;
     executor_config["python_graph_backend"] = "aclgraph";
+  }
+  const auto& algorithm = options_.speculative_algorithm();
+  int32_t max_decode_query_len = SpeculativeConfig::decode_query_len(
+      num_speculative_tokens, algorithm, options_.is_draft_engine());
+  if (options_.is_draft_engine() &&
+      SpeculativeConfig::is_mtp_algorithm(algorithm)) {
+    // Sequential MTP can replay two rows to repair the draft KV tail.
+    max_decode_query_len =
+        mtp_async::classify_combined_draft_execution_path(args_.model_type()) ==
+                mtp_async::CombinedDraftExecutionPath::QWEN3_5_PAGED_ATTENTION
+            ? SpeculativeConfig::decode_query_len(num_speculative_tokens)
+            : 2;
   }
   py_executor_ = executor_module.attr("ModelExecutor")(
       py_causal_lm_->python_model(),
       executor_config,
       options_.max_seqs_per_batch(),
-      options_.acl_graph_decode_batch_size_limit());
+      options_.acl_graph_decode_batch_size_limit(),
+      py::arg(/*name=*/"max_decode_query_len") = max_decode_query_len);
   py_causal_lm_->set_context_kv_graph_runner(
       py_executor_.attr("context_kv_graph_runner"));
   requires_input_batch_metadata_ =
@@ -503,7 +509,6 @@ ModelOutput PyExecutorImpl::run(const torch::Tensor& tokens,
                                    input_embedding,
                                    py_sync,
                                    topk_indices,
-                                   /*enable_graph=*/false,
                                    expert_load_data,
                                    eplb_decode_token_mask,
                                    params.meta.is_graph_warmup,

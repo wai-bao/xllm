@@ -161,7 +161,7 @@ def _assert_fia_capacity_graphs(
         device,
         graph_rows,
         8192,
-        device_kv_lengths=True,
+        kv_capacity_length_source="device",
         enable_graph_mode_decode_no_padding=not padded,
     )
     runner.bind_layer_caches([cache])

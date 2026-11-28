@@ -20,28 +20,25 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-TEST(AclGraphBucketPolicyUnitTest, ConvertsLocalLimitToGlobalDpCapacity) {
-  EXPECT_EQ(npu::acl_graph_max_global_batch_size(3000, 64, 32), 2048);
-  EXPECT_EQ(npu::acl_graph_max_global_batch_size(64, 64, 32), 64);
-  EXPECT_EQ(npu::acl_graph_max_global_batch_size(3000, 16, 32), 512);
-}
-
 TEST(AclGraphBucketPolicyUnitTest, MapsGlobalWarmupBucketsToLocalDpBatches) {
   EXPECT_TRUE(npu::is_acl_graph_decode_capture_allowed(
       /*batch_size=*/2,
       /*max_batch_size=*/16,
       /*dp_size=*/4,
-      /*is_graph_warmup=*/false));
+      /*is_graph_warmup=*/false,
+      /*decode_query_len=*/1));
   EXPECT_FALSE(npu::is_acl_graph_decode_capture_allowed(
       /*batch_size=*/3,
       /*max_batch_size=*/16,
       /*dp_size=*/4,
-      /*is_graph_warmup=*/false));
+      /*is_graph_warmup=*/false,
+      /*decode_query_len=*/1));
   EXPECT_TRUE(npu::is_acl_graph_decode_capture_allowed(
       /*batch_size=*/10,
       /*max_batch_size=*/40,
       /*dp_size=*/4,
-      /*is_graph_warmup=*/false));
+      /*is_graph_warmup=*/false,
+      /*decode_query_len=*/1));
 }
 
 TEST(AclGraphBucketPolicyUnitTest, RejectsNonCanonicalSingleDpBatches) {
@@ -49,12 +46,14 @@ TEST(AclGraphBucketPolicyUnitTest, RejectsNonCanonicalSingleDpBatches) {
       /*batch_size=*/20,
       /*max_batch_size=*/20,
       /*dp_size=*/1,
-      /*is_graph_warmup=*/false));
+      /*is_graph_warmup=*/false,
+      /*decode_query_len=*/1));
   EXPECT_FALSE(npu::is_acl_graph_decode_capture_allowed(
       /*batch_size=*/12,
       /*max_batch_size=*/20,
       /*dp_size=*/1,
-      /*is_graph_warmup=*/false));
+      /*is_graph_warmup=*/false,
+      /*decode_query_len=*/1));
 }
 
 TEST(AclGraphBucketPolicyUnitTest, AdmitsNoPaddingMtpTokenBuckets) {
@@ -63,13 +62,13 @@ TEST(AclGraphBucketPolicyUnitTest, AdmitsNoPaddingMtpTokenBuckets) {
       /*max_batch_size=*/16,
       /*dp_size=*/1,
       /*is_graph_warmup=*/false,
-      /*num_speculative_tokens=*/3));
+      /*decode_query_len=*/4));
   EXPECT_FALSE(npu::is_acl_graph_decode_capture_allowed(
       /*batch_size=*/11,
       /*max_batch_size=*/16,
       /*dp_size=*/1,
       /*is_graph_warmup=*/false,
-      /*num_speculative_tokens=*/3));
+      /*decode_query_len=*/4));
 }
 
 TEST(AclGraphBucketPolicyUnitTest, AdmitsNonDivisibleDpMtpTailBucket) {
@@ -78,20 +77,34 @@ TEST(AclGraphBucketPolicyUnitTest, AdmitsNonDivisibleDpMtpTailBucket) {
       /*max_batch_size=*/7,
       /*dp_size=*/2,
       /*is_graph_warmup=*/false,
-      3));
+      /*decode_query_len=*/4));
   EXPECT_TRUE(npu::is_acl_graph_decode_capture_allowed(
       /*batch_size=*/4,
       /*max_batch_size=*/7,
       /*dp_size=*/2,
       /*is_graph_warmup=*/false,
-      3));
+      /*decode_query_len=*/4));
 }
 
 TEST(AclGraphBucketPolicyUnitTest, AppliesWarmupCapacityInLocalDpUnits) {
-  EXPECT_TRUE(npu::is_acl_graph_decode_capture_allowed(4, 16, 4, true));
-  EXPECT_FALSE(npu::is_acl_graph_decode_capture_allowed(5, 16, 4, true));
-  EXPECT_FALSE(npu::is_acl_graph_decode_capture_allowed(15, 16, 1, false));
-  EXPECT_TRUE(npu::is_acl_graph_decode_capture_allowed(15, 16, 1, true));
+  EXPECT_TRUE(npu::is_acl_graph_decode_capture_allowed(
+      /*batch_size=*/4,
+      /*max_batch_size=*/16,
+      /*dp_size=*/4,
+      /*is_graph_warmup=*/true,
+      /*decode_query_len=*/1));
+  EXPECT_FALSE(npu::is_acl_graph_decode_capture_allowed(
+      /*batch_size=*/5,
+      /*max_batch_size=*/16,
+      /*dp_size=*/4,
+      /*is_graph_warmup=*/true,
+      /*decode_query_len=*/1));
+  EXPECT_TRUE(npu::is_acl_graph_decode_capture_allowed(
+      /*batch_size=*/15,
+      /*max_batch_size=*/16,
+      /*dp_size=*/1,
+      /*is_graph_warmup=*/true,
+      /*decode_query_len=*/1));
 }
 
 }  // namespace

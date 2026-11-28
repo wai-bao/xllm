@@ -26,6 +26,8 @@ limitations under the License.
 
 #include "common/metrics.h"
 #include "core/framework/config/kernel_config.h"
+#include "core/framework/config/model_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/sampling/sampling_params.h"
 #include "core/framework/speculative/spec_verify.h"
@@ -100,22 +102,21 @@ std::vector<int64_t> build_accepted_context_rows(
 }  // namespace
 
 bool DFlashWorkerImpl::prepare_parallel_draft_metadata(
-    LlmForwardInput& query_input,
-    const DecodeExpansionOptions& decode_options) {
+    LlmForwardInput& query_input) {
   auto& params = query_input.input_params;
-  scale_decode_parallel_token_counts(params, decode_options.query_width);
+  scale_decode_parallel_token_counts(params, draft_decode_options_.query_width);
   if (!draft_needs_dummy_tokens_) {
     return false;
   }
   std::replace(params.parallel.dp_global_token_nums.begin(),
                params.parallel.dp_global_token_nums.end(),
                0,
-               decode_options.query_width);
+               draft_decode_options_.query_width);
   if (params.meta.num_sequences != 0) {
     return false;
   }
 
-  build_idle_decode_input(query_input, decode_options);
+  build_idle_decode_input(query_input, draft_decode_options_);
   params.meta.actual_num_sequences = 0;
   query_input.runtime.input_host_buffer_has_layout = false;
   c10::StreamGuard stream_guard = prepare_stream_->set_stream_guard();
@@ -201,19 +202,38 @@ bool DFlashWorkerImpl::init_model(const std::string& model_weights_path,
     const std::string config_path = model_weights_path + "/config.json";
     CHECK(reader.parse(config_path))
         << "Failed to parse block-diffusion draft config: " << config_path;
-    mask_token_id_ = reader.value_or<int32_t>({"dflash_config.mask_token_id",
-                                               "mask_token_id",
-                                               "dspark_noise_token_id"},
-                                              /*default=*/-1);
-    CHECK_GE(mask_token_id_, 0)
+    const int32_t mask_token_id =
+        reader.value_or<int32_t>({"dflash_config.mask_token_id",
+                                  "mask_token_id",
+                                  "dspark_noise_token_id"},
+                                 /*default=*/-1);
+    CHECK_GE(mask_token_id, 0)
         << "Block-diffusion draft config requires mask_token_id, "
            "dflash_config.mask_token_id, or dspark_noise_token_id.";
 
     const ModelArgs& target_args = impl_->context_.get_model_args();
-    CHECK_LT(mask_token_id_, target_args.vocab_size())
-        << "Block-diffusion mask_token_id (" << mask_token_id_
+    CHECK_LT(mask_token_id, target_args.vocab_size())
+        << "Block-diffusion mask_token_id (" << mask_token_id
         << ") must be < target vocab_size (" << target_args.vocab_size()
         << ").";
+    const auto& draft_options = draft_impl_->options();
+    const auto& algorithm = draft_options.speculative_algorithm();
+    const auto& draft_args = draft_impl_->context_.get_model_args();
+    draft_decode_options_ = {
+        {.query_width = SpeculativeConfig::decode_query_len(
+             draft_options.num_speculative_tokens(),
+             algorithm,
+             draft_options.is_draft_engine()),
+         .per_request = SpeculativeConfig::chunked_block_diffusion(
+                            algorithm, draft_args.model_type())
+                            .value(),
+         .causal = false},
+        .block_size = draft_options.block_size(),
+        .mask_token_id = mask_token_id};
+    draft_needs_dummy_tokens_ =
+        SpeculativeConfig::is_dspark_algorithm(algorithm) &&
+        draft_decode_options_.per_request &&
+        ModelConfig::is_python_model_impl(context_.get_model_impl());
     expected_context_hidden_size_ =
         AuxHiddenCapture::aux_hidden_dim(target_args);
   }
@@ -241,15 +261,15 @@ std::optional<ForwardOutput> DFlashWorkerImpl::step_empty(
     return output;
   }
 
-  const DecodeExpansionOptions decode_options = prepare_for_draft();
   LlmForwardInput query_input = input.clone();
   dflash_detail::invalidate_draft_model_geometry(query_input.input_params);
   const int32_t num_sequences = query_input.input_params.meta.num_sequences;
-  if (!prepare_parallel_draft_metadata(query_input, decode_options)) {
-    const int32_t rows_per_sequence =
-        decode_options.per_request ? 1 : decode_options.query_width;
+  if (!prepare_parallel_draft_metadata(query_input)) {
+    const int32_t rows_per_sequence = draft_decode_options_.per_request
+                                          ? 1
+                                          : draft_decode_options_.query_width;
     update_decode_batch_metadata(query_input.input_params,
-                                 decode_options,
+                                 draft_decode_options_,
                                  num_sequences * rows_per_sequence);
   }
   LlmForwardInput draft_forward_input;
@@ -451,15 +471,6 @@ torch::Tensor DFlashWorkerImpl::anchor_token_ids(
   return input.token_ids_host.slice(/*dim=*/0, /*start=*/0, /*end=*/batch_size)
       .to(draft_impl_->device(), torch::kLong);
 }
-DecodeExpansionOptions DFlashWorkerImpl::prepare_for_draft() const {
-  DecodeExpansionOptions decode_options;
-  decode_options.query_width = options_.num_speculative_tokens() + 1;
-  decode_options.block_size = options_.block_size();
-  decode_options.per_request = true;
-  decode_options.causal = false;
-  decode_options.mask_token_id = mask_token_id_;
-  return decode_options;
-}
 
 void DFlashWorkerImpl::prepare_validate_inputs(
     const LlmForwardInput& input,
@@ -505,15 +516,14 @@ void DFlashWorkerImpl::prepare_query_inputs(const LlmForwardInput& input,
   input_params.embedding.input_embedding = torch::Tensor();
   dflash_detail::invalidate_draft_model_geometry(input_params);
 
-  const DecodeExpansionOptions decode_options = prepare_for_draft();
-  const bool idle_rank =
-      prepare_parallel_draft_metadata(query_input, decode_options);
+  const bool idle_rank = prepare_parallel_draft_metadata(query_input);
   if (idle_rank) {
     query_input.sampling_params.logits_indices() = torch::Tensor();
   } else {
     DecodeBatchContext batch_ctx = make_decode_batch_context(input);
-    DecodeBuildBuffers buf = expand_decode_inputs(batch_ctx, decode_options);
-    const int32_t query_width = decode_options.query_width;
+    DecodeBuildBuffers buf =
+        expand_decode_inputs(batch_ctx, draft_decode_options_);
+    const int32_t query_width = draft_decode_options_.query_width;
     const int32_t num_logits_per_request = options_.num_speculative_tokens();
     const int32_t num_logits = batch_ctx.num_requests * num_logits_per_request;
     const torch::Tensor& draft_query_indices =
@@ -530,7 +540,7 @@ void DFlashWorkerImpl::prepare_query_inputs(const LlmForwardInput& input,
                       num_logits_per_request)
               .reshape({-1});
         });
-    build_decode_input(query_input, buf, decode_options, device_);
+    build_decode_input(query_input, buf, draft_decode_options_, device_);
     query_input.sampling_params.logits_indices() = draft_query_indices;
   }
   prepare_draft_sampling(/*probabilistic=*/false, query_input.sampling_params);

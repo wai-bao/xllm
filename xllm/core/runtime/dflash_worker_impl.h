@@ -73,19 +73,13 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
       LlmForwardInput& validate_input,
       LlmForwardInput& draft_forward_input);
 
-  virtual DecodeExpansionOptions prepare_for_draft() const;
-
   void prepare_query_inputs(const LlmForwardInput& input,
                             LlmForwardInput& query_input);
   void prepare_validate_inputs(const LlmForwardInput& input,
                                LlmForwardInput& validate_input);
 
-  bool draft_needs_dummy_tokens_ = false;
-
  private:
-  bool prepare_parallel_draft_metadata(
-      LlmForwardInput& query_input,
-      const DecodeExpansionOptions& decode_options);
+  bool prepare_parallel_draft_metadata(LlmForwardInput& query_input);
 
   std::optional<ForwardOutput> run_validate(
       const LlmForwardInput& input,
@@ -106,12 +100,13 @@ class DFlashWorkerImpl : public DraftModelSpecWorkerImpl<LlmForwardInput> {
  protected:
   torch::Tensor anchor_token_ids(const LlmForwardInput& input) const;
 
-  int32_t mask_token_id_ = -1;
   int64_t expected_context_hidden_size_ = 0;
   // Whether the target model owns recurrent (linear attention) layers.
   bool target_is_hybrid_recurrent_ = false;
 
  private:
+  DecodeExpansionOptions draft_decode_options_;
+  bool draft_needs_dummy_tokens_ = false;
   CachedDeviceIndices draft_logits_indices_;
 };
 

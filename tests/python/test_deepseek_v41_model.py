@@ -44,7 +44,6 @@ from xllm.python.attention.dsa_metadata import (
     build_deepseek_v41_cache_config,
 )
 from xllm.python.layers import moe_parallel
-from xllm.python.layers.attention import Attention
 from xllm.python.model_executor import executor as executor_module
 from xllm.python.model_executor.executor import ModelExecutor
 from xllm.python.models import deepseek_v41 as dq
@@ -1985,13 +1984,13 @@ def test_attention_backend_reuses_model_quant_mode(monkeypatch: pytest.MonkeyPat
     config.pop("candidate_topk_blocks")
     config.pop("candidate_block_size")
     cfg = DeepseekV41Config.from_dict(config)
-    attention = Attention(
-        num_heads=cfg.n_heads,
-        num_kv_heads=1,
-        head_dim=cfg.head_dim,
-        scale=cfg.head_dim**-0.5,
-        sliding_window=cfg.window_size,
+    attention = dq.DeepseekV41Attention(
+        cfg,
         layer_id=0,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        mode=dq.CSA2LayerMode(dq.CSA2_MODE_SWA, 0),
+        quant_mode=quant_mode,
     )
     monkeypatch.setattr(current_platform, "is_npu", lambda: True)
     monkeypatch.setattr(dq, "_detect_v41_quant_mode", lambda _: pytest.fail("checkpoint format was reread"))
@@ -2000,7 +1999,6 @@ def test_attention_backend_reuses_model_quant_mode(monkeypatch: pytest.MonkeyPat
         torch.device("cpu"),
         torch.float32,
         config,
-        quant_mode=quant_mode,
     )
     assert isinstance(backend, Csa2AttentionBackend)
     assert backend.moe_graph_capturable == (quant_mode == V41_QUANT_ASCEND)

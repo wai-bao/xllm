@@ -8,16 +8,9 @@ cc_library(
     acl_graph_bucket_policy.h
     decode_graph_bucket.h
   SRCS
+    acl_graph_bucket_policy.cpp
     decode_graph_bucket.cpp
 )
-
-if(USE_NPU OR BUILD_TESTING)
-  target_sources(decode_graph_bucket PRIVATE acl_graph_bucket_policy.cpp)
-  target_link_libraries(decode_graph_bucket PRIVATE
-    Boost::boost
-    nlohmann_json::nlohmann_json
-  )
-endif()
 
 cc_library(
   NAME

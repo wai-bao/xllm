@@ -1023,15 +1023,17 @@ AclGraphExecutorImpl::AclGraphExecutorImpl(CausalLM* model,
                                            const ModelArgs& args,
                                            const torch::Device& device,
                                            const runtime::Options& options)
-    : model_(model), args_(args), device_(device), options_(options) {
-  initialize(model->is_hybrid_linear_attention(),
-             model->is_hybrid_linear_attention(),
-             model->supports_mla_graph_kv_bucketing());
-}
-
-void AclGraphExecutorImpl::initialize(bool need_update_attn_mask,
-                                      bool is_hybrid_linear_attention,
-                                      bool supports_mla_graph_kv_bucketing) {
+    : model_(model),
+      args_(args),
+      device_(device),
+      options_(options),
+      decode_query_len_(
+          SpeculativeConfig::decode_query_len(options.num_speculative_tokens(),
+                                              options.speculative_algorithm(),
+                                              options.is_draft_engine())) {
+  const bool is_hybrid_linear_attention = model->is_hybrid_linear_attention();
+  const bool supports_mla_graph_kv_bucketing =
+      model->supports_mla_graph_kv_bucketing();
   graph_slot_count_ = options_.enable_graph_double_buffer() ? 2 : 1;
   for (int32_t slot_idx = 0; slot_idx < graph_slot_count_; ++slot_idx) {
     GraphSlot& slot = graph_slots_[slot_idx];
@@ -1039,7 +1041,6 @@ void AclGraphExecutorImpl::initialize(bool need_update_attn_mask,
         std::make_unique<GraphPersistentParam>(args_,
                                                device_,
                                                options_,
-                                               need_update_attn_mask,
                                                is_hybrid_linear_attention,
                                                supports_mla_graph_kv_bucketing);
     slot.graph_pool = c10_npu::graph_pool_handle();
@@ -1157,13 +1158,9 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   const uint32_t n_tokens = tokens.size(/*dim=*/0);
   const uint32_t max_local_num_tokens =
       dp_token_nums.size() > 1 ? util::max(dp_token_nums) : n_tokens;
-  const int32_t num_decoding_tokens =
-      acl_graph_decode_tokens_per_sequence(options_.num_speculative_tokens(),
-                                           options_.speculative_algorithm(),
-                                           options_.is_draft_engine());
-  const uint32_t local_batch_size = n_tokens / num_decoding_tokens;
+  const uint32_t local_batch_size = n_tokens / decode_query_len_;
   const uint32_t max_local_batch_size =
-      max_local_num_tokens / num_decoding_tokens;
+      max_local_num_tokens / decode_query_len_;
 
   // Large decode batches create too many/too large ACL graphs and may OOM.
   // Fall back to eager mode when batch size exceeds the safety threshold.
@@ -1303,9 +1300,7 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
                                              max_graph_batch_size,
                                              dp_size,
                                              params.meta.is_graph_warmup,
-                                             options_.num_speculative_tokens(),
-                                             options_.speculative_algorithm(),
-                                             options_.is_draft_engine())) {
+                                             decode_query_len_)) {
       LOG_FIRST_N(WARNING, 1)
           << "Falling back to eager mode because no ACL graph was prewarmed "
              "for no-padding decode batch_size="

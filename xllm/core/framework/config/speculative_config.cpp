@@ -50,6 +50,29 @@ DEFINE_bool(enable_mtp_draft_body_tp1,
 
 namespace xllm {
 
+bool SpeculativeConfig::is_dflash_family(std::string_view algorithm) {
+  return is_dflash_algorithm(algorithm) || is_dflash2_algorithm(algorithm);
+}
+
+bool SpeculativeConfig::is_block_diffusion_algorithm(
+    std::string_view algorithm) {
+  return is_dflash_family(algorithm) || is_dspark_algorithm(algorithm);
+}
+
+int32_t SpeculativeConfig::decode_query_len(int32_t num_speculative_tokens,
+                                            std::string_view algorithm,
+                                            bool is_draft_engine) {
+  if (is_draft_engine) {
+    if (is_dspark_algorithm(algorithm)) {
+      return num_speculative_tokens;
+    }
+    if (is_eagle_family(algorithm)) {
+      return 1;
+    }
+  }
+  return num_speculative_tokens + 1;
+}
+
 std::optional<bool> SpeculativeConfig::chunked_block_diffusion(
     std::string_view algorithm,
     std::string_view model_type) {

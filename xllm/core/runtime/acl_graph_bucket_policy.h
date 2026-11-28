@@ -15,12 +15,8 @@ limitations under the License.
 
 #pragma once
 
-#include <algorithm>
 #include <cstdint>
-#include <string_view>
 #include <vector>
-
-#include "runtime/decode_graph_bucket.h"
 
 namespace xllm::npu {
 
@@ -35,14 +31,10 @@ inline bool is_acl_graph_compatibility_batch_size(uint64_t batch_size,
   return batch_size >= 32 && batch_size % 16 == 0;
 }
 
-inline uint32_t acl_graph_max_global_batch_size(
+constexpr uint32_t acl_graph_max_global_batch_size(
     uint32_t configured_max_batch_size,
     uint32_t local_batch_size_limit,
     uint32_t dp_size) {
-  if (configured_max_batch_size == 0 || local_batch_size_limit == 0 ||
-      dp_size == 0) {
-    return 0;
-  }
   const uint64_t graph_capacity =
       static_cast<uint64_t>(local_batch_size_limit) * dp_size;
   return graph_capacity < configured_max_batch_size
@@ -50,76 +42,18 @@ inline uint32_t acl_graph_max_global_batch_size(
              : configured_max_batch_size;
 }
 
-inline uint32_t acl_graph_max_full_local_batch_size(uint32_t max_batch_size,
-                                                    uint32_t dp_size) {
-  return dp_size == 0 ? 0 : max_batch_size / dp_size;
-}
+bool is_acl_graph_decode_capture_allowed(uint32_t batch_size,
+                                         uint32_t max_batch_size,
+                                         uint32_t dp_size,
+                                         bool is_graph_warmup,
+                                         int32_t decode_query_len);
 
-int32_t acl_graph_decode_tokens_per_sequence(
-    int32_t num_speculative_tokens,
-    std::string_view speculative_algorithm,
-    bool is_draft_engine);
-
-bool is_acl_graph_decode_capture_allowed(
-    uint32_t batch_size,
-    uint32_t max_batch_size,
-    uint32_t dp_size,
-    bool is_graph_warmup,
-    int32_t num_speculative_tokens = 0,
-    std::string_view speculative_algorithm = {},
-    bool is_draft_engine = false);
-
-// Return sequence-count buckets required to warm up MTP decode graphs. The
-// ACL graph executor keys MTP captures by token rows, so this policy belongs
-// with the runtime capability checks rather than the scheduler profile layer.
-// A nonzero max_graph_batch_size enables the no-padding compatibility filter;
-// zero means the full local range is used without that optional filter.
-inline std::vector<int32_t> get_acl_graph_mtp_warmup_batch_sizes(
+// A nonzero DP-local graph limit enables the no-padding compatibility filter.
+std::vector<int32_t> get_acl_graph_mtp_warmup_batch_sizes(
     uint32_t max_global_batch_size,
     uint32_t dp_size,
-    uint32_t num_speculative_tokens,
+    int32_t decode_query_len,
     bool enable_no_padding,
-    uint32_t max_graph_batch_size) {
-  std::vector<int32_t> batch_sizes;
-  if (max_global_batch_size == 0 || dp_size == 0 ||
-      num_speculative_tokens == 0) {
-    return batch_sizes;
-  }
-
-  const uint32_t max_local_batch_size =
-      acl_graph_max_full_local_batch_size(max_global_batch_size, dp_size);
-  const uint32_t max_graph_local_batch_size =
-      max_graph_batch_size > 0
-          ? std::min(max_local_batch_size, max_graph_batch_size)
-          : max_local_batch_size;
-  if (max_graph_local_batch_size == 0) {
-    return batch_sizes;
-  }
-
-  const uint64_t max_graph_token_count =
-      static_cast<uint64_t>(max_graph_local_batch_size) *
-      (num_speculative_tokens + 1);
-  int64_t last_token_bucket = 0;
-  for (uint32_t local_batch_size = 1;
-       local_batch_size <= max_graph_local_batch_size;
-       ++local_batch_size) {
-    const int64_t token_bucket = runtime::get_decode_graph_token_bucket(
-        static_cast<int64_t>(local_batch_size) * (num_speculative_tokens + 1),
-        enable_no_padding);
-    if (max_graph_batch_size > 0 && enable_no_padding &&
-        !is_acl_graph_compatibility_batch_size(
-            static_cast<uint64_t>(token_bucket), max_graph_token_count)) {
-      continue;
-    }
-    if (batch_sizes.empty() || token_bucket != last_token_bucket) {
-      batch_sizes.emplace_back(
-          static_cast<int32_t>(local_batch_size * dp_size));
-      last_token_bucket = token_bucket;
-    } else {
-      batch_sizes.back() = static_cast<int32_t>(local_batch_size * dp_size);
-    }
-  }
-  return batch_sizes;
-}
+    uint32_t max_graph_batch_size);
 
 }  // namespace xllm::npu
